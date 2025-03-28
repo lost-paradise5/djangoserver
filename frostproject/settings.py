@@ -77,13 +77,24 @@ WSGI_APPLICATION = 'frostproject.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'system_access',        # Имя базы данных
-        'USER': 'postgres',            # Имя пользователя
-        'PASSWORD': 'e#2%10%u9Qio',    # Пароль
-        'HOST': 'localhost',         # Или IP, если БД на другом сервере
-        'PORT': '5432',              # Порт PostgreSQL, по умолчанию 5432
+        'NAME': os.environ.get('DB_NAME', 'system_access'),  # имя вашей базы данных (можно тоже сделать переменной)
+        'USER': os.environ.get('DB_USER', 'postgres'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', 'e#2%10%u9Qio'),
+        'HOST': os.environ.get('DB_HOST', 'localhost'),
+        'PORT': os.environ.get('DB_PORT', '5432'),
     }
 }
+
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': 'system_access',        # Имя базы данных
+#         'USER': 'postgres',            # Имя пользователя
+#         'PASSWORD': 'e#2%10%u9Qio',    # Пароль
+#         'HOST': 'localhost',         # Или IP, если БД на другом сервере
+#         'PORT': '5432',              # Порт PostgreSQL, по умолчанию 5432
+#     }
+# }
 
 
 # Password validation
