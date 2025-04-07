@@ -87,20 +87,17 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
 def queue_create(request):
     """
     Эндпойнт для СОЗДАНИЯ (create).
-    Обязательны все поля:
-     inn, last_name, first_name, surname, beginwork_date,
-     organization, department, bitrix_code, subdivision, position,
-     phone, birth_date, action, start_vacation, end_vacation, type_vacation, shops_id
+    Обязательны все поля, кроме:
+    surname, start_vacation, end_vacation, type_vacation, shops_id
     """
     if request.method == 'POST':
         try:
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name', 'surname', 'beginwork_date',
+                'inn', 'last_name', 'first_name', 'beginwork_date',
                 'organization', 'department', 'bitrix_code', 'subdivision',
-                'position', 'phone', 'birth_date', 'action',
-                'start_vacation', 'end_vacation', 'type_vacation', 'shops_id'
+                'position', 'phone', 'birth_date', 'action'
             ]
 
             final_status, missing = validate_and_create_record(
@@ -125,17 +122,17 @@ def queue_create(request):
 def queue_update(request):
     """
     Эндпойнт для ИЗМЕНЕНИЯ (update).
-    Обязательны те же поля, что и при create.
+    Обязательны все поля, кроме:
+    surname, start_vacation, end_vacation, type_vacation, shops_id
     """
     if request.method == 'POST':
         try:
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name', 'surname', 'beginwork_date',
+                'inn', 'last_name', 'first_name', 'beginwork_date',
                 'organization', 'department', 'bitrix_code', 'subdivision',
-                'position', 'phone', 'birth_date', 'action',
-                'start_vacation', 'end_vacation', 'type_vacation', 'shops_id'
+                'position', 'phone', 'birth_date', 'action'
             ]
 
             final_status, missing = validate_and_create_record(
@@ -160,16 +157,15 @@ def queue_update(request):
 def queue_block(request):
     """
     Эндпойнт для БЛОКИРОВКИ (block).
-    Обязательные поля: inn, last_name, first_name, surname,
-                       department, position, action
+    Обязательные поля:
+    inn, last_name, first_name, position, department
     """
     if request.method == 'POST':
         try:
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name', 'surname',
-                'department', 'position', 'action'
+                'inn', 'last_name', 'first_name', 'position', 'department'
             ]
 
             final_status, missing = validate_and_create_record(
@@ -195,16 +191,16 @@ def queue_vacation(request):
     """
     Эндпойнт для ОТПУСКА (vacation).
     Обязательные поля:
-       inn, last_name, first_name, surname, action,
-       start_vacation, end_vacation, type_vacation
+    inn, last_name, first_name, position, department,
+    start_vacation, end_vacation, type_vacation
     """
     if request.method == 'POST':
         try:
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name', 'surname',
-                'action', 'start_vacation', 'end_vacation', 'type_vacation'
+                'inn', 'last_name', 'first_name', 'position', 'department',
+                'start_vacation', 'end_vacation', 'type_vacation'
             ]
 
             final_status, missing = validate_and_create_record(
