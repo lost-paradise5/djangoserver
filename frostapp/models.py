@@ -34,21 +34,9 @@ class MODUL_logs(models.Model):
         managed = False  
 
 
+        
+        
 class Logs(models.Model):
-    id = models.AutoField(primary_key=True)
-    location = models.CharField(max_length=10)  
-    record_id = models.IntegerField()
-    action = models.CharField(max_length=10)  
-    timestamp = models.DateTimeField(auto_now_add=True)
-    old_value = models.TextField(null=True, blank=True)
-    new_value = models.TextField(null=True, blank=True)
-
-    class Meta:
-        db_table = 'logs'
-        managed = False  
-        
-        
-class LogsV2(models.Model):
     id = models.AutoField(primary_key=True)
     location = models.CharField(max_length=10)  # 'INTERFACE' или 'MODUL'
     interface_id = models.IntegerField(null=True, blank=True)
@@ -59,5 +47,5 @@ class LogsV2(models.Model):
     new_value = models.TextField(null=True, blank=True)
 
     class Meta:
-        db_table = 'logs_v2'
+        db_table = 'logs'
         managed = False  # поскольку таблицу создали вручную SQL
