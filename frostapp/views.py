@@ -3,7 +3,7 @@ import json
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from .models import Queue, LogsV2, MODUL_logs
+from .models import Queue, Logs, MODUL_logs
 
 def encrypt_inn(inn):
     """
@@ -71,7 +71,7 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
         new_modul_log = MODUL_logs.objects.create(data=modul_data)
 
         # 2) Запись в logs
-        LogsV2.objects.create(
+        Logs.objects.create(
             location='MODUL',
             modul_id=new_modul_log.id,
             interface_id=None,
