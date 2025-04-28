@@ -3,7 +3,7 @@ import json
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from .models import Queue, Logs, MODUL_logs
+from .models import Queue, MODUL_logs
 
 def encrypt_inn(inn):
     """
@@ -18,69 +18,117 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
     """
     1) Смотрим payload['data'] (других полей в запросе нет).
     2) Проверяем наличие всех required_fields.
-    3) Если чего-то не хватает -> пишем в queue (status='failed'), а также в MODUL_logs и logs.
-    4) Если всё ок -> queue (status='pending') без логирования.
+    3) Если чего-то не хватает → пишем в queue (status='failed') + только в MODUL_logs.
+    4) Если всё ок → queue (status='pending'), без логирования.
 
     Возвращает (final_status, missing_fields).
     """
-    # Из тела запроса берём только "data"
     data = payload.get('data', {})
     if not isinstance(data, dict):
         data = {}
 
-    # По умолчанию статус 'pending'
     final_status = 'pending'
     attempts = 0
     last_attempt = None
 
     # Проверяем обязательные поля
-    missing = []
-    for field in required_fields:
-        value = data.get(field)
-        if not value:  # None, "", или ключ отсутствует
-            missing.append(field)
+    missing = [f for f in required_fields if not data.get(f)]
 
-    # Шифруем inn, если есть
-    if 'inn' in data and data['inn']:
+    # Хэшируем ИНН (если он есть и валиден)
+    if data.get('inn'):
         try:
             data['inn'] = encrypt_inn(data['inn'])
         except ValueError:
             missing.append('inn')
 
-    # Если поля пропущены -> статус failed
     if missing:
         final_status = 'failed'
 
     # Создаём запись в queue
-    record = Queue.objects.create(
+    Queue.objects.create(
         data=data,
         attempts=attempts,
         status=final_status,
         last_attempt=last_attempt
     )
 
-    # Если failed -> пишем в MODUL_logs и logs
+    # Если failed → фиксируем только в MODUL_logs
     if final_status == 'failed':
-        msg = f"Незаполненные поля: {missing}"
-
-        # 1) Запись в MODUL_logs
-        modul_data = {
-            "error": msg,
-            "payload": data
-        }
-        new_modul_log = MODUL_logs.objects.create(data=modul_data)
-
-        # 2) Запись в logs
-        Logs.objects.create(
-            location='MODUL',
-            modul_id=new_modul_log.id,
-            interface_id=None,
-            action=action_name,
-            old_value=None,
-            new_value=json.dumps(modul_data, ensure_ascii=False)
+        MODUL_logs.objects.create(
+            data={                       # JSONB-поле в таблице
+                "error": f"Незаполненные поля: {missing}",
+                "payload": data
+            }
         )
 
     return final_status, missing
+# def validate_and_create_record(payload, required_fields, action_name="CREATE"):
+#     """
+#     1) Смотрим payload['data'] (других полей в запросе нет).
+#     2) Проверяем наличие всех required_fields.
+#     3) Если чего-то не хватает -> пишем в queue (status='failed'), а также в MODUL_logs и logs.
+#     4) Если всё ок -> queue (status='pending') без логирования.
+
+#     Возвращает (final_status, missing_fields).
+#     """
+#     # Из тела запроса берём только "data"
+#     data = payload.get('data', {})
+#     if not isinstance(data, dict):
+#         data = {}
+
+#     # По умолчанию статус 'pending'
+#     final_status = 'pending'
+#     attempts = 0
+#     last_attempt = None
+
+#     # Проверяем обязательные поля
+#     missing = []
+#     for field in required_fields:
+#         value = data.get(field)
+#         if not value:  # None, "", или ключ отсутствует
+#             missing.append(field)
+
+#     # Шифруем inn, если есть
+#     if 'inn' in data and data['inn']:
+#         try:
+#             data['inn'] = encrypt_inn(data['inn'])
+#         except ValueError:
+#             missing.append('inn')
+
+#     # Если поля пропущены -> статус failed
+#     if missing:
+#         final_status = 'failed'
+
+#     # Создаём запись в queue
+#     record = Queue.objects.create(
+#         data=data,
+#         attempts=attempts,
+#         status=final_status,
+#         last_attempt=last_attempt
+#     )
+
+#     # Если failed -> пишем в MODUL_logs и logs
+#     if final_status == 'failed':
+#         msg = f"Незаполненные поля: {missing}"
+
+#         # 1) Запись в MODUL_logs
+#         modul_data = {
+#             "error": msg,
+#             "payload": data
+#         }
+#         new_modul_log = MODUL_logs.objects.create(data=modul_data)
+
+#         # 2) Запись в logs
+#         Logs.objects.create(
+#             location='MODUL',
+#             modul_id=new_modul_log.id,
+#             interface_id=None,
+#             action=action_name,
+#             old_value=None,
+#             new_value=json.dumps(modul_data, ensure_ascii=False)
+#         )
+
+#     return final_status, missing
 
 
 @csrf_exempt
