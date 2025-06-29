@@ -116,7 +116,7 @@ def register_cashier(request):
         # Получаем версию из конвертера
         converter = connect_converter()
         conv_cursor = converter.cursor()
-        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM signal WHERE signal = 'busy'")
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE signal = 'busy'")
         version = (conv_cursor.fetchone()['cnt'] or 0) + 1
         converter.close()
 
@@ -127,7 +127,7 @@ def register_cashier(request):
         """, (storeid, cashier_id, fio, inn, password_hashed, role_id, version))
 
         # Запись в signal
-        cursor.execute("INSERT INTO signal(signal, version) VALUES ('incr', %s)", (version,))
+        cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
         conn.commit()
         conn.close()
 
