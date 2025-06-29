@@ -1,9 +1,201 @@
 import hashlib
 import json
+import os
+import logging
+import random
+import string
+import pymysql
+import xml.etree.ElementTree as ET
+import cx_Oracle
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from .models import Queue, MODUL_logs
+
+
+
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+log_file_path = os.path.join(LOG_DIR, 'ukm_register.log')
+
+logger = logging.getLogger("ukm_logger")
+logger.setLevel(logging.INFO)
+file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+if not logger.hasHandlers():
+    logger.addHandler(file_handler)
+
+
+
+
+def connect_ukm():
+    return pymysql.connect(
+        host="192.168.17.237",
+        user="ukminfo",
+        password="CtHDbCGK.C",
+        database="ukmserver",
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+
+def connect_converter():
+    return pymysql.connect(
+        host="192.168.17.237",
+        port=3306,
+        user="user1C",
+        password="852654",
+        database="import4staffbonus",
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+
+def connect_oracle():
+    dsn = cx_Oracle.makedsn("192.168.17.237", 1521, service_name="xe")
+    return cx_Oracle.connect(user="supermag_user", password="supermag_pass", dsn=dsn, encoding="UTF-8")
+
+def is_ukm5_store(storeid):
+    try:
+        conn = connect_oracle()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 1
+            FROM smstoreproperties
+            WHERE propid = 'REP.UKMSERVER5' AND storeloc = :storeid
+        """, {'storeid': storeid})
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Oracle (определение УКМ5): {e}")
+        return False
+
+
+def generate_password():
+    return "KS" + ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+
+@csrf_exempt
+def register_cashier(request):
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        required_fields = ['inn', 'surname', 'name', 'patronymic', 'roleId', 'storeid']
+        missing = [f for f in required_fields if not data.get(f)]
+        if missing:
+            logger.error(f"Пропущены поля: {missing}")
+            return JsonResponse({'status': 'error', 'message': f'Пропущены поля: {missing}'}, status=400)
+
+        inn = data['inn']
+        fio = f"{data['surname']} {data['name']} {data['patronymic']}"
+        role_id = data['roleId']
+        storeid = int(data['storeid'])
+        password_plain = generate_password()
+        password_hashed = password_plain  # old_password можно внедрить позже
+
+        ukm_version = "UKM5" if is_ukm5_store(storeid) else "UKM4"
+        logger.info(f"Магазин {storeid} определён как {ukm_version}")
+
+        conn = connect_ukm()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM trm_in_users WHERE inn=%s AND name=%s", (inn, fio))
+        existing = cursor.fetchone()
+        if existing:
+            logger.info(f"[{ukm_version}] Сотрудник уже существует: {fio}, ID={existing['id']}")
+            return JsonResponse({'status': 'ok', 'message': 'Сотрудник уже зарегистрирован'}, status=200)
+
+        # Получаем новый ID
+        cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+        cashier_id = cursor.fetchone()['next_id'] or 1
+
+        # Получаем версию из конвертера
+        converter = connect_converter()
+        conv_cursor = converter.cursor()
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM signal WHERE signal = 'busy'")
+        version = (conv_cursor.fetchone()['cnt'] or 0) + 1
+        converter.close()
+
+        # Запись в users
+        cursor.execute("""
+            INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
+        """, (storeid, cashier_id, fio, inn, password_hashed, role_id, version))
+
+        # Запись в signal
+        cursor.execute("INSERT INTO signal(signal, version) VALUES ('incr', %s)", (version,))
+        conn.commit()
+        conn.close()
+
+        logger.info(f"[{ukm_version}] Кассир {fio} добавлен (ID={cashier_id})")
+
+        # Генерация XML если УКМ5
+        xml_path = None
+        if ukm_version == "UKM5":
+            xml_filename = f"StoreCashiers_{storeid}_{cashier_id}_F.xml"
+            xml_path = os.path.join(r"\\SGO1\UKM5\SGO\CASHLOAD", xml_filename)
+            try:
+                root = ET.Element("StoreCashiers")
+                cashier = ET.SubElement(root, "Cashier")
+                ET.SubElement(cashier, "Id").text = str(cashier_id)
+                ET.SubElement(cashier, "Name").text = fio
+                ET.SubElement(cashier, "INN").text = inn
+                ET.SubElement(cashier, "Password").text = password_plain
+                ET.SubElement(cashier, "RoleId").text = str(role_id)
+                ET.SubElement(cashier, "Deleted").text = "0"
+                tree = ET.ElementTree(root)
+                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                logger.info(f"XML-файл сохранён: {xml_path}")
+            except Exception as e:
+                logger.error(f"Ошибка генерации XML: {e}")
+                xml_path = None
+
+        return JsonResponse({
+            'status': 'ok',
+            'message': 'Кассир зарегистрирован',
+            'cashier_id': cashier_id,
+            'password': password_plain,
+            'ukm_version': ukm_version,
+            'xml_path': xml_path
+        })
+
+    except Exception as e:
+        logger.exception("Ошибка регистрации кассира")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def encrypt_inn(inn):
     """
