@@ -116,7 +116,7 @@ def register_cashier(request):
         # Получаем версию из конвертера
         converter = connect_converter()
         conv_cursor = converter.cursor()
-        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE signal = 'busy'")
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
         version = (conv_cursor.fetchone()['cnt'] or 0) + 1
         converter.close()
 
