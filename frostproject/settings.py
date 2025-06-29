@@ -81,7 +81,7 @@ DATABASES = {
         'NAME': os.environ.get('DB_NAME', 'system_access'),  # имя вашей базы данных (можно тоже сделать переменной)
         'USER': os.environ.get('DB_USER', 'postgres'),
         'PASSWORD': os.environ.get('DB_PASSWORD', 'e#2%10%u9Qio'),
-        'HOST': os.environ.get('DB_HOST', '192.168.17.70'),
+        'HOST': os.environ.get('DB_HOST', 'localhost'),
         'PORT': os.environ.get('DB_PORT', '5432'),
     }
 }
