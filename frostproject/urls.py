@@ -32,5 +32,5 @@ urlpatterns = [
     path('queue/update/', queue_update, name='queue_update'),
     path('queue/block/', queue_block, name='queue_block'),
     path('queue/vacation/', queue_vacation, name='queue_vacation'),
-    path('queue/register_cashier/', register_cashier),
+    path('queue/register_cashier/', register_cashier, name='register_cashier'),
 ]
