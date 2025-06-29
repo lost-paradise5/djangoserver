@@ -103,7 +103,7 @@ def register_cashier(request):
         conn = connect_ukm()
         cursor = conn.cursor()
 
-        cursor.execute("SELECT * FROM trm_in_users WHERE inn=%s AND name=%s", (inn, fio))
+        cursor.execute("SELECT * FROM trm_in_users WHERE user_inn=%s AND name=%s", (inn, fio))
         existing = cursor.fetchone()
         if existing:
             logger.info(f"[{ukm_version}] Сотрудник уже существует: {fio}, ID={existing['id']}")
