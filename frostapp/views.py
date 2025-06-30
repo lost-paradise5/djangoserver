@@ -95,45 +95,49 @@ def register_cashier(request):
         role_id = data['roleId']
         storeid = int(data['storeid'])
         password_plain = generate_password()
-        password_hashed = password_plain  # old_password можно внедрить позже
+        password_hashed = password_plain
 
+        # Определяем UKM4/UKM5
         ukm_version = "UKM5" if is_ukm5_store(storeid) else "UKM4"
         logger.info(f"Магазин {storeid} определён как {ukm_version}")
 
-        conn = connect_ukm()
-        cursor = conn.cursor()
+        # Проверка существования в ukmserver
+        ukm_conn = connect_ukm()
+        ukm_cursor = ukm_conn.cursor()
+        ukm_cursor.execute("SELECT * FROM trm_in_users WHERE user_inn=%s AND name=%s", (inn, fio))
+        existing = ukm_cursor.fetchone()
+        ukm_conn.close()
 
-        cursor.execute("SELECT * FROM trm_in_users WHERE user_inn=%s AND name=%s", (inn, fio))
-        existing = cursor.fetchone()
         if existing:
             logger.info(f"[{ukm_version}] Сотрудник уже существует: {fio}, ID={existing['id']}")
             return JsonResponse({'status': 'ok', 'message': 'Сотрудник уже зарегистрирован'}, status=200)
 
-        # Получаем новый ID
-        cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
-        cashier_id = cursor.fetchone()['next_id'] or 1
-
-        # Получаем версию из конвертера
+        # Работа с import4staffbonus
         converter = connect_converter()
         conv_cursor = converter.cursor()
-        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
-        version = (conv_cursor.fetchone()['cnt'] or 0) + 1
-        converter.close()
 
-        # Запись в users
-        cursor.execute("""
+        # Новый ID
+        conv_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM users")
+        cashier_id = conv_cursor.fetchone()['next_id'] or 1
+
+        # Версия
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM signal WHERE signal = 'busy'")
+        version = (conv_cursor.fetchone()['cnt'] or 0) + 1
+
+        # Вставка в users
+        conv_cursor.execute("""
             INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
             VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
         """, (storeid, cashier_id, fio, inn, password_hashed, role_id, version))
 
-        # Запись в signal
-        cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
-        conn.commit()
-        conn.close()
+        # Вставка в signal
+        conv_cursor.execute("INSERT INTO signal(signal, version) VALUES ('incr', %s)", (version,))
+        converter.commit()
+        converter.close()
 
         logger.info(f"[{ukm_version}] Кассир {fio} добавлен (ID={cashier_id})")
 
-        # Генерация XML если УКМ5
+        # XML для УКМ5
         xml_path = None
         if ukm_version == "UKM5":
             xml_filename = f"StoreCashiers_{storeid}_{cashier_id}_F.xml"
