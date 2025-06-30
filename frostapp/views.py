@@ -59,18 +59,18 @@ def connect_oracle():
 
 def is_ukm5_store(storeid):
     try:
-        conn = connect_oracle()
+        conn = connect_ukm()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT 1
-            FROM smstoreproperties
-            WHERE propid = 'REP.UKMSERVER5' AND storeloc = :storeid
-        """, {'storeid': storeid})
+            SELECT 1 FROM smstoreproperties 
+            WHERE propid = 'REP.UKMSERVER5' AND storeloc = %s
+        """, (storeid,))
         result = cursor.fetchone()
         conn.close()
+        logger.info(f"Проверка УКМ5 по storeid={storeid}: {'UKM5' if result else 'UKM4'}")
         return result is not None
     except Exception as e:
-        logger.error(f"Ошибка подключения к Oracle (определение УКМ5): {e}")
+        logger.error(f"Ошибка при определении УКМ5 через MySQL: {e}")
         return False
 
 
