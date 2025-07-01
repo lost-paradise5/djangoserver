@@ -116,9 +116,12 @@ def register_cashier(request):
         converter = connect_converter()
         conv_cursor = converter.cursor()
 
-        # Новый ID
-        conv_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM users")
-        cashier_id = conv_cursor.fetchone()['next_id'] or 1
+        # Получаем ID из ukmserver.trm_in_users
+        ukm_conn = connect_ukm()
+        ukm_cursor = ukm_conn.cursor()
+        ukm_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM trm_in_users")
+        cashier_id = ukm_cursor.fetchone()['next_id'] or 1
+        ukm_conn.close()
 
         # Версия
         conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
