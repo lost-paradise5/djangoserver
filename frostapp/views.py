@@ -59,22 +59,39 @@ def connect_oracle():
 
 def is_ukm5_store(storeid):
     try:
+        # Прямое подключение к Oracle по IP, порту и имени сервиса
         dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="BINUU00")
-        connection = cx_Oracle.connect(user="sys", password="qqq", dsn=dsn, mode=cx_Oracle.SYSDBA)
+        connection = cx_Oracle.connect("sys", "qqq", dsn=dsn, mode=cx_Oracle.SYSDBA)
         cursor = connection.cursor()
 
-        # Покажем все таблицы, доступные пользователю SYS (или видимые через ALL_TABLES)
-        cursor.execute("SELECT owner, table_name FROM all_tables WHERE ROWNUM <= 100 ORDER BY owner, table_name")
-        rows = cursor.fetchall()
-        logger.info(f"[Oracle] Всего таблиц: {len(rows)}. Примеры:")
-        for owner, table in rows:
-            logger.info(f"[Oracle] {owner}.{table}")
+        cursor.execute("""
+            SELECT T1.ID as SMSTORE,
+                   T2.PROPVAL as CLOSEDATE,
+                   T3.PROPVAL as UKM4STORE,
+                   T4.PROPVAL as UKM5STORE
+            FROM SMSTORELOCATIONS T1,
+                 (SELECT * FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.CLOSEDATE') T2,
+                 (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMStoreId') T3,
+                 (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER5') T4
+            WHERE T1.ID = T2.STORELOC(+)
+              AND T1.ID = T3.STORELOC(+)
+              AND T1.ID = T4.STORELOC(+)
+              AND T1.ID = :storeid
+        """, storeid=int(storeid))
 
+        row = cursor.fetchone()
+        cursor.close()
         connection.close()
-        return False
+
+        if row and row[3]:  # UKM5STORE
+            logger.info(f"[Oracle] Магазин {storeid} определён как UKM5")
+            return True
+        else:
+            logger.info(f"[Oracle] Магазин {storeid} определён как UKM4")
+            return False
 
     except Exception as e:
-        logger.error(f"Ошибка при подключении к Oracle: {e}")
+        logger.error(f"Ошибка при проверке UKM5 через Oracle: {e}")
         return False
 
 
