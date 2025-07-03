@@ -59,11 +59,11 @@ def connect_oracle():
 
 def is_ukm5_store(storeid):
     try:
-        dsn = "BINUU00"  # имя сервиса из tnsnames.ora или EZCONNECT
-        connection = cx_Oracle.connect("sys", "qqq", "BINUU00", mode=cx_Oracle.SYSDBA)
+        dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="BINUU00")
+        connection = cx_Oracle.connect("sys", "qqq", dsn=dsn, mode=cx_Oracle.SYSDBA)
         cursor = connection.cursor()
 
-        cursor.execute(f"""
+        cursor.execute("""
             SELECT T1.ID as SMSTORE,
                    T2.PROPVAL as CLOSEDATE,
                    T3.PROPVAL as UKM4STORE,
@@ -79,6 +79,7 @@ def is_ukm5_store(storeid):
         """, storeid=int(storeid))
 
         row = cursor.fetchone()
+        cursor.close()
         connection.close()
 
         if row and row[3]:  # UKM5STORE
