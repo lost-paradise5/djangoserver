@@ -61,7 +61,7 @@ def is_ukm5_store(storeid):
     try:
         # Прямое подключение к Oracle по IP, порту и имени сервиса
         dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="BINUU00")
-        connection = cx_Oracle.connect("supermag", "qqq", dsn=dsn, mode=cx_Oracle.SYSDBA)
+        connection = cx_Oracle.connect("supermag", "qqq", dsn=dsn)
         cursor = connection.cursor()
 
         cursor.execute("""
