@@ -160,7 +160,7 @@ def register_cashier(request):
                     username=fio,
                     password=password_hashed, 
                     system_id=2,
-                    status=1
+                    status=True
                 )
 
                 # 4. Вставка в qr_code
