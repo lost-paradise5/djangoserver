@@ -71,6 +71,8 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'frostproject.wsgi.application'
 
+os.environ['TNS_ADMIN'] = '/opt/oracle/instantclient_23_7/network/admin'
+
 
 # Database
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
