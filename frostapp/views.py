@@ -60,7 +60,7 @@ def connect_oracle():
 def is_ukm5_store(storeid):
     try:
         dsn = "BINUU00"  # имя сервиса из tnsnames.ora или EZCONNECT
-        connection = cx_Oracle.connect("sys", "qqq", dsn, mode=cx_Oracle.SYSDBA)
+        connection = cx_Oracle.connect("sys", "qqq", "192.168.17.237:1521/BINUU00", mode=cx_Oracle.SYSDBA)
         cursor = connection.cursor()
 
         cursor.execute(f"""
