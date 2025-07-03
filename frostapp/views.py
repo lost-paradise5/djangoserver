@@ -4,13 +4,17 @@ import os
 import logging
 import random
 import string
+import datetime
 import pymysql
 import xml.etree.ElementTree as ET
 import cx_Oracle
 from django.http import JsonResponse
+from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
 
-from .models import Queue, MODUL_logs
+
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode
 
 
 
@@ -52,7 +56,11 @@ def connect_converter():
         cursorclass=pymysql.cursors.DictCursor
     )
 
-
+def generate_qr_string(inn: str, salt: str = "INDIVIDUAL_SALT") -> str:
+    hash_inn = hashlib.sha256(inn.encode('utf-8')).hexdigest()
+    expiration = (datetime.datetime.utcnow() + datetime.timedelta(days=1)).strftime('%Y%m%d')
+    return f"KS{hash_inn}{expiration}{salt}"
+    
 def connect_oracle():
     dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="xe")
     return cx_Oracle.connect(user="supermag_user", password="supermag_pass", dsn=dsn, encoding="UTF-8")
@@ -117,6 +125,63 @@ def register_cashier(request):
         storeid = int(data['storeid'])
         password_plain = generate_password()
         password_hashed = password_plain
+
+        with transaction.atomic():
+            encrypted_inn = hashlib.sha256(inn.encode('utf-8')).hexdigest()
+            existing_user = User.objects.filter(encrypted_inn=encrypted_inn, full_name=fio).first()
+
+            if not existing_user:
+                # 1. Вставка в users
+                new_user = User.objects.create(
+                encrypted_inn=encrypted_inn,
+                full_name=fio,
+                mail="auto@example.com",
+                phone="+79999999999",
+                department_id=1,
+                position_id=2,
+                active=True,
+                tg_status=False,
+                created_at=timezone.now(),
+                updated_at=timezone.now()
+                )
+                user_id = new_user.id
+
+                # 2. Вставка в ukm_users
+                UKMUser.objects.create(
+                    id=user_id,
+                    roleId=role_id,
+                    storeId=storeid,
+                    version=1
+                )
+
+                # 3. Вставка в open_in_system
+                OpenInSystem.objects.create(
+                    id=user_id,
+                    username=fio,
+                    password=password_hashed, 
+                    system_id=2,
+                    status=1
+                )
+
+                # 4. Вставка в qr_code
+                qr_string = generate_qr_string(inn)
+                QRCode.objects.create(
+                    user=new_user,
+                    qr_data=qr_string,
+                    created_at=timezone.now(),
+                    used_at=None
+                )
+
+                logger.info(f"[PostgreSQL] Пользователь {fio} добавлен в users, ukm_users, open_in_system, qr_code.")
+            else:
+                logger.info(f"[PostgreSQL] Пользователь {fio} уже существует (ID={existing_user.id})")
+                new_user = existing_user
+        
+
+
+
+
+        
 
         # Определяем UKM4/UKM5
         ukm_version = "UKM5" if is_ukm5_store(storeid) else "UKM4"
@@ -421,3 +486,43 @@ def queue_vacation(request):
     else:
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
 
+
+
+
+
+
+
+
+
+
+@csrf_exempt
+def get_qr_code_by_tg(request):
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        tg_id = data.get('tg_id')
+
+        if not tg_id:
+            logger.error("Не указан tg_id")
+            return JsonResponse({'status': 'error', 'message': 'Не указан tg_id'}, status=400)
+
+        user = User.objects.filter(tg_id=str(tg_id)).first()
+
+        if not user:
+            logger.warning(f"Пользователь с tg_id={tg_id} не найден")
+            return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
+
+        qr_record = QRCode.objects.filter(user=user).order_by('-created_at').first()
+
+        if not qr_record:
+            logger.warning(f"QR-код для пользователя с tg_id={tg_id} не найден")
+            return JsonResponse({'status': 'error', 'message': 'QR-код не найден'}, status=404)
+
+        logger.info(f"QR-код для tg_id={tg_id} успешно получен")
+        return JsonResponse({'status': 'ok', 'qr_data': qr_record.qr_data}, status=200)
+
+    except Exception as e:
+        logger.exception("Ошибка при получении QR-кода")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
