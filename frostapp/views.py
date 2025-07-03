@@ -60,37 +60,20 @@ def connect_oracle():
 def is_ukm5_store(storeid):
     try:
         dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="BINUU00")
-        connection = cx_Oracle.connect("sys", "qqq", dsn=dsn, mode=cx_Oracle.SYSDBA)
+        connection = cx_Oracle.connect(user="supermag", password="supermag", dsn=dsn)
         cursor = connection.cursor()
 
-        cursor.execute("""
-            SELECT T1.ID as SMSTORE,
-                   T2.PROPVAL as CLOSEDATE,
-                   T3.PROPVAL as UKM4STORE,
-                   T4.PROPVAL as UKM5STORE
-            FROM SMSTORELOCATIONS T1,
-                 (SELECT * FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.CLOSEDATE') T2,
-                 (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMStoreId') T3,
-                 (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER5') T4
-            WHERE T1.ID = T2.STORELOC(+)
-              AND T1.ID = T3.STORELOC(+)
-              AND T1.ID = T4.STORELOC(+)
-              AND T1.ID = :storeid
-        """, storeid=int(storeid))
+        # Смотрим все таблицы в текущей схеме
+        cursor.execute("SELECT table_name FROM user_tables")
+        tables = cursor.fetchall()
+        table_names = [row[0] for row in tables]
+        logger.info(f"[Oracle] Найдено {len(table_names)} таблиц в схеме 'supermag': {table_names}")
 
-        row = cursor.fetchone()
-        cursor.close()
-        connection.close()
-
-        if row and row[3]:  # UKM5STORE
-            logger.info(f"[Oracle] Магазин {storeid} определён как UKM5")
-            return True
-        else:
-            logger.info(f"[Oracle] Магазин {storeid} определён как UKM4")
-            return False
+        # Можно вернуть False, т.к. здесь только отладка
+        return False
 
     except Exception as e:
-        logger.error(f"Ошибка при проверке UKM5 через Oracle: {e}")
+        logger.error(f"Ошибка при подключении к Oracle: {e}")
         return False
 
 
