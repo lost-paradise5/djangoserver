@@ -98,7 +98,7 @@ class OpenInSystem(models.Model):
     username = models.CharField(max_length=255)
     password = models.CharField(max_length=128)
     system_id = models.IntegerField()
-    status = models.IntegerField()
+    status = models.BooleanField()
 
     class Meta:
         db_table = 'open_in_system'
