@@ -60,16 +60,17 @@ def connect_oracle():
 def is_ukm5_store(storeid):
     try:
         dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="BINUU00")
-        connection = cx_Oracle.connect(user="supermag", password="supermag", dsn=dsn)
+        connection = cx_Oracle.connect(user="sys", password="qqq", dsn=dsn, mode=cx_Oracle.SYSDBA)
         cursor = connection.cursor()
 
-        # Смотрим все таблицы в текущей схеме
-        cursor.execute("SELECT table_name FROM user_tables")
-        tables = cursor.fetchall()
-        table_names = [row[0] for row in tables]
-        logger.info(f"[Oracle] Найдено {len(table_names)} таблиц в схеме 'supermag': {table_names}")
+        # Покажем все таблицы, доступные пользователю SYS (или видимые через ALL_TABLES)
+        cursor.execute("SELECT owner, table_name FROM all_tables WHERE ROWNUM <= 100 ORDER BY owner, table_name")
+        rows = cursor.fetchall()
+        logger.info(f"[Oracle] Всего таблиц: {len(rows)}. Примеры:")
+        for owner, table in rows:
+            logger.info(f"[Oracle] {owner}.{table}")
 
-        # Можно вернуть False, т.к. здесь только отладка
+        connection.close()
         return False
 
     except Exception as e:
