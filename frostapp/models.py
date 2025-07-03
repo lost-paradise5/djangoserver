@@ -83,9 +83,9 @@ class User(models.Model):
 
 
 class UKMUser(models.Model):
-    id = models.IntegerField(primary_key=True)  
-    roleId = models.IntegerField()
-    storeId = models.IntegerField()
+    id = models.IntegerField(primary_key=True)
+    roleid = models.IntegerField()
+    storeid = models.IntegerField()
     version = models.IntegerField()
 
     class Meta:
