@@ -49,3 +49,72 @@ class Logs(models.Model):
     class Meta:
         db_table = 'logs'
         managed = False  # поскольку таблицу создали вручную SQL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class User(models.Model):
+    id = models.AutoField(primary_key=True)
+    encrypted_inn = models.CharField(max_length=128)
+    full_name = models.CharField(max_length=255)
+    mail = models.CharField(max_length=255)
+    phone = models.CharField(max_length=50)
+    department_id = models.IntegerField()
+    position_id = models.IntegerField()
+    active = models.BooleanField(default=True)
+    tg_status = models.BooleanField(default=False)
+    tg_id = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'users'
+        managed = False
+
+
+class UKMUser(models.Model):
+    id = models.IntegerField(primary_key=True)  
+    roleId = models.IntegerField()
+    storeId = models.IntegerField()
+    version = models.IntegerField()
+
+    class Meta:
+        db_table = 'ukm_users'
+        managed = False
+
+
+class OpenInSystem(models.Model):
+    id = models.IntegerField(primary_key=True)
+    username = models.CharField(max_length=255)
+    password = models.CharField(max_length=128)
+    system_id = models.IntegerField()
+    status = models.IntegerField()
+
+    class Meta:
+        db_table = 'open_in_system'
+        managed = False
+
+
+class QRCode(models.Model):
+    id = models.AutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column='user_id')
+    qr_data = models.TextField()
+    created_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'qr_code'
+        managed = False
+
+
+
