@@ -54,7 +54,7 @@ def connect_converter():
 
 
 def connect_oracle():
-    dsn = cx_Oracle.makedsn("192.168.17.237", 1521, service_name="xe")
+    dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="xe")
     return cx_Oracle.connect(user="supermag_user", password="supermag_pass", dsn=dsn, encoding="UTF-8")
 
 def is_ukm5_store(storeid):
