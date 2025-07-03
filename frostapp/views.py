@@ -149,8 +149,8 @@ def register_cashier(request):
                 # 2. Вставка в ukm_users
                 UKMUser.objects.create(
                     id=user_id,
-                    roleId=role_id,
-                    storeId=storeid,
+                    roleid=role_id,
+                    storeid=storeid,
                     version=1
                 )
 
