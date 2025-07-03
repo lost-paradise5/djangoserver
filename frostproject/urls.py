@@ -21,7 +21,8 @@ from frostapp.views import (
     queue_update,
     queue_block,
     queue_vacation,
-    register_cashier
+    register_cashier, 
+    get_qr_code_by_tg
 )
 
 urlpatterns = [
@@ -33,4 +34,5 @@ urlpatterns = [
     path('queue/block/', queue_block, name='queue_block'),
     path('queue/vacation/', queue_vacation, name='queue_vacation'),
     path('queue/register_cashier/', register_cashier, name='register_cashier'),
+    path('get_qr_code/', get_qr_code_by_tg, name='get_qr_code'),
 ]
