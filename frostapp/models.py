@@ -118,3 +118,21 @@ class QRCode(models.Model):
 
 
 
+
+
+class Department(models.Model):
+    id   = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=255)
+
+    class Meta:
+        db_table = 'departments'
+        managed  = False
+
+
+class Position(models.Model):
+    id   = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=255)
+
+    class Meta:
+        db_table = 'positions'
+        managed  = False
