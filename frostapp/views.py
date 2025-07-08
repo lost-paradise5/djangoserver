@@ -212,7 +212,7 @@ def register_cashier(request):
 
                 # 3. Вставка в open_in_system
                 OpenInSystem.objects.create(
-                    id=user_id,
+                    user_id=user_id,
                     username=fio,
                     password=password_plain, 
                     system_id=9,
