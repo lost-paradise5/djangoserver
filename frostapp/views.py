@@ -103,8 +103,40 @@ def is_ukm5_store(storeid):
         return False
 
 
-def generate_password():
-    return "KS" + ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+
+
+
+
+
+
+def encrypt_inn_full(inn: str) -> str:
+    if not isinstance(inn, str) or not inn.isdigit():
+        raise ValueError("ИНН должен быть строкой, содержащей только цифры")
+    return hashlib.sha256(inn.encode("utf-8")).hexdigest()
+
+def encrypt_inn20(inn: str) -> str:
+    return encrypt_inn_full(inn)[:20]
+
+def build_user_password(hash20: str) -> str:
+    date_part = datetime.datetime.utcnow().strftime("%Y%m%d")
+    base      = f"KS{hash20}{date_part}"
+    max_len   = 40
+    salt_len  = max_len - len(base)
+    salt      = ''.join(random.choices(string.ascii_uppercase + string.digits, k=salt_len))
+    return base + salt
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 @csrf_exempt
 def register_cashier(request):
@@ -127,8 +159,6 @@ def register_cashier(request):
         pos_name   = data['position']
         role_id = data['roleId']
         storeid = int(data['storeid'])
-        password_plain = generate_password()
-        password_hashed = password_plain
 
 
         dep_obj = Department.objects.filter(name__iexact=dep_name).first()
@@ -146,13 +176,15 @@ def register_cashier(request):
                                 status=400)
 
         with transaction.atomic():
-            encrypted_inn = hashlib.sha256(inn.encode('utf-8')).hexdigest()
-            existing_user = User.objects.filter(encrypted_inn=encrypted_inn, full_name=fio).first()
+            inn_hash_full = encrypt_inn_full(inn) 
+            inn_hash_20   = inn_hash_full[:20]   
+            password_plain = build_user_password(inn_hash_20) 
+            qr_string      = password_plain          
 
             if not existing_user:
                 # 1. Вставка в users
                 new_user = User.objects.create(
-                encrypted_inn=encrypted_inn,
+                encrypted_inn=inn_hash_full,
                 full_name=fio,
                 mail          = mail,
                 phone         = phone,
@@ -177,13 +209,13 @@ def register_cashier(request):
                 OpenInSystem.objects.create(
                     id=user_id,
                     username=fio,
-                    password=password_hashed, 
+                    password=password_plain, 
                     system_id=2,
                     status=True
                 )
 
                 # 4. Вставка в qr_code
-                qr_string = generate_qr_string(inn)
+                qr_string = password_plain
                 QRCode.objects.create(
                     user=new_user,
                     qr_data=qr_string,
@@ -236,7 +268,7 @@ def register_cashier(request):
         conv_cursor.execute("""
             INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
             VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
-        """, (storeid, cashier_id, fio, inn, password_hashed, role_id, version))
+        """, (storeid, cashier_id, fio, inn_hash_20, password_plain, role_id, version))
 
         # Вставка в signal
         conv_cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
