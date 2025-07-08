@@ -210,7 +210,7 @@ def register_cashier(request):
                     id=user_id,
                     username=fio,
                     password=password_plain, 
-                    system_id=2,
+                    system_id=9,
                     status=True
                 )
 
