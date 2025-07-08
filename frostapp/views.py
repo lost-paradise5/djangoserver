@@ -14,7 +14,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
 
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position 
 
 
 
@@ -113,7 +113,7 @@ def register_cashier(request):
 
     try:
         data = json.loads(request.body)
-        required_fields = ['inn', 'surname', 'name', 'patronymic', 'roleId', 'storeid']
+        required_fields = ['inn', 'surname', 'name', 'patronymic', 'mail', 'phone', 'department', 'position', 'roleId', 'storeid']
         missing = [f for f in required_fields if not data.get(f)]
         if missing:
             logger.error(f"Пропущены поля: {missing}")
@@ -121,10 +121,29 @@ def register_cashier(request):
 
         inn = data['inn']
         fio = f"{data['surname']} {data['name']} {data['patronymic']}"
+        mail       = data['mail']
+        phone      = data['phone']
+        dep_name   = data['department']
+        pos_name   = data['position']
         role_id = data['roleId']
         storeid = int(data['storeid'])
         password_plain = generate_password()
         password_hashed = password_plain
+
+
+        dep_obj = Department.objects.filter(name__iexact=dep_name).first()
+        if not dep_obj:
+            logger.error(f"Отдел «{dep_name}» не найден")
+            return JsonResponse({'status': 'error',
+                                 'message': f'Отдел «{dep_name}» не найден'},
+                                status=400)
+
+        pos_obj = Position.objects.filter(name__iexact=pos_name).first()
+        if not pos_obj:
+            logger.error(f"Должность «{pos_name}» не найдена")
+            return JsonResponse({'status': 'error',
+                                 'message': f'Должность «{pos_name}» не найдена'},
+                                status=400)
 
         with transaction.atomic():
             encrypted_inn = hashlib.sha256(inn.encode('utf-8')).hexdigest()
@@ -135,10 +154,10 @@ def register_cashier(request):
                 new_user = User.objects.create(
                 encrypted_inn=encrypted_inn,
                 full_name=fio,
-                mail="auto@example.com",
-                phone="+79999999999",
-                department_id=244,
-                position_id=19,
+                mail          = mail,
+                phone         = phone,
+                department_id = dep_obj.id,
+                position_id   = pos_obj.id,
                 active=True,
                 tg_status=False,
                 created_at=timezone.now(),
