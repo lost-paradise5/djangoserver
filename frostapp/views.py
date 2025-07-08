@@ -16,7 +16,19 @@ from django.utils import timezone
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position 
 
+_HEX = set("0123456789abcdefABCDEF")
 
+def get_inn_hash(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("ИНН должен быть строкой")
+
+    if len(value) == 64 and all(ch in _HEX for ch in value):
+        return value.lower()                  
+
+    if value.isdigit():                     
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    raise ValueError("ИНН должен быть числом (10/12) или 64-символьным SHA-256")
 
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
@@ -110,9 +122,7 @@ def is_ukm5_store(storeid):
 
 
 def encrypt_inn_full(inn: str) -> str:
-    if not isinstance(inn, str) or not inn.isdigit():
-        raise ValueError("ИНН должен быть строкой, содержащей только цифры")
-    return hashlib.sha256(inn.encode("utf-8")).hexdigest()
+    return get_inn_hash(inn)
 
 def encrypt_inn20(inn: str) -> str:
     return encrypt_inn_full(inn)[:20]
@@ -176,7 +186,7 @@ def register_cashier(request):
                                 status=400)
 
         with transaction.atomic():
-            inn_hash_full = encrypt_inn_full(inn) 
+            inn_hash_full = get_inn_hash(inn) 
             inn_hash_20   = inn_hash_full[:20]   
             password_plain = build_user_password(inn_hash_20) 
             qr_string      = password_plain      
