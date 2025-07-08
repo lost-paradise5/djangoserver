@@ -179,7 +179,12 @@ def register_cashier(request):
             inn_hash_full = encrypt_inn_full(inn) 
             inn_hash_20   = inn_hash_full[:20]   
             password_plain = build_user_password(inn_hash_20) 
-            qr_string      = password_plain          
+            qr_string      = password_plain      
+
+            existing_user = User.objects.filter(
+                encrypted_inn=inn_hash_full,
+                full_name=fio
+            ).first()
 
             if not existing_user:
                 # 1. Вставка в users
