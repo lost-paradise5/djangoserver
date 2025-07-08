@@ -94,13 +94,8 @@ class UKMUser(models.Model):
 
 
 class OpenInSystem(models.Model):
-    id        = models.AutoField(primary_key=True) 
-    user      = models.ForeignKey(                    
-        User,
-        on_delete=models.CASCADE,
-        db_column='user_id',
-        related_name='systems'
-    )
+    id        = models.AutoField(primary_key=True)
+    user_id   = models.IntegerField(db_column='user_id')
     username = models.CharField(max_length=255)
     password = models.CharField(max_length=128)
     system_id = models.IntegerField()
