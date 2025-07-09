@@ -282,7 +282,7 @@ def register_cashier(request):
         # Вставка в users
         conv_cursor.execute("""
             INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
+            VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
         """, (storeid, cashier_id, fio, inn_hash_20, password_plain, role_id, version))
 
         # Вставка в signal
