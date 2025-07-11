@@ -242,7 +242,7 @@ def register_cashier(request):
                     continue
 
                 UKMUser.objects.create(
-                    id=user_id,
+                    user=new_user,
                     roleid=role_id,
                     storeid=sid,
                     version=1
