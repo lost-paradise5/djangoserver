@@ -256,7 +256,7 @@ def register_cashier(request):
                     VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
                 """, (sid, cashier_id, fio, inn_hash_20, password_plain, role_id, version))
 
-                conv_cursor.execute("INSERT INTO signal(signal, version) VALUES ('incr', %s)", (version,))
+                conv_cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
                 cashier_counter += 1
 
                 ukm_version = "UKM5" if is_ukm5_store(sid) else "UKM4"
