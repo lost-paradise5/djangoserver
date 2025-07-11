@@ -144,10 +144,6 @@ def build_user_password(hash20: str) -> str:
 
 
 
-
-
-
-
 @csrf_exempt
 def register_cashier(request):
     if request.method != 'POST':
@@ -163,170 +159,142 @@ def register_cashier(request):
 
         inn = data['inn']
         fio = f"{data['surname']} {data['name']} {data['patronymic']}"
-        mail       = data['mail']
-        phone      = data['phone']
-        dep_name   = data['department']
-        pos_name   = data['position']
+        mail = data['mail']
+        phone = data['phone']
+        dep_name = data['department']
+        pos_name = data['position']
         role_id = data['roleId']
-        storeid = int(data['storeid'])
 
+        # Разбор storeid: может быть одно значение или несколько через запятую
+        store_ids = [int(s.strip()) for s in str(data['storeid']).split(',') if s.strip().isdigit()]
+        if not store_ids:
+            return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
 
         dep_obj = Department.objects.filter(name__iexact=dep_name).first()
         if not dep_obj:
-            logger.error(f"Отдел «{dep_name}» не найден")
-            return JsonResponse({'status': 'error',
-                                 'message': f'Отдел «{dep_name}» не найден'},
-                                status=400)
+            return JsonResponse({'status': 'error', 'message': f'Отдел «{dep_name}» не найден'}, status=400)
 
         pos_obj = Position.objects.filter(name__iexact=pos_name).first()
         if not pos_obj:
-            logger.error(f"Должность «{pos_name}» не найдена")
-            return JsonResponse({'status': 'error',
-                                 'message': f'Должность «{pos_name}» не найдена'},
-                                status=400)
+            return JsonResponse({'status': 'error', 'message': f'Должность «{pos_name}» не найдена'}, status=400)
 
         with transaction.atomic():
-            inn_hash_full = get_inn_hash(inn) 
-            inn_hash_20   = inn_hash_full[:20]   
-            password_plain = build_user_password(inn_hash_20) 
-            qr_string      = password_plain      
+            inn_hash_full = get_inn_hash(inn)
+            inn_hash_20 = inn_hash_full[:20]
+            password_plain = build_user_password(inn_hash_20)
+            qr_string = password_plain
 
-            existing_user = User.objects.filter(
-                encrypted_inn=inn_hash_full,
-                full_name=fio
-            ).first()
-
+            existing_user = User.objects.filter(encrypted_inn=inn_hash_full, full_name=fio).first()
             if not existing_user:
-                # 1. Вставка в users
                 new_user = User.objects.create(
-                encrypted_inn=inn_hash_full,
-                full_name=fio,
-                mail          = mail,
-                phone         = phone,
-                department_id = dep_obj.id,
-                position_id   = pos_obj.id,
-                active=True,
-                tg_status=False,
-                created_at=timezone.now(),
-                updated_at=timezone.now()
+                    encrypted_inn=inn_hash_full,
+                    full_name=fio,
+                    mail=mail,
+                    phone=phone,
+                    department_id=dep_obj.id,
+                    position_id=pos_obj.id,
+                    active=True,
+                    tg_status=False,
+                    created_at=timezone.now(),
+                    updated_at=timezone.now()
                 )
                 user_id = new_user.id
 
-                # 2. Вставка в ukm_users
-                UKMUser.objects.create(
-                    id=user_id,
-                    roleid=role_id,
-                    storeid=storeid,
-                    version=1
-                )
-
-                # 3. Вставка в open_in_system
                 OpenInSystem.objects.create(
                     user_id=user_id,
                     username=fio,
-                    password=password_plain, 
+                    password=password_plain,
                     system_id=9,
                     status=True
                 )
 
-                # 4. Вставка в qr_code
-                qr_string = password_plain
                 QRCode.objects.create(
                     user=new_user,
                     qr_data=qr_string,
-                    created_at=timezone.now(),
-                    used_at=None
+                    created_at=timezone.now()
                 )
 
-                logger.info(f"[PostgreSQL] Пользователь {fio} добавлен в users, ukm_users, open_in_system, qr_code.")
+                logger.info(f"[PostgreSQL] Пользователь {fio} создан с ID={user_id}")
             else:
-                logger.info(f"[PostgreSQL] Пользователь {fio} уже существует (ID={existing_user.id})")
                 new_user = existing_user
-        
+                user_id = new_user.id
+                logger.info(f"[PostgreSQL] Пользователь уже существует: ID={user_id}")
 
+            existing_storeids = set(UKMUser.objects.filter(id=user_id).values_list('storeid', flat=True))
 
+            ukm_conn = connect_ukm()
+            ukm_cursor = ukm_conn.cursor()
+            ukm_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM trm_in_users")
+            cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
+            ukm_conn.close()
 
+            converter = connect_converter()
+            conv_cursor = converter.cursor()
+            conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
+            base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
 
-        
+            cashier_counter = 0
+            xml_paths = []
 
-        # Определяем UKM4/UKM5
-        ukm_version = "UKM5" if is_ukm5_store(storeid) else "UKM4"
-        logger.info(f"Магазин {storeid} определён как {ukm_version}")
+            for idx, sid in enumerate(store_ids):
+                if sid in existing_storeids:
+                    logger.info(f"[Пропуск] Пользователь уже зарегистрирован в storeid={sid}")
+                    continue
 
-        # Проверка существования в ukmserver
-        ukm_conn = connect_ukm()
-        ukm_cursor = ukm_conn.cursor()
-        ukm_cursor.execute("SELECT * FROM trm_in_users WHERE user_inn=%s AND name=%s", (inn, fio))
-        existing = ukm_cursor.fetchone()
-        ukm_conn.close()
+                UKMUser.objects.create(
+                    id=user_id,
+                    roleid=role_id,
+                    storeid=sid,
+                    version=1
+                )
 
-        if existing:
-            logger.info(f"[{ukm_version}] Сотрудник уже существует: {fio}, ID={existing['id']}")
-            return JsonResponse({'status': 'ok', 'message': 'Сотрудник уже зарегистрирован'}, status=200)
+                cashier_id = cashier_id_base + cashier_counter
+                version = base_version + cashier_counter
 
-        # Работа с import4staffbonus
-        converter = connect_converter()
-        conv_cursor = converter.cursor()
+                conv_cursor.execute("""
+                    INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+                    VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+                """, (sid, cashier_id, fio, inn_hash_20, password_plain, role_id, version))
 
-        # Получаем ID из ukmserver.trm_in_users
-        ukm_conn = connect_ukm()
-        ukm_cursor = ukm_conn.cursor()
-        ukm_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM trm_in_users")
-        cashier_id = ukm_cursor.fetchone()['next_id'] or 1
-        ukm_conn.close()
+                conv_cursor.execute("INSERT INTO signal(signal, version) VALUES ('incr', %s)", (version,))
+                cashier_counter += 1
 
-        # Версия
-        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
-        version = (conv_cursor.fetchone()['cnt'] or 0) + 1
+                ukm_version = "UKM5" if is_ukm5_store(sid) else "UKM4"
+                logger.info(f"Магазин {sid} определён как {ukm_version}")
 
-        # Вставка в users
-        conv_cursor.execute("""
-            INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-            VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-        """, (storeid, cashier_id, fio, inn_hash_20, password_plain, role_id, version))
+                if ukm_version == "UKM5":
+                    xml_filename = f"StoreCashiers_{sid}_{cashier_id}_F.xml"
+                    xml_path = os.path.join(r"\\SGO1\\UKM5\\SGO\\CASHLOAD", xml_filename)
+                    try:
+                        root = ET.Element("StoreCashiers")
+                        cashier_el = ET.SubElement(root, "Cashier")
+                        ET.SubElement(cashier_el, "Id").text = str(cashier_id)
+                        ET.SubElement(cashier_el, "Name").text = fio
+                        ET.SubElement(cashier_el, "INN").text = inn
+                        ET.SubElement(cashier_el, "Password").text = password_plain
+                        ET.SubElement(cashier_el, "RoleId").text = str(role_id)
+                        ET.SubElement(cashier_el, "Deleted").text = "0"
+                        tree = ET.ElementTree(root)
+                        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                        xml_paths.append(xml_path)
+                        logger.info(f"XML-файл сохранён: {xml_path}")
+                    except Exception as e:
+                        logger.error(f"Ошибка генерации XML для storeid={sid}: {e}")
 
-        # Вставка в signal
-        conv_cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
-        converter.commit()
-        converter.close()
-
-        logger.info(f"[{ukm_version}] Кассир {fio} добавлен (ID={cashier_id})")
-
-        # XML для УКМ5
-        xml_path = None
-        if ukm_version == "UKM5":
-            xml_filename = f"StoreCashiers_{storeid}_{cashier_id}_F.xml"
-            xml_path = os.path.join(r"\\SGO1\UKM5\SGO\CASHLOAD", xml_filename)
-            try:
-                root = ET.Element("StoreCashiers")
-                cashier = ET.SubElement(root, "Cashier")
-                ET.SubElement(cashier, "Id").text = str(cashier_id)
-                ET.SubElement(cashier, "Name").text = fio
-                ET.SubElement(cashier, "INN").text = inn
-                ET.SubElement(cashier, "Password").text = password_plain
-                ET.SubElement(cashier, "RoleId").text = str(role_id)
-                ET.SubElement(cashier, "Deleted").text = "0"
-                tree = ET.ElementTree(root)
-                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-                logger.info(f"XML-файл сохранён: {xml_path}")
-            except Exception as e:
-                logger.error(f"Ошибка генерации XML: {e}")
-                xml_path = None
+            converter.commit()
+            converter.close()
 
         return JsonResponse({
             'status': 'ok',
-            'message': 'Кассир зарегистрирован',
-            'cashier_id': cashier_id,
+            'message': 'Кассир зарегистрирован для всех storeid',
             'password': password_plain,
-            'ukm_version': ukm_version,
-            'xml_path': xml_path
+            'storeids': store_ids,
+            'xml_paths': xml_paths
         })
 
     except Exception as e:
         logger.exception("Ошибка регистрации кассира")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
-
 
 
 
