@@ -220,7 +220,7 @@ def register_cashier(request):
                 user_id = new_user.id
                 logger.info(f"[PostgreSQL] Пользователь уже существует: ID={user_id}")
 
-            existing_storeids = set(UKMUser.objects.filter(id=user_id).values_list('storeid', flat=True))
+            existing_storeids = set(UKMUser.objects.filter(user_id=user_id).values_list('storeid', flat=True))
 
             ukm_conn = connect_ukm()
             ukm_cursor = ukm_conn.cursor()
