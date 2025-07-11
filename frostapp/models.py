@@ -83,7 +83,8 @@ class User(models.Model):
 
 
 class UKMUser(models.Model):
-    id = models.IntegerField(primary_key=True)
+    id = models.AutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
     roleid = models.IntegerField()
     storeid = models.IntegerField()
     version = models.IntegerField()
