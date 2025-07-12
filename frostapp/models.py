@@ -112,6 +112,7 @@ class QRCode(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, db_column='user_id')
     qr_data = models.TextField()
     created_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
     used_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
