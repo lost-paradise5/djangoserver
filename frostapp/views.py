@@ -179,6 +179,9 @@ def register_cashier(request):
             return JsonResponse({'status': 'error', 'message': f'Должность «{pos_name}» не найдена'}, status=400)
 
         with transaction.atomic():
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            xml_dir = os.path.join(base_dir, 'xml')
+            os.makedirs(xml_dir, exist_ok=True)
             inn_hash_full = get_inn_hash(inn)
             inn_hash_20 = inn_hash_full[:20]
             password_plain = build_user_password(inn_hash_20)
@@ -263,10 +266,15 @@ def register_cashier(request):
                 logger.info(f"Магазин {sid} определён как {ukm_version}")
 
                 if ukm_version == "UKM5":
-                    xml_filename = f"StoreCashiers_{sid}_{cashier_id}_F.xml"
-                    xml_path = os.path.join(r"\\SGO1\\UKM5\\SGO\\CASHLOAD", xml_filename)
+                    xml_filename = f"StoreCashiers_{sid}_F.xml"
+                    xml_path = os.path.join(xml_dir, xml_filename)
                     try:
-                        root = ET.Element("StoreCashiers")
+                        if os.path.exists(xml_path):
+                            tree = ET.parse(xml_path)
+                            root = tree.getroot()
+                        else:
+                            root = ET.Element("StoreCashiers")
+                            tree = ET.ElementTree(root)
                         cashier_el = ET.SubElement(root, "Cashier")
                         ET.SubElement(cashier_el, "Id").text = str(cashier_id)
                         ET.SubElement(cashier_el, "Name").text = fio
@@ -274,10 +282,10 @@ def register_cashier(request):
                         ET.SubElement(cashier_el, "Password").text = password_plain
                         ET.SubElement(cashier_el, "RoleId").text = str(role_id)
                         ET.SubElement(cashier_el, "Deleted").text = "0"
-                        tree = ET.ElementTree(root)
+
                         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                         xml_paths.append(xml_path)
-                        logger.info(f"XML-файл сохранён: {xml_path}")
+                        logger.info(f"XML-файл обновлён: {xml_path}")
                     except Exception as e:
                         logger.error(f"Ошибка генерации XML для storeid={sid}: {e}")
 
