@@ -535,6 +535,79 @@ def queue_vacation(request):
 
 
 
+def regenerate_qr(user, inn_hash_20):
+
+    new_password = build_user_password(inn_hash_20)
+    new_qr_data = new_password
+    now = timezone.now()
+    expiration = now + datetime.timedelta(days=1)
+
+    QRCode.objects.filter(user=user).delete()
+    QRCode.objects.create(user=user, qr_data=new_qr_data, created_at=now, expires_at=expiration)
+
+    OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(password=new_qr_data)
+
+    converter = connect_converter()
+    conv_cursor = converter.cursor()
+    conv_cursor.execute(
+        "UPDATE users SET password = OLD_PASSWORD(%s) WHERE inn = %s",
+        (new_password, inn_hash_20)
+    )
+    converter.commit()
+    converter.close()
+
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    xml_dir = os.path.join(base_dir, 'xml')
+
+    ukm_users = UKMUser.objects.filter(user_id=user.id)
+    for ukm_user in ukm_users:
+        sid = ukm_user.storeid
+        if is_ukm5_store(sid):
+            xml_filename = f"StoreCashiers_{sid}_F.xml"
+            xml_path = os.path.join(xml_dir, xml_filename)
+
+            try:
+                if os.path.exists(xml_path):
+                    tree = ET.parse(xml_path)
+                    root = tree.getroot()
+                else:
+                    root = ET.Element("StoreCashiers")
+                    tree = ET.ElementTree(root)
+
+                for el in root.findall("Cashier"):
+                    if el.find("INN") is not None and el.find("INN").text == user.encrypted_inn:
+                        root.remove(el)
+
+                cashier_el = ET.SubElement(root, "Cashier")
+                ET.SubElement(cashier_el, "Id").text = str(user.id)
+                ET.SubElement(cashier_el, "Name").text = user.full_name
+                ET.SubElement(cashier_el, "INN").text = user.encrypted_inn
+                ET.SubElement(cashier_el, "Password").text = new_password
+                ET.SubElement(cashier_el, "RoleId").text = str(ukm_user.roleid)
+                ET.SubElement(cashier_el, "Deleted").text = "0"
+
+                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                logger.info(f"XML обновлён при регенерации QR: {xml_path}")
+            except Exception as e:
+                logger.error(f"Ошибка обновления XML для {sid}: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @csrf_exempt
@@ -551,19 +624,16 @@ def get_qr_code_by_tg(request):
             return JsonResponse({'status': 'error', 'message': 'Не указан tg_id'}, status=400)
 
         user = User.objects.filter(tg_id=str(tg_id)).first()
-
         if not user:
-            logger.warning(f"Пользователь с tg_id={tg_id} не найден")
             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
 
-        qr_record = QRCode.objects.filter(user=user).order_by('-created_at').first()
+        # Перегенерировать QR в любом случае
+        inn_hash_20 = user.encrypted_inn[:20]
+        regenerate_qr(user, inn_hash_20)
 
-        if not qr_record:
-            logger.warning(f"QR-код для пользователя с tg_id={tg_id} не найден")
-            return JsonResponse({'status': 'error', 'message': 'QR-код не найден'}, status=404)
-
-        logger.info(f"QR-код для tg_id={tg_id} успешно получен")
-        return JsonResponse({'status': 'ok', 'qr_data': qr_record.qr_data}, status=200)
+        # Получить новый QR-код и вернуть
+        new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
+        return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
 
     except Exception as e:
         logger.exception("Ошибка при получении QR-кода")
