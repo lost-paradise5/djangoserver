@@ -536,30 +536,51 @@ def queue_vacation(request):
 
 
 def regenerate_qr(user, inn_hash_20):
-
     new_password = build_user_password(inn_hash_20)
-    new_qr_data = new_password
     now = timezone.now()
     expiration = now + datetime.timedelta(days=1)
 
+    # Обновляем QR-код и OpenInSystem
     QRCode.objects.filter(user=user).delete()
-    QRCode.objects.create(user=user, qr_data=new_qr_data, created_at=now, expires_at=expiration)
+    QRCode.objects.create(user=user, qr_data=new_password, created_at=now, expires_at=expiration)
+    OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(password=new_password)
 
-    OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(password=new_qr_data)
-
+    # Подключение к MySQL
     converter = connect_converter()
     conv_cursor = converter.cursor()
-    conv_cursor.execute(
-        "UPDATE users SET password = OLD_PASSWORD(%s) WHERE inn = %s",
-        (new_password, inn_hash_20)
-    )
+
+    # Получаем базовый ID для вставки
+    conv_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM users")
+    base_id = conv_cursor.fetchone()['next_id'] or 1
+    current_id = base_id
+
+    ukm_users = UKMUser.objects.filter(user_id=user.id)
+
+    for ukm_user in ukm_users:
+        sid = ukm_user.storeid
+
+        conv_cursor.execute("""
+            INSERT INTO users (store, id, name, inn, password, role_id, deleted)
+            VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, 0)
+        """, (
+            sid,
+            current_id,
+            user.full_name,
+            inn_hash_20,
+            new_password,
+            ukm_user.roleid
+        ))
+
+        current_id += 1  # Инкремент ID для следующего магазина
+
     converter.commit()
     converter.close()
 
+    # Обновляем XML (только для UKM5)
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     xml_dir = os.path.join(base_dir, 'xml')
+    os.makedirs(xml_dir, exist_ok=True)
 
-    ukm_users = UKMUser.objects.filter(user_id=user.id)
     for ukm_user in ukm_users:
         sid = ukm_user.storeid
         if is_ukm5_store(sid):
@@ -574,12 +595,14 @@ def regenerate_qr(user, inn_hash_20):
                     root = ET.Element("StoreCashiers")
                     tree = ET.ElementTree(root)
 
+                # Удаляем старую запись по INN
                 for el in root.findall("Cashier"):
                     if el.find("INN") is not None and el.find("INN").text == user.encrypted_inn:
                         root.remove(el)
 
+                # Добавляем новую запись
                 cashier_el = ET.SubElement(root, "Cashier")
-                ET.SubElement(cashier_el, "Id").text = str(user.id)
+                ET.SubElement(cashier_el, "Id").text = str(current_id)  # Новый ID
                 ET.SubElement(cashier_el, "Name").text = user.full_name
                 ET.SubElement(cashier_el, "INN").text = user.encrypted_inn
                 ET.SubElement(cashier_el, "Password").text = new_password
