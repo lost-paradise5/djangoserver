@@ -545,50 +545,53 @@ def queue_vacation(request):
 
 def regenerate_qr(user, inn_hash_20):
     """
-    Перегенерирует пароль/QR-код и сообщает об изменениях
-    в import4staffbonus.users + добавляет запись в signal.
+    Перегенерирует пароль/QR-код сотрудника, добавляет его во все связанные
+    магазины в import4staffbonus.users и обязательно пишет строки в signal.
     """
     new_password = build_user_password(inn_hash_20)
     now          = timezone.now()
     expiration   = now + datetime.timedelta(days=1)
 
-    # 1. PostgreSQL: QR-код + open_in_system
+    # 1) PostgreSQL: QR-код + open_in_system
     QRCode.objects.filter(user=user).delete()
     QRCode.objects.create(user=user,
                           qr_data=new_password,
                           created_at=now,
                           expires_at=expiration)
-
     OpenInSystem.objects.filter(user_id=user.id,
                                 system_id=9).update(password=new_password)
 
-    # 2. MySQL (import4staffbonus)
+    # 2) MySQL: users + signal
     converter   = connect_converter()
     conv_cursor = converter.cursor()
 
-    # --- версия для signal ---
-    conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
+    # версия для signal
+    conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
     base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
 
-    # --- базовый id для users ---
-    conv_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM users")
-    current_id = conv_cursor.fetchone()['next_id'] or 1
+    # базовый id берём из ukmserver.trm_in_users
+    ukm_conn   = connect_ukm()
+    ukm_cursor = ukm_conn.cursor()
+    ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+    cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
+    ukm_conn.close()
 
-    ukm_users = list(UKMUser.objects.filter(user_id=user.id))
-    inserted_any_signal = False
+    cashier_counter      = 0       # для сдвига id / версии
+    inserted_any_signal  = False
+    ukm_users            = list(UKMUser.objects.filter(user_id=user.id))
 
-    for idx, ukm_user in enumerate(ukm_users):
-        sid     = ukm_user.storeid
-        version = base_version + idx
+    for ukm_user in ukm_users:
+        sid         = ukm_user.storeid
+        cashier_id  = cashier_id_base + cashier_counter
+        version     = base_version    + cashier_counter
 
-        # users
         conv_cursor.execute("""
             INSERT INTO users (store, id, name, inn, password,
                                role_id, version, deleted)
             VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
         """, (
             sid,
-            current_id,
+            cashier_id,
             user.full_name,
             inn_hash_20,
             new_password,
@@ -596,15 +599,14 @@ def regenerate_qr(user, inn_hash_20):
             version
         ))
 
-        # signal
         conv_cursor.execute(
             "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
             (version,)
         )
         inserted_any_signal = True
-        current_id += 1
+        cashier_counter    += 1
 
-    # Если не вставили ни одной записи (маловероятно) — всё-таки дадим сигнал
+    # если ничего не вставили (маловероятно) — всё-таки дёрнем сигнал
     if not inserted_any_signal:
         conv_cursor.execute(
             "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
@@ -614,10 +616,13 @@ def regenerate_qr(user, inn_hash_20):
     converter.commit()
     converter.close()
 
-    # 3. XML-файлы для UKM5 (без изменений)
+    # 3) XML для UKM5
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     xml_dir  = os.path.join(base_dir, 'xml')
     os.makedirs(xml_dir, exist_ok=True)
+
+    # продолжаем счётчик ID, чтобы он не конфликтовал в одном файле
+    next_free_id = cashier_id_base + cashier_counter
 
     for ukm_user in ukm_users:
         sid = ukm_user.storeid
@@ -635,14 +640,14 @@ def regenerate_qr(user, inn_hash_20):
                 root = ET.Element("StoreCashiers")
                 tree = ET.ElementTree(root)
 
-            # удалить старый кассир по INN
+            # удалить старую запись по INN
             for el in root.findall("Cashier"):
                 if el.findtext("INN") == user.encrypted_inn:
                     root.remove(el)
 
-            # новый кассир
+            # новая запись
             c_el = ET.SubElement(root, "Cashier")
-            ET.SubElement(c_el, "Id").text       = str(current_id)
+            ET.SubElement(c_el, "Id").text       = str(next_free_id)
             ET.SubElement(c_el, "Name").text     = user.full_name
             ET.SubElement(c_el, "INN").text      = user.encrypted_inn
             ET.SubElement(c_el, "Password").text = new_password
@@ -651,27 +656,9 @@ def regenerate_qr(user, inn_hash_20):
 
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             logger.info(f"XML обновлён при регенерации QR: {xml_path}")
-            current_id += 1
+            next_free_id += 1
         except Exception as exc:
             logger.error(f"Ошибка обновления XML для {sid}: {exc}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @csrf_exempt
@@ -680,22 +667,20 @@ def get_qr_code_by_tg(request):
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
 
     try:
-        data = json.loads(request.body)
+        data  = json.loads(request.body)
         tg_id = data.get('tg_id')
 
         if not tg_id:
-            logger.error("Не указан tg_id")
             return JsonResponse({'status': 'error', 'message': 'Не указан tg_id'}, status=400)
 
         user = User.objects.filter(tg_id=str(tg_id)).first()
         if not user:
             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
 
-        # Перегенерировать QR в любом случае
+        # всегда генерируем новый QR
         inn_hash_20 = user.encrypted_inn[:20]
         regenerate_qr(user, inn_hash_20)
 
-        # Получить новый QR-код и вернуть
         new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
         return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
 
