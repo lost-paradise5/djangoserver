@@ -943,7 +943,7 @@ def delete_cashier(request):
         conv_cursor = converter.cursor()
 
         # базовая версия для signal
-        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM signal WHERE signal='busy'")
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
         base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
 
         # берём уникальный ID кассира (как register_cashier)
@@ -967,7 +967,7 @@ def delete_cashier(request):
                   current_password, ukm_user.roleid, version))
 
             conv_cursor.execute(
-                "INSERT INTO signal(signal,version) VALUES ('incr',%s)",
+                "INSERT INTO `signal`(`signal`,version) VALUES ('incr',%s)",
                 (version,))
 
         converter.commit()
