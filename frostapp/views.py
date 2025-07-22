@@ -871,89 +871,115 @@ def update_cashier(request):
 @csrf_exempt
 def delete_cashier(request):
     """
-    Удаляет (блокирует) доступ кассира к указанным storeid:
-    •  чистим ukm_users (PostgreSQL)
-    •  ставим deleted=1 в import4staffbonus.users + пишем signal
-    •  обновляем XML для UKM5 – <Deleted>1
+    Закрывает доступ кассира (inn+fio) к указанным магазинам.
+
+    JSON-вход:
+        {
+          "inn"     : "<цифры или 64-симв. SHA256>",
+          "fio"     : "Фамилия Имя Отчество",
+          "storeid" : "1001,1002"
+        }
+
+    Шаги:
+      1) ищем пользователя в PostgreSQL.users;
+      2) получаем список ukm_users на удаление (не трогаем пароль/QR);
+      3) В MySQL.import4staffbonus.users -> INSERT   deleted = 1   +   signal;
+      4) UKM5 XML: <Deleted>1;
+      5) удаляем строки из ukm_users.
     """
     if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+        return JsonResponse({"status": "error",
+                             "message": "Только POST"}, status=405)
 
     try:
-        data       = json.loads(request.body)
-        inn_raw    = data.get('inn')
-        fio        = data.get('fio')
-        store_str  = str(data.get('storeid', '')).strip()
+        data = json.loads(request.body)
 
-        if not (inn_raw and fio and store_str):
-            return JsonResponse({'status': 'error',
-                                 'message': 'inn, fio, storeid обязательны'}, status=400)
+        inn_raw   = data.get("inn")
+        fio       = data.get("fio")
+        store_raw = str(data.get("storeid", "")).strip()
 
-        # распарсим storeid  → список int
-        store_ids = [int(s) for s in store_str.split(',') if s.strip().isdigit()]
+        if not (inn_raw and fio and store_raw):
+            return JsonResponse({"status": "error",
+                                 "message": "inn, fio и storeid обязательны"}, status=400)
+
+        # storeid -> список int
+        store_ids = [int(s) for s in store_raw.split(',') if s.strip().isdigit()]
         if not store_ids:
-            return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
+            return JsonResponse({"status": "error",
+                                 "message": "Некорректный storeid"}, status=400)
 
-        # поддерживаем “сырые” и уже-захэшированные ИНН
+        # поддерживаем и цифры, и уже-захэш. ИНН
         try:
             inn_hash_full = get_inn_hash(inn_raw)
-        except ValueError as exc:
-            return JsonResponse({'status': 'error', 'message': str(exc)}, status=400)
+        except ValueError as err:
+            return JsonResponse({"status": "error", "message": str(err)}, status=400)
 
         inn_hash_20 = inn_hash_full[:20]
 
-        # --- 1. ищем пользователя
+        # --- PostgreSQL: пользователь и доступы ----------------------------
         user = User.objects.filter(encrypted_inn=inn_hash_full,
                                    full_name=fio).first()
         if not user:
-            return JsonResponse({'status': 'error',
-                                 'message': 'Пользователь не найден'}, status=404)
+            return JsonResponse({"status": "error",
+                                 "message": "Пользователь не найден"}, status=404)
 
-        removed = []                       # реально удалённые storeid
+        # все storeid, которые реально у пользователя
+        ukm_to_remove = list(
+            UKMUser.objects.filter(user=user, storeid__in=store_ids)
+        )
+        if not ukm_to_remove:
+            return JsonResponse({"status": "ok",
+                                 "message": "У пользователя уже нет доступа к указанным магазинам",
+                                 "removed": []})
 
-        # --- 2. PostgreSQL: ukm_users
-        for sid in store_ids:
-            deleted_rows, _ = UKMUser.objects.filter(user_id=user.id,
-                                                     storeid=sid).delete()
-            if deleted_rows:
-                removed.append(sid)
+        # текущий пароль (оставим неизменным для записи-заглушки)
+        current_password = (OpenInSystem.objects
+                            .filter(user_id=user.id, system_id=9)
+                            .values_list("password", flat=True)
+                            .first()) or build_user_password(inn_hash_20)
 
-        if not removed:                    # ничего удалять
-            return JsonResponse({'status': 'ok',
-                                 'message': 'Доступ уже был закрыт',
-                                 'removed': []})
-
-        # --- 3. MySQL: users.deleted=1 + signal
+        # --- MySQL: INSERT deleted=1 + signal ------------------------------
         converter   = connect_converter()
         conv_cursor = converter.cursor()
 
         # базовая версия для signal
-        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM signal WHERE signal='busy'")
         base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
 
-        for offset, sid in enumerate(removed):
-            version = base_version + offset
+        # берём уникальный ID кассира (как register_cashier)
+        ukm_conn   = connect_ukm()
+        ukm_cursor = ukm_conn.cursor()
+        ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+        cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
+        ukm_conn.close()
 
-            # ставим deleted=1 (если запись есть)
+        for idx, ukm_user in enumerate(ukm_to_remove):
+            sid        = ukm_user.storeid
+            cashier_id = cashier_id_base + idx
+            version    = base_version   + idx
+
+            # вставка-заглушка
             conv_cursor.execute("""
-                 UPDATE users
-                    SET deleted=1, version=%s
-                  WHERE store=%s AND inn=%s AND deleted=0
-            """, (version, sid, inn_hash_20))
+                INSERT INTO users (store,id,name,inn,password,
+                                   role_id,version,deleted)
+                VALUES (%s,%s,%s,%s,OLD_PASSWORD(%s),%s,%s,1)
+            """, (sid, cashier_id, fio, inn_hash_20,
+                  current_password, ukm_user.roleid, version))
 
-            # строка в signal
             conv_cursor.execute(
-                "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
+                "INSERT INTO signal(signal,version) VALUES ('incr',%s)",
                 (version,))
+
         converter.commit()
         converter.close()
 
-        # --- 4. XML для UKM5
+        # --- UKM5 XML ------------------------------------------------------
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
         xml_dir  = os.path.join(base_dir, 'xml')
         os.makedirs(xml_dir, exist_ok=True)
 
-        for sid in removed:
+        for ukm_user in ukm_to_remove:
+            sid = ukm_user.storeid
             if not is_ukm5_store(sid):
                 continue
 
@@ -965,20 +991,23 @@ def delete_cashier(request):
                 tree = ET.parse(xml_path)
                 root = tree.getroot()
                 changed = False
-                for el in root.findall('Cashier'):
-                    if el.findtext('INN') == inn_hash_full:
-                        el.find('Deleted').text = '1'
+                for cash_el in root.findall("Cashier"):
+                    if cash_el.findtext("INN") == inn_hash_full:
+                        cash_el.find("Deleted").text = "1"
                         changed = True
                 if changed:
-                    tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+                    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                     logger.info(f"XML помечен Deleted=1: {xml_path}")
             except Exception as exc:
-                logger.error(f"Ошибка XML для {sid}: {exc}")
+                logger.error(f"Ошибка XML для магазина {sid}: {exc}")
 
-        return JsonResponse({'status': 'ok',
-                             'message': 'Доступ закрыт',
-                             'removed': removed})
+        # --- теперь убираем доступ в PostgreSQL ----------------------------
+        UKMUser.objects.filter(id__in=[u.id for u in ukm_to_remove]).delete()
+
+        return JsonResponse({"status": "ok",
+                             "message": "Доступ закрыт",
+                             "removed": [u.storeid for u in ukm_to_remove]})
 
     except Exception as exc:
-        logger.exception("update_cashier_delete error")
-        return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
+        logger.exception("delete_cashier error")
+        return JsonResponse({"status": "error", "message": str(exc)}, status=500)
