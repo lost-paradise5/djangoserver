@@ -687,3 +687,178 @@ def get_qr_code_by_tg(request):
     except Exception as e:
         logger.exception("Ошибка при получении QR-кода")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
+
+
+@csrf_exempt
+def update_cashier(request):
+    """
+    body = {
+        "inn"     : "1177228877" | "sha256hash",
+        "fio"     : "Фамилия Имя Отчество",
+        "storeid" : "1001" | "1001,1002"
+    }
+
+    • ищем пользователя по ИНН+ФИО;
+    • для каждого нового storeid:
+        – добавляем строку в ukm_users (PostgreSQL)
+        – вставляем строку в import4staffbonus.users (MySQL) с тем-же паролем
+        – вставляем строку в signal ('incr', version)
+        – при UKM-5 обновляем XML-файл StoreCashiers_{sid}_F.xml
+    • пароль не меняем — берём из open_in_system (system_id = 9)
+    """
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+
+        inn_raw  = data.get('inn')
+        fio      = data.get('fio')
+        storeids = data.get('storeid')
+
+        if not (inn_raw and fio and storeids):
+            return JsonResponse({'status': 'error',
+                                 'message': 'inn, fio и storeid обязательны'},
+                                status=400)
+
+        # ── подготовка данных ────────────────────────────────────────────────
+        encrypted_inn = get_inn_hash(inn_raw)
+        store_ids     = [int(s.strip()) for s in str(storeids).split(',') if s.strip().isdigit()]
+        if not store_ids:
+            return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
+
+        # ── ищем пользователя в PostgreSQL ──────────────────────────────────
+        user = User.objects.filter(encrypted_inn=encrypted_inn,
+                                   full_name=fio).first()
+        if not user:
+            return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
+
+        # пароль берём из open_in_system (system_id = 9)
+        open_rec = OpenInSystem.objects.filter(user_id=user.id,
+                                               system_id=9).first()
+        if not open_rec:
+            return JsonResponse({'status': 'error',
+                                 'message': 'Пароль для пользователя не найден'}, status=500)
+
+        password_plain = open_rec.password
+        inn_hash_20    = encrypted_inn[:20]
+
+        # уже имеющиеся магазины
+        existing_storeids = set(UKMUser.objects.filter(user_id=user.id)
+                                              .values_list('storeid', flat=True))
+
+        # ── подготовка MySQL счётчиков (id / version) ───────────────────────
+        ukm_conn   = connect_ukm()
+        ukm_cursor = ukm_conn.cursor()
+        ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+        cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
+        ukm_conn.close()
+
+        converter   = connect_converter()
+        conv_cursor = converter.cursor()
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
+        base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
+
+        # счётчики
+        cashier_counter     = 0
+        inserted_signals    = False
+        added_storeids      = []
+
+        # директория для XML UKM-5
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        xml_dir  = os.path.join(base_dir, 'xml')
+        os.makedirs(xml_dir, exist_ok=True)
+
+        # ── основной цикл по магазинам ───────────────────────────────────────
+        for sid in store_ids:
+            if sid in existing_storeids:
+                logger.info(f"[Пропуск] Доступ уже есть: storeid={sid}")
+                continue
+
+            # 1. ukm_users (PostgreSQL)
+            UKMUser.objects.create(
+                user     = user,
+                roleid   = 1,          # ← при желании берите из запроса
+                storeid  = sid,
+                version  = 1
+            )
+
+            # 2. import4staffbonus.users (MySQL)
+            cashier_id = cashier_id_base + cashier_counter
+            version    = base_version    + cashier_counter
+
+            conv_cursor.execute("""
+                INSERT INTO users (store, id, name, inn, password,
+                                   role_id, version, deleted)
+                VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+            """, (
+                sid,
+                cashier_id,
+                fio,
+                inn_hash_20,
+                password_plain,
+                1,          # role_id по умолчанию
+                version
+            ))
+
+            # 3. signal
+            conv_cursor.execute(
+                "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
+                (version,)
+            )
+            inserted_signals = True
+            cashier_counter += 1
+            added_storeids.append(sid)
+
+            # 4. XML для UKM-5
+            if is_ukm5_store(sid):
+                xml_filename = f"StoreCashiers_{sid}_F.xml"
+                xml_path     = os.path.join(xml_dir, xml_filename)
+
+                try:
+                    if os.path.exists(xml_path):
+                        tree = ET.parse(xml_path)
+                        root = tree.getroot()
+                    else:
+                        root = ET.Element("StoreCashiers")
+                        tree = ET.ElementTree(root)
+
+                    c_el = ET.SubElement(root, "Cashier")
+                    ET.SubElement(c_el, "Id").text       = str(cashier_id)
+                    ET.SubElement(c_el, "Name").text     = fio
+                    ET.SubElement(c_el, "INN").text      = inn_raw
+                    ET.SubElement(c_el, "Password").text = password_plain
+                    ET.SubElement(c_el, "RoleId").text   = "1"
+                    ET.SubElement(c_el, "Deleted").text  = "0"
+
+                    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                    logger.info(f"[XML] Обновлён файл {xml_path}")
+                except Exception as exc:
+                    logger.error(f"[XML] Ошибка для {sid}: {exc}")
+
+        # если ни одной новой записи – ответим, что всё уже было
+        if not added_storeids:
+            return JsonResponse({'status': 'ok',
+                                 'message': 'У пользователя уже был доступ ко всем указанным магазинам'})
+
+        # safety-signal, если по какой-то причине не вставили ни одной строки
+        if not inserted_signals:
+            conv_cursor.execute(
+                "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
+                (base_version,)
+            )
+
+        converter.commit()
+        converter.close()
+
+        return JsonResponse({'status'  : 'ok',
+                             'message' : 'Доступ открыт',
+                             'added'   : added_storeids})
+
+    except Exception as exc:
+        logger.exception("open_access_cashier error")
+        return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
