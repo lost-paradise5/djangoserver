@@ -862,3 +862,123 @@ def update_cashier(request):
     except Exception as exc:
         logger.exception("open_access_cashier error")
         return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
+
+
+
+
+
+
+@csrf_exempt
+def delete_cashier(request):
+    """
+    Удаляет (блокирует) доступ кассира к указанным storeid:
+    •  чистим ukm_users (PostgreSQL)
+    •  ставим deleted=1 в import4staffbonus.users + пишем signal
+    •  обновляем XML для UKM5 – <Deleted>1
+    """
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+    try:
+        data       = json.loads(request.body)
+        inn_raw    = data.get('inn')
+        fio        = data.get('fio')
+        store_str  = str(data.get('storeid', '')).strip()
+
+        if not (inn_raw and fio and store_str):
+            return JsonResponse({'status': 'error',
+                                 'message': 'inn, fio, storeid обязательны'}, status=400)
+
+        # распарсим storeid  → список int
+        store_ids = [int(s) for s in store_str.split(',') if s.strip().isdigit()]
+        if not store_ids:
+            return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
+
+        # поддерживаем “сырые” и уже-захэшированные ИНН
+        try:
+            inn_hash_full = get_inn_hash(inn_raw)
+        except ValueError as exc:
+            return JsonResponse({'status': 'error', 'message': str(exc)}, status=400)
+
+        inn_hash_20 = inn_hash_full[:20]
+
+        # --- 1. ищем пользователя
+        user = User.objects.filter(encrypted_inn=inn_hash_full,
+                                   full_name=fio).first()
+        if not user:
+            return JsonResponse({'status': 'error',
+                                 'message': 'Пользователь не найден'}, status=404)
+
+        removed = []                       # реально удалённые storeid
+
+        # --- 2. PostgreSQL: ukm_users
+        for sid in store_ids:
+            deleted_rows, _ = UKMUser.objects.filter(user_id=user.id,
+                                                     storeid=sid).delete()
+            if deleted_rows:
+                removed.append(sid)
+
+        if not removed:                    # ничего удалять
+            return JsonResponse({'status': 'ok',
+                                 'message': 'Доступ уже был закрыт',
+                                 'removed': []})
+
+        # --- 3. MySQL: users.deleted=1 + signal
+        converter   = connect_converter()
+        conv_cursor = converter.cursor()
+
+        # базовая версия для signal
+        conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
+        base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
+
+        for offset, sid in enumerate(removed):
+            version = base_version + offset
+
+            # ставим deleted=1 (если запись есть)
+            conv_cursor.execute("""
+                 UPDATE users
+                    SET deleted=1, version=%s
+                  WHERE store=%s AND inn=%s AND deleted=0
+            """, (version, sid, inn_hash_20))
+
+            # строка в signal
+            conv_cursor.execute(
+                "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
+                (version,))
+        converter.commit()
+        converter.close()
+
+        # --- 4. XML для UKM5
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        xml_dir  = os.path.join(base_dir, 'xml')
+        os.makedirs(xml_dir, exist_ok=True)
+
+        for sid in removed:
+            if not is_ukm5_store(sid):
+                continue
+
+            xml_path = os.path.join(xml_dir, f"StoreCashiers_{sid}_F.xml")
+            if not os.path.exists(xml_path):
+                continue
+
+            try:
+                tree = ET.parse(xml_path)
+                root = tree.getroot()
+                changed = False
+                for el in root.findall('Cashier'):
+                    if el.findtext('INN') == inn_hash_full:
+                        el.find('Deleted').text = '1'
+                        changed = True
+                if changed:
+                    tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+                    logger.info(f"XML помечен Deleted=1: {xml_path}")
+            except Exception as exc:
+                logger.error(f"Ошибка XML для {sid}: {exc}")
+
+        return JsonResponse({'status': 'ok',
+                             'message': 'Доступ закрыт',
+                             'removed': removed})
+
+    except Exception as exc:
+        logger.exception("update_cashier_delete error")
+        return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
