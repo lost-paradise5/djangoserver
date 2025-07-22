@@ -235,6 +235,7 @@ def register_cashier(request):
             conv_cursor = converter.cursor()
             conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
             base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
+            inserted_any_signal = False
 
             cashier_counter = 0
             xml_paths = []
@@ -260,6 +261,7 @@ def register_cashier(request):
                 """, (sid, cashier_id, fio, inn_hash_20, password_plain, role_id, version))
 
                 conv_cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
+                inserted_any_signal = True
                 cashier_counter += 1
 
                 ukm_version = "UKM5" if is_ukm5_store(sid) else "UKM4"
@@ -288,6 +290,12 @@ def register_cashier(request):
                         logger.info(f"XML-файл обновлён: {xml_path}")
                     except Exception as e:
                         logger.error(f"Ошибка генерации XML для storeid={sid}: {e}")
+
+            if not inserted_any_signal:        
+                conv_cursor.execute(
+                    "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
+                    (base_version,)
+                )
 
             converter.commit()
             converter.close()
