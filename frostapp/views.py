@@ -544,83 +544,116 @@ def queue_vacation(request):
 
 
 def regenerate_qr(user, inn_hash_20):
+    """
+    Перегенерирует пароль/QR-код и сообщает об изменениях
+    в import4staffbonus.users + добавляет запись в signal.
+    """
     new_password = build_user_password(inn_hash_20)
-    now = timezone.now()
-    expiration = now + datetime.timedelta(days=1)
+    now          = timezone.now()
+    expiration   = now + datetime.timedelta(days=1)
 
-    # Обновляем QR-код и OpenInSystem
+    # 1. PostgreSQL: QR-код + open_in_system
     QRCode.objects.filter(user=user).delete()
-    QRCode.objects.create(user=user, qr_data=new_password, created_at=now, expires_at=expiration)
-    OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(password=new_password)
+    QRCode.objects.create(user=user,
+                          qr_data=new_password,
+                          created_at=now,
+                          expires_at=expiration)
 
-    # Подключение к MySQL
-    converter = connect_converter()
+    OpenInSystem.objects.filter(user_id=user.id,
+                                system_id=9).update(password=new_password)
+
+    # 2. MySQL (import4staffbonus)
+    converter   = connect_converter()
     conv_cursor = converter.cursor()
 
-    # Получаем базовый ID для вставки
+    # --- версия для signal ---
+    conv_cursor.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
+    base_version = (conv_cursor.fetchone()['cnt'] or 0) + 1
+
+    # --- базовый id для users ---
     conv_cursor.execute("SELECT MAX(id) + 1 AS next_id FROM users")
-    base_id = conv_cursor.fetchone()['next_id'] or 1
-    current_id = base_id
+    current_id = conv_cursor.fetchone()['next_id'] or 1
 
-    ukm_users = UKMUser.objects.filter(user_id=user.id)
+    ukm_users = list(UKMUser.objects.filter(user_id=user.id))
+    inserted_any_signal = False
 
-    for ukm_user in ukm_users:
-        sid = ukm_user.storeid
+    for idx, ukm_user in enumerate(ukm_users):
+        sid     = ukm_user.storeid
+        version = base_version + idx
 
+        # users
         conv_cursor.execute("""
-            INSERT INTO users (store, id, name, inn, password, role_id, deleted)
-            VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, 0)
+            INSERT INTO users (store, id, name, inn, password,
+                               role_id, version, deleted)
+            VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
         """, (
             sid,
             current_id,
             user.full_name,
             inn_hash_20,
             new_password,
-            ukm_user.roleid
+            ukm_user.roleid,
+            version
         ))
 
-        current_id += 1  # Инкремент ID для следующего магазина
+        # signal
+        conv_cursor.execute(
+            "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
+            (version,)
+        )
+        inserted_any_signal = True
+        current_id += 1
+
+    # Если не вставили ни одной записи (маловероятно) — всё-таки дадим сигнал
+    if not inserted_any_signal:
+        conv_cursor.execute(
+            "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
+            (base_version,)
+        )
 
     converter.commit()
     converter.close()
 
-    # Обновляем XML (только для UKM5)
+    # 3. XML-файлы для UKM5 (без изменений)
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    xml_dir = os.path.join(base_dir, 'xml')
+    xml_dir  = os.path.join(base_dir, 'xml')
     os.makedirs(xml_dir, exist_ok=True)
 
     for ukm_user in ukm_users:
         sid = ukm_user.storeid
-        if is_ukm5_store(sid):
-            xml_filename = f"StoreCashiers_{sid}_F.xml"
-            xml_path = os.path.join(xml_dir, xml_filename)
+        if not is_ukm5_store(sid):
+            continue
 
-            try:
-                if os.path.exists(xml_path):
-                    tree = ET.parse(xml_path)
-                    root = tree.getroot()
-                else:
-                    root = ET.Element("StoreCashiers")
-                    tree = ET.ElementTree(root)
+        xml_filename = f"StoreCashiers_{sid}_F.xml"
+        xml_path     = os.path.join(xml_dir, xml_filename)
 
-                # Удаляем старую запись по INN
-                for el in root.findall("Cashier"):
-                    if el.find("INN") is not None and el.find("INN").text == user.encrypted_inn:
-                        root.remove(el)
+        try:
+            if os.path.exists(xml_path):
+                tree = ET.parse(xml_path)
+                root = tree.getroot()
+            else:
+                root = ET.Element("StoreCashiers")
+                tree = ET.ElementTree(root)
 
-                # Добавляем новую запись
-                cashier_el = ET.SubElement(root, "Cashier")
-                ET.SubElement(cashier_el, "Id").text = str(current_id)  # Новый ID
-                ET.SubElement(cashier_el, "Name").text = user.full_name
-                ET.SubElement(cashier_el, "INN").text = user.encrypted_inn
-                ET.SubElement(cashier_el, "Password").text = new_password
-                ET.SubElement(cashier_el, "RoleId").text = str(ukm_user.roleid)
-                ET.SubElement(cashier_el, "Deleted").text = "0"
+            # удалить старый кассир по INN
+            for el in root.findall("Cashier"):
+                if el.findtext("INN") == user.encrypted_inn:
+                    root.remove(el)
 
-                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-                logger.info(f"XML обновлён при регенерации QR: {xml_path}")
-            except Exception as e:
-                logger.error(f"Ошибка обновления XML для {sid}: {e}")
+            # новый кассир
+            c_el = ET.SubElement(root, "Cashier")
+            ET.SubElement(c_el, "Id").text       = str(current_id)
+            ET.SubElement(c_el, "Name").text     = user.full_name
+            ET.SubElement(c_el, "INN").text      = user.encrypted_inn
+            ET.SubElement(c_el, "Password").text = new_password
+            ET.SubElement(c_el, "RoleId").text   = str(ukm_user.roleid)
+            ET.SubElement(c_el, "Deleted").text  = "0"
+
+            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+            logger.info(f"XML обновлён при регенерации QR: {xml_path}")
+            current_id += 1
+        except Exception as exc:
+            logger.error(f"Ошибка обновления XML для {sid}: {exc}")
 
 
 
