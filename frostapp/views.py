@@ -57,6 +57,23 @@ def connect_ukm():
     )
 
 
+
+def get_trm_employee_id(enc_inn_full: str, fio: str) -> int | None:
+    enc20 = enc_inn_full[:20]
+    conn  = connect_ukm()
+    cur   = conn.cursor()
+    cur.execute(
+        "SELECT id FROM trm_in_users WHERE user_inn=%s AND name=%s",
+        (enc20, fio)
+    )
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    return row["id"] if row else None
+
+
+
+
+
 def connect_converter():
     return pymysql.connect(
         host="192.168.17.237",
@@ -575,14 +592,18 @@ def regenerate_qr(user, inn_hash_20):
     ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
     cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
     ukm_conn.close()
-
+    ukm_emp_id = get_trm_employee_id(user.encrypted_inn, user.full_name)
     cashier_counter      = 0       # для сдвига id / версии
     inserted_any_signal  = False
     ukm_users            = list(UKMUser.objects.filter(user_id=user.id))
 
     for ukm_user in ukm_users:
         sid         = ukm_user.storeid
-        cashier_id  = cashier_id_base + cashier_counter
+        if ukm_emp_id:               
+            cashier_id = ukm_emp_id
+        else:                    
+            cashier_id = cashier_id_base + cashier_counter
+            cashier_counter += 1
         version     = base_version    + cashier_counter
 
         conv_cursor.execute("""
@@ -747,6 +768,8 @@ def update_cashier(request):
         password_plain = open_rec.password
         inn_hash_20    = encrypted_inn[:20]
 
+        ukm_emp_id = get_trm_employee_id(encrypted_inn, fio)
+
         # уже имеющиеся магазины
         existing_storeids = set(UKMUser.objects.filter(user_id=user.id)
                                               .values_list('storeid', flat=True))
@@ -788,7 +811,12 @@ def update_cashier(request):
             )
 
             # 2. import4staffbonus.users (MySQL)
-            cashier_id = cashier_id_base + cashier_counter
+            if ukm_emp_id:                
+                cashier_id = ukm_emp_id
+            else:                        
+                cashier_id = cashier_id_base + cashier_counter
+                cashier_counter += 1      
+        
             version    = base_version    + cashier_counter
 
             conv_cursor.execute("""
@@ -938,6 +966,8 @@ def delete_cashier(request):
                             .values_list("password", flat=True)
                             .first()) or build_user_password(inn_hash_20)
 
+        ukm_emp_id = get_trm_employee_id(inn_hash_full, fio)
+
         # --- MySQL: INSERT deleted=1 + signal ------------------------------
         converter   = connect_converter()
         conv_cursor = converter.cursor()
@@ -955,7 +985,7 @@ def delete_cashier(request):
 
         for idx, ukm_user in enumerate(ukm_to_remove):
             sid        = ukm_user.storeid
-            cashier_id = cashier_id_base + idx
+            cashier_id = ukm_emp_id if ukm_emp_id else (cashier_id_base + idx)
             version    = base_version   + idx
 
             # вставка-заглушка
