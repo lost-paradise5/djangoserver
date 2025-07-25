@@ -153,7 +153,12 @@ def build_user_password(hash20: str) -> str:
     return base + salt
 
 
-
+def mysql_pwd(raw: str) -> str:
+    """
+    Возвращает строку для OLD_PASSWORD – без префикса 'KS'.
+    Если префикса нет, возвращаем как есть (защитный fallback).
+    """
+    return raw[2:] if raw.startswith("KS") else raw
 
 
 
@@ -275,7 +280,7 @@ def register_cashier(request):
                 conv_cursor.execute("""
                     INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
                     VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-                """, (sid, cashier_id, fio, inn_hash_20, password_plain, role_id, version))
+                """, (sid, cashier_id, fio, inn_hash_20, mysql_pwd(password_plain), role_id, version))
 
                 conv_cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
                 inserted_any_signal = True
@@ -615,7 +620,7 @@ def regenerate_qr(user, inn_hash_20):
             cashier_id,
             user.full_name,
             inn_hash_20,
-            new_password,
+            mysql_pwd(new_password),
             ukm_user.roleid,
             version
         ))
@@ -828,7 +833,7 @@ def update_cashier(request):
                 cashier_id,
                 fio,
                 inn_hash_20,
-                password_plain,
+                mysql_pwd(password_plain),
                 1,          # role_id по умолчанию
                 version
             ))
