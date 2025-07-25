@@ -603,6 +603,7 @@ def regenerate_qr(user, inn_hash_20):
     ukm_users            = list(UKMUser.objects.filter(user_id=user.id))
     plspls = mysql_pwd(new_password)
     logger.info(f"Пароль {new_password} переведен в {plspls}")
+    logger.info(f"Пользователи {ukm_users}")
 
     for ukm_user in ukm_users:
         sid         = ukm_user.storeid
@@ -633,9 +634,11 @@ def regenerate_qr(user, inn_hash_20):
         )
         inserted_any_signal = True
         cashier_counter    += 1
+        logger.info(f"Вставка прошла для пользователя с id {cashier_id}, Магазин {sid}, Пользователь { user.full_name}, Пароль {plspls}")
 
     # если ничего не вставили (маловероятно) — всё-таки дёрнем сигнал
     if not inserted_any_signal:
+        logger.info(f"Вставлять нечего")
         conv_cursor.execute(
             "INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)",
             (base_version,)
