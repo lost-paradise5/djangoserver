@@ -601,6 +601,8 @@ def regenerate_qr(user, inn_hash_20):
     cashier_counter      = 0       # для сдвига id / версии
     inserted_any_signal  = False
     ukm_users            = list(UKMUser.objects.filter(user_id=user.id))
+    plspls = mysql_pwd(new_password)
+    logger.info(f"Пароль {new_password} переведен в {plspls}")
 
     for ukm_user in ukm_users:
         sid         = ukm_user.storeid
@@ -620,7 +622,7 @@ def regenerate_qr(user, inn_hash_20):
             cashier_id,
             user.full_name,
             inn_hash_20,
-            mysql_pwd(new_password),
+            plspls,
             ukm_user.roleid,
             version
         ))
