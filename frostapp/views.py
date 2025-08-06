@@ -58,13 +58,12 @@ def connect_ukm():
 
 
 
-def get_trm_employee_id(enc_inn_full: str, fio: str) -> int | None:
-    enc20 = enc_inn_full[:20]
-    conn  = connect_ukm()
-    cur   = conn.cursor()
+def get_trm_employee_id(plain_inn: str, fio: str) -> int | None:
+    conn = connect_ukm()
+    cur  = conn.cursor()
     cur.execute(
         "SELECT id FROM trm_in_users WHERE user_inn=%s AND name=%s",
-        (enc20, fio)
+        (plain_inn, fio)                    
     )
     row = cur.fetchone()
     cur.close(); conn.close()
@@ -162,6 +161,18 @@ def mysql_pwd(raw: str) -> str:
 
 
 
+def make_hash_parts(plain_inn: str) -> tuple[str, str]:
+    """
+    Нужен только для генерации пароля/QR.
+    Возвращает полный SHA-256 и первые 20 символов.
+    """
+    full = hashlib.sha256(plain_inn.encode('utf-8')).hexdigest()
+    return full, full[:20]
+
+
+
+
+
 
 
 
@@ -179,7 +190,7 @@ def register_cashier(request):
             logger.error(f"Пропущены поля: {missing}")
             return JsonResponse({'status': 'error', 'message': f'Пропущены поля: {missing}'}, status=400)
 
-        inn = data['inn']
+        inn = data['inn'].strip()
         fio = f"{data['surname']} {data['name']} {data['patronymic']}"
         mail = data['mail']
         phone = data['phone']
@@ -204,15 +215,14 @@ def register_cashier(request):
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
             xml_dir = os.path.join(base_dir, 'xml')
             os.makedirs(xml_dir, exist_ok=True)
-            inn_hash_full = get_inn_hash(inn)
-            inn_hash_20 = inn_hash_full[:20]
+            inn_hash_full, inn_hash_20 = make_hash_parts(inn)
             password_plain = build_user_password(inn_hash_20)
             qr_string = password_plain
 
-            existing_user = User.objects.filter(encrypted_inn=inn_hash_full, full_name=fio).first()
+            existing_user = User.objects.filter(encrypted_inn=inn, full_name=fio).first()
             if not existing_user:
                 new_user = User.objects.create(
-                    encrypted_inn=inn_hash_full,
+                    encrypted_inn=inn,
                     full_name=fio,
                     mail=mail,
                     phone=phone,
@@ -570,6 +580,7 @@ def regenerate_qr(user, inn_hash_20):
     Перегенерирует пароль/QR-код сотрудника, добавляет его во все связанные
     магазины в import4staffbonus.users и обязательно пишет строки в signal.
     """
+    inn_hash_full, inn_hash_20 = make_hash_parts(user.encrypted_inn)
     new_password = build_user_password(inn_hash_20)
     now          = timezone.now()
     expiration   = now + datetime.timedelta(days=1)
@@ -622,7 +633,7 @@ def regenerate_qr(user, inn_hash_20):
             sid,
             cashier_id,
             user.full_name,
-            inn_hash_20,
+            user.encrypted_inn,
             plspls,
             ukm_user.roleid,
             version
@@ -747,7 +758,7 @@ def update_cashier(request):
     try:
         data = json.loads(request.body)
 
-        inn_raw  = data.get('inn')
+        plain_inn = data.get('inn').strip()
         fio      = data.get('fio')
         storeids = data.get('storeid')
 
@@ -763,7 +774,7 @@ def update_cashier(request):
             return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
 
         # ── ищем пользователя в PostgreSQL ──────────────────────────────────
-        user = User.objects.filter(encrypted_inn=encrypted_inn,
+        user = User.objects.filter(encrypted_inn=plain_inn,
                                    full_name=fio).first()
         if not user:
             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
@@ -837,7 +848,7 @@ def update_cashier(request):
                 sid,
                 cashier_id,
                 fio,
-                inn_hash_20,
+                plain_inn,
                 mysql_pwd(password_plain),
                 1,          # role_id по умолчанию
                 version
