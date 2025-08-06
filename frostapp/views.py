@@ -85,9 +85,9 @@ def connect_converter():
     )
 
 def generate_qr_string(inn: str, salt: str = "INDIVIDUAL_SALT") -> str:
-    hash_inn = hashlib.sha256(inn.encode('utf-8')).hexdigest()
-    expiration = (datetime.datetime.utcnow() + datetime.timedelta(days=1)).strftime('%Y%m%d')
-    return f"KS{hash_inn}{expiration}{salt}"
+    expiration = (datetime.datetime.utcnow() + datetime.timedelta(days=1)
+                  ).strftime('%Y%m%d')
+    return f"KS{inn}{expiration}{salt}"
     
 def connect_oracle():
     dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="xe")
@@ -143,13 +143,23 @@ def encrypt_inn_full(inn: str) -> str:
 def encrypt_inn20(inn: str) -> str:
     return encrypt_inn_full(inn)[:20]
 
-def build_user_password(hash20: str) -> str:
-    date_part = datetime.datetime.utcnow().strftime("%Y%m%d")
-    base      = f"KS{hash20}{date_part}"
-    max_len   = 40
-    salt_len  = max_len - len(base)
-    salt      = ''.join(random.choices(string.ascii_uppercase + string.digits, k=salt_len))
-    return base + salt
+def build_user_password(plain_inn: str) -> str:
+    """
+    Формирует пароль вида:
+
+        KS<ИНН><YYYYMMDD><RANDOM>
+
+    * KS        – постоянный префикс
+    * ИНН       – 10 / 12 цифр, БЕЗ хэша
+    * YYYYMMDD  – дата UTC
+    * RANDOM    – заглавные A-Z + цифры, чтобы итог всегда был 40 симв.
+    """
+    date_part = datetime.datetime.utcnow().strftime("%Y%m%d")      # 8
+    base      = f"KS{plain_inn}{date_part}"                       # 2+len(INN)+8
+    salt_len  = 40 - len(base)
+    salt      = ''.join(random.choices(string.ascii_uppercase + string.digits,
+                                       k=salt_len))
+    return base + salt                                             # ровно 40
 
 
 def mysql_pwd(raw: str) -> str:
@@ -158,23 +168,6 @@ def mysql_pwd(raw: str) -> str:
     Если префикса нет, возвращаем как есть (защитный fallback).
     """
     return raw[2:] if raw.startswith("KS") else raw
-
-
-
-def make_hash_parts(plain_inn: str) -> tuple[str, str]:
-    """
-    Нужен только для генерации пароля/QR.
-    Возвращает полный SHA-256 и первые 20 символов.
-    """
-    full = hashlib.sha256(plain_inn.encode('utf-8')).hexdigest()
-    return full, full[:20]
-
-
-
-
-
-
-
 
 
 @csrf_exempt
@@ -215,8 +208,8 @@ def register_cashier(request):
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
             xml_dir = os.path.join(base_dir, 'xml')
             os.makedirs(xml_dir, exist_ok=True)
-            inn_hash_full, inn_hash_20 = make_hash_parts(inn)
-            password_plain = build_user_password(inn_hash_20)
+            
+            password_plain = build_user_password(inn)
             qr_string = password_plain
 
             existing_user = User.objects.filter(encrypted_inn=inn, full_name=fio).first()
@@ -290,7 +283,7 @@ def register_cashier(request):
                 conv_cursor.execute("""
                     INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
                     VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-                """, (sid, cashier_id, fio, inn_hash_20, mysql_pwd(password_plain), role_id, version))
+                """, (sid, cashier_id, fio, inn, mysql_pwd(password_plain), role_id, version))
 
                 conv_cursor.execute("INSERT INTO `signal`(`signal`, version) VALUES ('incr', %s)", (version,))
                 inserted_any_signal = True
@@ -575,13 +568,13 @@ def queue_vacation(request):
 
 
 
-def regenerate_qr(user, inn_hash_20):
+def regenerate_qr(user):
     """
     Перегенерирует пароль/QR-код сотрудника, добавляет его во все связанные
     магазины в import4staffbonus.users и обязательно пишет строки в signal.
     """
-    inn_hash_full, inn_hash_20 = make_hash_parts(user.encrypted_inn)
-    new_password = build_user_password(inn_hash_20)
+    
+    new_password = build_user_password(user.encrypted_inn)
     now          = timezone.now()
     expiration   = now + datetime.timedelta(days=1)
 
@@ -721,7 +714,7 @@ def get_qr_code_by_tg(request):
 
         # всегда генерируем новый QR
         inn_hash_20 = user.encrypted_inn[:20]
-        regenerate_qr(user, inn_hash_20)
+        regenerate_qr(user)
 
         new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
         return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
@@ -762,13 +755,13 @@ def update_cashier(request):
         fio      = data.get('fio')
         storeids = data.get('storeid')
 
-        if not (inn_raw and fio and storeids):
+        if not (plain_inn and fio and storeids):
             return JsonResponse({'status': 'error',
                                  'message': 'inn, fio и storeid обязательны'},
                                 status=400)
 
         # ── подготовка данных ────────────────────────────────────────────────
-        encrypted_inn = get_inn_hash(inn_raw)
+        # encrypted_inn = get_inn_hash(inn_raw)
         store_ids     = [int(s.strip()) for s in str(storeids).split(',') if s.strip().isdigit()]
         if not store_ids:
             return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
@@ -787,9 +780,8 @@ def update_cashier(request):
                                  'message': 'Пароль для пользователя не найден'}, status=500)
 
         password_plain = open_rec.password
-        inn_hash_20    = encrypted_inn[:20]
 
-        ukm_emp_id = get_trm_employee_id(encrypted_inn, fio)
+        ukm_emp_id = get_trm_employee_id(plain_inn, fio)
 
         # уже имеющиеся магазины
         existing_storeids = set(UKMUser.objects.filter(user_id=user.id)
@@ -879,7 +871,7 @@ def update_cashier(request):
                     c_el = ET.SubElement(root, "Cashier")
                     ET.SubElement(c_el, "Id").text       = str(cashier_id)
                     ET.SubElement(c_el, "Name").text     = fio
-                    ET.SubElement(c_el, "INN").text      = inn_raw
+                    ET.SubElement(c_el, "INN").text      = plain_inn
                     ET.SubElement(c_el, "Password").text = password_plain
                     ET.SubElement(c_el, "RoleId").text   = "1"
                     ET.SubElement(c_el, "Deleted").text  = "0"
@@ -966,7 +958,7 @@ def delete_cashier(request):
         inn_hash_20 = inn_hash_full[:20]
 
         # --- PostgreSQL: пользователь и доступы ----------------------------
-        user = User.objects.filter(encrypted_inn=inn_hash_full,
+        user = User.objects.filter(encrypted_inn=inn_raw,
                                    full_name=fio).first()
         if not user:
             return JsonResponse({"status": "error",
@@ -987,7 +979,7 @@ def delete_cashier(request):
                             .values_list("password", flat=True)
                             .first()) or build_user_password(inn_hash_20)
 
-        ukm_emp_id = get_trm_employee_id(inn_hash_full, fio)
+        ukm_emp_id = get_trm_employee_id(inn_raw, fio)
 
         # --- MySQL: INSERT deleted=1 + signal ------------------------------
         converter   = connect_converter()
@@ -1014,7 +1006,7 @@ def delete_cashier(request):
                 INSERT INTO users (store,id,name,inn,password,
                                    role_id,version,deleted)
                 VALUES (%s,%s,%s,%s,OLD_PASSWORD(%s),%s,%s,1)
-            """, (sid, cashier_id, fio, inn_hash_20,
+            """, (sid, cashier_id, fio, inn_raw,
                   current_password, ukm_user.roleid, version))
 
             conv_cursor.execute(
@@ -1043,7 +1035,7 @@ def delete_cashier(request):
                 root = tree.getroot()
                 changed = False
                 for cash_el in root.findall("Cashier"):
-                    if cash_el.findtext("INN") == inn_hash_full:
+                    if cash_el.findtext("INN") == inn_raw:
                         cash_el.find("Deleted").text = "1"
                         changed = True
                 if changed:
