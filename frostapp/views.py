@@ -132,7 +132,11 @@ def is_ukm5_store(storeid):
 
 
 
-
+def ensure_plain_inn(value: str) -> str:
+    v = (value or "").strip()
+    if not (v.isdigit() and len(v) in (10, 12)):
+        raise ValueError("ИНН должен содержать 10 или 12 цифр")
+    return v
 
 
 
@@ -215,6 +219,7 @@ def register_cashier(request):
             existing_user = User.objects.filter(encrypted_inn=inn, full_name=fio).first()
             if not existing_user:
                 new_user = User.objects.create(
+                    employee_id=inn,
                     encrypted_inn=inn,
                     full_name=fio,
                     mail=mail,
@@ -574,7 +579,7 @@ def regenerate_qr(user):
     магазины в import4staffbonus.users и обязательно пишет строки в signal.
     """
     
-    new_password = build_user_password(user.encrypted_inn)
+    new_password = build_user_password(user.employee_id)
     now          = timezone.now()
     expiration   = now + datetime.timedelta(days=1)
 
@@ -601,7 +606,7 @@ def regenerate_qr(user):
     ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
     cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
     ukm_conn.close()
-    ukm_emp_id = get_trm_employee_id(user.encrypted_inn, user.full_name)
+    ukm_emp_id = get_trm_employee_id(user.employee_id, user.full_name)
     cashier_counter      = 0       # для сдвига id / версии
     inserted_any_signal  = False
     ukm_users            = list(UKMUser.objects.filter(user_id=user.id))
@@ -626,7 +631,7 @@ def regenerate_qr(user):
             sid,
             cashier_id,
             user.full_name,
-            user.encrypted_inn,
+            user.employee_id,
             plspls,
             ukm_user.roleid,
             version
@@ -677,14 +682,14 @@ def regenerate_qr(user):
 
             # удалить старую запись по INN
             for el in root.findall("Cashier"):
-                if el.findtext("INN") == user.encrypted_inn:
+                if el.findtext("INN") == user.employee_id:
                     root.remove(el)
 
             # новая запись
             c_el = ET.SubElement(root, "Cashier")
             ET.SubElement(c_el, "Id").text       = str(next_free_id)
             ET.SubElement(c_el, "Name").text     = user.full_name
-            ET.SubElement(c_el, "INN").text      = user.encrypted_inn
+            ET.SubElement(c_el, "INN").text      = user.employee_id
             ET.SubElement(c_el, "Password").text = new_password
             ET.SubElement(c_el, "RoleId").text   = str(ukm_user.roleid)
             ET.SubElement(c_el, "Deleted").text  = "0"
@@ -751,7 +756,7 @@ def update_cashier(request):
     try:
         data = json.loads(request.body)
 
-        plain_inn = data.get('inn').strip()
+        plain_inn = ensure_plain_inn(data.get('inn'))
         fio      = data.get('fio')
         storeids = data.get('storeid')
 
@@ -767,7 +772,7 @@ def update_cashier(request):
             return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
 
         # ── ищем пользователя в PostgreSQL ──────────────────────────────────
-        user = User.objects.filter(encrypted_inn=plain_inn,
+        user = User.objects.filter(employee_id=plain_inn,
                                    full_name=fio).first()
         if not user:
             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
@@ -935,7 +940,7 @@ def delete_cashier(request):
     try:
         data = json.loads(request.body)
 
-        inn_raw   = data.get("inn")
+        inn_raw = ensure_plain_inn(data.get("inn"))
         fio       = data.get("fio")
         store_raw = str(data.get("storeid", "")).strip()
 
@@ -958,7 +963,7 @@ def delete_cashier(request):
         inn_hash_20 = inn_hash_full[:20]
 
         # --- PostgreSQL: пользователь и доступы ----------------------------
-        user = User.objects.filter(encrypted_inn=inn_raw,
+        user = User.objects.filter(employee_id=inn_raw,
                                    full_name=fio).first()
         if not user:
             return JsonResponse({"status": "error",
@@ -977,7 +982,7 @@ def delete_cashier(request):
         current_password = (OpenInSystem.objects
                             .filter(user_id=user.id, system_id=9)
                             .values_list("password", flat=True)
-                            .first()) or build_user_password(inn_hash_20)
+                            .first()) or build_user_password(inn_raw)
 
         ukm_emp_id = get_trm_employee_id(inn_raw, fio)
 
