@@ -20,85 +20,109 @@ _HEX = set("0123456789abcdefABCDEF")
 
 
 
-def get_store_info(storeid: int) -> dict:
+def get_store_info(storeid: int | str) -> dict:
     """
-    Берём из Oracle:
-      - признак UKM5 (REP.UKMSERVER5)
-      - IP UKM4-сервера (REP.UKMSERVER) — это хост MySQL import4.
-    Подробное логирование без утечки пароля.
+    Возвращает:
+      - ukm4ip  ← PROP_ID 'REP.UKMSERVER' (IP сервера УКМ4, где крутится MySQL import4)
+      - is_ukm5 ← наличие/значение PROP_ID 'REP.UKMSERVER5'
+    Поиск умеет работать и по SMSTORE (T1.ID), и по UKM4STORE (PROPVAL = 'REP.UKMStoreId').
     """
-    ORA_HOST    = os.getenv("ORACLE_HOST", "192.168.17.239")
-    ORA_PORT    = int(os.getenv("ORACLE_PORT", "1521"))
-    ORA_SVC     = os.getenv("ORACLE_SERVICE", "BINUU00")
-    ORA_USER    = os.getenv("ORACLE_USER", "supermag")
-    ORA_PASSWORD= os.getenv("ORACLE_PASSWORD", "qqq")  # <-- реальный пароль
+    ORA_HOST     = os.getenv("ORACLE_HOST", "192.168.17.239")
+    ORA_PORT     = int(os.getenv("ORACLE_PORT", "1521"))
+    ORA_SERVICE  = os.getenv("ORACLE_SERVICE", "BINUU00")
+    ORA_USER     = os.getenv("ORACLE_USER", "supermag")
+    ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
 
-    sql = """
-        SELECT T1.ID as SMSTORE,
-               T2.PROPVAL as CLOSEDATE,
-               T3.PROPVAL as UKM4STORE,
-               T5.PROPVAL as UKM4IP,
-               T4.PROPVAL as UKM5STORE
-        FROM SMSTORELOCATIONS T1,
-             (SELECT * FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.CLOSEDATE') T2,
-             (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMStoreId') T3,
-             (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER5') T4,
-             (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER') T5
-        WHERE T1.ID = T2.STORELOC(+)
-          AND T1.ID = T3.STORELOC(+)
-          AND T1.ID = T4.STORELOC(+)
-          AND T1.ID = T5.STORELOC(+)
-          AND T1.ID = :storeid
-    """
+    sid_raw = str(storeid).strip()
+    logger.info(f"[Oracle] get_store_info: старт. входной storeid={sid_raw!r}")
 
-    logger.info(f"[Oracle] get_store_info: старт для storeid={storeid}")
-    logger.debug(f"[Oracle] Параметры подключения: host={ORA_HOST}, port={ORA_PORT}, service={ORA_SVC}, user={ORA_USER}")
-
-    connection = cursor = None
+    conn = cur = None
     try:
-        dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SVC)
-        logger.debug(f"[Oracle] DSN сформирован")
-
+        dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SERVICE)
         logger.info("[Oracle] Подключение...")
-        # ПЕРЕДАЁМ РЕАЛЬНЫЙ ПАРОЛЬ, НО НЕ ЛОГИРУЕМ ЕГО
-        connection = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
-        logger.info(f"[Oracle] Подключено. Версия: {getattr(connection, 'version', 'unknown')}")
+        conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
+        logger.info(f"[Oracle] Подключено. Версия: {getattr(conn, 'version', 'unknown')}")
 
-        cursor = connection.cursor()
-        logger.debug("[Oracle] Курсор открыт")
+        # Шаг 1. Пытаемся трактовать как SMSTORE (T1.ID)
+        storeloc_id = None
+        try:
+            sid_int = int(sid_raw)
+        except Exception:
+            sid_int = None
 
-        logger.debug(f"[Oracle] Выполнение SQL (с биндами storeid={int(storeid)})")
-        cursor.execute(sql, storeid=int(storeid))
-        row = cursor.fetchone()
-        logger.debug(f"[Oracle] fetchone() → {row}")
+        cur = conn.cursor()
+        if sid_int is not None:
+            cur.execute("SELECT COUNT(*) FROM SMSTORELOCATIONS WHERE ID = :sid", sid=sid_int)
+            cnt = cur.fetchone()[0]
+            logger.info(f"[Oracle] Проверка SMSTORELOCATIONS(ID={sid_int}) → count={cnt}")
+            if cnt > 0:
+                storeloc_id = sid_int
 
-        if not row:
-            logger.warning(f"[Oracle] Магазин {storeid}: запись не найдена")
-            return {"is_ukm5": False, "ukm4ip": None}
+        # Шаг 2. Если не нашли по T1.ID — ищем по UKM4STORE (REP.UKMStoreId)
+        if storeloc_id is None:
+            logger.info(f"[Oracle] Пытаемся сопоставить UKM4STORE={sid_raw!r} → STORELOC")
+            cur.execute("""
+                SELECT STORELOC
+                FROM SMSTOREPROPERTIES
+                WHERE PROPID = 'REP.UKMStoreId'
+                  AND TRIM(PROPVAL) = TRIM(:ukm4)
+                FETCH FIRST 1 ROWS ONLY
+            """, ukm4=sid_raw)
+            row = cur.fetchone()
+            if row:
+                storeloc_id = int(row[0])
+                logger.info(f"[Oracle] Маппинг UKM4STORE={sid_raw} → STORELOC={storeloc_id}")
+            else:
+                logger.warning(f"[Oracle] Не найден STORELOC по UKM4STORE={sid_raw}")
+                return {"is_ukm5": False, "ukm4ip": None}
 
-        ukm4ip = (row[3] or "").strip() if row[3] else None
-        is_ukm5 = bool(row[4])
+        # Шаг 3. Тянем все свойства по найденному STORELOC
+        cur.execute("""
+            SELECT PROPID, PROPVAL
+            FROM SMSTOREPROPERTIES
+            WHERE STORELOC = :sl
+        """, sl=storeloc_id)
+        rows = cur.fetchall()
+        logger.info(f"[Oracle] Свойств у STORELOC={storeloc_id}: {len(rows)}")
 
-        logger.info(f"[Oracle] Магазин {storeid}: is_ukm5={is_ukm5}, UKM4IP={ukm4ip!r}")
-        return {"is_ukm5": is_ukm5, "ukm4ip": ukm4ip}
+        props = {}
+        for propid, propval in rows:
+            k = str(propid).strip() if propid is not None else ""
+            v = propval.strip() if isinstance(propval, str) else propval
+            props[k] = v
+
+        # Интересующие ключи
+        ukm4ip  = props.get("REP.UKMSERVER")
+        ukm5val = props.get("REP.UKMSERVER5")
+        ukm4sid = props.get("REP.UKMStoreId")
+        logger.info(f"[Oracle] REP.UKMStoreId={ukm4sid!r}, REP.UKMSERVER={ukm4ip!r}, REP.UKMSERVER5={ukm5val!r}")
+
+        # Попытка альтернативных названий для IP, если вдруг ключ другой
+        if not ukm4ip:
+            for alt in ("REP.UKM4SERVER", "UKMSERVER", "UKM.SERVER", "REP.UKM_SERVER"):
+                if alt in props:
+                    ukm4ip = props[alt]
+                    logger.info(f"[Oracle] Найден альтернативный ключ IP: {alt} → {ukm4ip!r}")
+                    break
+
+        result = {
+            "is_ukm5": bool(ukm5val),
+            "ukm4ip": ukm4ip.strip() if isinstance(ukm4ip, str) else ukm4ip
+        }
+        logger.info(f"[Oracle] Результат для входного {sid_raw}: {result}")
+        return result
 
     except Exception as e:
-        logger.exception(f"[Oracle] Ошибка в get_store_info(storeid={storeid}): {e}")
+        logger.exception(f"[Oracle] Ошибка в get_store_info(storeid={sid_raw}): {e}")
         return {"is_ukm5": False, "ukm4ip": None}
-
     finally:
-        if cursor:
-            try:
-                cursor.close()
-                logger.debug("[Oracle] Курсор закрыт")
-            except Exception as e:
-                logger.warning(f"[Oracle] Ошибка при закрытии курсора: {e}")
-        if connection:
-            try:
-                connection.close()
-                logger.debug("[Oracle] Соединение закрыто")
-            except Exception as e:
-                logger.warning(f"[Oracle] Ошибка при закрытии соединения: {e}")
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"[Oracle] Ошибка при закрытии соединения: {e}")
 
 
 
