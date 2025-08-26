@@ -22,50 +22,95 @@ _HEX = set("0123456789abcdefABCDEF")
 
 def get_store_info(storeid: int) -> dict:
     """
-    Берём из Oracle:
-      - признак UKM5 (наличие значения в проперти REP.UKMSERVER5)
-      - IP UKM4-сервера (REP.UKMSERVER) — он же хост MySQL import4
+    Читает из Oracle (SuperMag) признак UKM5 и IP сервера UKM4 (UKM4IP).
+    Подробно логирует все шаги.
     """
-    try:
-        dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="BINUU00")
-        connection = cx_Oracle.connect("supermag", "qqq", dsn=dsn)
-        cursor = connection.cursor()
+    host = "192.168.17.239"
+    port = 1521
+    service = "BINUU00"
+    user = "supermag"
 
-        cursor.execute("""
-            SELECT T1.ID as SMSTORE,
-                   T2.PROPVAL as CLOSEDATE,
-                   T3.PROPVAL as UKM4STORE,
-                   T5.PROPVAL as UKM4IP,
-                   T4.PROPVAL as UKM5STORE
-            FROM SMSTORELOCATIONS T1,
-                 (SELECT * FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.CLOSEDATE') T2,
-                 (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMStoreId') T3,
-                 (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER5') T4,
-                 (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER') T5
-            WHERE T1.ID = T2.STORELOC(+)
-              AND T1.ID = T3.STORELOC(+)
-              AND T1.ID = T4.STORELOC(+)
-              AND T1.ID = T5.STORELOC(+)
-              AND T1.ID = :storeid
-        """, storeid=int(storeid))
+    sql = """
+        SELECT T1.ID as SMSTORE,
+               T2.PROPVAL as CLOSEDATE,
+               T3.PROPVAL as UKM4STORE,
+               T5.PROPVAL as UKM4IP,
+               T4.PROPVAL as UKM5STORE
+        FROM SMSTORELOCATIONS T1,
+             (SELECT * FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.CLOSEDATE') T2,
+             (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMStoreId') T3,
+             (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER5') T4,
+             (SELECT STORELOC, PROPVAL FROM SMSTOREPROPERTIES WHERE PROPID = 'REP.UKMSERVER') T5
+        WHERE T1.ID = T2.STORELOC(+)
+          AND T1.ID = T3.STORELOC(+)
+          AND T1.ID = T4.STORELOC(+)
+          AND T1.ID = T5.STORELOC(+)
+          AND T1.ID = :storeid
+    """
+
+    binds = {"storeid": int(storeid)}
+
+    logger.info(f"[Oracle] get_store_info: старт для storeid={storeid}")
+    logger.debug(f"[Oracle] Параметры подключения: host={host}, port={port}, service={service}, user={user}")
+
+    connection = None
+    cursor = None
+    try:
+        dsn = cx_Oracle.makedsn(host, port, service_name=service)
+        logger.debug(f"[Oracle] DSN сформирован: {dsn!r}")
+
+        logger.info("[Oracle] Подключение...")
+        # пароль в логах не показываем
+        connection = cx_Oracle.connect(user=user, password="***MASKED***", dsn=dsn)
+        # небольшая хитрость: получим версию уже из активного соединения
+        try:
+            logger.info(f"[Oracle] Подключено. Версия сервера: {getattr(connection, 'version', 'unknown')}")
+        except Exception:
+            logger.debug("[Oracle] Не удалось получить версию соединения (не критично)")
+
+        cursor = connection.cursor()
+        logger.debug("[Oracle] Курсор открыт")
+
+        # Уберём лишние переводы строк в SQL при логировании
+        sql_min = " ".join(sql.split())
+        logger.debug(f"[Oracle] Выполнение SQL: {sql_min}")
+        logger.debug(f"[Oracle] Бинды: {binds}")
+
+        cursor.execute(sql, storeid=binds["storeid"])
+        logger.debug("[Oracle] cursor.execute завершён")
 
         row = cursor.fetchone()
-        cursor.close()
-        connection.close()
+        logger.debug(f"[Oracle] fetchone() → {row}")
 
         if not row:
             logger.warning(f"[Oracle] Магазин {storeid}: запись не найдена")
             return {"is_ukm5": False, "ukm4ip": None}
 
+        # row: [SMSTORE, CLOSEDATE, UKM4STORE, UKM4IP, UKM5STORE]
         ukm4ip = (row[3] or "").strip() if row[3] else None
-        is_ukm5 = bool(row[4])  # UKM5STORE
-        logger.info(f"[Oracle] Магазин {storeid}: UKM5={is_ukm5}, UKM4IP={ukm4ip}")
+        is_ukm5 = bool(row[4])
+
+        logger.info(f"[Oracle] Магазин {storeid}: распарсили is_ukm5={is_ukm5}, UKM4IP={ukm4ip!r}")
         return {"is_ukm5": is_ukm5, "ukm4ip": ukm4ip}
 
     except Exception as e:
-        logger.error(f"Ошибка Oracle при получении свойств магазина {storeid}: {e}")
+        logger.exception(f"[Oracle] Ошибка в get_store_info(storeid={storeid}): {e}")
         return {"is_ukm5": False, "ukm4ip": None}
 
+    finally:
+        # Закрываем курсор/соединение с логированием (без падений при повторных закрытиях)
+        if cursor is not None:
+            try:
+                cursor.close()
+                logger.debug("[Oracle] Курсор закрыт")
+            except Exception as e:
+                logger.warning(f"[Oracle] Ошибка при закрытии курсора: {e}")
+        if connection is not None:
+            try:
+                connection.close()
+                logger.debug("[Oracle] Соединение закрыто")
+            except Exception as e:
+                logger.warning(f"[Oracle] Ошибка при закрытии соединения: {e}")
 
 
 
