@@ -22,13 +22,16 @@ _HEX = set("0123456789abcdefABCDEF")
 
 def get_store_info(storeid: int) -> dict:
     """
-    Читает из Oracle (SuperMag) признак UKM5 и IP сервера UKM4 (UKM4IP).
-    Подробно логирует все шаги.
+    Берём из Oracle:
+      - признак UKM5 (REP.UKMSERVER5)
+      - IP UKM4-сервера (REP.UKMSERVER) — это хост MySQL import4.
+    Подробное логирование без утечки пароля.
     """
-    host = "192.168.17.239"
-    port = 1521
-    service = "BINUU00"
-    user = "supermag"
+    ORA_HOST    = os.getenv("ORACLE_HOST", "192.168.17.239")
+    ORA_PORT    = int(os.getenv("ORACLE_PORT", "1521"))
+    ORA_SVC     = os.getenv("ORACLE_SERVICE", "BINUU00")
+    ORA_USER    = os.getenv("ORACLE_USER", "supermag")
+    ORA_PASSWORD= os.getenv("ORACLE_PASSWORD", "qqq")  # <-- реальный пароль
 
     sql = """
         SELECT T1.ID as SMSTORE,
@@ -48,37 +51,24 @@ def get_store_info(storeid: int) -> dict:
           AND T1.ID = :storeid
     """
 
-    binds = {"storeid": int(storeid)}
-
     logger.info(f"[Oracle] get_store_info: старт для storeid={storeid}")
-    logger.debug(f"[Oracle] Параметры подключения: host={host}, port={port}, service={service}, user={user}")
+    logger.debug(f"[Oracle] Параметры подключения: host={ORA_HOST}, port={ORA_PORT}, service={ORA_SVC}, user={ORA_USER}")
 
-    connection = None
-    cursor = None
+    connection = cursor = None
     try:
-        dsn = cx_Oracle.makedsn(host, port, service_name=service)
-        logger.debug(f"[Oracle] DSN сформирован: {dsn!r}")
+        dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SVC)
+        logger.debug(f"[Oracle] DSN сформирован")
 
         logger.info("[Oracle] Подключение...")
-        # пароль в логах не показываем
-        connection = cx_Oracle.connect(user=user, password="***MASKED***", dsn=dsn)
-        # небольшая хитрость: получим версию уже из активного соединения
-        try:
-            logger.info(f"[Oracle] Подключено. Версия сервера: {getattr(connection, 'version', 'unknown')}")
-        except Exception:
-            logger.debug("[Oracle] Не удалось получить версию соединения (не критично)")
+        # ПЕРЕДАЁМ РЕАЛЬНЫЙ ПАРОЛЬ, НО НЕ ЛОГИРУЕМ ЕГО
+        connection = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
+        logger.info(f"[Oracle] Подключено. Версия: {getattr(connection, 'version', 'unknown')}")
 
         cursor = connection.cursor()
         logger.debug("[Oracle] Курсор открыт")
 
-        # Уберём лишние переводы строк в SQL при логировании
-        sql_min = " ".join(sql.split())
-        logger.debug(f"[Oracle] Выполнение SQL: {sql_min}")
-        logger.debug(f"[Oracle] Бинды: {binds}")
-
-        cursor.execute(sql, storeid=binds["storeid"])
-        logger.debug("[Oracle] cursor.execute завершён")
-
+        logger.debug(f"[Oracle] Выполнение SQL (с биндами storeid={int(storeid)})")
+        cursor.execute(sql, storeid=int(storeid))
         row = cursor.fetchone()
         logger.debug(f"[Oracle] fetchone() → {row}")
 
@@ -86,11 +76,10 @@ def get_store_info(storeid: int) -> dict:
             logger.warning(f"[Oracle] Магазин {storeid}: запись не найдена")
             return {"is_ukm5": False, "ukm4ip": None}
 
-        # row: [SMSTORE, CLOSEDATE, UKM4STORE, UKM4IP, UKM5STORE]
         ukm4ip = (row[3] or "").strip() if row[3] else None
         is_ukm5 = bool(row[4])
 
-        logger.info(f"[Oracle] Магазин {storeid}: распарсили is_ukm5={is_ukm5}, UKM4IP={ukm4ip!r}")
+        logger.info(f"[Oracle] Магазин {storeid}: is_ukm5={is_ukm5}, UKM4IP={ukm4ip!r}")
         return {"is_ukm5": is_ukm5, "ukm4ip": ukm4ip}
 
     except Exception as e:
@@ -98,14 +87,13 @@ def get_store_info(storeid: int) -> dict:
         return {"is_ukm5": False, "ukm4ip": None}
 
     finally:
-        # Закрываем курсор/соединение с логированием (без падений при повторных закрытиях)
-        if cursor is not None:
+        if cursor:
             try:
                 cursor.close()
                 logger.debug("[Oracle] Курсор закрыт")
             except Exception as e:
                 logger.warning(f"[Oracle] Ошибка при закрытии курсора: {e}")
-        if connection is not None:
+        if connection:
             try:
                 connection.close()
                 logger.debug("[Oracle] Соединение закрыто")
