@@ -234,13 +234,16 @@ def get_next_version_for_store(conn, store_id: int) -> tuple[int, int, int]:
     """
     Возвращает (next_version, users_max, signal_max) для указанного магазина.
     next_version = max( MAX(version) в users по этому store,
-                        MAX(version) в signal ) + 1
+                        MAX(version) в `signal` ) + 1
     """
     cur = conn.cursor()
-    cur.execute("SELECT COALESCE(MAX(version), 0) AS v FROM users WHERE store=%s", (store_id,))
+
+    cur.execute("SELECT COALESCE(MAX(`version`), 0) AS v FROM `users` WHERE `store`=%s", (store_id,))
     v_users = cur.fetchone()['v'] or 0
-    cur.execute("SELECT COALESCE(MAX(version), 0) AS v FROM signal")
+
+    cur.execute("SELECT COALESCE(MAX(`version`), 0) AS v FROM `signal`")
     v_signal = cur.fetchone()['v'] or 0
+
     next_v = max(v_users, v_signal) + 1
     return next_v, v_users, v_signal
 
