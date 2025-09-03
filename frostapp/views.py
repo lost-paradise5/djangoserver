@@ -780,6 +780,50 @@ def get_qr_code_by_tg(request):
 
 
 
+@csrf_exempt
+def get_qr_code_by_employee_id(request):
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        employee_id = (data.get('employee_id') or "").strip()
+
+        if not employee_id:
+            return JsonResponse({'status': 'error', 'message': 'Не указан employee_id'}, status=400)
+
+        # Опциональная валидация: ИНН = 10/12 цифр
+        try:
+            plain_inn = ensure_plain_inn(employee_id)
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'message': f'Некорректный employee_id: {e}'}, status=400)
+
+        user = User.objects.filter(employee_id=plain_inn).first()
+        if not user:
+            return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
+
+        # всегда генерируем новый QR / пароль
+        regenerate_qr(user)
+
+        new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
+        if not new_qr:
+            return JsonResponse({'status': 'error', 'message': 'Не удалось сформировать QR-код'}, status=500)
+
+        return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
+
+    except Exception as e:
+        logger.exception("Ошибка при получении QR-кода по employee_id")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
+
+
+
+
+
+
 
 @csrf_exempt
 def update_cashier(request):
