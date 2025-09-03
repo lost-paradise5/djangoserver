@@ -24,7 +24,8 @@ from frostapp.views import (
     register_cashier, 
     get_qr_code_by_tg,
     update_cashier,
-    delete_cashier
+    delete_cashier,
+    get_qr_code_by_employee_id,
     
 )
 
@@ -40,4 +41,5 @@ urlpatterns = [
     path('get_qr_code/', get_qr_code_by_tg, name='get_qr_code'),
     path('queue/update_cashier/', update_cashier, name='update_cashier'),
     path('queue/delete_cashier/', delete_cashier, name='delete_cashier'),
+    path('get_qr_code_by_employee_id/', get_qr_code_by_employee_id, name='get_qr_code_by_employee_id'),
 ]
