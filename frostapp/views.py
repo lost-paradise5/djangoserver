@@ -272,6 +272,216 @@ def mysql_pwd(raw: str) -> str:
     return raw[2:] if raw.startswith("KS") else raw
 
 
+
+
+
+# ────────────────────────────────────────────────  Oracle-коннект (единый)
+def connect_oracle_supermag():
+    ORA_HOST     = os.getenv("ORACLE_HOST", "192.168.17.239")
+    ORA_PORT     = int(os.getenv("ORACLE_PORT", "1521"))
+    ORA_SERVICE  = os.getenv("ORACLE_SERVICE", "BINUU00")
+    ORA_USER     = os.getenv("ORACLE_USER", "supermag")
+    ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
+    dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SERVICE)
+    return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+
+# ────────────────────────────────────────────────  Базовый SQL
+BASE_STORES_SQL = """
+SELECT
+  r.title AS region,
+  t1.id   AS smstore,
+  t1.name AS name,
+  t1.address AS address,
+  t2.propval AS closedate,
+  t3.propval AS ukm4store,
+  t5.propval AS ukm4ip,
+  t4.propval AS ukm5store,
+  t6.propval AS latitude,
+  t7.propval AS longitude
+FROM smstorelocations t1
+JOIN smregions r ON r.rgnid = t1.rgnid
+LEFT JOIN smstoreproperties t2 ON t2.storeloc = t1.id AND t2.propid = 'REP.CLOSEDATE'
+LEFT JOIN smstoreproperties t3 ON t3.storeloc = t1.id AND t3.propid = 'REP.UKMStoreId'
+LEFT JOIN smstoreproperties t4 ON t4.storeloc = t1.id AND t4.propid = 'REP.UKMSERVER5'
+LEFT JOIN smstoreproperties t5 ON t5.storeloc = t1.id AND t5.propid = 'REP.UKMSERVER'
+LEFT JOIN smstoreproperties t6 ON t6.storeloc = t1.id AND t6.propid = 'REP.STORE.Latitude'
+LEFT JOIN smstoreproperties t7 ON t7.storeloc = t1.id AND t7.propid = 'REP.STORE.Longitude'
+WHERE
+  UPPER(t1.name) NOT LIKE 'Я %%'
+  AND t1.name NOT LIKE '%%ТЕСТ%%'
+  AND t1.idclass IN (
+    SELECT id FROM supermag.sastoreclass
+    WHERE tree LIKE '1.1.%%' OR tree LIKE '1.2.%%' OR tree LIKE '1.3.%%' OR tree LIKE '1.4.%%' OR tree LIKE '2.1.%%' OR tree LIKE '2.2.%%'
+  )
+  AND t1.accepted = 1
+  AND t1.loctype = 4
+  {only_active_clause}
+  {extra_filters}
+ORDER BY r.title, t1.name
+"""
+
+def _fetch_stores(q: str, region: str, only_active: bool):
+    extra_filters_sql = []
+    binds = {}
+
+    if region:
+        extra_filters_sql.append("AND r.title = :region")
+        binds['region'] = region
+
+    if q:
+        like = f"%{q.lower()}%"
+        if q.isdigit():
+            extra_filters_sql.append("""
+            AND (
+                LOWER(t1.name) LIKE :q
+                OR LOWER(t1.address) LIKE :q
+                OR t1.id = :sid
+                OR t3.propval = :ukm4sid
+            )""")
+            binds['q'] = like
+            binds['sid'] = int(q)
+            binds['ukm4sid'] = q
+        else:
+            extra_filters_sql.append("""
+            AND (
+                LOWER(t1.name) LIKE :q
+                OR LOWER(t1.address) LIKE :q
+            )""")
+            binds['q'] = like
+
+    only_active_clause = "AND (t2.propval IS NULL OR TO_DATE(t2.propval,'DD.MM.YYYY') >= TRUNC(SYSDATE))" if only_active else ""
+
+    sql = BASE_STORES_SQL.format(
+        only_active_clause=only_active_clause,
+        extra_filters=(" " + " ".join(extra_filters_sql)) if extra_filters_sql else ""
+    )
+
+    rows = []
+    conn = cur = None
+    try:
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+        cur.execute(sql, binds)
+        cols = [d[0].lower() for d in cur.description]
+        for r in cur.fetchall():
+            item = dict(zip(cols, r))
+            # координаты -> float, если возможно
+            for k in ('latitude', 'longitude'):
+                if item.get(k) is not None:
+                    s = str(item[k]).replace(',', '.')
+                    try:
+                        item[k] = float(s)
+                    except Exception:
+                        pass
+            rows.append(item)
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+    return rows
+
+@csrf_exempt
+def export_stores_xml(request):
+    """
+    GET /export/stores/xml/?q=&region=&only_active=1
+    Сохраняет файл вида /app/xml/stores_YYYYMMDD_HHMMSS.xml
+    """
+    try:
+        q = (request.GET.get('q') or '').strip()
+        region = (request.GET.get('region') or '').strip()
+        only_active = (request.GET.get('only_active') or '1') in ('1', 'true', 'True')
+
+        rows = _fetch_stores(q, region, only_active)
+
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        xml_dir = os.path.join(base_dir, 'xml')
+        os.makedirs(xml_dir, exist_ok=True)
+
+        ts = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        fname = f"stores_{ts}.xml"
+        fpath = os.path.join(xml_dir, fname)
+
+        root = ET.Element("Stores")
+        root.set("exported_at_utc", ts)
+        root.set("only_active", "1" if only_active else "0")
+        if q: root.set("q", q)
+        if region: root.set("region", region)
+
+        for r in rows:
+            s_el = ET.SubElement(root, "Store")
+            ET.SubElement(s_el, "Region").text     = str(r.get('region') or '')
+            ET.SubElement(s_el, "SMSTORE").text    = str(r.get('smstore') or '')
+            ET.SubElement(s_el, "Name").text       = str(r.get('name') or '')
+            ET.SubElement(s_el, "Address").text    = str(r.get('address') or '')
+            ET.SubElement(s_el, "CloseDate").text  = str(r.get('closedate') or '')
+            ET.SubElement(s_el, "UKM4Store").text  = str(r.get('ukm4store') or '')
+            ET.SubElement(s_el, "UKM4IP").text     = str(r.get('ukm4ip') or '')
+            ET.SubElement(s_el, "UKM5Store").text  = str(r.get('ukm5store') or '')
+            ET.SubElement(s_el, "Latitude").text   = '' if r.get('latitude') is None else str(r.get('latitude'))
+            ET.SubElement(s_el, "Longitude").text  = '' if r.get('longitude') is None else str(r.get('longitude'))
+
+        tree = ET.ElementTree(root)
+        tree.write(fpath, encoding="utf-8", xml_declaration=True)
+
+        return JsonResponse({
+            'status': 'ok',
+            'saved_to': fpath,
+            'filename': fname,
+            'count': len(rows)
+        })
+    except Exception as e:
+        logger.exception("export_stores_xml error")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @csrf_exempt
 def register_cashier(request):
     if request.method != 'POST':
