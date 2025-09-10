@@ -26,6 +26,7 @@ from frostapp.views import (
     update_cashier,
     delete_cashier,
     get_qr_code_by_employee_id,
+    export_stores_xml,
     
 )
 
@@ -42,4 +43,5 @@ urlpatterns = [
     path('queue/update_cashier/', update_cashier, name='update_cashier'),
     path('queue/delete_cashier/', delete_cashier, name='delete_cashier'),
     path('get_qr_code_by_employee_id/', get_qr_code_by_employee_id, name='get_qr_code_by_employee_id'),
+    path('export/stores/xml/', export_stores_xml, name='export_stores_xml'),
 ]
