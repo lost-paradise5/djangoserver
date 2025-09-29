@@ -2,6 +2,9 @@ import hashlib
 import json
 import os
 import logging
+import requests
+import time
+from typing import Tuple, Optional
 import random
 import string
 import datetime
@@ -153,6 +156,20 @@ if not logger.hasHandlers():
     logger.addHandler(file_handler)
 
 
+# ────────────────────────────────────────────────  1С: параметры и HTTP-сессия
+ONEC_EMP_IDENT_URL = os.getenv(
+    "ONEC_EMP_IDENT_URL",
+    "http://192.168.17.26/zupcorp_http/hs/API/Post_EmployeeIdentification"
+)
+ONEC_USER = os.getenv("ONEC_USER")       # если 1С требует базовую auth
+ONEC_PASS = os.getenv("ONEC_PASS")
+
+# Глобальная Session (реюз TCP-соединений)
+_ONEC_SESSION = requests.Session()
+_ONEC_SESSION.headers.update({"Content-Type": "application/json; charset=utf-8"})
+
+
+
 
 
 def connect_ukm():
@@ -235,6 +252,91 @@ def ensure_plain_inn(value: str) -> str:
     if not (v.isdigit() and len(v) in (10, 12)):
         raise ValueError("ИНН должен содержать 10 или 12 цифр")
     return v
+
+
+
+def _parse_and_format_dt(dt_raw: str) -> str:
+    """
+    Приводит дату/время к строке вида 'DD.MM.YYYY H:MM:SS'
+    Допускаемые входы: '24.09.2025 8:45:00', '24.09.2025 08:45', '2025-09-24 08:45:00',
+    ISO-похожие и т.п. из списка fmts.
+    """
+    s = (dt_raw or "").strip()
+    if not s:
+        raise ValueError("Пустой Datetime")
+
+    fmts = [
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ]
+    dt = None
+    last_err = None
+    for f in fmts:
+        try:
+            dt = datetime.datetime.strptime(s, f)
+            break
+        except Exception as e:
+            last_err = e
+    if dt is None and len(s.split()) == 2 and s.count(':') == 1 and '.' in s.split()[0]:
+        try:
+            dt = datetime.datetime.strptime(s + ":00", "%d.%m.%Y %H:%M:%S")
+        except Exception:
+            pass
+    if dt is None:
+        raise ValueError(f"Некорректный Datetime: {dt_raw!r}; последняя ошибка: {last_err}")
+
+    out = dt.strftime("%d.%m.%Y %H:%M:%S")
+    # Убираем лидирующий ноль у часа: 'DD.MM.YYYY 08:..' → 'DD.MM.YYYY 8:..'
+    if out[11] == '0':
+        out = out[:11] + out[12:]
+    return out
+
+
+def _onec_auth() -> Optional[Tuple[str, str]]:
+    return (ONEC_USER, ONEC_PASS) if ONEC_USER and ONEC_PASS else None
+
+
+def _post_to_onec(payload: dict, idem_key: str, timeout=(3, 7), retries=2) -> Tuple[int, str]:
+    """
+    Отправка в 1С с ретраями и идемпотентным ключом (в заголовке).
+    timeout: (connect, read); retries: доп. попытки (итого 1+retries).
+    Возвращает (status_code, text). Генерирует RuntimeError при сетевых сбоях после всех попыток.
+    """
+    headers = {"X-Idempotency-Key": idem_key}
+    auth = _onec_auth()
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = _ONEC_SESSION.post(
+                ONEC_EMP_IDENT_URL,
+                json=payload,
+                headers=headers,
+                auth=auth,
+                timeout=timeout,
+            )
+            return resp.status_code, (resp.text or "")
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(0.3 * (2 ** attempt))  # 0.3s, 0.6s
+    raise RuntimeError(f"Ошибка запроса в 1С: {last_exc}")
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1260,3 +1362,65 @@ def delete_cashier(request):
     except Exception as exc:
         logger.exception("delete_cashier error")
         return JsonResponse({"status": "error", "message": str(exc)}, status=500)
+
+
+
+
+@csrf_exempt
+def employee_identification(request):
+    """
+    POST /employee-identification/
+    Тело:
+    {
+      "inn": "1234567890",          # 10/12 цифр
+      "fio": "Иванов Иван Иванович",
+      "mx": "137",                  # id магазина, строкой
+      "datetime": "24.09.2025 8:45:00"
+    }
+    Никаких записей в БД. Только валидация, нормализация и отправка в 1С.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+    try:
+        body = request.body.decode('utf-8') if request.body else "{}"
+        data = json.loads(body)
+
+        inn_raw = (data.get("inn") or "").strip()
+        fio_raw = (data.get("fio") or "").strip()
+        mx_raw  = (data.get("mx")  or data.get("storeid") or "").strip()
+        dt_raw  = (data.get("datetime") or data.get("Datetime") or "").strip()
+
+        # Валидации/нормализация — без записи в БД
+        inn_plain = ensure_plain_inn(inn_raw)          # 10/12 цифр
+        if not fio_raw:
+            return JsonResponse({'status': 'error', 'message': 'Пустой FIO'}, status=400)
+        if not mx_raw:
+            return JsonResponse({'status': 'error', 'message': 'Пустой MX (id магазина)'}, status=400)
+        dt_norm = _parse_and_format_dt(dt_raw)         # 'DD.MM.YYYY H:MM:SS'
+
+        onec_payload = {
+            "INN": inn_plain,
+            "FIO": fio_raw,
+            "MX": str(mx_raw),
+            "Datetime": dt_norm,
+        }
+        idem_key = hashlib.sha256(
+            f"{inn_plain}|{fio_raw}|{mx_raw}|{dt_norm}".encode("utf-8")
+        ).hexdigest()
+
+        status_code, text = _post_to_onec(onec_payload, idem_key)
+        ok = 200 <= status_code < 300
+
+        logger.info(f"[1C] POST {ONEC_EMP_IDENT_URL} → {status_code}; payload={onec_payload}")
+
+        return JsonResponse({
+            "status": "ok" if ok else "error",
+            "onec_status_code": status_code,
+            "onec_response": text,
+            "payload": onec_payload
+        }, status=200 if ok else 502)
+
+    except Exception as e:
+        logger.exception("employee_identification error")
+        return JsonResponse({"status": "error", "message": str(e)}, status=400)
