@@ -381,3 +381,4 @@ class Command(BaseCommand):
         logger.info(
             f"ГОТОВО: обновлено={updated}, создано={created}. Лог: {log_path}; "
             f"CSV updates: {backup_csv}; CSV creates: {create_csv}"
+        )
