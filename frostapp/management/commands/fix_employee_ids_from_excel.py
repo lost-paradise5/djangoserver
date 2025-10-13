@@ -6,8 +6,10 @@ from typing import Optional, Tuple, Dict
 import pandas as pd
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
-from frostapp.models import User, Department, Position  # добавили Department, Position
+
+from frostapp.models import User, Department, Position  # модели с managed=False
 
 # ────────────────────────────── Логгер
 def _setup_logger():
@@ -31,10 +33,12 @@ def _setup_logger():
 
     return logger, log_path
 
+
 # ────────────────────────────── Нормализации
 def _norm_inn(v: str) -> Optional[str]:
     s = re.sub(r'\D+', '', str(v or ''))
     return s if len(s) in (10, 12) else None
+
 
 def _norm_fio(last: str, first: str, patr: str) -> str:
     parts = [str(last or '').strip(), str(first or '').strip(), str(patr or '').strip()]
@@ -42,14 +46,22 @@ def _norm_fio(last: str, first: str, patr: str) -> str:
     fio = fio.replace('Ё', 'Е').replace('ё', 'е')
     return re.sub(r'\s+', ' ', fio).strip()
 
+
 def _norm_name_key(name: str) -> str:
     n = str(name or '').strip().lower()
     n = n.replace('ё', 'е')
     n = re.sub(r'\s+', ' ', n)
     return n
 
+
 def _norm_str(x) -> str:
     return re.sub(r'\s+', ' ', str(x or '').strip())
+
+
+def _blank_if_nan(s: str) -> str:
+    ss = (s or '').strip().lower()
+    return '' if ss in ('nan', 'none', 'null', '-') else s
+
 
 # ────────────────────────────── Вспомогалки для Excel
 def _col_letter_to_idx(letter: str) -> int:
@@ -64,16 +76,17 @@ def _col_letter_to_idx(letter: str) -> int:
         idx = idx * 26 + (ord(ch) - ord('A') + 1)
     return idx - 1  # zero-based
 
+
 def _auto_locate_headers(df: pd.DataFrame, logger) -> Tuple[int, Dict[str, int]]:
     """
     Ищем 'инн/inn', 'фамилия/surname/last', 'имя/name', 'отчество/patronymic'
     Возвращаем start_row (первая строка с данными) и mapping словарь.
     """
     patterns = {
-        'inn':      re.compile(r'^\s*(инн|inn)\s*$', re.I),
-        'last':     re.compile(r'^\s*(фам|фамилия|surname|last)\s*$', re.I),
-        'first':    re.compile(r'^\s*(имя|name)\s*$', re.I),
-        'patr':     re.compile(r'^\s*(отчество|patronymic|otchestvo|middle)\s*$', re.I),
+        'inn':   re.compile(r'^\s*(инн|inn)\s*$', re.I),
+        'last':  re.compile(r'^\s*(фам|фамилия|surname|last)\s*$', re.I),
+        'first': re.compile(r'^\s*(имя|name)\s*$', re.I),
+        'patr':  re.compile(r'^\s*(отчество|patronymic|otchestvo|middle)\s*$', re.I),
     }
     max_scan_rows = min(10, len(df))
     found: Dict[str, Tuple[int, int]] = {}
@@ -97,6 +110,7 @@ def _auto_locate_headers(df: pd.DataFrame, logger) -> Tuple[int, Dict[str, int]]
 
     raise ValueError("Не удалось автоматически найти все заголовки (ИНН/Фамилия/Имя/Отчество). "
                      "Укажи явно колонки через --col-inn/--col-last/--col-first/--col-patr и --start-row.")
+
 
 class Command(BaseCommand):
     help = ("Обновляет users.employee_id по Excel и, при необходимости, "
@@ -143,13 +157,13 @@ class Command(BaseCommand):
             return
 
         # Определяем колонки
-        col_inn  = opts.get('col_inn')
-        col_last = opts.get('col_last')
-        col_first= opts.get('col_first')
-        col_patr = opts.get('col_patr')
-        col_email= opts.get('col_email')
-        col_dept = opts.get('col_dept')
-        col_pos  = opts.get('col_pos')
+        col_inn   = opts.get('col_inn')
+        col_last  = opts.get('col_last')
+        col_first = opts.get('col_first')
+        col_patr  = opts.get('col_patr')
+        col_email = opts.get('col_email')
+        col_dept  = opts.get('col_dept')
+        col_pos   = opts.get('col_pos')
         start_row_opt = opts.get('start_row')
 
         if all([col_inn, col_last, col_first, col_patr]):
@@ -163,19 +177,21 @@ class Command(BaseCommand):
             if col_pos:   extra_idxs['pos']   = _col_letter_to_idx(col_pos)
 
             start_row = (start_row_opt - 1) if start_row_opt and start_row_opt > 0 else 1
-            logger.info(f"Колонки: inn={col_inn}({ci}), last={col_last}({cl}), first={col_first}({cf}), "
-                        f"patr={col_patr}({cp}), email={col_email}, dept={col_dept}, pos={col_pos}; start_row={start_row+1}")
+            logger.info(
+                f"Колонки: inn={col_inn}({ci}), last={col_last}({cl}), first={col_first}({cf}), "
+                f"patr={col_patr}({cp}), email={col_email}, dept={col_dept}, pos={col_pos}; start_row={start_row+1}"
+            )
 
             used_cols = [ci, cl, cf, cp] + list(extra_idxs.values())
             sub = df.iloc[start_row:, used_cols].copy()
-            # Назначаем имена
-            col_names = ['inn_raw','last','first','patr']
-            for k in ('email','dept','pos'):
+
+            col_names = ['inn_raw', 'last', 'first', 'patr']
+            for k in ('email', 'dept', 'pos'):
                 if k in extra_idxs:
                     col_names.append(k)
             sub.columns = col_names
         else:
-            # авто-заголовки только для базовых 4-х; email/dept/pos руками указывать, если нужны
+            # авто-заголовки только для базовых 4-х; email/dept/pos указывать буквами при необходимости
             try:
                 start_row, mapping = _auto_locate_headers(df, logger)
                 base_cols = [mapping['inn'], mapping['last'], mapping['first'], mapping['patr']]
@@ -186,8 +202,8 @@ class Command(BaseCommand):
                 if col_pos:   extra_idxs['pos']   = _col_letter_to_idx(col_pos);   used_cols.append(extra_idxs['pos'])
 
                 sub = df.iloc[start_row:, used_cols].copy()
-                col_names = ['inn_raw','last','first','patr']
-                for k in ('email','dept','pos'):
+                col_names = ['inn_raw', 'last', 'first', 'patr']
+                for k in ('email', 'dept', 'pos'):
                     if k in extra_idxs:
                         col_names.append(k)
                 sub.columns = col_names
@@ -200,9 +216,9 @@ class Command(BaseCommand):
         if 'dept'  not in sub.columns: sub['dept']  = ''
         if 'pos'   not in sub.columns: sub['pos']   = ''
 
-        sub['email'] = sub['email'].map(_norm_str)
-        sub['dept']  = sub['dept'].map(_norm_str)
-        sub['pos']   = sub['pos'].map(_norm_str)
+        sub['email'] = sub['email'].map(_norm_str).map(_blank_if_nan)
+        sub['dept']  = sub['dept'].map(_norm_str).map(_blank_if_nan)
+        sub['pos']   = sub['pos'].map(_norm_str).map(_blank_if_nan)
 
         sub['inn_norm'] = sub['inn_raw'].map(_norm_inn)
         sub['fio'] = sub.apply(lambda r: _norm_fio(r['last'], r['first'], r['patr']), axis=1)
@@ -211,20 +227,22 @@ class Command(BaseCommand):
         logger.info(f"Подготовлено строк к обработке: {total_rows}")
 
         # Кэш пользователей из БД (по нормализованному ФИО)
-        qs = User.objects.all().only('id','full_name','employee_id')
+        qs = User.objects.all().only('id', 'full_name', 'employee_id')
         db_map = {}
         for u in qs:
             db_map.setdefault(_norm_name_key(u.full_name), []).append((u.id, u.employee_id))
 
         # Кэш отделов/должностей
-        dep_map = { _norm_name_key(d.name): d.id for d in Department.objects.all().only('id','name') }
-        pos_map = { _norm_name_key(p.name): p.id for p in Position.objects.all().only('id','name') }
-        logger.info(f"Пользователи={qs.count()} (уник. ключей ФИО={len(db_map)}); "
-                    f"Отделов={len(dep_map)}, Должностей={len(pos_map)}")
+        dep_map = {_norm_name_key(d.name): d.id for d in Department.objects.all().only('id', 'name')}
+        pos_map = {_norm_name_key(p.name): p.id for p in Position.objects.all().only('id', 'name')}
+        logger.info(
+            f"Пользователи={qs.count()} (уник. ключей ФИО={len(db_map)}); "
+            f"Отделов={len(dep_map)}, Должностей={len(pos_map)}"
+        )
 
         to_update = []  # (user_id, old_inn, new_inn, fio)
         to_create = []  # (fio, inn, email, dep_id, pos_id)
-        stats = {'unchanged':0,'bad_inn':0,'not_found':0,'duplicate':0,'no_dept':0,'no_pos':0}
+        stats = {'unchanged': 0, 'bad_inn': 0, 'not_found': 0, 'duplicate': 0, 'no_dept': 0, 'no_pos': 0}
 
         for i, row in sub.iterrows():
             fio = row['fio']
@@ -242,18 +260,13 @@ class Command(BaseCommand):
             matches = db_map.get(key, [])
 
             if not matches:
-                # Создание, если разрешено и заданы отдел/должность
                 if not allow_create:
                     stats['not_found'] += 1
                     logger.warning(f"[{i}] НЕ НАЙДЕН в БД: '{fio}' → пропуск (create_missing=FALSE)")
                     continue
 
-                dep_id = None
-                pos_id = None
-                if dep_name:
-                    dep_id = dep_map.get(_norm_name_key(dep_name))
-                if pos_name:
-                    pos_id = pos_map.get(_norm_name_key(pos_name))
+                dep_id = dep_map.get(_norm_name_key(dep_name)) if dep_name else None
+                pos_id = pos_map.get(_norm_name_key(pos_name)) if pos_name else None
 
                 if dep_id is None:
                     stats['no_dept'] += 1
@@ -283,21 +296,23 @@ class Command(BaseCommand):
             to_update.append((user_id, old_inn_str, inn_new, fio))
             logger.info(f"[{i}] ОБНОВЛЕНИЕ id={user_id} '{fio}': {old_inn_str} → {inn_new}")
 
-        logger.info(f"ИТОГО: план обновлений={len(to_update)}, план созданий={len(to_create)}, "
-                    f"без_изменений={stats['unchanged']}, не_найдено={stats['not_found']}, "
-                    f"дубликаты={stats['duplicate']}, плохой_инн={stats['bad_inn']}, "
-                    f"нет_отдела={stats['no_dept']}, нет_должности={stats['no_pos']}")
+        logger.info(
+            f"ИТОГО: план обновлений={len(to_update)}, план созданий={len(to_create)}, "
+            f"без_изменений={stats['unchanged']}, не_найдено={stats['not_found']}, "
+            f"дубликаты={stats['duplicate']}, плохой_инн={stats['bad_inн'] if 'bad_inн' in stats else stats['bad_inn']}, "
+            f"нет_отдела={stats['no_dept']}, нет_должности={stats['no_pos']}"
+        )
 
         # CSV бэкапы
         ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
         if backup_csv is None:
-            backup_csv = os.path.join('/app','logs', f'fix_employee_ids_plan_{ts}.csv')
-        create_csv = os.path.join('/app','logs', f'create_users_plan_{ts}.csv')
+            backup_csv = os.path.join('/app', 'logs', f'fix_employee_ids_plan_{ts}.csv')
+        create_csv = os.path.join('/app', 'logs', f'create_users_plan_{ts}.csv')
 
         try:
             with open(backup_csv, 'w', newline='', encoding='utf-8') as f:
                 wr = csv.writer(f, delimiter=';')
-                wr.writerow(['user_id','full_name','old_employee_id','new_employee_id'])
+                wr.writerow(['user_id', 'full_name', 'old_employee_id', 'new_employee_id'])
                 for uid, old_inn, new_inn, fio in to_update:
                     wr.writerow([uid, fio, old_inn, new_inn])
             logger.info(f"Бэкап плана обновлений: {backup_csv}")
@@ -307,7 +322,7 @@ class Command(BaseCommand):
         try:
             with open(create_csv, 'w', newline='', encoding='utf-8') as f:
                 wr = csv.writer(f, delimiter=';')
-                wr.writerow(['full_name','employee_id','email','department_id','position_id'])
+                wr.writerow(['full_name', 'employee_id', 'email', 'department_id', 'position_id'])
                 for fio, inn, email, dep_id, pos_id in to_create:
                     wr.writerow([fio, inn, email, dep_id, pos_id])
             logger.info(f"Бэкап плана созданий: {create_csv}")
@@ -322,18 +337,18 @@ class Command(BaseCommand):
         updated = 0
         created = 0
         with transaction.atomic():
-            # Обновления employee_id
+            # 1) Обновления employee_id
             for k in range(0, len(to_update), batch):
-                chunk = to_update[k:k+batch]
+                chunk = to_update[k:k + batch]
                 for uid, _, new_inn, _ in chunk:
                     User.objects.filter(id=uid).update(employee_id=new_inn)
                 updated += len(chunk)
-                logger.info(f"[WRITE] Обновлён батч #{k//batch + 1}: {len(chunk)} записей")
+                logger.info(f"[WRITE] Обновлён батч #{k // batch + 1}: {len(chunk)} записей")
 
-            # Создания пользователей
+            # 2) Создания пользователей c обработкой конфликтов по encrypted_inn
             now = timezone.now()
             for k in range(0, len(to_create), batch):
-                chunk = to_create[k:k+batch]
+                chunk = to_create[k:k + batch]
                 objs = []
                 for fio, inn, email, dep_id, pos_id in chunk:
                     objs.append(User(
@@ -341,7 +356,7 @@ class Command(BaseCommand):
                         encrypted_inn=inn,  # как в register_cashier — без хэша
                         full_name=fio,
                         mail=email or '',
-                        phone='',            # нет в файле — ставим пустую строку
+                        phone='',            # нет в файле — пусто
                         department_id=dep_id,
                         position_id=pos_id,
                         active=True,
@@ -349,9 +364,20 @@ class Command(BaseCommand):
                         created_at=now,
                         updated_at=now
                     ))
-                User.objects.bulk_create(objs, batch_size=batch)
-                created += len(chunk)
-                logger.info(f"[WRITE] Создан батч пользователей #{k//batch + 1}: {len(chunk)} записей")
+                # НЕ падаем на уникальных конфликтах
+                created_objs = User.objects.bulk_create(objs, batch_size=batch, ignore_conflicts=True)
+                created += len(created_objs)
+                logger.info(f"[WRITE] Создан батч пользователей #{k // batch + 1}: {len(created_objs)} записей (с учётом конфликтов)")
 
-        logger.info(f"ГОТОВО: обновлено={updated}, создано={created}. Лог: {log_path}; "
-                    f"CSV updates: {backup_csv}; CSV creates: {create_csv}")
+                # Для тех, кто уже существовал с таким же INN (encrypted_inn) — дотянем поля
+                for o in objs:
+                    User.objects.filter(encrypted_inn=o.encrypted_inn).update(
+                        mail=o.mail or F('mail'),
+                        department_id=o.department_id or F('department_id'),
+                        position_id=o.position_id or F('position_id'),
+                    )
+                logger.info(f"[WRITE] Обновлены email/department/position для уже существующих записей по совпадающему INN в батче #{k // batch + 1}")
+
+        logger.info(
+            f"ГОТОВО: обновлено={updated}, создано={created}. Лог: {log_path}; "
+            f"CSV updates: {backup_csv}; CSV creates: {create_csv}"
