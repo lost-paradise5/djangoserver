@@ -5,6 +5,7 @@ from frostapp.models import User, QRCode
 from frostapp.views import regenerate_qr
 from itertools import islice
 from zoneinfo import ZoneInfo
+from datetime import timezone as dt_tz
 import logging
 import os
 
@@ -62,7 +63,7 @@ class Command(BaseCommand):
                             if last_qr:
                                 dt = last_qr.created_at
                                 if timezone.is_naive(dt):
-                                    dt = timezone.make_aware(dt, timezone.utc)
+                                    dt = timezone.make_aware(dt, dt_tz.utc)
                                 if dt.astimezone(tz).date() == today_local:
                                     skipped += 1
                                     continue
