@@ -59,10 +59,11 @@ def _norm_phone(x: str) -> str:
         return '+7' + digits
     return '+' + digits
 
-def _fio(last: str, first: str, patr: str) -> str:
+def _norm_fio(last: str, first: str, patr: str) -> str:
     parts = [str(last or '').strip(), str(first or '').strip(), str(patr or '').strip()]
     fio = ' '.join(p for p in parts if p)
-    return fio.replace('Ё', 'Е').replace('ё', 'е')
+    fio = fio.replace('Ё', 'Е').replace('ё', 'е')
+    return re.sub(r'\s+', ' ', fio).strip()
 
 def _fio_key(fio: str) -> str:
     s = _norm_str(fio).lower()
@@ -129,6 +130,30 @@ def _build_password(inn: str) -> str:
     salt = ''.join(random.choices(string.ascii_uppercase + string.digits, k=max(0, need)))
     return base + salt
 
+def _norm_store_token(v: str) -> str:
+    """
+    Нормализует значение из колонки 'ИДМагазин':
+      - '2013.0' -> '2013'
+      - ' 2013 ' -> '2013'
+      - '2013;2014' обрабатывается внешним сплитом
+    Возвращает строку (в т.ч. пустую).
+    """
+    s = _blank_if_nan(_norm_str(v))
+    if not s:
+        return ''
+    s = s.replace(',', '.')
+    # если число/число.десятичное
+    m = re.match(r'^\d+(?:\.\d+)?$', s)
+    if m:
+        try:
+            return str(int(float(s)))
+        except Exception:
+            pass
+    # если просто цифры
+    if s.isdigit():
+        return str(int(s))
+    return s
+
 # ────────────────────────────── Маппинг stores: smstore → ukm4store
 def _load_sm_to_ukm4_map(logger) -> Dict[str, str]:
     sql = "SELECT smstore, ukm4store FROM stores WHERE smstore IS NOT NULL AND ukm4store IS NOT NULL"
@@ -136,8 +161,8 @@ def _load_sm_to_ukm4_map(logger) -> Dict[str, str]:
     with connection.cursor() as cur:
         cur.execute(sql)
         for sm, ukm4 in cur.fetchall():
-            sm_s = str(sm).strip()
-            ukm_s = str(ukm4).strip()
+            sm_s = _norm_store_token(sm)
+            ukm_s = _norm_store_token(ukm4)
             if sm_s:
                 mapping[sm_s] = ukm_s
     logger.info(f"Загружен маппинг stores: {len(mapping)} пар smstore→ukm4store")
@@ -218,14 +243,12 @@ class Command(BaseCommand):
             if 'dept'  in mapping: extra['dept']  = mapping['dept'];  used_cols.append(mapping['dept'])
             if 'pos'   in mapping: extra['pos']   = mapping['pos'];   used_cols.append(mapping['pos'])
             if 'store' in mapping: extra['store'] = mapping['store']; used_cols.append(mapping['store'])
-            # но если явно передали букву для store — переопределим
-            if col_store: extra['store'] = _col_letter_to_idx(col_store); 
+            # переопределяем, если явно передали буквы
+            if col_store: extra['store'] = _col_letter_to_idx(col_store)
             if col_email: extra['email'] = _col_letter_to_idx(col_email)
             if col_phone: extra['phone'] = _col_letter_to_idx(col_phone)
             if col_dept:  extra['dept']  = _col_letter_to_idx(col_dept)
             if col_pos:   extra['pos']   = _col_letter_to_idx(col_pos)
-            if col_store and 'store' not in extra:
-                extra['store'] = _col_letter_to_idx(col_store)
 
             used_cols = base_cols + list(extra.values())
             sub = df.iloc[start_row:, used_cols].copy()
@@ -263,7 +286,7 @@ class Command(BaseCommand):
         sub['phone'] = sub['phone'].map(_norm_phone)
         sub['dept']  = sub['dept'].map(_norm_str).map(_blank_if_nan)
         sub['pos']   = sub['pos'].map(_norm_str).map(_blank_if_nan)
-        sub['store'] = sub['store'].map(lambda v: _blank_if_nan(_norm_str(v)))
+        sub['store'] = sub['store'].map(_norm_store_token)
 
         sub['inn'] = sub['inn_raw'].map(_norm_inn)
         sub['fio'] = sub.apply(lambda r: _norm_fio(r['last'], r['first'], r['patr']), axis=1)
@@ -359,9 +382,11 @@ class Command(BaseCommand):
             store_raw = r['store']
             if user_id and store_raw:
                 # допускаем несколько значений через , ; пробел
-                parts = re.split(r'[;, ]+', store_raw.strip())
-                parts = [p for p in parts if p]
-                for sm in parts:
+                tokens = re.split(r'[;, ]+', store_raw.strip())
+                tokens = [_norm_store_token(t) for t in tokens if t]
+                for sm in tokens:
+                    if not sm:
+                        continue
                     ukm4 = sm_to_ukm4.get(sm)
                     if not ukm4:
                         stats['no_store_map'] += 1
@@ -462,7 +487,7 @@ class Command(BaseCommand):
                 try:
                     created = User.objects.bulk_create(objs, batch_size=batch, ignore_conflicts=True)
                     created_users += len(created)
-                except IntegrityError as ie:
+                except IntegrityError:
                     # На всякий случай — персонально вставим и проигнорим конфликты
                     for o in objs:
                         try:
