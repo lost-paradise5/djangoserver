@@ -266,7 +266,7 @@ class Command(BaseCommand):
         sub['store'] = sub['store'].map(lambda v: _blank_if_nan(_norm_str(v)))
 
         sub['inn'] = sub['inn_raw'].map(_norm_inn)
-        sub['fio'] = sub.apply(lambda r: _fio(r['last'], r['first'], r['patr']), axis=1)
+        sub['fio'] = sub.apply(lambda r: _norm_fio(r['last'], r['first'], r['patr']), axis=1)
         sub = sub[sub['fio'] != '']
         sub = sub[sub['inn'].notna()]  # выбросим строки с плохим ИНН
         logger.info(f"Подготовлено строк: {len(sub)}")
