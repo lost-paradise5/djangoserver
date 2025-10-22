@@ -463,6 +463,7 @@ class Command(BaseCommand):
         created_ukm   = 0
         created_open  = 0
         created_qr    = 0
+        inn_conflicts: List[tuple] = []  # (user_id, fio, new_inn, owner_user_id, owner_fio)
 
         with transaction.atomic():
             # 1) Создание пользователей (ignore_conflicts, потом «дотягиваем» недостающее)
@@ -505,18 +506,33 @@ class Command(BaseCommand):
                     )
                     User.objects.filter(encrypted_inn=o.encrypted_inn).filter(Q(phone__isnull=True)|Q(phone='')).update(phone=o.phone)
 
-            # 2) Обновление ИНН
+            # 2) Обновление ИНН (с защитой от уникального encrypted_inn)
             for k in range(0, len(update_inn), batch):
-                for uid, _, inn_new, _fio in update_inn[k:k+batch]:
-                    User.objects.filter(id=uid).update(employee_id=inn_new, encrypted_inn=inn_new)
-                    updated_inn += 1
+                chunk = update_inn[k:k+batch]
+                for uid, _, inn_new, fio in chunk:
+                    owner = (User.objects
+                             .exclude(id=uid)
+                             .filter(encrypted_inn=inn_new)
+                             .values('id', 'full_name')
+                             .first())
+                    if owner:
+                        logger.warning(
+                            f"[WRITE] Конфликт encrypted_inн='{inn_new}' у user_id={uid} ('{fio}'); "
+                            f"уже занят user_id={owner['id']} ('{owner['full_name']}'). Обновляю только employee_id."
+                        )
+                        User.objects.filter(id=uid).update(employee_id=inn_new)
+                        inn_conflicts.append((uid, fio, inn_new, owner['id'], owner['full_name']))
+                        updated_inn += 1
+                    else:
+                        User.objects.filter(id=uid).update(employee_id=inn_new, encrypted_inn=inn_new)
+                        updated_inn += 1
 
             # 3) Телефон (только пустые)
             for k in range(0, len(phone_fill), batch):
                 for uid, phone in phone_fill[k:k+batch]:
                     affected = (User.objects
                                 .filter(id=uid)
-                                .filter(Q(phone__isnull=True) | Q(phone=''))
+                                .filter(Q(phone__isnull=True) | Q(phone==''))
                                 .update(phone=phone))
                     filled_phone += affected
 
@@ -552,9 +568,22 @@ class Command(BaseCommand):
                         )
                         created_qr += 1
 
+        # выгрузим конфликты encrypted_inn, если были
+        if inn_conflicts:
+            conflicts_path = os.path.join('/app/logs', f'users_inn_conflicts_{ts}.csv')
+            try:
+                with open(conflicts_path, 'w', newline='', encoding='utf-8') as f:
+                    wr = csv.writer(f, delimiter=';')
+                    wr.writerow(['user_id', 'fio', 'requested_inn', 'owner_user_id', 'owner_fio'])
+                    for row in inn_conflicts:
+                        wr.writerow(row)
+                logger.info(f"Зафиксированы конфликты encrypted_inn: {conflicts_path} (шт: {len(inn_conflicts)})")
+            except Exception as e:
+                logger.warning(f"Не удалось записать CSV конфликтов encrypted_inн: {e}")
+
         logger.info(
-            f"ГОТОВО. users: создано={created_users}, inn_обновлено={updated_inn}, "
-            f"phone_добавлено={filled_phone}; ukm_users создано={created_ukm}; "
+            f"ГОТОВО. users: создано={created_users}, inn_обновлено={updated_inн}, "
+            f"phone_добавлено={filled_phone}; ukm_users создано={created_ukм}; "
             f"open_in_system создано={created_open}; qr_code создано={created_qr}. "
             f"Лог: {log_path}"
         )
