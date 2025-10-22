@@ -532,7 +532,7 @@ class Command(BaseCommand):
                 for uid, phone in phone_fill[k:k+batch]:
                     affected = (User.objects
                                 .filter(id=uid)
-                                .filter(Q(phone__isnull=True) | Q(phone==''))
+                                .filter(Q(phone__isnull=True) | Q(phone=''))
                                 .update(phone=phone))
                     filled_phone += affected
 
@@ -582,8 +582,8 @@ class Command(BaseCommand):
                 logger.warning(f"Не удалось записать CSV конфликтов encrypted_inн: {e}")
 
         logger.info(
-            f"ГОТОВО. users: создано={created_users}, inn_обновлено={updated_inн}, "
-            f"phone_добавлено={filled_phone}; ukm_users создано={created_ukм}; "
+            f"ГОТОВО. users: создано={created_users}, inn_обновлено={updated_inn}, "
+            f"phone_добавлено={filled_phone}; ukm_users создано={created_ukm}; "
             f"open_in_system создано={created_open}; qr_code создано={created_qr}. "
             f"Лог: {log_path}"
         )
