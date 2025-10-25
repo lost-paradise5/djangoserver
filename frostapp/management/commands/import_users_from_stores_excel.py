@@ -12,7 +12,7 @@ from frostapp.models import (
     User, Department, Position, UKMUser, OpenInSystem, QRCode
 )
 
-# ────────────────────────────── Константы для MySQL-коннектов (как во views.py)
+# ────────────────────────────── Константы для MySQL-коннектов (пример; при необходимости поменяйте)
 MYSQL_CONVERTER_USER = "ukm_import"
 MYSQL_CONVERTER_PASS = "jgOKsc2n"
 MYSQL_CONVERTER_DB   = "import4"
@@ -83,7 +83,6 @@ def _norm_role(x) -> Optional[int]:
     s = _blank_if_nan(_norm_str(x))
     if not s:
         return None
-    # вытащим число (на случай "1 (кассир)")
     m = re.search(r'\d+', s)
     if not m:
         return None
@@ -308,9 +307,9 @@ def _push_to_converter(logger, host: str, store: int, cashier_id: int, fio: str,
 class Command(BaseCommand):
     help = (
         "Импорт пользователей из Excel (ИНН/ФИО/email/телефон/отдел/должность/Роль). "
-        "Если в строке указан ИДМагазин — создаются записи в ukm_users (storeid = stores.ukm4store, role_id из колонки), "
-        "open_in_system (system_id=9) и qr_code. "
-        "Дополнительно: роль прокидывается в конвертер (import4.users) по ukm4ip из таблицы stores."
+        "Если в строке указан ИДМагазин и Роль НЕ пуста — создаются/обновляются записи в ukm_users (storeid = stores.ukm4store, role_id из колонки), "
+        "open_in_system (system_id=9) и qr_code, и роль уходит в конвертер. "
+        "Если Роль пуста — по магазинам ничего не делаем."
     )
 
     def add_arguments(self, parser):
@@ -330,7 +329,8 @@ class Command(BaseCommand):
         parser.add_argument('--col-role', help='Колонка Роль на кассе (например, N / 14 столбец)')
 
         parser.add_argument('--start-row', type=int, help='1-based; если не указан — авто от заголовков')
-        parser.add_argument('--roleid', type=int, default=1, help='roleid по умолчанию, если в Excel пусто')
+        # Оставляем флаг для совместимости, но когда роль пустая — НЕ используем его.
+        parser.add_argument('--roleid', type=int, default=1, help='roleid по умолчанию (исп. только если явно задан в Excel)')
         parser.add_argument('--batch', type=int, default=300)
         parser.add_argument('--dry-run', action='store_true')
 
@@ -429,7 +429,7 @@ class Command(BaseCommand):
         sub['dept']  = sub['dept'].map(_norm_str).map(_blank_if_nan)
         sub['pos']   = sub['pos'].map(_norm_str).map(_blank_if_nan)
         sub['store'] = sub['store'].map(_norm_store_token)
-        sub['role']  = sub['role'].map(_norm_role)
+        sub['role']  = sub['role'].map(_norm_role)  # -> Optional[int]
 
         sub['inn'] = sub['inn_raw'].map(_norm_inn)
         sub['fio'] = sub.apply(lambda r: _norm_fio(r['last'], r['first'], r['patr']), axis=1)
@@ -440,8 +440,8 @@ class Command(BaseCommand):
         # ── Кэши БД
         users = User.objects.all().only('id','full_name','employee_id','encrypted_inn','mail','phone','department_id','position_id')
         by_fio: Dict[str, List[dict]] = {}
-        by_inn_plain: Dict[str, int] = {}   # по employee_id (цифровой ИНН)
-        by_inn_hash:  Dict[str, int] = {}   # по encrypted_inn, если он уже 64-hex
+        by_inn_plain: Dict[str, int] = {}
+        by_inn_hash:  Dict[str, int] = {}
         for u in users:
             by_fio.setdefault(_fio_key(u.full_name), []).append({
                 'id': u.id,
@@ -473,10 +473,10 @@ class Command(BaseCommand):
         update_inn   = []      # (user_id, old_inn, new_inn, fio)
         phone_fill   = []      # (user_id, phone)
         create_ukm   = []      # (user_id, storeid_ukm4, roleid_row)
-        update_ukm   = []      # (user_id, storeid_ukm4, roleid_row) — если роль изменилась
+        update_ukm   = []      # (user_id, storeid_ukm4, roleid_row)
         create_open  = []      # (user_id, username, password)
         create_qr    = []      # (user_id, qr_data, created_at, expires_at)
-        hash_sync    = []      # (user_id, inn, fio) — синхронизировать encrypted_inn → SHA-256(inn)
+        hash_sync    = []      # (user_id, inn, fio)
 
         # Для пуша в конвертер: (user_id, fio, inn, storeid_ukm4, roleid_row)
         mysql_jobs: Dict[Tuple[int, int], Tuple[int, str, str, int, int]] = {}
@@ -491,7 +491,16 @@ class Command(BaseCommand):
             phone = r['phone']
             dep_id = dep_map.get(_fio_key(r['dept'])) if r['dept'] else None
             pos_id = pos_map.get(_fio_key(r['pos'])) if r['pos'] else None
-            roleid_row = r['role'] if r['role'] is not None else default_roleid
+
+            # роль может быть None → тогда по магазинам НИЧЕГО не делаем
+            roleid_row = r['role']
+            if pd.isna(roleid_row):
+                roleid_row = None
+            if roleid_row is not None:
+                try:
+                    roleid_row = int(roleid_row)
+                except Exception:
+                    roleid_row = None  # не число -> игнорируем
 
             if r['dept'] and dep_id is None:
                 stats['not_found_dep'] += 1
@@ -507,19 +516,15 @@ class Command(BaseCommand):
                 user_id = cand[0]['id']
                 old_inn = cand[0]['employee_id'] or ''
                 old_phone = cand[0]['phone'] or ''
-                # синхронизация encrypted_inn → hash
                 hash_sync.append((user_id, inn, fio))
-                # телефон, если пуст
                 if not old_phone and phone:
                     phone_fill.append((user_id, phone))
-                # обновить ИНН, если отличается
                 if old_inn != inn:
                     update_inn.append((user_id, old_inn, inn, fio))
             elif len(cand) > 1:
                 stats['dupl_fio'] += 1
                 logger.warning(f"[{i}] Дубликаты ФИО в БД: '{fio}', ids={[c['id'] for c in cand]} → пропуск")
             else:
-                # не нашли по ФИО — попробуем по ИНН: сперва plain, затем hash
                 uid_by_inn = by_inn_plain.get(inn) or by_inn_hash.get(_hash_inn_hex(inn))
                 if uid_by_inn:
                     user_id = uid_by_inn
@@ -528,15 +533,14 @@ class Command(BaseCommand):
                     if urow and not urow['phone'] and phone:
                         phone_fill.append((user_id, phone))
                 else:
-                    # план на создание
                     if dep_id is None or pos_id is None:
                         logger.warning(f"[{i}] Нет dep/pos → не создаю пользователя '{fio}'")
                     else:
                         create_users.append((fio, inn, email, phone, dep_id, pos_id))
 
-            # обработка магазинов (ИДМагазин)
+            # обработка магазинов (ИДМагазин) — ТОЛЬКО если роль указана
             store_raw = r['store']
-            if user_id and store_raw:
+            if user_id and store_raw and (roleid_row is not None):
                 tokens = re.split(r'[;, ]+', store_raw.strip())
                 tokens = [_norm_store_token(t) for t in tokens if t]
                 for sm in tokens:
@@ -553,7 +557,6 @@ class Command(BaseCommand):
                         logger.warning(f"[{i}] ukm4store не число: '{ukm4}' (sm={sm}, fio={fio})")
                         continue
 
-                    # ukm_users: создаём или обновляем роль при расхождении
                     existing = UKMUser.objects.filter(user_id=user_id, storeid=storeid_final).first()
                     if existing is None:
                         create_ukm.append((user_id, storeid_final, roleid_row))
@@ -561,10 +564,9 @@ class Command(BaseCommand):
                         if existing.roleid != roleid_row:
                             update_ukm.append((user_id, storeid_final, roleid_row))
 
-                    # работу в конвертер складываем в «задания»
                     mysql_jobs[(user_id, storeid_final)] = (user_id, fio, inn, storeid_final, roleid_row)
 
-                # open_in_system — если нет записи с system_id=9 → создадим
+                # open_in_system / qr_code — тоже только если роль была указана
                 open_exists = OpenInSystem.objects.filter(user_id=user_id, system_id=9).exists()
                 if not open_exists:
                     pwd = _build_password(inn)
@@ -631,14 +633,14 @@ class Command(BaseCommand):
         created_users = 0
         updated_inn_cnt = 0
         filled_phone  = 0
-        created_ukm   = 0
-        updated_ukm   = 0
-        created_open  = 0
-        created_qr    = 0
+        created_ukm_cnt   = 0
+        updated_ukm_cnt   = 0
+        created_open_cnt  = 0
+        created_qr_cnt    = 0
         inn_conflicts: List[tuple] = []  # (user_id, fio, new_inn, owner_user_id, owner_fio)
 
         with transaction.atomic():
-            # 1) Создание пользователей (ignore_conflicts, потом «дотягиваем» недостающее)
+            # 1) Создание пользователей
             for k in range(0, len(create_users), batch):
                 chunk = create_users[k:k+batch]
                 objs = []
@@ -714,7 +716,7 @@ class Command(BaseCommand):
                                 .update(phone=phone))
                     filled_phone += affected
 
-            # 3.5) Синхронизация encrypted_inn → SHA-256 по данным Excel, даже если ИНН не менялся
+            # 3.5) Синхронизация encrypted_inn → SHA-256
             if hash_sync:
                 sync_map: Dict[int, Tuple[str, str]] = {}
                 for uid, inn, fio in hash_sync:
@@ -735,21 +737,21 @@ class Command(BaseCommand):
                     cur = (User.objects.filter(id=uid)
                            .values_list('encrypted_inn', flat=True)
                            .first()) or ''
-                    if cur.strip().lower() != target_hash:
+                    if (cur or '').strip().lower() != target_hash:
                         User.objects.filter(id=uid).update(encrypted_inn=target_hash)
 
-            # 4) ukm_users (create/update роли)
+            # 4) ukm_users (create/update роли) — только там, где роль была указана
             for k in range(0, len(create_ukm), batch):
                 objs = [UKMUser(user_id=uid, roleid=rid, storeid=sid, version=1)
                         for (uid, sid, rid) in create_ukm[k:k+batch]]
                 for o in objs:
                     if not UKMUser.objects.filter(user_id=o.user_id, storeid=o.storeid).exists():
                         o.save()
-                        created_ukm += 1
+                        created_ukm_cnt += 1
             for k in range(0, len(update_ukm), batch):
                 for uid, sid, rid in update_ukm[k:k+batch]:
                     affected = UKMUser.objects.filter(user_id=uid, storeid=sid).update(roleid=rid)
-                    updated_ukm += affected
+                    updated_ukm_cnt += affected
 
             # 5) open_in_system
             for k in range(0, len(create_open), batch):
@@ -758,7 +760,7 @@ class Command(BaseCommand):
                         OpenInSystem.objects.create(
                             user_id=uid, username=username, password=pwd, system_id=9, status=True
                         )
-                        created_open += 1
+                        created_open_cnt += 1
 
             # 6) qr_code
             for k in range(0, len(create_qr), batch):
@@ -770,11 +772,9 @@ class Command(BaseCommand):
                         QRCode.objects.create(
                             user_id=uid, qr_data=pwd, created_at=created_at, expires_at=expires_at
                         )
-                        created_qr += 1
+                        created_qr_cnt += 1
 
-        # ── Пуш в конвертер (import4) — вне транзакции PostgreSQL
-        # Готовим пароли: для каждого user_id возьмём существующий open_in_system.password (system_id=9),
-        # если его нет — сформируем временно (не сохраняем в PG).
+        # ── Пуш в конвертер (import4) — только для заданий, где роль указана
         pwd_cache: Dict[int, str] = {}
         need_pw_for = {uid for (uid, _sid) in mysql_jobs.keys()}
         for uid in need_pw_for:
@@ -783,18 +783,15 @@ class Command(BaseCommand):
                  .values_list('password', flat=True)
                  .first())
             if not p:
-                # fallback — сгенерим локально от employee_id
                 inn_plain = (User.objects.filter(id=uid).values_list('employee_id', flat=True).first()) or ''
                 p = _build_password(inn_plain) if inn_plain else _build_password('0000000000')
             pwd_cache[uid] = p
 
-        # Вычислим cashier_id (trm_in_users.id) для каждого user (глобально)
         ukm_central = _connect_ukm_central(logger)
         next_free_trm_id = _get_next_trm_id(logger, ukm_central)
         cashier_id_by_user: Dict[int, int] = {}
 
         for (uid, sid), (uid_, fio, inn, storeid, rid) in mysql_jobs.items():
-            # cashier_id: возьмём существующий, иначе выделим новый
             if uid not in cashier_id_by_user:
                 existing_id = _get_trm_employee_id(logger, ukm_central, inn, fio)
                 if existing_id is not None:
@@ -803,7 +800,6 @@ class Command(BaseCommand):
                     cashier_id_by_user[uid] = next_free_trm_id
                     next_free_trm_id += 1
 
-        # Пошлём в import4 по каждому store
         pushed_ok = 0
         for (uid, sid), (uid_, fio, inn, storeid, rid) in mysql_jobs.items():
             host = _blank_if_nan(ukm4_to_ip.get(str(storeid), ''))
@@ -836,7 +832,7 @@ class Command(BaseCommand):
 
         logger.info(
             f"ГОТОВО. users: создано={created_users}, inn_обновлено={updated_inn_cnt}, "
-            f"phone_добавлено={filled_phone}; ukm_users создано={created_ukm}, обновлено_роль={updated_ukm}; "
-            f"open_in_system создано={created_open}; qr_code создано={created_qr}; "
+            f"phone_добавлено={filled_phone}; ukm_users создано={created_ukm_cnt}, обновлено_роль={updated_ukm_cnt}; "
+            f"open_in_system создано={created_open_cnt}; qr_code создано={created_qr_cnt}; "
             f"в import4 отправлено={pushed_ok}/{len(mysql_jobs)}. Лог: {log_path}"
         )
