@@ -174,7 +174,7 @@ _ONEC_SESSION.headers.update({"Content-Type": "application/json; charset=utf-8"}
 
 def connect_ukm():
     return pymysql.connect(
-        host="192.168.17.237",
+        host="192.168.17.234",
         user="ukminfo",
         password="CtHDbCGK.C",
         database="ukmserver",
@@ -201,7 +201,7 @@ def get_trm_employee_id(plain_inn: str, fio: str) -> int | None:
 
 def connect_converter():
     return pymysql.connect(
-        host="192.168.17.237",
+        host="192.168.17.234",
         port=3306,
         user="user1C",
         password="852654",
@@ -1061,32 +1061,222 @@ def regenerate_qr(user):
             logger.error(f"[XML] Ошибка для {sid}: {exc}")
 
 
+
+
+
+
+
+
+def _set_password_pg(user, new_password: str) -> None:
+    """
+    Обновляет пароль во всех связанных PG-таблицах:
+      • qr_code  — пересоздаём запись (expires_at = now + 1 day)
+      • open_in_system (system_id=9) — создаём/обновляем пароль
+    """
+    now = timezone.now()
+    expiration = now + datetime.timedelta(days=1)
+
+    # QR: пересоздаём, чтобы был всегда один актуальный
+    QRCode.objects.filter(user=user).delete()
+    QRCode.objects.create(
+        user=user,
+        qr_data=new_password,
+        created_at=now,
+        expires_at=expiration
+    )
+    logger.info(f"[PG] QRCode regenerated for user_id={user.id}; expires_at={expiration.isoformat()}")
+
+    # open_in_system: обновляем, если запись есть; иначе создаём
+    updated = OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(
+        username=user.full_name,
+        password=new_password,
+        status=True
+    )
+    if updated:
+        logger.info(f"[PG] OpenInSystem updated (system_id=9) for user_id={user.id}")
+    else:
+        OpenInSystem.objects.create(
+            user_id=user.id,
+            username=user.full_name,
+            password=new_password,
+            system_id=9,
+            status=True
+        )
+        logger.info(f"[PG] OpenInSystem created (system_id=9) for user_id={user.id}")
+
+
+
+
+
+
 @csrf_exempt
 def get_qr_code_by_tg(request):
     if request.method != 'POST':
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
 
     try:
-        data  = json.loads(request.body)
-        tg_id = data.get('tg_id')
+        data  = json.loads(request.body) if request.body else {}
+        tg_id = (data.get('tg_id') or '').strip()
+        logger.info(f"[QR/TG] === START === tg_id={tg_id!r}")
 
         if not tg_id:
+            logger.error("[QR/TG] tg_id not provided")
             return JsonResponse({'status': 'error', 'message': 'Не указан tg_id'}, status=400)
 
+        # 1) Находим пользователя по tg_id
         user = User.objects.filter(tg_id=str(tg_id)).first()
         if not user:
+            logger.error(f"[QR/TG] User not found by tg_id={tg_id!r}")
             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
 
-        # всегда генерируем новый QR
-        inn_hash_20 = user.encrypted_inn[:20]
-        regenerate_qr(user)
+        fio = (user.full_name or '').strip()
+        employee_id_raw = (user.employee_id or '').strip()
+        logger.info(f"[QR/TG] User found: id={user.id}, fio={fio!r}, employee_id_raw={employee_id_raw!r}")
 
-        new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
-        return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
+        # 2) Валидация ИНН (ожидаем 10/12 цифр)
+        try:
+            plain_inn = ensure_plain_inn(employee_id_raw)
+            logger.info(f"[QR/TG] employee_id verified as INN={plain_inn}")
+        except Exception as e:
+            logger.error(f"[QR/TG] Bad employee_id for user_id={user.id}: {e}")
+            return JsonResponse({'status': 'error', 'message': f'Некорректный employee_id: {e}'}, status=400)
+
+        # 3) Берём все (storeid, roleid) для пользователя из ukm_users
+        ukm_links = list(UKMUser.objects.filter(user_id=user.id).values('storeid', 'roleid'))
+        logger.info(f"[QR/TG] ukm_users rows for user_id={user.id}: count={len(ukm_links)}; rows={ukm_links!r}")
+        if not ukm_links:
+            logger.error(f"[QR/TG] No ukm_users rows for user_id={user.id} — nothing to push to import4")
+            return JsonResponse({'status': 'error', 'message': 'Для пользователя нет записей в ukm_users'}, status=404)
+
+        # 4) Ищем в центральной trm_in_users по (user_inn, name)
+        ukm_emp_id = get_trm_employee_id(plain_inn, fio)
+        if ukm_emp_id is None:
+            # надо определить базовый новый id
+            ukm_conn = connect_ukm()
+            cur = ukm_conn.cursor()
+            cur.execute("SELECT MAX(id) + 1 AS next_id FROM trm_in_users")
+            cashier_id_base = cur.fetchone()['next_id'] or 1
+            cur.close()
+            ukm_conn.close()
+            logger.info(f"[QR/TG] trm_in_users match: NOT FOUND; next free id base={cashier_id_base}")
+        else:
+            cashier_id_base = None
+            logger.info(f"[QR/TG] trm_in_users match: FOUND id={ukm_emp_id}")
+
+        # 5) Генерируем НОВЫЙ пароль
+        new_password = build_user_password(plain_inn)
+        masked = new_password[:6] + "..." + new_password[-4:]
+        logger.info(f"[QR/TG] New password generated (masked): {masked}; len={len(new_password)}")
+
+        # 6) Обновляем пароль в PostgreSQL (QR + open_in_system)
+        _set_password_pg(user, new_password)
+        logger.info(f"[QR/TG] PG updated for user_id={user.id} (QRCode + OpenInSystem)")
+
+        # 7) Для каждого магазина — запись в import4.users + сигнал в import4.signal
+        cashier_counter = 0
+        for link in ukm_links:
+            sid = int(link['storeid'])
+            role_id = int(link['roleid'])
+            cashier_id = ukm_emp_id if ukm_emp_id is not None else (cashier_id_base + cashier_counter)
+
+            logger.info(f"[QR/TG] -> Store loop start: storeid={sid}, role_id={role_id}, cashier_id={cashier_id}")
+
+            # IP конвертера для магазина
+            info = get_store_info(sid)
+            ukm4ip = info.get("ukm4ip")
+            is_ukm5 = info.get("is_ukm5", False)
+            logger.info(f"[QR/TG] Store {sid}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
+
+            if not ukm4ip:
+                logger.error(f"[QR/TG] Store {sid}: ukm4ip not found. Skip MySQL import4 write.")
+                cashier_counter += 1
+                continue
+
+            try:
+                conv = connect_store_mysql(ukm4ip)
+                cur = conv.cursor()
+
+                # ваша логика version: COUNT(signal='busy') + 1
+                cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
+                base_version = (cur.fetchone()['cnt'] or 0) + 1
+                logger.info(f"[QR/TG] Store {sid} ({ukm4ip}): computed version={base_version} via 'busy' counter")
+
+                # Вставка в import4.users. Пароль: OLD_PASSWORD(без 'KS')
+                cur.execute("""
+                    INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+                    VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+                """, (sid, cashier_id, fio, plain_inn, mysql_pwd(new_password), role_id, base_version))
+                logger.info(f"[QR/TG] Store {sid} ({ukm4ip}): users inserted (store={sid}, id={cashier_id}, role_id={role_id}, deleted=0)")
+
+                # Сигнал «incr»
+                cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
+                logger.info(f"[QR/TG] Store {sid} ({ukm4ip}): signal inserted: ('incr', {base_version})")
+
+                conv.commit()
+                cur.close()
+                conv.close()
+                logger.info(f"[QR/TG] Store {sid} ({ukm4ip}): COMMIT OK")
+            except Exception as e:
+                logger.error(f"[QR/TG] Store {sid} ({ukm4ip}) WRITE ERROR: {e}", exc_info=True)
+
+            cashier_counter += 1
+
+        # 8) Готово — возвращаем только статус и пароль
+        logger.info(f"[QR/TG] === DONE === Returning password (masked): {masked}")
+        return JsonResponse({'status': 'ok', 'password': new_password})
 
     except Exception as e:
-        logger.exception("Ошибка при получении QR-кода")
+        logger.exception("Ошибка при get_qr_code_by_tg (расширенная логика)")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# @csrf_exempt
+# def get_qr_code_by_tg(request):
+#     if request.method != 'POST':
+#         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+#     try:
+#         data  = json.loads(request.body)
+#         tg_id = data.get('tg_id')
+
+#         if not tg_id:
+#             return JsonResponse({'status': 'error', 'message': 'Не указан tg_id'}, status=400)
+
+#         user = User.objects.filter(tg_id=str(tg_id)).first()
+#         if not user:
+#             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
+
+#         # всегда генерируем новый QR
+#         inn_hash_20 = user.encrypted_inn[:20]
+#         regenerate_qr(user)
+
+#         new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
+#         return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
+
+#     except Exception as e:
+#         logger.exception("Ошибка при получении QR-кода")
+#         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
 
