@@ -1227,7 +1227,7 @@ def get_qr_code_by_tg(request):
 
         # 8) Успех — возвращаем только статус и пароль
         logger.info(f"[QR/TG] === DONE === Returning password (masked): {masked}")
-        return JsonResponse({'status': 'ok', 'password': new_password})
+        return JsonResponse({'status': 'ok', 'qr_data': new_password})
 
     except Exception as e:
         logger.exception("Ошибка при get_qr_code_by_tg (расширенная логика)")
