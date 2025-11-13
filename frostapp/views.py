@@ -1046,7 +1046,7 @@ def regenerate_qr(user):
                 if el.findtext("INN") == user.employee_id:
                     root.remove(el)
 
-            c_el = ET.SubElement(root, "Cashier")
+            c_el = ET.SubElement(root, "cashier")
             ET.SubElement(c_el, "id").text = str(next_free_id)
             ET.SubElement(c_el, "name").text = user.full_name
             ET.SubElement(c_el, "INN").text = user.employee_id
@@ -1544,7 +1544,7 @@ def delete_cashier(request):
                         changed = True
                 if changed:
                     tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-                    logger.info(f"[XML] Deleted=1: {xml_path}")
+                    logger.info(f"[XML] deleted=1: {xml_path}")
             except Exception as exc:
                 logger.error(f"[XML] Ошибка для магазина {sid}: {exc}")
 
