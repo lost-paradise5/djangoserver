@@ -720,22 +720,22 @@ def register_cashier(request):
 
                 # XML для UKM5
                 if is_ukm5:
-                    xml_filename = f"StoreCashiers_{sid}_F.xml"
+                    xml_filename = f"storeCashiers_{sid}_F.xml"
                     xml_path = os.path.join(xml_dir, xml_filename)
                     try:
                         if os.path.exists(xml_path):
                             tree = ET.parse(xml_path)
                             root = tree.getroot()
                         else:
-                            root = ET.Element("StoreCashiers")
+                            root = ET.Element("storeCashiers")
                             tree = ET.ElementTree(root)
-                        cashier_el = ET.SubElement(root, "Cashier")
-                        ET.SubElement(cashier_el, "Id").text = str(cashier_id)
-                        ET.SubElement(cashier_el, "Name").text = fio
+                        cashier_el = ET.SubElement(root, "cashier")
+                        ET.SubElement(cashier_el, "id").text = str(cashier_id)
+                        ET.SubElement(cashier_el, "name").text = fio
                         ET.SubElement(cashier_el, "INN").text = inn
-                        ET.SubElement(cashier_el, "Password").text = password_plain
-                        ET.SubElement(cashier_el, "RoleId").text = str(role_id)
-                        ET.SubElement(cashier_el, "Deleted").text = "0"
+                        ET.SubElement(cashier_el, "password").text = password_plain
+                        ET.SubElement(cashier_el, "roleId").text = str(role_id)
+                        ET.SubElement(cashier_el, "deleted").text = "0"
 
                         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                         xml_paths.append(xml_path)
@@ -1031,7 +1031,7 @@ def regenerate_qr(user):
         sid = ukm_user.storeid
         if not is_ukm5_store(sid):
             continue
-        xml_filename = f"StoreCashiers_{sid}_F.xml"
+        xml_filename = f"storeCashiers_{sid}_F.xml"
         xml_path = os.path.join(xml_dir, xml_filename)
 
         try:
@@ -1039,20 +1039,20 @@ def regenerate_qr(user):
                 tree = ET.parse(xml_path)
                 root = tree.getroot()
             else:
-                root = ET.Element("StoreCashiers")
+                root = ET.Element("storeCashiers")
                 tree = ET.ElementTree(root)
 
-            for el in root.findall("Cashier"):
+            for el in root.findall("cashier"):
                 if el.findtext("INN") == user.employee_id:
                     root.remove(el)
 
             c_el = ET.SubElement(root, "Cashier")
-            ET.SubElement(c_el, "Id").text = str(next_free_id)
-            ET.SubElement(c_el, "Name").text = user.full_name
+            ET.SubElement(c_el, "id").text = str(next_free_id)
+            ET.SubElement(c_el, "name").text = user.full_name
             ET.SubElement(c_el, "INN").text = user.employee_id
-            ET.SubElement(c_el, "Password").text = new_password
-            ET.SubElement(c_el, "RoleId").text = str(ukm_user.roleid)
-            ET.SubElement(c_el, "Deleted").text = "0"
+            ET.SubElement(c_el, "password").text = new_password
+            ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
+            ET.SubElement(c_el, "deleted").text = "0"
 
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
@@ -1413,23 +1413,23 @@ def update_cashier(request):
                 logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
 
             if is_ukm5:
-                xml_filename = f"StoreCashiers_{sid}_F.xml"
+                xml_filename = f"storeCashiers_{sid}_F.xml"
                 xml_path = os.path.join(xml_dir, xml_filename)
                 try:
                     if os.path.exists(xml_path):
                         tree = ET.parse(xml_path)
                         root = tree.getroot()
                     else:
-                        root = ET.Element("StoreCashiers")
+                        root = ET.Element("storeCashiers")
                         tree = ET.ElementTree(root)
 
-                    c_el = ET.SubElement(root, "Cashier")
-                    ET.SubElement(c_el, "Id").text = str(cashier_id)
-                    ET.SubElement(c_el, "Name").text = fio
+                    c_el = ET.SubElement(root, "cashier")
+                    ET.SubElement(c_el, "id").text = str(cashier_id)
+                    ET.SubElement(c_el, "name").text = fio
                     ET.SubElement(c_el, "INN").text = plain_inn
-                    ET.SubElement(c_el, "Password").text = password_plain
-                    ET.SubElement(c_el, "RoleId").text = "1"
-                    ET.SubElement(c_el, "Deleted").text = "0"
+                    ET.SubElement(c_el, "password").text = password_plain
+                    ET.SubElement(c_el, "roleId").text = "1"
+                    ET.SubElement(c_el, "deleted").text = "0"
 
                     tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                     logger.info(f"[XML] Обновлён файл {xml_path}")
@@ -1531,16 +1531,16 @@ def delete_cashier(request):
             sid = ukm_user.storeid
             if not is_ukm5_store(sid):
                 continue
-            xml_path = os.path.join(xml_dir, f"StoreCashiers_{sid}_F.xml")
+            xml_path = os.path.join(xml_dir, f"storeCashiers_{sid}_F.xml")
             if not os.path.exists(xml_path):
                 continue
             try:
                 tree = ET.parse(xml_path)
                 root = tree.getroot()
                 changed = False
-                for cash_el in root.findall("Cashier"):
+                for cash_el in root.findall("cashier"):
                     if cash_el.findtext("INN") == inn_raw:
-                        cash_el.find("Deleted").text = "1"
+                        cash_el.find("deleted").text = "1"
                         changed = True
                 if changed:
                     tree.write(xml_path, encoding="utf-8", xml_declaration=True)
