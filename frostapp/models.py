@@ -140,3 +140,28 @@ class Position(models.Model):
     class Meta:
         db_table = 'positions'
         managed  = False
+
+
+class Store(models.Model):
+    """
+    Таблица магазинов из PostgreSQL:
+    stores(id, region, smstore, name, address, close_date,
+           ukm4store, ukm4ip, ukm5store, latitude, longitude)
+    """
+    id = models.AutoField(primary_key=True)
+    region = models.TextField(null=True, blank=True)
+    smstore = models.IntegerField(null=True, blank=True)
+    name = models.TextField(null=True, blank=True)
+    address = models.TextField(null=True, blank=True)
+    close_date = models.DateField(null=True, blank=True)
+
+    ukm4store = models.IntegerField(null=True, blank=True)
+    ukm4ip = models.GenericIPAddressField(null=True, blank=True)
+    ukm5store = models.IntegerField(null=True, blank=True)
+
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+
+    class Meta:
+        db_table = 'stores'
+        managed = False
