@@ -235,11 +235,18 @@ def _find_storecashiers_file_for_store(store_id: int) -> Optional[Tuple[str, int
 
 def _generate_storecashiers_number(store_id: int) -> int:
     """
-    Генерирует случайный положительный номер файла для магазина,
-    гарантируя отсутствие коллизий по Number для этого smstore.
+    Number = количество секунд с 00:00 текущего дня (локальное/настроенное время Django).
+    При коллизии (файл с таким Number уже существует для этого store_id) —
+    увеличиваем Number, пока не найдём свободный.
     """
-    xml_store_id = resolve_xml_store_id(store_id)
-    pattern = re.compile(rf"^storeCashiers_\[{xml_store_id}\]_\[(\d+)\]_\[F\]\.xml$")
+    now = timezone.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_since_midnight = int((now - midnight).total_seconds())  # 0..86399
+
+    base_num = seconds_since_midnight
+
+    # Собираем уже использованные Number для этого магазина
+    pattern = re.compile(rf"^storeCashiers_\[{store_id}\]_\[(\d+)\]_\[F\]\.xml$")
     used_numbers = set()
 
     try:
@@ -250,12 +257,17 @@ def _generate_storecashiers_number(store_id: int) -> int:
     except FileNotFoundError:
         pass
 
-    for _ in range(1000):
-        num = random.randint(1, 999_999_999)
-        if num not in used_numbers:
-            return num
+    # Если текущий номер ещё не использован — берём его
+    if base_num not in used_numbers:
+        return base_num
 
-    return (max(used_numbers) + 1) if used_numbers else 1
+    # Если вдруг такой Number уже есть — двигаемся вверх, пока не найдём свободный
+    n = base_num + 1
+    # Теоретически может уйти за 86400, но это не критично — это просто уникальный int
+    while n in used_numbers:
+        n += 1
+
+    return n
 
 
 def _get_or_create_storecashiers_tree(store_id: int) -> Tuple[str, ET.ElementTree, ET.Element]:
