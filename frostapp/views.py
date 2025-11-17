@@ -11,6 +11,7 @@ import datetime
 import pymysql
 import xml.etree.ElementTree as ET
 import cx_Oracle
+import re   
 from django.http import JsonResponse
 from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
@@ -154,6 +155,10 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 if not logger.hasHandlers():
     logger.addHandler(file_handler)
+    
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+XML_DIR = os.path.join(BASE_DIR, 'xml')
+os.makedirs(XML_DIR, exist_ok=True)
 
 
 # ────────────────────────────────────────────────  1С: параметры и HTTP-сессия
@@ -169,7 +174,97 @@ _ONEC_SESSION = requests.Session()
 _ONEC_SESSION.headers.update({"Content-Type": "application/json; charset=utf-8"})
 
 
+def _find_storecashiers_file_for_store(store_id: int) -> Optional[Tuple[str, int]]:
+    """
+    Ищет последний файл вида:
+      storeCashiers_[storeId]_[Number]_[F].xml
+    для указанного магазина в XML_DIR.
+    Возвращает (полный_путь, Number) или None, если файлов нет.
+    """
+    pattern = re.compile(rf"^storeCashiers_\[{store_id}\]_\[(\d+)\]_\[F\]\.xml$")
+    best_name = None
+    best_num = -1
 
+    try:
+        for name in os.listdir(XML_DIR):
+            m = pattern.match(name)
+            if m:
+                num = int(m.group(1))
+                if num > best_num:
+                    best_num = num
+                    best_name = name
+    except FileNotFoundError:
+        return None
+
+    if best_name is None:
+        return None
+    return os.path.join(XML_DIR, best_name), best_num
+
+
+def _generate_storecashiers_number(store_id: int) -> int:
+    """
+    Генерирует случайный положительный номер файла для магазина,
+    гарантируя отсутствие коллизий по Number для этого store_id.
+    """
+    pattern = re.compile(rf"^storeCashiers_\[{store_id}\]_\[(\d+)\]_\[F\]\.xml$")
+    used_numbers = set()
+
+    try:
+        for name in os.listdir(XML_DIR):
+            m = pattern.match(name)
+            if m:
+                used_numbers.add(int(m.group(1)))
+    except FileNotFoundError:
+        pass
+
+    for _ in range(1000):
+        num = random.randint(1, 999_999_999)
+        if num not in used_numbers:
+            return num
+
+    return (max(used_numbers) + 1) if used_numbers else 1
+
+
+def _get_or_create_storecashiers_tree(store_id: int) -> Tuple[str, ET.ElementTree, ET.Element]:
+    """
+    Возвращает (xml_path, tree, root) для storeCashiers текущего магазина.
+
+    - Если файл уже есть (storeCashiers_[storeId]_[Number]_[F].xml) —
+      берём файл с максимальным Number.
+    - Если нет — создаём новый с рандомным Number.
+    При создании и при загрузке выставляем:
+      <storeCashiers fullness="F" storeId="...">
+        <version>Number</version>
+        ...
+      </storeCashiers>
+    """
+    found = _find_storecashiers_file_for_store(store_id)
+    if found:
+        xml_path, number = found
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        root.set("fullness", "F")
+        root.set("storeId", str(store_id))
+
+        version_el = root.find("version")
+        if version_el is None:
+            version_el = ET.SubElement(root, "version")
+        if not (version_el.text or "").strip():
+            version_el.text = str(number)
+
+        return xml_path, tree, root
+
+    number = _generate_storecashiers_number(store_id)
+    filename = f"storeCashiers_[{store_id}]_[{number}]_[F].xml"
+    xml_path = os.path.join(XML_DIR, filename)
+
+    root = ET.Element("storeCashiers", fullness="F", storeId=str(store_id))
+    version_el = ET.SubElement(root, "version")
+    version_el.text = str(number)
+    tree = ET.ElementTree(root)
+
+    return xml_path, tree, root
 
 
 def connect_ukm():
@@ -194,7 +289,6 @@ def get_trm_employee_id(plain_inn: str, fio: str) -> int | None:
     row = cur.fetchone()
     cur.close(); conn.close()
     return row["id"] if row else None
-
 
 
 
@@ -497,13 +591,9 @@ def export_stores_xml(request):
 
         rows = _fetch_stores(q, region, only_active)
 
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        xml_dir = os.path.join(base_dir, 'xml')
-        os.makedirs(xml_dir, exist_ok=True)
-
         ts = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
         fname = f"stores_{ts}.xml"
-        fpath = os.path.join(xml_dir, fname)
+        fpath = os.path.join(XML_DIR, fname)
 
         root = ET.Element("Stores")
         root.set("exported_at_utc", ts)
@@ -720,21 +810,15 @@ def register_cashier(request):
 
                 # XML для UKM5
                 if is_ukm5:
-                    xml_filename = f"storeCashiers_{sid}_F.xml"
-                    xml_path = os.path.join(xml_dir, xml_filename)
                     try:
-                        if os.path.exists(xml_path):
-                            tree = ET.parse(xml_path)
-                            root = tree.getroot()
-                        else:
-                            root = ET.Element("storeCashiers")
-                            tree = ET.ElementTree(root)
+                        xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+
                         cashier_el = ET.SubElement(root, "cashier")
+                        ET.SubElement(cashier_el, "roleId").text = str(role_id)
                         ET.SubElement(cashier_el, "id").text = str(cashier_id)
                         ET.SubElement(cashier_el, "name").text = fio
                         ET.SubElement(cashier_el, "INN").text = inn
                         ET.SubElement(cashier_el, "password").text = password_plain
-                        ET.SubElement(cashier_el, "roleId").text = str(role_id)
                         ET.SubElement(cashier_el, "deleted").text = "0"
 
                         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
@@ -1022,36 +1106,26 @@ def regenerate_qr(user):
         cashier_counter += 1
 
     # XML для UKM5 (обновляем записи)
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    xml_dir = os.path.join(base_dir, 'xml')
-    os.makedirs(xml_dir, exist_ok=True)
-
     next_free_id = cashier_id_base + cashier_counter
+
     for ukm_user in ukm_users:
         sid = ukm_user.storeid
         if not is_ukm5_store(sid):
             continue
-        xml_filename = f"storeCashiers_{sid}_F.xml"
-        xml_path = os.path.join(xml_dir, xml_filename)
 
         try:
-            if os.path.exists(xml_path):
-                tree = ET.parse(xml_path)
-                root = tree.getroot()
-            else:
-                root = ET.Element("storeCashiers")
-                tree = ET.ElementTree(root)
+            xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
 
-            for el in root.findall("cashier"):
+            for el in list(root.findall("cashier")):
                 if el.findtext("INN") == user.employee_id:
                     root.remove(el)
 
             c_el = ET.SubElement(root, "cashier")
+            ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
             ET.SubElement(c_el, "id").text = str(next_free_id)
             ET.SubElement(c_el, "name").text = user.full_name
             ET.SubElement(c_el, "INN").text = user.employee_id
             ET.SubElement(c_el, "password").text = new_password
-            ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
             ET.SubElement(c_el, "deleted").text = "0"
 
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
@@ -1413,22 +1487,15 @@ def update_cashier(request):
                 logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
 
             if is_ukm5:
-                xml_filename = f"storeCashiers_{sid}_F.xml"
-                xml_path = os.path.join(xml_dir, xml_filename)
                 try:
-                    if os.path.exists(xml_path):
-                        tree = ET.parse(xml_path)
-                        root = tree.getroot()
-                    else:
-                        root = ET.Element("storeCashiers")
-                        tree = ET.ElementTree(root)
+                    xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
 
                     c_el = ET.SubElement(root, "cashier")
+                    ET.SubElement(c_el, "roleId").text = "1"  
                     ET.SubElement(c_el, "id").text = str(cashier_id)
                     ET.SubElement(c_el, "name").text = fio
                     ET.SubElement(c_el, "INN").text = plain_inn
                     ET.SubElement(c_el, "password").text = password_plain
-                    ET.SubElement(c_el, "roleId").text = "1"
                     ET.SubElement(c_el, "deleted").text = "0"
 
                     tree.write(xml_path, encoding="utf-8", xml_declaration=True)
@@ -1523,25 +1590,41 @@ def delete_cashier(request):
                 logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
 
         # XML помечаем Deleted=1 только для UKM5
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        xml_dir = os.path.join(base_dir, 'xml')
-        os.makedirs(xml_dir, exist_ok=True)
-
         for ukm_user in ukm_to_remove:
             sid = ukm_user.storeid
             if not is_ukm5_store(sid):
                 continue
-            xml_path = os.path.join(xml_dir, f"storeCashiers_{sid}_F.xml")
+
+            found = _find_storecashiers_file_for_store(sid)
+            if not found:
+                continue
+            xml_path, number = found
+
             if not os.path.exists(xml_path):
                 continue
+
             try:
                 tree = ET.parse(xml_path)
                 root = tree.getroot()
+
+                # Гарантируем корректные атрибуты корня
+                root.set("fullness", "F")
+                root.set("storeId", str(sid))
+                version_el = root.find("version")
+                if version_el is None:
+                    version_el = ET.SubElement(root, "version")
+                if not (version_el.text or "").strip():
+                    version_el.text = str(number)
+
                 changed = False
                 for cash_el in root.findall("cashier"):
                     if cash_el.findtext("INN") == inn_raw:
-                        cash_el.find("deleted").text = "1"
+                        deleted_el = cash_el.find("deleted")
+                        if deleted_el is None:
+                            deleted_el = ET.SubElement(cash_el, "deleted")
+                        deleted_el.text = "1"
                         changed = True
+
                 if changed:
                     tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                     logger.info(f"[XML] deleted=1: {xml_path}")
