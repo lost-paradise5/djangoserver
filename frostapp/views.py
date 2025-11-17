@@ -346,6 +346,98 @@ def connect_converter():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor
     )
+    
+    
+
+
+def _write_converter_user_and_signal(
+    cashier_id: int,
+    plain_inn: str,
+    fio: str,
+    password_plain: str,
+    store_id: int,
+    role_id: int
+) -> None:
+    """
+    Запись в конвертер (БД import4staffbonus):
+      • users  – тот же пароль, что и в PG (с префиксом KS, БЕЗ OLD_PASSWORD)
+      • signal – версия по счётчику 'busy', как в import4.signal
+
+    Структура таблицы users может отличаться, поэтому читаем список колонок через SHOW COLUMNS
+    и заполняем только те поля, которые реально существуют.
+    """
+    conv = cur = None
+    try:
+        conv = connect_converter()
+        cur = conv.cursor()
+
+        # Версия по счётчику 'busy'
+        cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
+        row = cur.fetchone() or {}
+        base_version = (row.get('cnt') or 0) + 1
+        logger.info(
+            f"[CONVERTER] base_version={base_version} (busy cnt) "
+            f"для cashier_id={cashier_id}"
+        )
+
+        # Выясняем структуру таблицы users
+        cur.execute("SHOW COLUMNS FROM `users`")
+        cols_rows = cur.fetchall() or []
+        col_names = [r['Field'] for r in cols_rows]
+        logger.info(f"[CONVERTER] users columns: {col_names}")
+
+        values_map = {}
+
+        if 'id' in col_names:
+            values_map['id'] = cashier_id
+        if 'store' in col_names:
+            values_map['store'] = store_id
+        if 'name' in col_names:
+            values_map['name'] = fio
+        if 'inn' in col_names:
+            values_map['inn'] = plain_inn
+        if 'password' in col_names:
+            # ВАЖНО: тот же пароль, что в open_in_system/qr_code (с префиксом KS, БЕЗ OLD_PASSWORD)
+            values_map['password'] = password_plain
+        if 'role_id' in col_names:
+            values_map['role_id'] = role_id
+        if 'version' in col_names:
+            values_map['version'] = base_version
+        if 'deleted' in col_names:
+            values_map['deleted'] = 0
+
+        if not values_map:
+            logger.warning("[CONVERTER] Структура users неожиданная (нет знакомых полей) – пропускаем INSERT")
+        else:
+            columns_sql = ", ".join(f"`{k}`" for k in values_map.keys())
+            placeholders = ", ".join(["%s"] * len(values_map))
+            sql = f"INSERT INTO `users` ({columns_sql}) VALUES ({placeholders})"
+            cur.execute(sql, list(values_map.values()))
+            logger.info(
+                f"[CONVERTER] users row inserted: store={store_id}, "
+                f"id={cashier_id}, version={base_version}"
+            )
+
+        # signal: incr / version
+        cur.execute("INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)", (base_version,))
+        logger.info(f"[CONVERTER] signal row inserted: incr/{base_version}")
+
+        conv.commit()
+    except Exception as e:
+        logger.error(f"[CONVERTER] Error while inserting users/signal: {e}", exc_info=True)
+        if conv:
+            try:
+                conv.rollback()
+            except Exception:
+                pass
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conv:
+                conv.close()
+        except Exception:
+            pass
 
 
 def generate_qr_string(inn: str, salt: str = "INDIVIDUAL_SALT") -> str:
@@ -382,11 +474,168 @@ def connect_store_mysql(host: str):
     )
 
 
+
+
+
+def _update_store_mysql_and_xml_for_single_store(
+    store_id: int,
+    cashier_id: int,
+    role_id: int,
+    plain_inn: str,
+    fio: str,
+    password_plain: str
+) -> None:
+    """
+    Обновляет кассира по ОДНОМУ магазину:
+      • UKM4 (MySQL import4.users + import4.signal)
+      • UKM5 (XML storeCashiers_...)
+    Пароль в MySQL – OLD_PASSWORD(mysql_pwd(password_plain)).
+    Пароль в XML – тот же, что в PG (с префиксом KS).
+    """
+    logger.info(
+        f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
+        f"cashier_id={cashier_id}, role_id={role_id}"
+    )
+
+    info = get_store_info(store_id)
+    ukm4ip = info.get("ukm4ip")
+    is_ukm5 = info.get("is_ukm5", False)
+    logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
+
+    # --- UKM4 / MySQL import4 ---
+    if ukm4ip:
+        conv = cur = None
+        try:
+            conv = connect_store_mysql(ukm4ip)
+            cur = conv.cursor()
+
+            # Версию берём как (COUNT(signal='busy') + 1)
+            cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
+            row = cur.fetchone() or {}
+            base_version = (row.get('cnt') or 0) + 1
+            logger.info(
+                f"[QR/EMP] Store {store_id} ({ukm4ip}): version={base_version} "
+                f"по счётчику signal='busy'"
+            )
+
+            # Вставляем users (password = OLD_PASSWORD(без 'KS'))
+            cur.execute("""
+                INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+                VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+            """, (
+                store_id,
+                cashier_id,
+                fio,
+                plain_inn,
+                mysql_pwd(password_plain),
+                role_id,
+                base_version
+            ))
+            logger.info(
+                f"[QR/EMP] Store {store_id} ({ukm4ip}): users inserted "
+                f"(id={cashier_id}, role_id={role_id}, version={base_version})"
+            )
+
+            # Сигнал 'incr'
+            cur.execute("INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)", (base_version,))
+            logger.info(
+                f"[QR/EMP] Store {store_id} ({ukm4ip}): signal inserted incr/{base_version}"
+            )
+
+            conv.commit()
+        except Exception as e:
+            logger.error(
+                f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}",
+                exc_info=True
+            )
+            if conv:
+                try:
+                    conv.rollback()
+                except Exception:
+                    pass
+        finally:
+            try:
+                if cur:
+                    cur.close()
+                if conv:
+                    conv.close()
+            except Exception:
+                pass
+    else:
+        logger.error(
+            f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal"
+        )
+
+    # --- UKM5 / XML ---
+    if is_ukm5:
+        try:
+            xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
+
+            # Удаляем старые <cashier> с этим ИНН
+            changed = False
+            for cash_el in list(root.findall("cashier")):
+                if cash_el.findtext("INN") == plain_inn:
+                    root.remove(cash_el)
+                    changed = True
+            if changed:
+                logger.info(
+                    f"[QR/EMP] Store {store_id}: старые записи <cashier> "
+                    f"с INN={plain_inn} удалены из {xml_path}"
+                )
+
+            cash_el = ET.SubElement(root, "cashier")
+            ET.SubElement(cash_el, "roleId").text = str(role_id)
+            ET.SubElement(cash_el, "id").text = str(cashier_id)
+            ET.SubElement(cash_el, "name").text = fio
+            ET.SubElement(cash_el, "INN").text = plain_inn
+            ET.SubElement(cash_el, "password").text = password_plain
+
+            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+            logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
+        except Exception as e:
+            logger.error(
+                f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}",
+                exc_info=True
+            )
+
 def ensure_plain_inn(value: str) -> str:
     v = (value or "").strip()
     if not (v.isdigit() and len(v) in (10, 12)):
         raise ValueError("ИНН должен содержать 10 или 12 цифр")
     return v
+
+
+def normalize_phone_ru(phone: str) -> Optional[str]:
+    """
+    Нормализует телефон к формату +7XXXXXXXXXX.
+    Принимает варианты:
+      +7 924 000-00-00
+      8 (924) 000-00-00
+      79240000000
+      9240000000
+    Если не удаётся нормализовать — возвращает None.
+    """
+    if not phone:
+        return None
+
+    raw = str(phone)
+    digits = ''.join(ch for ch in raw if ch.isdigit())
+
+    if not digits:
+        return None
+
+    if len(digits) == 11 and digits[0] in ('7', '8'):
+        norm = '+7' + digits[1:]
+        return norm
+
+    if len(digits) == 10:
+        norm = '+7' + digits
+        return norm
+
+    if len(digits) == 11:
+        return '+' + digits
+
+    return '+' + digits
 
 
 
@@ -1151,7 +1400,6 @@ def get_qr_code_by_tg(request):
             logger.error(f"[QR/TG] JSON parse error: {e}; body={data_raw!r}")
             return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
 
-        # tg_id может быть int/str — всегда приводим к str перед .strip()
         tg_id_val = data.get('tg_id', '')
         tg_id = str(tg_id_val).strip()
         logger.info(f"[QR/TG] === START === raw_tg_id={tg_id_val!r} → tg_id='{tg_id}'")
@@ -1266,37 +1514,245 @@ def get_qr_code_by_tg(request):
 
 @csrf_exempt
 def get_qr_code_by_employee_id(request):
+    """
+    ВХОД (POST, JSON):
+    {
+      "inn": "7536207278",
+      "fio": "Иванов Иван Иванович",
+      "storeId": 101,
+      "roleId": 1,
+      "phone": "8 (924) 000-00-00"
+    }
+
+    Логика:
+      1) Ищем пользователя в users по employee_id = ИНН.
+      2) Если нашли:
+         - при необходимости нормализуем/обновляем телефон;
+         - гарантируем запись в ukm_users по этому storeId/roleId;
+         - гарантируем наличие QRCode + OpenInSystem;
+         - генерируем НОВЫЙ пароль, обновляем его в PG (qr_code + open_in_system),
+           конвертере (users+signal) и UKM4/UKM5 по данному магазину.
+      3) Если не нашли:
+         - создаём пользователя (employee_id = ИНН, encrypted_inn = SHA-256(ИНН),
+           full_name = ФИО, phone = нормализованный номер);
+         - создаём ukm_users для storeId/roleId;
+         - создаём QRCode + OpenInSystem с новым паролем;
+         - делаем то же самое в конвертере и UKM4/UKM5.
+      4) Если какие-то записи (ukm_users/qr_code/open_in_system) отсутствовали,
+         они будут созданы/дополнены; пароль везде будет обновлён.
+    """
     if request.method != 'POST':
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
 
     try:
-        data = json.loads(request.body)
-        employee_id = (data.get('employee_id') or "").strip()
-
-        if not employee_id:
-            return JsonResponse({'status': 'error', 'message': 'Не указан employee_id'}, status=400)
-
-        # валидация: ИНН = 10/12 цифр
+        body = request.body.decode('utf-8') if request.body else "{}"
         try:
-            plain_inn = ensure_plain_inn(employee_id)
+            data = json.loads(body)
         except Exception as e:
-            return JsonResponse({'status': 'error', 'message': f'Некорректный employee_id: {e}'}, status=400)
+            logger.error(f"[QR/EMP] JSON parse error: {e}; body={body!r}")
+            return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
 
-        user = User.objects.filter(employee_id=plain_inn).first()
-        if not user:
-            return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
+        inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
+        fio_raw = (data.get('fio') or "").strip()
+        store_raw = str(data.get('storeId') or data.get('storeid') or "").strip()
+        role_raw = str(data.get('roleId') or data.get('roleid') or "").strip()
+        phone_raw = (data.get('phone') or "").strip()
 
-        # всегда генерируем новый QR / пароль
-        regenerate_qr(user)
+        logger.info(
+            f"[QR/EMP] START: inn={inn_raw!r}, fio={fio_raw!r}, "
+            f"storeid={store_raw!r}, roleId={role_raw!r}, phone={phone_raw!r}"
+        )
 
-        new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
-        if not new_qr:
-            return JsonResponse({'status': 'error', 'message': 'Не удалось сформировать QR-код'}, status=500)
+        # ИНН
+        if not inn_raw:
+            return JsonResponse({'status': 'error', 'message': 'Не указан ИНН'}, status=400)
+        try:
+            plain_inn = ensure_plain_inn(inn_raw)
+        except Exception as e:
+            logger.error(f"[QR/EMP] Bad INN: {e}")
+            return JsonResponse({'status': 'error', 'message': f'Некорректный ИНН: {e}'}, status=400)
 
-        return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
+        #  ФИО 
+        if not fio_raw:
+            return JsonResponse({'status': 'error', 'message': 'Не указано ФИО'}, status=400)
+        fio = " ".join(fio_raw.split())
+        logger.info(f"[QR/EMP] Нормализованное ФИО: {fio!r}")
+
+        # storeId 
+        if not store_raw:
+            return JsonResponse({'status': 'error', 'message': 'Не указан storeId'}, status=400)
+        try:
+            store_id = int(store_raw)
+        except ValueError:
+            return JsonResponse({'status': 'error', 'message': 'Некорректный storeId'}, status=400)
+
+        # roleId
+        if not role_raw:
+            return JsonResponse({'status': 'error', 'message': 'Не указан roleId'}, status=400)
+        try:
+            role_id = int(role_raw)
+        except ValueError:
+            return JsonResponse({'status': 'error', 'message': 'Некорректный roleId'}, status=400)
+
+        # Телефон
+        phone_norm = None
+        if phone_raw:
+            phone_norm = normalize_phone_ru(phone_raw)
+            if phone_norm:
+                logger.info(f"[QR/EMP] Phone normalized: {phone_raw!r} -> {phone_norm!r}")
+            else:
+                logger.warning(f"[QR/EMP] Не удалось нормализовать телефон: {phone_raw!r}")
+        else:
+            logger.info("[QR/EMP] Телефон не передан")
+
+        # PostgreSQL: user + ukm_users + QR + OpenInSystem
+        with transaction.atomic():
+            user = User.objects.filter(employee_id=plain_inn).first()
+            if user:
+                logger.info(
+                    f"[QR/EMP] Найден существующий пользователь: id={user.id}, "
+                    f"full_name={user.full_name!r}, phone={user.phone!r}"
+                )
+            else:
+                hashed_inn = encrypt_inn_full(plain_inn)
+                now = timezone.now()
+
+                user = User.objects.create(
+                    employee_id=plain_inn,
+                    encrypted_inn=hashed_inn,
+                    full_name=fio,
+                    mail=data.get('mail', ''),
+                    phone=phone_norm or '',
+                    department_id=data.get('department_id') or 0,
+                    position_id=data.get('position_id') or 0,
+                    active=True,
+                    tg_status=False,
+                    created_at=now,
+                    updated_at=now
+                )
+                logger.info(
+                    f"[QR/EMP] Создан новый пользователь: id={user.id}, "
+                    f"encrypted_inn={hashed_inn}"
+                )
+
+            # обновляем телефон, если он пришёл и отличается
+            if phone_norm and user.phone != phone_norm:
+                old_phone = user.phone
+                user.phone = phone_norm
+                user.updated_at = timezone.now()
+                user.save(update_fields=['phone', 'updated_at'])
+                logger.info(
+                    f"[QR/EMP] Обновлён телефон user_id={user.id}: "
+                    f"{old_phone!r} -> {phone_norm!r}"
+                )
+
+            # ukm_users по этому магазину
+            ukm_link, created_ukm = UKMUser.objects.get_or_create(
+                user=user,
+                storeid=store_id,
+                defaults={'roleid': role_id, 'version': 1}
+            )
+            if created_ukm:
+                logger.info(
+                    f"[QR/EMP] Создан UKMUser: user_id={user.id}, "
+                    f"storeid={store_id}, roleid={role_id}"
+                )
+            else:
+                if ukm_link.roleid != role_id:
+                    old_role = ukm_link.roleid
+                    ukm_link.roleid = role_id
+                    ukm_link.save(update_fields=['roleid'])
+                    logger.info(
+                        f"[QR/EMP] Обновлён roleid в UKMUser: user_id={user.id}, "
+                        f"storeid={store_id}, {old_role} -> {role_id}"
+                    )
+                else:
+                    logger.info(
+                        f"[QR/EMP] UKMUser уже существует: user_id={user.id}, "
+                        f"storeid={store_id}, roleid={role_id}"
+                    )
+
+            has_qr = QRCode.objects.filter(user=user).exists()
+            has_open = OpenInSystem.objects.filter(user_id=user.id, system_id=9).exists()
+            logger.info(
+                f"[QR/EMP] Состояние PG-связей user_id={user.id}: "
+                f"has_qr={has_qr}, has_open_in_system={has_open}"
+            )
+
+            # Генерируем НОВЫЙ пароль
+            new_password = build_user_password(plain_inn)
+            masked = new_password[:6] + "..." + new_password[-4:]
+            logger.info(
+                f"[QR/EMP] Новый пароль сгенерирован (masked): {masked}, "
+                f"len={len(new_password)}"
+            )
+
+            # Обновляем PG: qr_code + open_in_system (создаём/обновляем)
+            _set_password_pg(user, new_password)
+            logger.info(
+                f"[QR/EMP] PG обновлён для user_id={user.id} (QRCode + OpenInSystem)"
+            )
+
+        # ВНЕ транзакции PG: внешний UKM/конвертер
+
+        # trm_in_users: ищем существующий id
+        ukm_emp_id = None
+        try:
+            ukm_emp_id = get_trm_employee_id(plain_inn, fio)
+        except Exception as e:
+            logger.error(f"[QR/EMP] get_trm_employee_id error: {e}", exc_info=True)
+
+        if ukm_emp_id is not None:
+            cashier_id = ukm_emp_id
+            logger.info(f"[QR/EMP] trm_in_users: найден id={cashier_id}")
+        else:
+            cashier_id = 1
+            try:
+                ukm_conn = connect_ukm()
+                cur = ukm_conn.cursor()
+                cur.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+                row = cur.fetchone() or {}
+                if row.get('next_id'):
+                    cashier_id = row['next_id']
+                logger.info(
+                    f"[QR/EMP] trm_in_users: запись не найдена, next_id={cashier_id}"
+                )
+                cur.close()
+                ukm_conn.close()
+            except Exception as e:
+                logger.error(
+                    f"[QR/EMP] Ошибка получения next_id из trm_in_users: {e}",
+                    exc_info=True
+                )
+
+        # Конвертер: import4staffbonus.users + signal
+        _write_converter_user_and_signal(
+            cashier_id=cashier_id,
+            plain_inn=plain_inn,
+            fio=fio,
+            password_plain=new_password,
+            store_id=store_id,
+            role_id=role_id
+        )
+
+        # UKM4 + UKM5 по этому магазину
+        _update_store_mysql_and_xml_for_single_store(
+            store_id=store_id,
+            cashier_id=cashier_id,
+            role_id=role_id,
+            plain_inn=plain_inn,
+            fio=fio,
+            password_plain=new_password
+        )
+
+        logger.info(
+            f"[QR/EMP] DONE: user_id={user.id}, storeid={store_id}, "
+            f"cashier_id={cashier_id}, returning password (masked): {masked}"
+        )
+        return JsonResponse({'status': 'ok', 'qr_data': new_password})
 
     except Exception as e:
-        logger.exception("Ошибка при получении QR-кода по employee_id")
+        logger.exception("Ошибка при get_qr_code_by_employee_id (расширенная логика)")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
