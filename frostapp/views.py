@@ -18,7 +18,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
 
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position 
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store
 
 _HEX = set("0123456789abcdefABCDEF")
 
@@ -129,8 +129,6 @@ def get_store_info(storeid: int | str) -> dict:
             logger.warning(f"[Oracle] Ошибка при закрытии соединения: {e}")
 
 
-
-
 def get_inn_hash(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("ИНН должен быть строкой")
@@ -161,27 +159,61 @@ XML_DIR = os.path.join(BASE_DIR, 'xml')
 os.makedirs(XML_DIR, exist_ok=True)
 
 
-# ────────────────────────────────────────────────  1С: параметры и HTTP-сессия
+#  1С: параметры и HTTP-сессия
 ONEC_EMP_IDENT_URL = os.getenv(
     "ONEC_EMP_IDENT_URL",
     "http://192.168.17.26/zupcorp_http/hs/API/Post_EmployeeIdentification"
 )
-ONEC_USER = os.getenv("ONEC_USER")       # если 1С требует базовую auth
+ONEC_USER = os.getenv("ONEC_USER")       
 ONEC_PASS = os.getenv("ONEC_PASS")
 
-# Глобальная Session (реюз TCP-соединений)
+# Глобальная Session 
 _ONEC_SESSION = requests.Session()
 _ONEC_SESSION.headers.update({"Content-Type": "application/json; charset=utf-8"})
+
+
+def resolve_xml_store_id(raw_store_id: int | str) -> int:
+    """
+    Преобразует id магазина из УКМ (ukm4store),
+    в smstore из PostgreSQL таблицы stores.
+
+    Если в таблице stores нет записи или smstore некорректен –
+    возвращаем исходный id (как сейчас).
+    """
+    sid_raw = str(raw_store_id).strip()
+    try:
+        mapped = (
+            Store.objects
+            .filter(ukm4store=sid_raw)
+            .values_list('smstore', flat=True)
+            .first()
+        )
+        if mapped is None:
+            logger.warning(f"[XML] storeid={sid_raw} не найден в stores.ukm4store – используем исходный id")
+            return int(sid_raw)
+
+        try:
+            return int(mapped)
+        except (TypeError, ValueError):
+            logger.warning(f"[XML] Некорректный smstore={mapped!r} для ukm4store={sid_raw} – используем исходный id")
+            return int(sid_raw)
+    except Exception as e:
+        logger.exception(f"[XML] Ошибка при resolve_xml_store_id({sid_raw!r}): {e}")
+        try:
+            return int(sid_raw)
+        except Exception:
+            return 0
 
 
 def _find_storecashiers_file_for_store(store_id: int) -> Optional[Tuple[str, int]]:
     """
     Ищет последний файл вида:
-      storeCashiers_[storeId]_[Number]_[F].xml
-    для указанного магазина в XML_DIR.
+      storeCashiers_[smstore]_[Number]_[F].xml
+    smstore получаем из таблицы stores по ukm4store = store_id.
     Возвращает (полный_путь, Number) или None, если файлов нет.
     """
-    pattern = re.compile(rf"^storeCashiers_\[{store_id}\]_\[(\d+)\]_\[F\]\.xml$")
+    xml_store_id = resolve_xml_store_id(store_id)
+    pattern = re.compile(rf"^storeCashiers_\[{xml_store_id}\]_\[(\d+)\]_\[F\]\.xml$")
     best_name = None
     best_num = -1
 
@@ -204,9 +236,10 @@ def _find_storecashiers_file_for_store(store_id: int) -> Optional[Tuple[str, int
 def _generate_storecashiers_number(store_id: int) -> int:
     """
     Генерирует случайный положительный номер файла для магазина,
-    гарантируя отсутствие коллизий по Number для этого store_id.
+    гарантируя отсутствие коллизий по Number для этого smstore.
     """
-    pattern = re.compile(rf"^storeCashiers_\[{store_id}\]_\[(\d+)\]_\[F\]\.xml$")
+    xml_store_id = resolve_xml_store_id(store_id)
+    pattern = re.compile(rf"^storeCashiers_\[{xml_store_id}\]_\[(\d+)\]_\[F\]\.xml$")
     used_numbers = set()
 
     try:
@@ -227,17 +260,18 @@ def _generate_storecashiers_number(store_id: int) -> int:
 
 def _get_or_create_storecashiers_tree(store_id: int) -> Tuple[str, ET.ElementTree, ET.Element]:
     """
-    Возвращает (xml_path, tree, root) для storeCashiers текущего магазина.
+    Возвращает (xml_path, tree, root) для storeCashiers магазина.
 
-    - Если файл уже есть (storeCashiers_[storeId]_[Number]_[F].xml) —
-      берём файл с максимальным Number.
-    - Если нет — создаём новый с рандомным Number.
-    При создании и при загрузке выставляем:
-      <storeCashiers fullness="F" storeId="...">
-        <version>Number</version>
-        ...
-      </storeCashiers>
+    На вход приходит ukm4store (store_id).
+    Для XML:
+      - вычисляем smstore через resolve_xml_store_id()
+      - имя файла: storeCashiers_[smstore]_[Number]_[F].xml
+      - <storeCashiers fullness="F" storeId="smstore">
+          <version>1.0</version>
+        </storeCashiers>
     """
+    xml_store_id = resolve_xml_store_id(store_id)
+
     found = _find_storecashiers_file_for_store(store_id)
     if found:
         xml_path, number = found
@@ -245,23 +279,23 @@ def _get_or_create_storecashiers_tree(store_id: int) -> Tuple[str, ET.ElementTre
         root = tree.getroot()
 
         root.set("fullness", "F")
-        root.set("storeId", str(store_id))
+        root.set("storeId", str(xml_store_id))
 
         version_el = root.find("version")
         if version_el is None:
             version_el = ET.SubElement(root, "version")
-        if not (version_el.text or "").strip():
-            version_el.text = str(number)
+        version_el.text = "1.0"
 
         return xml_path, tree, root
 
+    # файла ещё нет – создаём новый
     number = _generate_storecashiers_number(store_id)
-    filename = f"storeCashiers_[{store_id}]_[{number}]_[F].xml"
+    filename = f"storeCashiers_[{xml_store_id}]_[{number}]_[F].xml"
     xml_path = os.path.join(XML_DIR, filename)
 
-    root = ET.Element("storeCashiers", fullness="F", storeId=str(store_id))
+    root = ET.Element("storeCashiers", fullness="F", storeId=str(xml_store_id))
     version_el = ET.SubElement(root, "version")
-    version_el.text = str(number)
+    version_el.text = "1.0"
     tree = ET.ElementTree(root)
 
     return xml_path, tree, root
@@ -278,7 +312,6 @@ def connect_ukm():
     )
 
 
-
 def get_trm_employee_id(plain_inn: str, fio: str) -> int | None:
     conn = connect_ukm()
     cur  = conn.cursor()
@@ -291,8 +324,6 @@ def get_trm_employee_id(plain_inn: str, fio: str) -> int | None:
     return row["id"] if row else None
 
 
-
-
 def connect_converter():
     return pymysql.connect(
         host="192.168.17.234",
@@ -303,8 +334,6 @@ def connect_converter():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor
     )
-
-
 
 
 def generate_qr_string(inn: str, salt: str = "INDIVIDUAL_SALT") -> str:
@@ -384,7 +413,6 @@ def _parse_and_format_dt(dt_raw: str) -> str:
         raise ValueError(f"Некорректный Datetime: {dt_raw!r}; последняя ошибка: {last_err}")
 
     out = dt.strftime("%d.%m.%Y %H:%M:%S")
-    # Убираем лидирующий ноль у часа: 'DD.MM.YYYY 08:..' → 'DD.MM.YYYY 8:..'
     if out[11] == '0':
         out = out[:11] + out[12:]
     return out
@@ -416,23 +444,8 @@ def _post_to_onec(payload: dict, idem_key: str, timeout=(3, 7), retries=2) -> Tu
         except Exception as exc:
             last_exc = exc
             if attempt < retries:
-                time.sleep(0.3 * (2 ** attempt))  # 0.3s, 0.6s
+                time.sleep(0.3 * (2 ** attempt)) 
     raise RuntimeError(f"Ошибка запроса в 1С: {last_exc}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def encrypt_inn_full(inn: str) -> str:
@@ -452,8 +465,8 @@ def build_user_password(plain_inn: str) -> str:
     * YYYYMMDD  – дата UTC
     * RANDOM    – заглавные A-Z + цифры, чтобы итог всегда был 40 симв.
     """
-    date_part = datetime.datetime.utcnow().strftime("%Y%m%d")      # 8
-    base      = f"KS{plain_inn}{date_part}"                       # 2+len(INN)+8
+    date_part = datetime.datetime.utcnow().strftime("%Y%m%d")     
+    base      = f"KS{plain_inn}{date_part}"                   
     salt_len  = 40 - len(base)
     salt      = ''.join(random.choices(string.ascii_uppercase + string.digits,
                                        k=salt_len))
@@ -468,10 +481,7 @@ def mysql_pwd(raw: str) -> str:
     return raw[2:] if raw.startswith("KS") else raw
 
 
-
-
-
-# ────────────────────────────────────────────────  Oracle-коннект (единый)
+# Oracle-коннект (единый)
 def connect_oracle_supermag():
     ORA_HOST     = os.getenv("ORACLE_HOST", "192.168.17.239")
     ORA_PORT     = int(os.getenv("ORACLE_PORT", "1521"))
@@ -481,7 +491,7 @@ def connect_oracle_supermag():
     dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SERVICE)
     return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
 
-# ────────────────────────────────────────────────  Базовый SQL
+# Базовый SQL
 BASE_STORES_SQL = """
 SELECT
   r.title AS region,
@@ -626,52 +636,6 @@ def export_stores_xml(request):
     except Exception as e:
         logger.exception("export_stores_xml error")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @csrf_exempt
@@ -819,7 +783,6 @@ def register_cashier(request):
                         ET.SubElement(cashier_el, "name").text = fio
                         ET.SubElement(cashier_el, "INN").text = inn
                         ET.SubElement(cashier_el, "password").text = password_plain
-                        ET.SubElement(cashier_el, "deleted").text = "0"
 
                         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                         xml_paths.append(xml_path)
@@ -838,10 +801,6 @@ def register_cashier(request):
     except Exception as e:
         logger.exception("Ошибка регистрации кассира")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
-
-
-
 
 
 def encrypt_inn(inn):
@@ -1041,12 +1000,6 @@ def queue_vacation(request):
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
 
 
-
-
-
-
-
-
 def regenerate_qr(user):
     new_password = build_user_password(user.employee_id)
     now = timezone.now()
@@ -1126,18 +1079,12 @@ def regenerate_qr(user):
             ET.SubElement(c_el, "name").text = user.full_name
             ET.SubElement(c_el, "INN").text = user.employee_id
             ET.SubElement(c_el, "password").text = new_password
-            ET.SubElement(c_el, "deleted").text = "0"
 
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
             next_free_id += 1
         except Exception as exc:
             logger.error(f"[XML] Ошибка для {sid}: {exc}")
-
-
-
-
-
 
 
 
@@ -1177,10 +1124,6 @@ def _set_password_pg(user, new_password: str) -> None:
             status=True
         )
         logger.info(f"[PG] OpenInSystem created (system_id=9) for user_id={user.id}")
-
-
-
-
 
 
 @csrf_exempt
@@ -1309,57 +1252,6 @@ def get_qr_code_by_tg(request):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# @csrf_exempt
-# def get_qr_code_by_tg(request):
-#     if request.method != 'POST':
-#         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
-
-#     try:
-#         data  = json.loads(request.body)
-#         tg_id = data.get('tg_id')
-
-#         if not tg_id:
-#             return JsonResponse({'status': 'error', 'message': 'Не указан tg_id'}, status=400)
-
-#         user = User.objects.filter(tg_id=str(tg_id)).first()
-#         if not user:
-#             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
-
-#         # всегда генерируем новый QR
-#         inn_hash_20 = user.encrypted_inn[:20]
-#         regenerate_qr(user)
-
-#         new_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
-#         return JsonResponse({'status': 'ok', 'qr_data': new_qr.qr_data})
-
-#     except Exception as e:
-#         logger.exception("Ошибка при получении QR-кода")
-#         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
-
-
-
-
 @csrf_exempt
 def get_qr_code_by_employee_id(request):
     if request.method != 'POST':
@@ -1372,7 +1264,7 @@ def get_qr_code_by_employee_id(request):
         if not employee_id:
             return JsonResponse({'status': 'error', 'message': 'Не указан employee_id'}, status=400)
 
-        # Опциональная валидация: ИНН = 10/12 цифр
+        # валидация: ИНН = 10/12 цифр
         try:
             plain_inn = ensure_plain_inn(employee_id)
         except Exception as e:
@@ -1491,12 +1383,11 @@ def update_cashier(request):
                     xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
 
                     c_el = ET.SubElement(root, "cashier")
-                    ET.SubElement(c_el, "roleId").text = "1"  
+                    ET.SubElement(c_el, "roleId").text = "1"
                     ET.SubElement(c_el, "id").text = str(cashier_id)
                     ET.SubElement(c_el, "name").text = fio
                     ET.SubElement(c_el, "INN").text = plain_inn
                     ET.SubElement(c_el, "password").text = password_plain
-                    ET.SubElement(c_el, "deleted").text = "0"
 
                     tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                     logger.info(f"[XML] Обновлён файл {xml_path}")
@@ -1513,9 +1404,6 @@ def update_cashier(request):
     except Exception as exc:
         logger.exception("open_access_cashier error")
         return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
-
-
-
 
 
 
@@ -1553,7 +1441,6 @@ def delete_cashier(request):
 
         ukm_emp_id = get_trm_employee_id(inn_raw, fio)
 
-        # базовый кассир id
         ukm_conn = connect_ukm()
         ukm_cursor = ukm_conn.cursor()
         ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
@@ -1589,7 +1476,6 @@ def delete_cashier(request):
             else:
                 logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
 
-        # XML помечаем Deleted=1 только для UKM5
         for ukm_user in ukm_to_remove:
             sid = ukm_user.storeid
             if not is_ukm5_store(sid):
@@ -1607,27 +1493,26 @@ def delete_cashier(request):
                 tree = ET.parse(xml_path)
                 root = tree.getroot()
 
+                xml_store_id = resolve_xml_store_id(sid)
+
                 # Гарантируем корректные атрибуты корня
                 root.set("fullness", "F")
-                root.set("storeId", str(sid))
+                root.set("storeId", str(xml_store_id))
+
                 version_el = root.find("version")
                 if version_el is None:
                     version_el = ET.SubElement(root, "version")
-                if not (version_el.text or "").strip():
-                    version_el.text = str(number)
+                version_el.text = "1.0"
 
                 changed = False
-                for cash_el in root.findall("cashier"):
+                for cash_el in list(root.findall("cashier")):
                     if cash_el.findtext("INN") == inn_raw:
-                        deleted_el = cash_el.find("deleted")
-                        if deleted_el is None:
-                            deleted_el = ET.SubElement(cash_el, "deleted")
-                        deleted_el.text = "1"
+                        root.remove(cash_el)
                         changed = True
 
                 if changed:
                     tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-                    logger.info(f"[XML] deleted=1: {xml_path}")
+                    logger.info(f"[XML] Удалён кассир (INN={inn_raw}) из {xml_path}")
             except Exception as exc:
                 logger.error(f"[XML] Ошибка для магазина {sid}: {exc}")
 
