@@ -1969,6 +1969,305 @@ def get_qr_code_by_tg(request):
 #         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
+# 19.11.2025 - работает, если в storeId придёт Код МХ - id из супермага
+# @csrf_exempt
+# def get_qr_code_by_employee_id(request):
+#     """
+#     ВХОД (POST, JSON):
+#     {
+#       "inn": "7536207278",
+#       "fio": "Иванов Иван Иванович",
+#       "storeId": 101,
+#       "roleId": 1,
+#       "phone": "8 (924) 000-00-00"
+#     }
+#     """
+#     if request.method != 'POST':
+#         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+#     body = ""
+#     try:
+#         body = request.body.decode('utf-8') if request.body else "{}"
+#         try:
+#             data = json.loads(body)
+#         except Exception as e:
+#             logger.error(f"[QR/EMP] JSON parse error: {e}; body={body!r}")
+#             send_telegram_log(
+#                 f"[QR/EMP] ERROR: JSON parse error: {e}\n"
+#                 f"raw_body={body}"
+#             )
+#             return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
+
+#         inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
+#         fio_raw = (data.get('fio') or "").strip()
+#         store_raw = str(data.get('storeId') or data.get('storeid') or "").strip()
+#         role_raw = str(data.get('roleId') or data.get('roleid') or "").strip()
+#         phone_raw = (data.get('phone') or "").strip()
+
+#         logger.info(
+#             f"[QR/EMP] START: inn={inn_raw!r}, fio={fio_raw!r}, "
+#             f"storeid={store_raw!r}, roleId={role_raw!r}, phone={phone_raw!r}"
+#         )
+
+#         # ИНН
+#         if not inn_raw:
+#             msg = "[QR/EMP] ERROR: Не указан ИНН"
+#             send_telegram_log(f"{msg}\nraw_body={body}")
+#             return JsonResponse({'status': 'error', 'message': 'Не указан ИНН'}, status=400)
+#         try:
+#             plain_inn = ensure_plain_inn(inn_raw)
+#         except Exception as e:
+#             logger.error(f"[QR/EMP] Bad INN: {e}")
+#             send_telegram_log(
+#                 f"[QR/EMP] ERROR: Некорректный ИНН: {e}\n"
+#                 f"raw_body={body}"
+#             )
+#             return JsonResponse({'status': 'error', 'message': f'Некорректный ИНН: {e}'}, status=400)
+
+#         # ФИО
+#         if not fio_raw:
+#             msg = "[QR/EMP] ERROR: Не указано ФИО"
+#             send_telegram_log(
+#                 f"{msg}\n"
+#                 f"INN={plain_inn}\n"
+#                 f"raw_body={body}"
+#             )
+#             return JsonResponse({'status': 'error', 'message': 'Не указано ФИО'}, status=400)
+#         fio = " ".join(fio_raw.split())
+#         logger.info(f"[QR/EMP] Нормализованное ФИО: {fio!r}")
+
+#         # storeId
+#         if not store_raw:
+#             msg = "[QR/EMP] ERROR: Не указан storeId"
+#             send_telegram_log(
+#                 f"{msg}\n"
+#                 f"INN={plain_inn}\n"
+#                 f"FIO={fio}\n"
+#                 f"raw_body={body}"
+#             )
+#             return JsonResponse({'status': 'error', 'message': 'Не указан storeId'}, status=400)
+#         try:
+#             store_id = int(store_raw)
+#         except ValueError:
+#             msg = "[QR/EMP] ERROR: Некорректный storeId"
+#             send_telegram_log(
+#                 f"{msg}\n"
+#                 f"INN={plain_inn}\n"
+#                 f"FIO={fio}\n"
+#                 f"storeId_raw={store_raw}\n"
+#                 f"raw_body={body}"
+#             )
+#             return JsonResponse({'status': 'error', 'message': 'Некорректный storeId'}, status=400)
+
+#         # roleId
+#         if not role_raw:
+#             msg = "[QR/EMP] ERROR: Не указан roleId"
+#             send_telegram_log(
+#                 f"{msg}\n"
+#                 f"INN={plain_inn}\n"
+#                 f"FIO={fio}\n"
+#                 f"storeId={store_id}\n"
+#                 f"raw_body={body}"
+#             )
+#             return JsonResponse({'status': 'error', 'message': 'Не указан roleId'}, status=400)
+#         try:
+#             role_id = int(role_raw)
+#         except ValueError:
+#             msg = "[QR/EMP] ERROR: Некорректный roleId"
+#             send_telegram_log(
+#                 f"{msg}\n"
+#                 f"INN={plain_inn}\n"
+#                 f"FIO={fio}\n"
+#                 f"storeId={store_id}\n"
+#                 f"roleId_raw={role_raw}\n"
+#                 f"raw_body={body}"
+#             )
+#             return JsonResponse({'status': 'error', 'message': 'Некорректный roleId'}, status=400)
+
+#         # Телефон
+#         phone_norm = None
+#         if phone_raw:
+#             phone_norm = normalize_phone_ru(phone_raw)
+#             if phone_norm:
+#                 logger.info(f"[QR/EMP] Phone normalized: {phone_raw!r} -> {phone_norm!r}")
+#             else:
+#                 logger.warning(f"[QR/EMP] Не удалось нормализовать телефон: {phone_raw!r}")
+#         else:
+#             logger.info("[QR/EMP] Телефон не передан")
+
+#         # PostgreSQL: user + ukm_users + QR + OpenInSystem
+#         with transaction.atomic():
+#             user = User.objects.filter(employee_id=plain_inn).first()
+#             if user:
+#                 logger.info(
+#                     f"[QR/EMP] Найден существующий пользователь: id={user.id}, "
+#                     f"full_name={user.full_name!r}, phone={user.phone!r}"
+#                 )
+#             else:
+#                 hashed_inn = encrypt_inn_full(plain_inn)
+#                 now = timezone.now()
+
+#                 user = User.objects.create(
+#                     employee_id=plain_inn,
+#                     encrypted_inn=hashed_inn,
+#                     full_name=fio,
+#                     mail=data.get('mail', ''),
+#                     phone=phone_norm or '',
+#                     department_id=data.get('department_id') or 777,
+#                     position_id=data.get('position_id') or 777,
+#                     active=True,
+#                     tg_status=False,
+#                     created_at=now,
+#                     updated_at=now
+#                 )
+#                 logger.info(
+#                     f"[QR/EMP] Создан новый пользователь: id={user.id}, "
+#                     f"encrypted_inn={hashed_inn}"
+#                 )
+
+#             # обновляем телефон, если он пришёл и отличается
+#             if phone_norm and user.phone != phone_norm:
+#                 old_phone = user.phone
+#                 user.phone = phone_norm
+#                 user.updated_at = timezone.now()
+#                 user.save(update_fields=['phone', 'updated_at'])
+#                 logger.info(
+#                     f"[QR/EMP] Обновлён телефон user_id={user.id}: "
+#                     f"{old_phone!r} -> {phone_norm!r}"
+#                 )
+
+#             # ukm_users по этому магазину
+#             ukm_link, created_ukm = UKMUser.objects.get_or_create(
+#                 user=user,
+#                 storeid=store_id,
+#                 defaults={'roleid': role_id, 'version': 1}
+#             )
+#             if created_ukm:
+#                 logger.info(
+#                     f"[QR/EMP] Создан UKMUser: user_id={user.id}, "
+#                     f"storeid={store_id}, roleid={role_id}"
+#                 )
+#             else:
+#                 if ukm_link.roleid != role_id:
+#                     old_role = ukm_link.roleid
+#                     ukm_link.roleid = role_id
+#                     ukm_link.save(update_fields=['roleid'])
+#                     logger.info(
+#                         f"[QR/EMP] Обновлён roleid в UKMUser: user_id={user.id}, "
+#                         f"storeid={store_id}, {old_role} -> {role_id}"
+#                     )
+#                 else:
+#                     logger.info(
+#                         f"[QR/EMP] UKMUser уже существует: user_id={user.id}, "
+#                         f"storeid={store_id}, roleid={role_id}"
+#                     )
+
+#             has_qr = QRCode.objects.filter(user=user).exists()
+#             has_open = OpenInSystem.objects.filter(user_id=user.id, system_id=9).exists()
+#             logger.info(
+#                 f"[QR/EMP] Состояние PG-связей user_id={user.id}: "
+#                 f"has_qr={has_qr}, has_open_in_system={has_open}"
+#             )
+
+#             # Генерируем НОВЫЙ пароль
+#             new_password = build_user_password(plain_inn)
+#             masked = new_password[:6] + "..." + new_password[-4:]
+#             logger.info(
+#                 f"[QR/EMP] Новый пароль сгенерирован (masked): {masked}, "
+#                 f"len={len(new_password)}"
+#             )
+
+#             # Обновляем PG: qr_code + open_in_system (создаём/обновляем)
+#             _set_password_pg(user, new_password)
+#             logger.info(
+#                 f"[QR/EMP] PG обновлён для user_id={user.id} (QRCode + OpenInSystem)"
+#             )
+
+#         # ВНЕ транзакции PG: внешний UKM/конвертер
+
+#         # trm_in_users: ищем существующий id
+#         ukm_emp_id = None
+#         try:
+#             ukm_emp_id = get_trm_employee_id(plain_inn, fio)
+#         except Exception as e:
+#             logger.error(f"[QR/EMP] get_trm_employee_id error: {e}", exc_info=True)
+
+#         if ukm_emp_id is not None:
+#             cashier_id = ukm_emp_id
+#             logger.info(f"[QR/EMP] trm_in_users: найден id={cashier_id}")
+#         else:
+#             cashier_id = 1
+#             try:
+#                 ukm_conn = connect_ukm()
+#                 cur = ukm_conn.cursor()
+#                 cur.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+#                 row = cur.fetchone() or {}
+#                 if row.get('next_id'):
+#                     cashier_id = row['next_id']
+#                 logger.info(
+#                     f"[QR/EMP] trm_in_users: запись не найдена, next_id={cashier_id}"
+#                 )
+#                 cur.close()
+#                 ukm_conn.close()
+#             except Exception as e:
+#                 logger.error(
+#                     f"[QR/EMP] Ошибка получения next_id из trm_in_users: {e}",
+#                     exc_info=True
+#                 )
+
+#         # Конвертер: import4staffbonus.users + signal
+#         _write_converter_user_and_signal(
+#             cashier_id=cashier_id,
+#             plain_inn=plain_inn,
+#             fio=fio,
+#             password_plain=new_password,
+#             store_id=store_id,
+#             role_id=role_id
+#         )
+
+#         # UKM4 + UKM5 по этому магазину
+#         _update_store_mysql_and_xml_for_single_store(
+#             store_id=store_id,
+#             cashier_id=cashier_id,
+#             role_id=role_id,
+#             plain_inn=plain_inn,
+#             fio=fio,
+#             password_plain=new_password
+#         )
+
+#         logger.info(
+#             f"[QR/EMP] DONE: user_id={user.id}, storeid={store_id}, "
+#             f"cashier_id={cashier_id}, returning password (masked): {masked}"
+#         )
+
+#         # Лог в телеграм по результату
+#         send_telegram_log(
+#             "[QR/EMP] SUCCESS\n"
+#             f"INN: {plain_inn}\n"
+#             f"FIO: {fio}\n"
+#             f"storeId: {store_id}\n"
+#             f"roleId: {role_id}\n"
+#             f"user_id: {user.id}\n"
+#             f"cashier_id: {cashier_id}\n"
+#             f"phone_raw: {phone_raw}\n"
+#             f"phone_norm: {phone_norm or ''}\n"
+#             f"qr_data: {new_password}"
+#         )
+
+#         return JsonResponse({'status': 'ok', 'qr_data': new_password})
+
+#     except Exception as e:
+#         logger.exception("Ошибка при get_qr_code_by_employee_id (расширенная логика)")
+#         try:
+#             send_telegram_log(
+#                 "[QR/EMP] EXCEPTION\n"
+#                 f"{e}\n"
+#                 f"raw_body={body}"
+#             )
+#         except Exception:
+#             pass
+#         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
 @csrf_exempt
 def get_qr_code_by_employee_id(request):
     """
@@ -1976,10 +2275,12 @@ def get_qr_code_by_employee_id(request):
     {
       "inn": "7536207278",
       "fio": "Иванов Иван Иванович",
-      "storeId": 101,
+      "storeId": 514,           # smstore из Супермага
       "roleId": 1,
       "phone": "8 (924) 000-00-00"
     }
+    Теперь storeId = SMSTORE (Supermag),
+    а реальный id магазина для УКМ и конвертера берётся как stores.ukm4store.
     """
     if request.method != 'POST':
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
@@ -1997,15 +2298,15 @@ def get_qr_code_by_employee_id(request):
             )
             return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
 
-        inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
-        fio_raw = (data.get('fio') or "").strip()
+        inn_raw   = (data.get('inn') or data.get('employee_id') or "").strip()
+        fio_raw   = (data.get('fio') or "").strip()
         store_raw = str(data.get('storeId') or data.get('storeid') or "").strip()
-        role_raw = str(data.get('roleId') or data.get('roleid') or "").strip()
+        role_raw  = str(data.get('roleId') or data.get('roleid') or "").strip()
         phone_raw = (data.get('phone') or "").strip()
 
         logger.info(
             f"[QR/EMP] START: inn={inn_raw!r}, fio={fio_raw!r}, "
-            f"storeid={store_raw!r}, roleId={role_raw!r}, phone={phone_raw!r}"
+            f"storeId(smstore)={store_raw!r}, roleId={role_raw!r}, phone={phone_raw!r}"
         )
 
         # ИНН
@@ -2035,20 +2336,20 @@ def get_qr_code_by_employee_id(request):
         fio = " ".join(fio_raw.split())
         logger.info(f"[QR/EMP] Нормализованное ФИО: {fio!r}")
 
-        # storeId
+        # storeId: теперь это SMSTORE
         if not store_raw:
-            msg = "[QR/EMP] ERROR: Не указан storeId"
+            msg = "[QR/EMP] ERROR: Не указан storeId (smstore)"
             send_telegram_log(
                 f"{msg}\n"
                 f"INN={plain_inn}\n"
                 f"FIO={fio}\n"
                 f"raw_body={body}"
             )
-            return JsonResponse({'status': 'error', 'message': 'Не указан storeId'}, status=400)
+            return JsonResponse({'status': 'error', 'message': 'Не указан storeId (smstore)'}, status=400)
         try:
-            store_id = int(store_raw)
+            sm_store_id = int(store_raw)
         except ValueError:
-            msg = "[QR/EMP] ERROR: Некорректный storeId"
+            msg = "[QR/EMP] ERROR: Некорректный storeId (smstore)"
             send_telegram_log(
                 f"{msg}\n"
                 f"INN={plain_inn}\n"
@@ -2056,16 +2357,68 @@ def get_qr_code_by_employee_id(request):
                 f"storeId_raw={store_raw}\n"
                 f"raw_body={body}"
             )
-            return JsonResponse({'status': 'error', 'message': 'Некорректный storeId'}, status=400)
+            return JsonResponse({'status': 'error', 'message': 'Некорректный storeId (smstore)'}, status=400)
 
-        # roleId
+        # Маппинг SMSTORE → UKM4STORE по таблице stores
+        store_obj = Store.objects.filter(smstore=sm_store_id).first()
+        if not store_obj or store_obj.ukm4store is None:
+            msg = (
+                "[QR/EMP] ERROR: Магазин не найден в таблице stores "
+                f"или не заполнен ukm4store для smstore={sm_store_id}"
+            )
+            logger.error(msg)
+            send_telegram_log(
+                f"{msg}\n"
+                f"INN={plain_inn}\n"
+                f"FIO={fio}\n"
+                f"raw_body={body}"
+            )
+            return JsonResponse(
+                {
+                    'status': 'error',
+                    'message': (
+                        'Магазин с указанным storeId (smstore) не найден в справочнике stores '
+                        'или для него не указан ukm4store'
+                    )
+                },
+                status=400
+            )
+
+        try:
+            ukm_store_id = int(store_obj.ukm4store)
+        except (TypeError, ValueError):
+            msg = (
+                "[QR/EMP] ERROR: Поле ukm4store в stores имеет некорректное значение "
+                f"для smstore={sm_store_id}: {store_obj.ukm4store!r}"
+            )
+            logger.error(msg)
+            send_telegram_log(
+                f"{msg}\n"
+                f"INN={plain_inn}\n"
+                f"FIO={fio}\n"
+                f"raw_body={body}"
+            )
+            return JsonResponse(
+                {
+                    'status': 'error',
+                    'message': 'Некорректное значение ukm4store для указанного smstore'
+                },
+                status=400
+            )
+
+        logger.info(
+            f"[QR/EMP] Mapping smstore={sm_store_id} → ukm4store={ukm_store_id} "
+            f"(Store.id={store_obj.id}, name={store_obj.name!r})"
+        )
+
+        #  roleId 
         if not role_raw:
             msg = "[QR/EMP] ERROR: Не указан roleId"
             send_telegram_log(
                 f"{msg}\n"
                 f"INN={plain_inn}\n"
                 f"FIO={fio}\n"
-                f"storeId={store_id}\n"
+                f"storeId(smstore)={sm_store_id}\n"
                 f"raw_body={body}"
             )
             return JsonResponse({'status': 'error', 'message': 'Не указан roleId'}, status=400)
@@ -2077,7 +2430,7 @@ def get_qr_code_by_employee_id(request):
                 f"{msg}\n"
                 f"INN={plain_inn}\n"
                 f"FIO={fio}\n"
-                f"storeId={store_id}\n"
+                f"storeId(smstore)={sm_store_id}\n"
                 f"roleId_raw={role_raw}\n"
                 f"raw_body={body}"
             )
@@ -2094,7 +2447,7 @@ def get_qr_code_by_employee_id(request):
         else:
             logger.info("[QR/EMP] Телефон не передан")
 
-        # PostgreSQL: user + ukm_users + QR + OpenInSystem
+        # === PostgreSQL: User + UKMUser (storeid = ukm4store) + QR + OpenInSystem ===
         with transaction.atomic():
             user = User.objects.filter(employee_id=plain_inn).first()
             if user:
@@ -2105,7 +2458,6 @@ def get_qr_code_by_employee_id(request):
             else:
                 hashed_inn = encrypt_inn_full(plain_inn)
                 now = timezone.now()
-
                 user = User.objects.create(
                     employee_id=plain_inn,
                     encrypted_inn=hashed_inn,
@@ -2124,7 +2476,7 @@ def get_qr_code_by_employee_id(request):
                     f"encrypted_inn={hashed_inn}"
                 )
 
-            # обновляем телефон, если он пришёл и отличается
+            # Обновляем телефон при необходимости
             if phone_norm and user.phone != phone_norm:
                 old_phone = user.phone
                 user.phone = phone_norm
@@ -2135,16 +2487,16 @@ def get_qr_code_by_employee_id(request):
                     f"{old_phone!r} -> {phone_norm!r}"
                 )
 
-            # ukm_users по этому магазину
+            # UKMUser: storeid = ukm4store
             ukm_link, created_ukm = UKMUser.objects.get_or_create(
                 user=user,
-                storeid=store_id,
+                storeid=ukm_store_id,
                 defaults={'roleid': role_id, 'version': 1}
             )
             if created_ukm:
                 logger.info(
                     f"[QR/EMP] Создан UKMUser: user_id={user.id}, "
-                    f"storeid={store_id}, roleid={role_id}"
+                    f"storeid(ukm4)={ukm_store_id}, roleid={role_id}"
                 )
             else:
                 if ukm_link.roleid != role_id:
@@ -2153,22 +2505,22 @@ def get_qr_code_by_employee_id(request):
                     ukm_link.save(update_fields=['roleid'])
                     logger.info(
                         f"[QR/EMP] Обновлён roleid в UKMUser: user_id={user.id}, "
-                        f"storeid={store_id}, {old_role} -> {role_id}"
+                        f"storeid(ukm4)={ukm_store_id}, {old_role} -> {role_id}"
                     )
                 else:
                     logger.info(
                         f"[QR/EMP] UKMUser уже существует: user_id={user.id}, "
-                        f"storeid={store_id}, roleid={role_id}"
+                        f"storeid(ukm4)={ukm_store_id}, roleid={role_id}"
                     )
 
-            has_qr = QRCode.objects.filter(user=user).exists()
+            has_qr   = QRCode.objects.filter(user=user).exists()
             has_open = OpenInSystem.objects.filter(user_id=user.id, system_id=9).exists()
             logger.info(
                 f"[QR/EMP] Состояние PG-связей user_id={user.id}: "
                 f"has_qr={has_qr}, has_open_in_system={has_open}"
             )
 
-            # Генерируем НОВЫЙ пароль
+            # Новый пароль
             new_password = build_user_password(plain_inn)
             masked = new_password[:6] + "..." + new_password[-4:]
             logger.info(
@@ -2176,7 +2528,7 @@ def get_qr_code_by_employee_id(request):
                 f"len={len(new_password)}"
             )
 
-            # Обновляем PG: qr_code + open_in_system (создаём/обновляем)
+            # Обновляем PG: qr_code + open_in_system
             _set_password_pg(user, new_password)
             logger.info(
                 f"[QR/EMP] PG обновлён для user_id={user.id} (QRCode + OpenInSystem)"
@@ -2184,7 +2536,7 @@ def get_qr_code_by_employee_id(request):
 
         # ВНЕ транзакции PG: внешний UKM/конвертер
 
-        # trm_in_users: ищем существующий id
+        # trm_in_users
         ukm_emp_id = None
         try:
             ukm_emp_id = get_trm_employee_id(plain_inn, fio)
@@ -2214,19 +2566,19 @@ def get_qr_code_by_employee_id(request):
                     exc_info=True
                 )
 
-        # Конвертер: import4staffbonus.users + signal
+        # Конвертер: import4staffbonus.users + signal (store = ukm4store)
         _write_converter_user_and_signal(
             cashier_id=cashier_id,
             plain_inn=plain_inn,
             fio=fio,
             password_plain=new_password,
-            store_id=store_id,
+            store_id=ukm_store_id,
             role_id=role_id
         )
 
-        # UKM4 + UKM5 по этому магазину
+        # UKM4 + UKM5: _update_store_mysql_and_xml_for_single_store ожидает УКМ-id
         _update_store_mysql_and_xml_for_single_store(
-            store_id=store_id,
+            store_id=ukm_store_id,
             cashier_id=cashier_id,
             role_id=role_id,
             plain_inn=plain_inn,
@@ -2235,23 +2587,77 @@ def get_qr_code_by_employee_id(request):
         )
 
         logger.info(
-            f"[QR/EMP] DONE: user_id={user.id}, storeid={store_id}, "
-            f"cashier_id={cashier_id}, returning password (masked): {masked}"
+            f"[QR/EMP] DONE: user_id={user.id}, smstore={sm_store_id}, "
+            f"ukm4store={ukm_store_id}, cashier_id={cashier_id}, "
+            f"returning password (masked): {masked}"
         )
 
-        # Лог в телеграм по результату
-        send_telegram_log(
-            "[QR/EMP] SUCCESS\n"
-            f"INN: {plain_inn}\n"
-            f"FIO: {fio}\n"
-            f"storeId: {store_id}\n"
-            f"roleId: {role_id}\n"
-            f"user_id: {user.id}\n"
-            f"cashier_id: {cashier_id}\n"
-            f"phone_raw: {phone_raw}\n"
-            f"phone_norm: {phone_norm or ''}\n"
-            f"qr_data: {new_password}"
+        # === Красивый лог в Telegram с ролями и магазинами ===
+
+        # Все связи ukm_users для пользователя
+        ukm_links_all = list(
+            UKMUser.objects.filter(user=user).values('storeid', 'roleid', 'version')
         )
+        store_ids_ukm_all = [l['storeid'] for l in ukm_links_all]
+
+        # Подтягиваем названия/смсторы по ukm4store
+        stores_map = {
+            row['ukm4store']: row
+            for row in Store.objects.filter(ukm4store__in=store_ids_ukm_all)
+                                   .values('ukm4store', 'smstore', 'name')
+        }
+
+        lines_roles = []
+        for link in ukm_links_all:
+            sid_ukm = link['storeid']
+            info = stores_map.get(sid_ukm)
+            if info:
+                lines_roles.append(
+                    f"  • UKM4={sid_ukm}, SMSTORE={info['smstore']}, "
+                    f"Name={info['name']}, roleId={link['roleid']}, "
+                    f"version={link['version']}"
+                )
+            else:
+                lines_roles.append(
+                    f"  • UKM4={sid_ukm}, roleId={link['roleid']}, "
+                    f"version={link['version']}"
+                )
+
+        roles_block = "\n".join(lines_roles) if lines_roles else "  (нет записей в ukm_users)"
+
+        msg_lines = [
+            "✅ [QR/EMP] Успешная выдача/обновление QR",
+            "",
+            "Сотрудник:",
+            f"  ФИО: {fio}",
+            f"  INN: {plain_inn}",
+            f"  user_id (PG): {user.id}",
+            "",
+            "Магазин:",
+            f"  Входной storeId (smstore): {sm_store_id}",
+            f"  ukm4store (для UKM/конвертера): {ukm_store_id}",
+        ]
+        if store_obj:
+            msg_lines.append(f"  Название: {store_obj.name}")
+            if store_obj.address:
+                msg_lines.append(f"  Адрес: {store_obj.address}")
+
+        msg_lines.extend(
+            [
+                "",
+                "Роль и доступы (ukm_users):",
+                roles_block,
+                "",
+                "Техническая информация:",
+                f"  roleId из запроса: {role_id}",
+                f"  cashier_id (trm_in_users): {cashier_id}",
+                f"  phone_raw: {phone_raw}",
+                f"  phone_norm: {phone_norm or ''}",
+                f"  qr_data: {new_password}",
+            ]
+        )
+
+        send_telegram_log("\n".join(msg_lines))
 
         return JsonResponse({'status': 'ok', 'qr_data': new_password})
 
@@ -2266,8 +2672,6 @@ def get_qr_code_by_employee_id(request):
         except Exception:
             pass
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
-
 
 
 
