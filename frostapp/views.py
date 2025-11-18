@@ -166,33 +166,80 @@ TELEGRAM_ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_ADMIN_CHAT_ID", "1811037612"))
 
 def send_telegram_log(message: str) -> None:
     """
-    Отправка текста в Telegram-чат администратора.
-    Ошибки не роняют основной поток — просто логируются.
-    Длинные сообщения режем по ~4000 символов.
+    Отправка читаемых, многострочных логов в Telegram-чат администратора.
+
+    Особенности:
+      • Не роняет основной поток при ошибках.
+      • Длинные сообщения режет по ~4000 символов.
+      • Обрезает лишние пробелы по краям.
+      • Отключает превью ссылок, чтобы логи не раздувались.
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
         return
+
+    text = (message or "").strip()
+    if not text:
+        text = "(пустое сообщение лога)"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     max_len = 4000
 
     try:
-        if len(message) <= max_len:
+        if len(text) <= max_len:
             requests.post(
                 url,
-                json={"chat_id": TELEGRAM_ADMIN_CHAT_ID, "text": message},
-                timeout=3,
+                json={
+                    "chat_id": TELEGRAM_ADMIN_CHAT_ID,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                },
+                timeout=5,
             )
         else:
-            for i in range(0, len(message), max_len):
-                part = message[i:i + max_len]
+            # режем по кускам
+            for i in range(0, len(text), max_len):
+                part = text[i:i + max_len]
                 requests.post(
                     url,
-                    json={"chat_id": TELEGRAM_ADMIN_CHAT_ID, "text": part},
-                    timeout=3,
+                    json={
+                        "chat_id": TELEGRAM_ADMIN_CHAT_ID,
+                        "text": part,
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=5,
                 )
     except Exception as e:
         logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)
+# Работает на 19.11.2025
+# def send_telegram_log(message: str) -> None:
+#     """
+#     Отправка текста в Telegram-чат администратора.
+#     Ошибки не роняют основной поток — просто логируются.
+#     Длинные сообщения режем по ~4000 символов.
+#     """
+#     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
+#         return
+
+#     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+#     max_len = 4000
+
+#     try:
+#         if len(message) <= max_len:
+#             requests.post(
+#                 url,
+#                 json={"chat_id": TELEGRAM_ADMIN_CHAT_ID, "text": message},
+#                 timeout=3,
+#             )
+#         else:
+#             for i in range(0, len(message), max_len):
+#                 part = message[i:i + max_len]
+#                 requests.post(
+#                     url,
+#                     json={"chat_id": TELEGRAM_ADMIN_CHAT_ID, "text": part},
+#                     timeout=3,
+#                 )
+#     except Exception as e:
+#         logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)
 
 
 
