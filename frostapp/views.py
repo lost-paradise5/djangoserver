@@ -21,6 +21,7 @@ from django.utils import timezone
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store
 
 _HEX = set("0123456789abcdefABCDEF")
+UKM5_FULL_XML_STORE_ID = 2013
 
 
 
@@ -402,6 +403,149 @@ def _get_or_create_storecashiers_tree(store_id: int) -> Tuple[str, ET.ElementTre
     return xml_path, tree, root
 
 
+def build_full_ukm5_xml_for_store(store_id: int) -> Optional[str]:
+    """
+    Полная пересборка storeCashiers XML для УКМ-5 по одному магазину (ukm4store).
+
+    В файл попадают ВСЕ кассиры, у которых есть UKMUser.storeid = store_id.
+    Пароль берём из OpenInSystem (system_id=9).
+    id кассира:
+      - если есть запись в trm_in_users (user_inn + name) — используем её id;
+      - иначе берём MAX(id)+1 и дальше инкрементируем в рамках этой пересборки.
+
+    Возвращает путь к новому XML или None, если магазин не УКМ5.
+    """
+    info = get_store_info(store_id)
+    if not info.get("is_ukm5", False):
+        logger.info(f"[XML/FULL] Store {store_id} не является УКМ-5 (is_ukm5=False) – пересборка не нужна")
+        return None
+
+    xml_store_id = resolve_xml_store_id(store_id)
+    if not xml_store_id:
+        logger.error(f"[XML/FULL] Не удалось получить xml_store_id для storeid={store_id}")
+        return None
+
+    links = list(
+        UKMUser.objects
+        .filter(storeid=store_id)
+        .select_related("user")
+        .order_by("user_id")
+    )
+    logger.info(
+        f"[XML/FULL] Пересборка storeCashiers для storeid={store_id} "
+        f"(xml_store_id={xml_store_id}), кассиров={len(links)}"
+    )
+
+    # Генерим Number = секунды с полуночи, избегаем коллизий
+    now = timezone.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_since_midnight = int((now - midnight).total_seconds())
+
+    pattern = re.compile(rf"^storeCashiers_\[{xml_store_id}\]_\[(\d+)\]_\[F\]\.xml$")
+    used_numbers: set[int] = set()
+    try:
+        for name in os.listdir(XML_DIR):
+            m = pattern.match(name)
+            if m:
+                used_numbers.add(int(m.group(1)))
+    except FileNotFoundError:
+        pass
+
+    number = seconds_since_midnight
+    while number in used_numbers:
+        number += 1
+
+    filename = f"storeCashiers_[{xml_store_id}]_[{number}]_[F].xml"
+    xml_path = os.path.join(XML_DIR, filename)
+
+    root = ET.Element("storeCashiers", fullness="F", storeId=str(xml_store_id))
+    version_el = ET.SubElement(root, "version")
+    version_el.text = "1.0"
+
+    user_ids = [l.user_id for l in links]
+    # Сразу подтянем пароли для всех пользователей
+    open_map = {
+        row["user_id"]: row["password"]
+        for row in OpenInSystem.objects
+            .filter(user_id__in=user_ids, system_id=9)
+            .values("user_id", "password")
+    }
+
+    next_new_id: Optional[int] = None
+
+    for link in links:
+        user = link.user
+        fio = (user.full_name or "").strip()
+        emp_raw = (user.employee_id or "").strip()
+
+        if not fio or not emp_raw:
+            logger.warning(
+                f"[XML/FULL] Пропуск user_id={user.id}: пустое ФИО ({fio!r}) "
+                f"или employee_id ({emp_raw!r})"
+            )
+            continue
+
+        try:
+            plain_inn = ensure_plain_inn(emp_raw)
+        except Exception as e:
+            logger.warning(
+                f"[XML/FULL] Пропуск user_id={user.id}: некорректный INN "
+                f"{emp_raw!r}: {e}"
+            )
+            continue
+
+        password_plain = open_map.get(user.id)
+        if not password_plain:
+            logger.warning(
+                f"[XML/FULL] Пропуск user_id={user.id}: нет OpenInSystem(system_id=9)"
+            )
+            continue
+
+        # Пытаемся взять id из trm_in_users
+        cashier_id = get_trm_employee_id(plain_inn, fio)
+        if cashier_id is None:
+            if next_new_id is None:
+                try:
+                    ukm_conn = connect_ukm()
+                    cur = ukm_conn.cursor()
+                    cur.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+                    row = cur.fetchone() or {}
+                    next_new_id = row.get("next_id") or 1
+                    cur.close()
+                    ukm_conn.close()
+                    logger.info(f"[XML/FULL] trm_in_users: base next_id={next_new_id}")
+                except Exception as e:
+                    logger.error(
+                        f"[XML/FULL] Ошибка получения next_id из trm_in_users: {e}",
+                        exc_info=True
+                    )
+                    if next_new_id is None:
+                        next_new_id = 1
+            cashier_id = next_new_id
+            next_new_id += 1
+
+        c_el = ET.SubElement(root, "cashier")
+        ET.SubElement(c_el, "roleId").text = str(link.roleid)
+        ET.SubElement(c_el, "id").text = str(cashier_id)
+        ET.SubElement(c_el, "name").text = fio
+        ET.SubElement(c_el, "INN").text = plain_inn
+        ET.SubElement(c_el, "password").text = password_plain
+
+    tree = ET.ElementTree(root)
+    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+
+    logger.info(
+        f"[XML/FULL] Готов полный storeCashiers для storeid={store_id}: {xml_path}"
+    )
+    return xml_path
+
+
+
+
+
+
+
+
 def connect_ukm():
     return pymysql.connect(
         host="192.168.17.234",
@@ -565,6 +709,128 @@ def connect_store_mysql(host: str):
 
 
 
+#20.11.2025 изменил для 2013 магазина
+# def _update_store_mysql_and_xml_for_single_store(
+#     store_id: int,
+#     cashier_id: int,
+#     role_id: int,
+#     plain_inn: str,
+#     fio: str,
+#     password_plain: str
+# ) -> None:
+#     """
+#     Обновляет кассира по ОДНОМУ магазину:
+#       • UKM4 (MySQL import4.users + import4.signal)
+#       • UKM5 (XML storeCashiers_...)
+#     Пароль в MySQL – OLD_PASSWORD(mysql_pwd(password_plain)).
+#     Пароль в XML – тот же, что в PG (с префиксом KS).
+#     """
+#     logger.info(
+#         f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
+#         f"cashier_id={cashier_id}, role_id={role_id}"
+#     )
+
+#     info = get_store_info(store_id)
+#     ukm4ip = info.get("ukm4ip")
+#     is_ukm5 = info.get("is_ukm5", False)
+#     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
+
+#     # --- UKM4 / MySQL import4 ---
+#     if ukm4ip:
+#         conv = cur = None
+#         try:
+#             conv = connect_store_mysql(ukm4ip)
+#             cur = conv.cursor()
+
+#             # Версию берём как (COUNT(signal='busy') + 1)
+#             cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
+#             row = cur.fetchone() or {}
+#             base_version = (row.get('cnt') or 0) + 1
+#             logger.info(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): version={base_version} "
+#                 f"по счётчику signal='busy'"
+#             )
+
+#             # Вставляем users (password = OLD_PASSWORD(без 'KS'))
+#             cur.execute("""
+#                 INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+#                 VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+#             """, (
+#                 store_id,
+#                 cashier_id,
+#                 fio,
+#                 plain_inn,
+#                 mysql_pwd(password_plain),
+#                 role_id,
+#                 base_version
+#             ))
+#             logger.info(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): users inserted "
+#                 f"(id={cashier_id}, role_id={role_id}, version={base_version})"
+#             )
+
+#             # Сигнал 'incr'
+#             cur.execute("INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)", (base_version,))
+#             logger.info(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): signal inserted incr/{base_version}"
+#             )
+
+#             conv.commit()
+#         except Exception as e:
+#             logger.error(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}",
+#                 exc_info=True
+#             )
+#             if conv:
+#                 try:
+#                     conv.rollback()
+#                 except Exception:
+#                     pass
+#         finally:
+#             try:
+#                 if cur:
+#                     cur.close()
+#                 if conv:
+#                     conv.close()
+#             except Exception:
+#                 pass
+#     else:
+#         logger.error(
+#             f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal"
+#         )
+
+#     # --- UKM5 / XML ---
+#     if is_ukm5:
+#         try:
+#             xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
+
+#             # Удаляем старые <cashier> с этим ИНН
+#             changed = False
+#             for cash_el in list(root.findall("cashier")):
+#                 if cash_el.findtext("INN") == plain_inn:
+#                     root.remove(cash_el)
+#                     changed = True
+#             if changed:
+#                 logger.info(
+#                     f"[QR/EMP] Store {store_id}: старые записи <cashier> "
+#                     f"с INN={plain_inn} удалены из {xml_path}"
+#                 )
+
+#             cash_el = ET.SubElement(root, "cashier")
+#             ET.SubElement(cash_el, "roleId").text = str(role_id)
+#             ET.SubElement(cash_el, "id").text = str(cashier_id)
+#             ET.SubElement(cash_el, "name").text = fio
+#             ET.SubElement(cash_el, "INN").text = plain_inn
+#             ET.SubElement(cash_el, "password").text = password_plain
+
+#             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+#             logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
+#         except Exception as e:
+#             logger.error(
+#                 f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}",
+#                 exc_info=True
+#             )
+
 
 def _update_store_mysql_and_xml_for_single_store(
     store_id: int,
@@ -657,35 +923,52 @@ def _update_store_mysql_and_xml_for_single_store(
 
     # --- UKM5 / XML ---
     if is_ukm5:
-        try:
-            xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
-
-            # Удаляем старые <cashier> с этим ИНН
-            changed = False
-            for cash_el in list(root.findall("cashier")):
-                if cash_el.findtext("INN") == plain_inn:
-                    root.remove(cash_el)
-                    changed = True
-            if changed:
+        # Для магазина 2013 всегда пересобираем ПОЛНЫЙ XML
+        if store_id == UKM5_FULL_XML_STORE_ID:
+            try:
+                xml_path = build_full_ukm5_xml_for_store(store_id)
                 logger.info(
-                    f"[QR/EMP] Store {store_id}: старые записи <cashier> "
-                    f"с INN={plain_inn} удалены из {xml_path}"
+                    f"[QR/EMP] Store {store_id}: полный XML для УКМ-5 пересобран: {xml_path}"
                 )
+            except Exception as e:
+                logger.error(
+                    f"[QR/EMP] Store {store_id}: ошибка при полной пересборке XML/UKM5: {e}",
+                    exc_info=True
+                )
+        else:
+            # Для остальных магазинов оставляем старое поведение (upsert по одному кассиру)
+            try:
+                xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
 
-            cash_el = ET.SubElement(root, "cashier")
-            ET.SubElement(cash_el, "roleId").text = str(role_id)
-            ET.SubElement(cash_el, "id").text = str(cashier_id)
-            ET.SubElement(cash_el, "name").text = fio
-            ET.SubElement(cash_el, "INN").text = plain_inn
-            ET.SubElement(cash_el, "password").text = password_plain
+                changed = False
+                for cash_el in list(root.findall("cashier")):
+                    if cash_el.findtext("INN") == plain_inn:
+                        root.remove(cash_el)
+                        changed = True
+                if changed:
+                    logger.info(
+                        f"[QR/EMP] Store {store_id}: старые записи <cashier> "
+                        f"с INN={plain_inn} удалены из {xml_path}"
+                    )
 
-            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-            logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
-        except Exception as e:
-            logger.error(
-                f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}",
-                exc_info=True
-            )
+                cash_el = ET.SubElement(root, "cashier")
+                ET.SubElement(cash_el, "roleId").text = str(role_id)
+                ET.SubElement(cash_el, "id").text = str(cashier_id)
+                ET.SubElement(cash_el, "name").text = fio
+                ET.SubElement(cash_el, "INN").text = plain_inn
+                ET.SubElement(cash_el, "password").text = password_plain
+
+                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
+            except Exception as e:
+                logger.error(
+                    f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}",
+                    exc_info=True
+                )
+            
+            
+            
+            
 
 def ensure_plain_inn(value: str) -> str:
     v = (value or "").strip()
@@ -1124,21 +1407,52 @@ def register_cashier(request):
 
                 # XML для UKM5
                 if is_ukm5:
-                    try:
-                        xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+                    if sid == UKM5_FULL_XML_STORE_ID:
+                        # Для магазина 2013 — полный файл, со ВСЕМИ кассирами
+                        try:
+                            full_xml_path = build_full_ukm5_xml_for_store(sid)
+                            if full_xml_path:
+                                xml_paths.append(full_xml_path)
+                                logger.info(
+                                    f"[XML] Полный XML для УКМ5 магазина {sid} пересобран: {full_xml_path}"
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"[XML] Ошибка полной пересборки для storeid={sid}: {e}"
+                            )
+                    else:
+                        # Остальные магазины — старое поведение (вставка одного кассира)
+                        try:
+                            xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
 
-                        cashier_el = ET.SubElement(root, "cashier")
-                        ET.SubElement(cashier_el, "roleId").text = str(role_id)
-                        ET.SubElement(cashier_el, "id").text = str(cashier_id)
-                        ET.SubElement(cashier_el, "name").text = fio
-                        ET.SubElement(cashier_el, "INN").text = inn
-                        ET.SubElement(cashier_el, "password").text = password_plain
+                            cashier_el = ET.SubElement(root, "cashier")
+                            ET.SubElement(cashier_el, "roleId").text = str(role_id)
+                            ET.SubElement(cashier_el, "id").text = str(cashier_id)
+                            ET.SubElement(cashier_el, "name").text = fio
+                            ET.SubElement(cashier_el, "INN").text = inn
+                            ET.SubElement(cashier_el, "password").text = password_plain
 
-                        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-                        xml_paths.append(xml_path)
-                        logger.info(f"[XML] Файл обновлён: {xml_path}")
-                    except Exception as e:
-                        logger.error(f"[XML] Ошибка генерации для storeid={sid}: {e}")
+                            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                            xml_paths.append(xml_path)
+                            logger.info(f"[XML] Файл обновлён: {xml_path}")
+                        except Exception as e:
+                            logger.error(f"[XML] Ошибка генерации для storeid={sid}: {e}")
+                # if is_ukm5:
+                #     try:
+                #         xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+
+                #         cashier_el = ET.SubElement(root, "cashier")
+                #         ET.SubElement(cashier_el, "roleId").text = str(role_id)
+                #         ET.SubElement(cashier_el, "id").text = str(cashier_id)
+                #         ET.SubElement(cashier_el, "name").text = fio
+                #         ET.SubElement(cashier_el, "INN").text = inn
+                #         ET.SubElement(cashier_el, "password").text = password_plain
+
+                #         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                #         xml_paths.append(xml_path)
+                #         logger.info(f"[XML] Файл обновлён: {xml_path}")
+                #     except Exception as e:
+                #         logger.error(f"[XML] Ошибка генерации для storeid={sid}: {e}")
 
         return JsonResponse({
             'status': 'ok',
@@ -1417,24 +1731,58 @@ def regenerate_qr(user):
             continue
 
         try:
-            xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+            if sid == UKM5_FULL_XML_STORE_ID:
+                # Для магазина 2013 при смене пароля пересобираем полный XML
+                xml_path = build_full_ukm5_xml_for_store(sid)
+                logger.info(
+                    f"[XML] Полный XML пересобран при регенерации QR для storeid={sid}: {xml_path}"
+                )
+            else:
+                # Остальные магазины — точечное обновление одного кассира
+                xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
 
-            for el in list(root.findall("cashier")):
-                if el.findtext("INN") == user.employee_id:
-                    root.remove(el)
+                for el in list(root.findall("cashier")):
+                    if el.findtext("INN") == user.employee_id:
+                        root.remove(el)
 
-            c_el = ET.SubElement(root, "cashier")
-            ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
-            ET.SubElement(c_el, "id").text = str(next_free_id)
-            ET.SubElement(c_el, "name").text = user.full_name
-            ET.SubElement(c_el, "INN").text = user.employee_id
-            ET.SubElement(c_el, "password").text = new_password
+                c_el = ET.SubElement(root, "cashier")
+                ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
+                ET.SubElement(c_el, "id").text = str(next_free_id)
+                ET.SubElement(c_el, "name").text = user.full_name
+                ET.SubElement(c_el, "INN").text = user.employee_id
+                ET.SubElement(c_el, "password").text = new_password
 
-            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-            logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
-            next_free_id += 1
+                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
+                next_free_id += 1
         except Exception as exc:
             logger.error(f"[XML] Ошибка для {sid}: {exc}")
+    # next_free_id = cashier_id_base + cashier_counter
+
+    # for ukm_user in ukm_users:
+    #     sid = ukm_user.storeid
+    #     if not is_ukm5_store(sid):
+    #         continue
+
+    #     try:
+    #         xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+
+    #         for el in list(root.findall("cashier")):
+    #             if el.findtext("INN") == user.employee_id:
+    #                 root.remove(el)
+
+    #         c_el = ET.SubElement(root, "cashier")
+    #         ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
+    #         ET.SubElement(c_el, "id").text = str(next_free_id)
+    #         ET.SubElement(c_el, "name").text = user.full_name
+    #         ET.SubElement(c_el, "INN").text = user.employee_id
+    #         ET.SubElement(c_el, "password").text = new_password
+
+    #         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+    #         logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
+    #         next_free_id += 1
+    #     except Exception as exc:
+    #         logger.error(f"[XML] Ошибка для {sid}: {exc}")
 
 
 
