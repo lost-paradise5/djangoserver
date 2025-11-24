@@ -548,7 +548,21 @@ def connect_converter():
         cursorclass=pymysql.cursors.DictCursor
     )
     
-    
+def _calc_next_signal_version(cur) -> int:
+    """
+    Возвращает следующий номер версии для MySQL-таблицы `signal`.
+
+    Берём MAX(version) по всей таблице и увеличиваем на 1.
+    Так версия всегда растёт, даже если нет строк с signal='busy'.
+    """
+    cur.execute("SELECT MAX(`version`) AS max_ver FROM `signal`")
+    row = cur.fetchone() or {}
+    max_ver = row.get("max_ver") or 0
+    try:
+        max_ver = int(max_ver)
+    except (TypeError, ValueError):
+        max_ver = 0
+    return max_ver + 1
 
 
 def _write_converter_user_and_signal(
@@ -573,11 +587,9 @@ def _write_converter_user_and_signal(
         cur = conv.cursor()
 
         # Версия по счётчику 'busy'
-        cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
-        row = cur.fetchone() or {}
-        base_version = (row.get('cnt') or 0) + 1
+        base_version = _calc_next_signal_version(cur)
         logger.info(
-            f"[CONVERTER] base_version={base_version} (busy cnt) "
+            f"[CONVERTER] base_version={base_version} (по MAX(signal.version)) "
             f"для cashier_id={cashier_id}"
         )
 
@@ -833,12 +845,10 @@ def _update_store_mysql_and_xml_for_single_store(
             cur = conv.cursor()
 
             # Версию берём как (COUNT(signal='busy') + 1)
-            cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
-            row = cur.fetchone() or {}
-            base_version = (row.get('cnt') or 0) + 1
+            base_version = _calc_next_signal_version(cur)
             logger.info(
-                f"[QR/EMP] Store {store_id} ({ukm4ip}): version={base_version} "
-                f"по счётчику signal='busy'"
+                f"[QR/EMP] Store {store_id} ({ukm4ip}): next version={base_version} "
+                f"(по MAX(signal.version))"
             )
 
             # Вставляем users (password = OLD_PASSWORD(без 'KS'))
@@ -1356,8 +1366,8 @@ def register_cashier(request):
                     try:
                         conv = connect_store_mysql(ukm4ip)
                         cur = conv.cursor()
-                        cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal` = 'busy'")
-                        base_version = (cur.fetchone()['cnt'] or 0) + 1
+
+                        base_version = _calc_next_signal_version(cur)
 
                         cur.execute("""
                             INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
@@ -1367,7 +1377,10 @@ def register_cashier(request):
                         cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
                         conv.commit()
                         conv.close()
-                        logger.info(f"[MySQL:{ukm4ip}] Добавлен кассир store={sid}, id={cashier_id}, version={base_version}")
+                        logger.info(
+                            f"[MySQL:{ukm4ip}] Добавлен кассир store={sid}, "
+                            f"id={cashier_id}, version={base_version}"
+                        )
                     except Exception as e:
                         logger.error(f"[MySQL:{ukm4ip}] Ошибка вставки для store={sid}: {e}")
                 else:
@@ -1664,8 +1677,8 @@ def regenerate_qr(user):
             try:
                 conv = connect_store_mysql(ukm4ip)
                 cur = conv.cursor()
-                cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
-                base_version = (cur.fetchone()['cnt'] or 0) + 1
+
+                base_version = _calc_next_signal_version(cur)
 
                 cur.execute("""
                     INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
@@ -1682,7 +1695,10 @@ def regenerate_qr(user):
                 cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
                 conv.commit()
                 conv.close()
-                logger.info(f"[MySQL:{ukm4ip}] Пароль обновлён store={sid}, id={cashier_id}, version={base_version}")
+                logger.info(
+                    f"[MySQL:{ukm4ip}] Пароль обновлён store={sid}, "
+                    f"id={cashier_id}, version={base_version}"
+                )
             except Exception as e:
                 logger.error(f"[MySQL:{ukm4ip}] Ошибка обновления пароля для store={sid}: {e}")
         else:
@@ -3147,8 +3163,8 @@ def update_cashier(request):
                 try:
                     conv = connect_store_mysql(ukm4ip)
                     cur = conv.cursor()
-                    cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
-                    base_version = (cur.fetchone()['cnt'] or 0) + 1
+
+                    base_version = _calc_next_signal_version(cur)
 
                     cur.execute("""
                         INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
@@ -3254,8 +3270,8 @@ def delete_cashier(request):
                 try:
                     conv = connect_store_mysql(ukm4ip)
                     cur = conv.cursor()
-                    cur.execute("SELECT COUNT(*) AS cnt FROM `signal` WHERE `signal`='busy'")
-                    base_version = (cur.fetchone()['cnt'] or 0) + 1
+
+                    base_version = _calc_next_signal_version(cur)
 
                     cur.execute("""
                         INSERT INTO users (store,id,name,inn,password,role_id,version,deleted)
