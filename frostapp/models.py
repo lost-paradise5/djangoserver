@@ -170,20 +170,25 @@ class Store(models.Model):
 
 
 class AuthSession(models.Model):
-    id = models.AutoField(primary_key=True)
-    session_id = models.UUIDField(unique=True, default=uuid.uuid4, editable=False)
+    STATUS_CHOICES = [
+        ('pending',   'Pending'),   # телефон подтверждён, магазин ещё не выбран
+        ('pin_sent',  'PIN sent'),  # PIN отправлен, ждём ввода
+        ('success',   'Success'),   # PIN успешно введён
+        ('expired',   'Expired'),   # истёк срок действия
+        ('blocked',   'Blocked'),   # превышено количество попыток
+    ]
 
+    id = models.BigAutoField(primary_key=True)
+    session_id = models.UUIDField(default=uuid.uuid4, unique=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
-    storeid = models.IntegerField(null=True, blank=True)   # ukm_users.storeid
-    pin_hash = models.CharField(max_length=64, null=True, blank=True)
-
-    status = models.CharField(max_length=20, default='pending')  # pending / pin_sent / success / expired / blocked
-    attempts = models.IntegerField(default=0)
-    expires_at = models.DateTimeField()  # now() + 2 минуты
-
-    created_at = models.DateTimeField()
-    updated_at = models.DateTimeField()
+    storeid = models.IntegerField(null=True, blank=True)  # ukm_users.storeid (ukm4store)
+    pin_hash = models.CharField(max_length=64, null=True, blank=True)  # SHA-256(PIN)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    attempts = models.IntegerField(default=0)              # сколько неверных попыток уже было
+    expires_at = models.DateTimeField()                    # до какого момента жива сессия/ПИН
+    created_at = models.DateTimeField(auto_now_add=True)   # совпадает с DEFAULT NOW()
+    updated_at = models.DateTimeField(auto_now=True)       # будем обновлять через save()
 
     class Meta:
         db_table = 'auth_sessions'
-        managed = False
+        managed = False 
