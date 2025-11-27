@@ -1,4 +1,5 @@
 from django.db import models
+import uuid
 
 class Queue(models.Model):
     id = models.AutoField(primary_key=True)
