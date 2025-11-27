@@ -1059,6 +1059,223 @@ def connect_oracle_supermag():
     dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SERVICE)
     return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
 
+
+
+
+
+def get_dbname_for_smstore(smstore_id: int) -> Optional[str]:
+    """
+    Возвращает имя базы (REP.DBNAME) для магазина SMSTORELOCATIONS.id = smstore_id,
+    либо None, если свойства нет.
+
+    SELECT propval
+    FROM smstoreproperties
+    WHERE storeloc = :sid AND propid = 'REP.DBNAME'
+    """
+    conn = cur = None
+    try:
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT propval
+            FROM smstoreproperties
+            WHERE storeloc = :sid
+              AND propid = 'REP.DBNAME'
+            """,
+            sid=smstore_id
+        )
+        row = cur.fetchone()
+        if not row:
+            logger.warning(f"[SM/DBNAME] REP.DBNAME not found for STORELOC={smstore_id}")
+            return None
+
+        dbname = row[0]
+        if dbname is None:
+            logger.warning(f"[SM/DBNAME] REP.DBNAME is NULL for STORELOC={smstore_id}")
+            return None
+
+        dbname_str = str(dbname).strip()
+        logger.info(f"[SM/DBNAME] STORELOC={smstore_id} -> DBNAME={dbname_str!r}")
+        return dbname_str
+
+    except Exception as e:
+        logger.exception(f"[SM/DBNAME] Error while fetching dbname for STORELOC={smstore_id}: {e}")
+        # Тут либо возвращаем None, либо пробрасываем. Явно пробрасываем, а view вернёт 500.
+        raise
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@csrf_exempt
+def sm_get_dbname(request):
+    """
+    GET  /sm/dbname/?storeId=225
+    или
+    POST /sm/dbname/  { "storeId": 225 }
+    """
+    if request.method not in ('GET', 'POST'):
+        return JsonResponse({'status': 'error', 'message': 'Только GET или POST'}, status=405)
+
+    try:
+        raw_store = ""
+
+        if request.method == 'GET':
+            raw_store = (
+                (request.GET.get('storeId') or
+                 request.GET.get('smstore') or
+                 request.GET.get('id') or "")
+                .strip()
+            )
+            logger.info(f"[SM/GET_DBNAME] GET, raw_store={raw_store!r}")
+        else:
+            body = request.body.decode('utf-8') if request.body else "{}"
+            logger.info(f"[SM/GET_DBNAME] POST, raw_body={body!r}")
+            try:
+                data = json.loads(body)
+            except Exception as e:
+                logger.error(f"[SM/GET_DBNAME] JSON parse error: {e}")
+                return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
+            raw_store = str(
+                data.get('storeId') or
+                data.get('smstore') or
+                data.get('id') or ""
+            ).strip()
+            logger.info(f"[SM/GET_DBNAME] Parsed raw_store={raw_store!r}")
+
+        if not raw_store:
+            logger.error("[SM/GET_DBNAME] storeId/smstore не передан")
+            return JsonResponse(
+                {'status': 'error', 'message': 'Не передан storeId (smstore)'},
+                status=400
+            )
+
+        try:
+            smstore_id = int(raw_store)
+        except ValueError:
+            logger.error(f"[SM/GET_DBNAME] storeId не число: {raw_store!r}")
+            return JsonResponse(
+                {'status': 'error', 'message': 'storeId (smstore) должен быть числом'},
+                status=400
+            )
+
+        logger.info(f"[SM/GET_DBNAME] Ищем REP.DBNAME для STORELOC={smstore_id}")
+
+        try:
+            dbname = get_dbname_for_smstore(smstore_id)
+        except Exception as e:
+            logger.exception(f"[SM/GET_DBNAME] Ошибка внутри get_dbname_for_smstore: {e}")
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+        if not dbname:
+            logger.warning(f"[SM/GET_DBNAME] REP.DBNAME не найден для STORELOC={smstore_id}")
+            return JsonResponse(
+                {'status': 'error',
+                 'message': f'Имя базы (REP.DBNAME) не найдено для STORELOC={smstore_id}'},
+                status=404
+            )
+
+        logger.info(
+            f"[SM/GET_DBNAME] OK: STORELOC={smstore_id} → DBNAME={dbname!r}"
+        )
+        return JsonResponse({
+            'status': 'ok',
+            'smstore': smstore_id,
+            'dbname': dbname,
+        })
+
+    except Exception as e:
+        logger.exception("[SM/GET_DBNAME] Unexpected error")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+@csrf_exempt
+def sm_list_databases(request):
+    """
+    GET /sm/databases/
+    Список магазинов + их база (REP.DBNAME)
+    """
+    if request.method != 'GET':
+        return JsonResponse({'status': 'error', 'message': 'Только GET'}, status=405)
+
+    sql = """
+        SELECT
+          l.id       AS smstore,
+          l.name     AS name,
+          p.propval  AS dbname
+        FROM smstorelocations l
+        LEFT JOIN smstoreproperties p
+          ON p.storeloc = l.id
+         AND p.propid   = 'REP.DBNAME'
+        WHERE
+          l.name NOT LIKE 'я%%'
+          AND l.name NOT LIKE '%%ТЕСТ%%'
+          AND l.formatid IN (19, 20, 9, 8, 6, 22, 23)
+        ORDER BY l.name
+    """
+
+    conn = cur = None
+    try:
+        logger.info("[SM/LIST_DB] Старт запроса списка магазинов + баз")
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+        cur.execute(sql)
+
+        items = []
+        rows = cur.fetchall()
+        logger.info(f"[SM/LIST_DB] Получено строк из Oracle: {len(rows)}")
+
+        for smstore, name, dbname in rows:
+            name_s = (name or "").strip()
+            db_s = (dbname or "").strip() if dbname is not None else ""
+            logger.info(
+                "[SM/LIST_DB] STORE: smstore=%s, name=%r, dbname=%r",
+                smstore, name_s, db_s
+            )
+            items.append({
+                "smstore": smstore,
+                "name": name_s,
+                "dbname": db_s,
+            })
+
+        logger.info(f"[SM/LIST_DB] Итог: count={len(items)}")
+        return JsonResponse({
+            "status": "ok",
+            "count": len(items),
+            "items": items
+        })
+
+    except Exception as e:
+        logger.exception("[SM/LIST_DB] Unexpected error")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Базовый SQL
 BASE_STORES_SQL = """
 SELECT
