@@ -222,31 +222,38 @@ def send_telegram_to_user(user, message: str) -> bool:
     Отправка сообщения сотруднику по user.tg_id.
     Возвращает True/False, исключения не пробрасывает.
     """
-    tg_id = (user.tg_id or "").strip() if getattr(user, "tg_id", None) else ""
+    tg_raw = getattr(user, "tg_id", None)
+
+    # tg_raw может быть int, str, None — приводим к строке безопасно
+    if tg_raw is None:
+        tg_id = ""
+    else:
+        tg_id = str(tg_raw).strip()
+
     if not tg_id or not TELEGRAM_BOT_TOKEN:
-        logger.warning(f"[TELEGRAM] tg_id отсутствует для user_id={getattr(user, 'id', None)}")
+        logger.warning(
+            f"[TELEGRAM] tg_id отсутствует или пустой для user_id={getattr(user, 'id', None)}"
+        )
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(
             url,
-            json={
-                "chat_id": tg_id,
-                "text": message,
-                "disable_web_page_preview": True,
-            },
-            timeout=5,
+            json={"chat_id": tg_id, "text": message},
+            timeout=10,
         )
-        if resp.status_code != 200:
+        if resp.status_code != 200 or not resp.json().get("ok"):
             logger.error(
-                f"[TELEGRAM] Ошибка отправки пользователю user_id={user.id}: "
-                f"{resp.status_code} {resp.text}"
+                f"[TELEGRAM] Ошибка отправки сообщения user_id={getattr(user, 'id', None)} "
+                f"status={resp.status_code} body={resp.text}"
             )
             return False
         return True
     except Exception as e:
-        logger.error(f"[TELEGRAM] Исключение при отправке пользователю: {e}", exc_info=True)
+        logger.exception(
+            f"[TELEGRAM] Исключение при отправке сообщения user_id={getattr(user, 'id', None)}: {e}"
+        )
         return False
 
 
