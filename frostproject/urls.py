@@ -29,8 +29,10 @@ from frostapp.views import (
     export_stores_xml,
     employee_identification,
     sm_get_dbname,         
-    sm_list_databases,    
-    
+    sm_list_databases,
+    agent_auth_start,
+    agent_auth_select_store,
+    agent_auth_verify_pin,
 )
 
 urlpatterns = [
@@ -50,4 +52,7 @@ urlpatterns = [
     path('employee-identification/', employee_identification, name='employee_identification'),
     path('sm/dbname/', sm_get_dbname, name='sm_get_dbname'),
     path('sm/databases/', sm_list_databases, name='sm_list_databases'),
+    path('agent/auth/start/', agent_auth_start, name='agent_auth_start'),
+    path('agent/auth/select_store/', agent_auth_select_store, name='agent_auth_select_store'),
+    path('agent/auth/verify_pin/', agent_auth_verify_pin, name='agent_auth_verify_pin'),
 ]
