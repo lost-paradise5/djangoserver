@@ -28,6 +28,8 @@ from frostapp.views import (
     get_qr_code_by_employee_id,
     export_stores_xml,
     employee_identification,
+    sm_get_dbname,         
+    sm_list_databases,    
     
 )
 
@@ -46,4 +48,6 @@ urlpatterns = [
     path('get_qr_code_by_employee_id/', get_qr_code_by_employee_id, name='get_qr_code_by_employee_id'),
     path('export/stores/xml/', export_stores_xml, name='export_stores_xml'),
     path('employee-identification/', employee_identification, name='employee_identification'),
+    path('sm/dbname/', sm_get_dbname, name='sm_get_dbname'),
+    path('sm/databases/', sm_list_databases, name='sm_list_databases'),
 ]
