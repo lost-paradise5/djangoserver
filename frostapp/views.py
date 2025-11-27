@@ -165,7 +165,9 @@ TELEGRAM_BOT_TOKEN = os.getenv(
     "7330478125:AAEYPbkbSIMj_N56_V7gEvJN2dxh2SF7bMo"
 )
 TELEGRAM_ADMIN_CHAT_ID = int(os.getenv("TELEGRAM_ADMIN_CHAT_ID", "1811037612"))
-
+PIN_TTL_MINUTES = 2    
+SESSION_TTL_MINUTES = 10   
+MAX_PIN_ATTEMPTS = 3     
 
 def send_telegram_log(message: str) -> None:
     """
@@ -1987,11 +1989,14 @@ def agent_auth_start(request):
       "phone": "+7924..."
     }
 
-    1) Ищем пользователя по телефону.
-    2) Находим его магазины (ukm_users + stores).
-    3) Создаём AuthSession.
-       - если магазинов > 1 → step=SELECT_STORE, отдаём список магазинов
-       - если магазин 1 → сразу шлём PIN в Telegram, step=WAIT_PIN
+    Логика:
+      1) Ищем пользователя по телефону (варианты формата).
+      2) Ищем его магазины (ukm_users + stores).
+      3) Создаём AuthSession в auth_sessions.
+         - если магазинов > 1 → step=SELECT_STORE, отдаём список магазинов,
+           статус сессии 'pending'
+         - если магазин 1 → сразу шлём PIN в Telegram, статус 'pin_sent',
+           step=WAIT_PIN
     """
     if request.method != 'POST':
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
@@ -2060,30 +2065,30 @@ def agent_auth_start(request):
             'roleid': row['roleid'],
         })
 
-    session_id = uuid.uuid4().hex
-    session_phone = phone_norm or phone_raw
+    # UUID для session_id: и в БД, и в ответе
+    session_uuid = uuid.uuid4()
+    session_id = str(session_uuid)
 
-    # Один магазин – сразу генерим PIN и отправляем
+    # Один магазин – сразу PIN
     if len(ukm_links) == 1:
         selected_sid = ukm_links[0]['storeid']
         pin = _generate_pin_code()
-        expires_at = timezone.now() + datetime.timedelta(minutes=2)
+        expires_at = timezone.now() + datetime.timedelta(minutes=PIN_TTL_MINUTES)
+        pin_hash = hashlib.sha256(pin.encode('utf-8')).hexdigest()
 
         AuthSession.objects.create(
-            session_id=session_id,
+            session_id=session_uuid,
             user=user,
-            phone=session_phone,
-            state="WAIT_PIN",
-            selected_storeid=selected_sid,
-            pin_code=pin,
-            pin_expires_at=expires_at,
-            attempts_left=3,
-            is_active=True,
+            storeid=selected_sid,
+            pin_hash=pin_hash,
+            status='pin_sent',
+            attempts=0,
+            expires_at=expires_at,
         )
 
         ok = send_telegram_to_user(
             user,
-            f"Ваш код авторизации: {pin}\nОн действителен 2 минуты."
+            f"Ваш код авторизации: {pin}\nОн действителен {PIN_TTL_MINUTES} минут(ы)."
         )
         if not ok:
             logger.error(f"[AGENT_AUTH/START] Не удалось отправить PIN user_id={user.id}")
@@ -2113,22 +2118,22 @@ def agent_auth_start(request):
         })
 
     # Несколько магазинов – сначала выбор магазина
+    expires_at = timezone.now() + datetime.timedelta(minutes=SESSION_TTL_MINUTES)
     AuthSession.objects.create(
-        session_id=session_id,
+        session_id=session_uuid,
         user=user,
-        phone=session_phone,
-        state="PHONE_VERIFIED",
-        selected_storeid=None,
-        pin_code=None,
-        pin_expires_at=None,
-        attempts_left=3,
-        is_active=True,
+        storeid=None,
+        pin_hash=None,
+        status='pending',
+        attempts=0,
+        expires_at=expires_at,
     )
 
     return JsonResponse({
         'status': 'ok',
         'session_id': session_id,
         'step': 'SELECT_STORE',
+        'expires_at': expires_at.isoformat(),
         'user': {
             'id': user.id,
             'fio': user.full_name,
@@ -2171,7 +2176,7 @@ def agent_auth_select_store(request):
     sess = (
         AuthSession.objects
         .select_related('user')
-        .filter(session_id=session_id, is_active=True)
+        .filter(session_id=session_id)
         .first()
     )
     if not sess:
@@ -2180,10 +2185,19 @@ def agent_auth_select_store(request):
             'message': 'Сессия не найдена или уже истекла'
         }, status=404)
 
-    if sess.state != "PHONE_VERIFIED":
+    now = timezone.now()
+    if now > sess.expires_at:
+        sess.status = 'expired'
+        sess.save(update_fields=['status', 'updated_at'])
         return JsonResponse({
             'status': 'error',
-            'message': f'Неверное состояние сессии: {sess.state}, нужно начать заново'
+            'message': 'Сессия истекла, начните авторизацию заново'
+        }, status=400)
+
+    if sess.status != 'pending':
+        return JsonResponse({
+            'status': 'error',
+            'message': f'Неверное состояние сессии: {sess.status}, нужно начать заново'
         }, status=400)
 
     # Проверяем, что этот магазин действительно привязан к пользователю
@@ -2194,21 +2208,21 @@ def agent_auth_select_store(request):
         }, status=403)
 
     pin = _generate_pin_code()
-    expires_at = timezone.now() + datetime.timedelta(minutes=2)
+    expires_at = timezone.now() + datetime.timedelta(minutes=PIN_TTL_MINUTES)
+    pin_hash = hashlib.sha256(pin.encode('utf-8')).hexdigest()
 
-    sess.selected_storeid = storeid
-    sess.pin_code = pin
-    sess.pin_expires_at = expires_at
-    sess.attempts_left = 3
-    sess.state = "WAIT_PIN"
+    sess.storeid = storeid
+    sess.pin_hash = pin_hash
+    sess.status = 'pin_sent'
+    sess.attempts = 0
+    sess.expires_at = expires_at
     sess.save(update_fields=[
-        'selected_storeid', 'pin_code', 'pin_expires_at',
-        'attempts_left', 'state', 'updated_at'
+        'storeid', 'pin_hash', 'status', 'attempts', 'expires_at', 'updated_at'
     ])
 
     ok = send_telegram_to_user(
         sess.user,
-        f"Ваш код авторизации: {pin}\nОн действителен 2 минуты."
+        f"Ваш код авторизации: {pin}\nОн действителен {PIN_TTL_MINUTES} минут(ы)."
     )
     if not ok:
         logger.error(f"[AGENT_AUTH/SELECT_STORE] Не удалось отправить PIN user_id={sess.user.id}")
@@ -2275,7 +2289,7 @@ def agent_auth_verify_pin(request):
     sess = (
         AuthSession.objects
         .select_related('user')
-        .filter(session_id=session_id, is_active=True)
+        .filter(session_id=session_id)
         .first()
     )
     if not sess:
@@ -2284,62 +2298,60 @@ def agent_auth_verify_pin(request):
             'message': 'Сессия не найдена или уже истекла'
         }, status=404)
 
-    if sess.state != "WAIT_PIN":
-        return JsonResponse({
-            'status': 'error',
-            'message': f'Неверное состояние сессии: {sess.state}, начните заново'
-        }, status=400)
-
     now = timezone.now()
 
     # Проверка тайм-аута
-    if not sess.pin_expires_at or now > sess.pin_expires_at:
-        sess.state = "EXPIRED"
-        sess.is_active = False
-        sess.save(update_fields=['state', 'is_active', 'updated_at'])
+    if now > sess.expires_at:
+        sess.status = 'expired'
+        sess.save(update_fields=['status', 'updated_at'])
         return JsonResponse({
             'status': 'error',
             'message': 'PIN истёк, начните авторизацию заново'
         }, status=400)
 
+    # Проверка статуса
+    if sess.status != 'pin_sent':
+        return JsonResponse({
+            'status': 'error',
+            'message': f'Неверное состояние сессии: {sess.status}, начните заново'
+        }, status=400)
+
     # Проверка попыток
-    if sess.attempts_left <= 0:
-        sess.state = "BLOCKED"
-        sess.is_active = False
-        sess.save(update_fields=['state', 'is_active', 'updated_at'])
+    if sess.attempts >= MAX_PIN_ATTEMPTS:
+        sess.status = 'blocked'
+        sess.save(update_fields=['status', 'updated_at'])
         return JsonResponse({
             'status': 'error',
             'message': 'Превышено количество попыток, начните заново'
         }, status=400)
 
-    # Сравнение PIN
-    if pin_input != (sess.pin_code or ""):
-        sess.attempts_left = max(0, sess.attempts_left - 1)
-        if sess.attempts_left == 0:
-            sess.state = "BLOCKED"
-            sess.is_active = False
-            sess.save(update_fields=[
-                'attempts_left', 'state', 'is_active', 'updated_at'
-            ])
+    # Сравнение PIN по хэшу
+    pin_hash_input = hashlib.sha256(pin_input.encode('utf-8')).hexdigest()
+    if pin_hash_input != (sess.pin_hash or ""):
+        sess.attempts = sess.attempts + 1
+        if sess.attempts >= MAX_PIN_ATTEMPTS:
+            sess.status = 'blocked'
+        sess.save(update_fields=['attempts', 'status', 'updated_at'])
+
+        attempts_left = max(0, MAX_PIN_ATTEMPTS - sess.attempts)
+        if attempts_left == 0:
             return JsonResponse({
                 'status': 'error',
                 'message': 'Неверный PIN, попытки закончились',
                 'attempts_left': 0
             }, status=400)
         else:
-            sess.save(update_fields=['attempts_left', 'updated_at'])
             return JsonResponse({
                 'status': 'error',
                 'message': 'Неверный PIN',
-                'attempts_left': sess.attempts_left
+                'attempts_left': attempts_left
             }, status=400)
 
     # PIN верный
-    sess.state = "COMPLETED"
-    sess.is_active = False
-    sess.save(update_fields=['state', 'is_active', 'updated_at'])
+    sess.status = 'success'
+    sess.save(update_fields=['status', 'updated_at'])
 
-    if not sess.selected_storeid:
+    if not sess.storeid:
         return JsonResponse({
             'status': 'error',
             'message': 'Для сессии не выбран магазин, начните заново'
@@ -2368,7 +2380,7 @@ def agent_auth_verify_pin(request):
     password = creds.password
 
     # Информация о магазине + DBNAME
-    ukm_storeid = sess.selected_storeid
+    ukm_storeid = sess.storeid
     store_obj = Store.objects.filter(ukm4store=ukm_storeid).first()
 
     smstore = store_obj.smstore if store_obj else None
