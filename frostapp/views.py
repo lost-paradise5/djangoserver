@@ -1108,6 +1108,258 @@ def connect_oracle_supermag():
     dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SERVICE)
     return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
 
+def _oracle_rows_to_jsonable(cur):
+    """
+    Превращает результат Oracle SELECT в список словарей, пригодных для JSON.
+    Даты → ISO-строки, всё непонятное → str().
+    """
+    cols = [d[0].lower() for d in cur.description]
+    items = []
+
+    for row in cur.fetchall():
+        obj = {}
+        for col, val in zip(cols, row):
+            if isinstance(val, (datetime.date, datetime.datetime)):
+                obj[col] = val.isoformat(sep=' ')
+            elif isinstance(val, (int, float, str, bool)) or val is None:
+                obj[col] = val
+            else:
+                obj[col] = str(val)
+        items.append(obj)
+
+    return items
+
+
+
+@csrf_exempt
+def sm_staff_list(request):
+    """
+    GET /sm/staff/?limit=100&offset=0&q=иванов
+
+    Возвращает содержимое таблицы SMSTAFF (пользователи Супермага).
+    Параметры:
+      - limit  (по умолчанию 200, максимум 1000)
+      - offset (по умолчанию 0)
+      - q      (поиск по surname/name, опционально)
+    """
+    if request.method != 'GET':
+        return JsonResponse(
+            {'status': 'error', 'message': 'Только GET'},
+            status=405,
+            json_dumps_params={'ensure_ascii': False}
+        )
+
+    try:
+        # Параметры
+        try:
+            limit = int(request.GET.get('limit', '200'))
+        except ValueError:
+            limit = 200
+        try:
+            offset = int(request.GET.get('offset', '0'))
+        except ValueError:
+            offset = 0
+
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
+
+        q = (request.GET.get('q') or '').strip().lower()
+
+        # Базовый SQL
+        sql = "SELECT * FROM smstaff"
+        binds = {}
+
+        if q:
+            sql += """
+            WHERE
+              LOWER(surname) LIKE :q
+              OR LOWER(name) LIKE :q
+            """
+            binds['q'] = f"%{q}%"
+
+        # Пагинация (Oracle 12+)
+        sql += """
+        ORDER BY surname
+        OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY
+        """
+        binds['off'] = offset
+        binds['lim'] = limit
+
+        conn = cur = None
+        try:
+            conn = connect_oracle_supermag()
+            cur = conn.cursor()
+            cur.execute(sql, binds)
+            items = _oracle_rows_to_jsonable(cur)
+        finally:
+            try:
+                if cur:
+                    cur.close()
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+        return JsonResponse(
+            {
+                'status': 'ok',
+                'count': len(items),
+                'limit': limit,
+                'offset': offset,
+                'items': items,
+            },
+            json_dumps_params={'ensure_ascii': False, 'indent': 2}
+        )
+
+    except Exception as e:
+        logger.exception("[SM/STAFF_LIST] Unexpected error")
+        return JsonResponse(
+            {'status': 'error', 'message': str(e)},
+            status=500,
+            json_dumps_params={'ensure_ascii': False}
+        )
+
+
+
+@csrf_exempt
+def sm_staff_columns(request):
+    """
+    GET /sm/staff/columns/
+
+    Возвращает структуру таблицы SMSTAFF (колонки, типы, длину, nullable).
+    """
+    if request.method != 'GET':
+        return JsonResponse(
+            {'status': 'error', 'message': 'Только GET'},
+            status=405,
+            json_dumps_params={'ensure_ascii': False}
+        )
+
+    conn = cur = None
+    try:
+        sql = """
+        SELECT
+          column_id,
+          column_name,
+          data_type,
+          data_length,
+          nullable
+        FROM all_tab_columns
+        WHERE owner = 'SUPERMAG'
+          AND table_name = 'SMSTAFF'
+        ORDER BY column_id
+        """
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+        cur.execute(sql)
+        items = _oracle_rows_to_jsonable(cur)
+
+        return JsonResponse(
+            {'status': 'ok', 'count': len(items), 'columns': items},
+            json_dumps_params={'ensure_ascii': False, 'indent': 2}
+        )
+
+    except Exception as e:
+        logger.exception("[SM/STAFF_COLUMNS] Unexpected error")
+        return JsonResponse(
+            {'status': 'error', 'message': str(e)},
+            status=500,
+            json_dumps_params={'ensure_ascii': False}
+        )
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        
+        
+        
+@csrf_exempt
+def sm_sql(request):
+    """
+    POST /sm/sql/
+
+    ВХОД (JSON):
+    {
+      "sql": "select ...",
+      "binds": {"p1": "val", ...}   # опционально
+    }
+
+    Ограничения:
+      • Разрешены только SELECT/WITH (без insert/update/delete/alter и т.п.).
+    """
+    if request.method != 'POST':
+        return JsonResponse(
+            {'status': 'error', 'message': 'Только POST'},
+            status=405,
+            json_dumps_params={'ensure_ascii': False}
+        )
+
+    raw_body = ""
+    try:
+        raw_body = request.body.decode('utf-8') if request.body else "{}"
+        data = json.loads(raw_body)
+    except Exception as e:
+        logger.error(f"[SM/SQL] JSON parse error: {e}; body={raw_body!r}")
+        return JsonResponse(
+            {'status': 'error', 'message': 'Некорректный JSON'},
+            status=400,
+            json_dumps_params={'ensure_ascii': False}
+        )
+
+    sql = (data.get('sql') or '').strip()
+    binds = data.get('binds') or {}
+
+    if not sql:
+        return JsonResponse(
+            {'status': 'error', 'message': 'Пустой sql'},
+            status=400,
+            json_dumps_params={'ensure_ascii': False}
+        )
+
+    sql_lower = sql.lower().lstrip()
+    if not (sql_lower.startswith('select') or sql_lower.startswith('with')):
+        return JsonResponse(
+            {'status': 'error', 'message': 'Разрешены только SELECT/WITH запросы'},
+            status=400,
+            json_dumps_params={'ensure_ascii': False}
+        )
+
+    conn = cur = None
+    try:
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+        cur.execute(sql, binds)
+        items = _oracle_rows_to_jsonable(cur)
+
+        return JsonResponse(
+            {
+                'status': 'ok',
+                'count': len(items),
+                'items': items,
+            },
+            json_dumps_params={'ensure_ascii': False, 'indent': 2}
+        )
+
+    except Exception as e:
+        logger.exception("[SM/SQL] Unexpected error")
+        return JsonResponse(
+            {'status': 'error', 'message': str(e)},
+            status=500,
+            json_dumps_params={'ensure_ascii': False}
+        )
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
 
 
 
