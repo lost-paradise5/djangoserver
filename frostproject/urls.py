@@ -33,6 +33,9 @@ from frostapp.views import (
     agent_auth_start,
     agent_auth_select_store,
     agent_auth_verify_pin,
+    sm_staff_list,
+    sm_staff_columns,
+    sm_sql,
 )
 
 urlpatterns = [
@@ -55,4 +58,7 @@ urlpatterns = [
     path('agent/auth/start/', agent_auth_start, name='agent_auth_start'),
     path('agent/auth/select_store/', agent_auth_select_store, name='agent_auth_select_store'),
     path('agent/auth/verify_pin/', agent_auth_verify_pin, name='agent_auth_verify_pin'),
+    path('sm/staff/', sm_staff_list, name='sm_staff_list'),
+    path('sm/staff/columns/', sm_staff_columns, name='sm_staff_columns'),
+    path('sm/sql/', sm_sql, name='sm_sql'),
 ]
