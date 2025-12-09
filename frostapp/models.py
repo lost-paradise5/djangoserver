@@ -192,3 +192,40 @@ class AuthSession(models.Model):
     class Meta:
         db_table = 'auth_sessions'
         managed = False 
+
+
+
+
+class QRIssueLog(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    created_at = models.DateTimeField(blank=True, null=True)
+
+    endpoint = models.CharField(max_length=64)   
+    method   = models.CharField(max_length=32)    
+    status   = models.CharField(max_length=16)   
+
+    user = models.ForeignKey(
+        'User',
+        models.DO_NOTHING,
+        db_column='user_id',
+        blank=True,
+        null=True,
+    )
+    employee_inn = models.CharField(max_length=20, blank=True, null=True)
+    employee_fio = models.TextField(blank=True, null=True)
+    tg_id        = models.CharField(max_length=32, blank=True, null=True)
+
+    phone_raw        = models.CharField(max_length=32, blank=True, null=True)
+    phone_normalized = models.CharField(max_length=32, blank=True, null=True)
+
+    sm_store_id  = models.IntegerField(blank=True, null=True)
+    ukm_store_id = models.IntegerField(blank=True, null=True)
+    role_id      = models.IntegerField(blank=True, null=True)
+
+    qr_data       = models.TextField(blank=True, null=True)
+    error_message = models.TextField(blank=True, null=True)
+    raw_request   = models.JSONField(blank=True, null=True)
+
+    class Meta:
+        managed = False        
+        db_table = 'qr_issue_logs'
