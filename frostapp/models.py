@@ -198,11 +198,11 @@ class AuthSession(models.Model):
 
 class QRIssueLog(models.Model):
     id = models.BigAutoField(primary_key=True)
-    created_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
-    endpoint = models.CharField(max_length=64)   
-    method   = models.CharField(max_length=32)    
-    status   = models.CharField(max_length=16)   
+    endpoint = models.CharField(max_length=64)
+    method   = models.CharField(max_length=32)
+    status   = models.CharField(max_length=16)
 
     user = models.ForeignKey(
         'User',
@@ -227,5 +227,5 @@ class QRIssueLog(models.Model):
     raw_request   = models.JSONField(blank=True, null=True)
 
     class Meta:
-        managed = False        
+        managed = False
         db_table = 'qr_issue_logs'
