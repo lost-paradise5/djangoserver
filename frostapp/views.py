@@ -20,7 +20,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
 
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog
 
 _HEX = set("0123456789abcdefABCDEF")
 UKM5_FULL_XML_STORE_ID = 2013
@@ -216,6 +216,49 @@ def send_telegram_log(message: str) -> None:
     except Exception as e:
         logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)
         
+        
+def log_qr_issue(
+    *,
+    endpoint: str,
+    method: str,
+    status: str,
+    user: Optional[User] = None,
+    employee_inn: str = "",
+    employee_fio: str = "",
+    tg_id: str = "",
+    phone_raw: str = "",
+    phone_normalized: str = "",
+    sm_store_id: Optional[int] = None,
+    ukm_store_id: Optional[int] = None,
+    role_id: Optional[int] = None,
+    qr_data: str = "",
+    error_message: str = "",
+    raw_request: Optional[dict] = None,
+) -> None:
+    """
+    Запись отдельной строки в qr_issue_logs.
+    Никакие ошибки наружу не выкидывает.
+    """
+    try:
+        QRIssueLog.objects.create(
+            endpoint=endpoint,
+            method=method,
+            status=status,
+            user=user,
+            employee_inn=employee_inn or "",
+            employee_fio=employee_fio or "",
+            tg_id=(tg_id or "")[:32],
+            phone_raw=(phone_raw or "")[:32],
+            phone_normalized=(phone_normalized or "")[:32],
+            sm_store_id=sm_store_id,
+            ukm_store_id=ukm_store_id,
+            role_id=role_id,
+            qr_data=qr_data or "",
+            error_message=error_message or "",
+            raw_request=raw_request if isinstance(raw_request, dict) else None,
+        )
+    except Exception as e:
+        logger.error(f"[QR/DBLOG] Ошибка записи в qr_issue_logs: {e}", exc_info=True)
         
 def send_telegram_to_user(user, message: str) -> bool:
     """
@@ -2742,6 +2785,21 @@ def get_qr_code_by_tg(request):
                 ])
             send_telegram_log("\n".join(lines))
 
+            try:
+                log_qr_issue(
+                    endpoint='get_qr_code_by_tg',
+                    method='BY_TG',
+                    status='error',
+                    user=None,
+                    employee_inn=inn or "",
+                    employee_fio=fio or "",
+                    tg_id=tg_id or "",
+                    error_message=f"{stage}: {human_msg}",
+                    raw_request={"raw_body": raw_body} if raw_body else None,
+                )
+            except Exception:
+                pass
+
         # 0) Парсим JSON
         try:
             data = json.loads(data_raw)
@@ -2913,6 +2971,35 @@ def get_qr_code_by_tg(request):
             f"  • Новый QR-код (строка): {new_password}",
         ]
         send_telegram_log("\n".join(msg_lines))
+        try:
+            try:
+                raw_request = json.loads(data_raw) if data_raw else None
+            except Exception:
+                raw_request = {"raw_body": data_raw}
+
+            for link in ukm_links:
+                sid = int(link['storeid'])
+                role_id = int(link['roleid'])
+
+                log_qr_issue(
+                    endpoint='get_qr_code_by_tg',
+                    method='BY_TG',
+                    status='ok',
+                    user=user,
+                    employee_inn=plain_inn,
+                    employee_fio=fio,
+                    tg_id=tg_id,
+                    phone_raw=user.phone or "",
+                    phone_normalized=user.phone or "",
+                    sm_store_id=None,         
+                    ukm_store_id=sid,
+                    role_id=role_id,
+                    qr_data=new_password,
+                    error_message="",
+                    raw_request=raw_request,
+                )
+        except Exception:
+            pass
 
         logger.info(f"[QR/TG] === DONE === Returning password (masked): {masked}")
         return JsonResponse({'status': 'ok', 'qr_data': new_password})
@@ -2983,6 +3070,38 @@ def get_qr_code_by_employee_id(request):
                 short_body = body if len(body) <= 1000 else body[:1000] + "…"
                 lines.extend(["", "📦 Сырой JSON-запрос:", short_body])
             send_telegram_log("\n".join(lines))
+            try:
+                sm_id = None
+                if smstore_raw and str(smstore_raw).isdigit():
+                    sm_id = int(smstore_raw)
+
+                ukm_id = None
+                if isinstance(ukm4, int):
+                    ukm_id = ukm4
+
+                role_id_int = None
+                if str(role_raw).isdigit():
+                    role_id_int = int(role_raw)
+
+                log_qr_issue(
+                    endpoint='get_qr_code_by_employee_id',
+                    method='BY_INN',
+                    status='error',
+                    user=None,
+                    employee_inn=inn_raw or "",
+                    employee_fio=fio_raw or "",
+                    tg_id="",
+                    phone_raw=phone_raw or "",
+                    phone_normalized="",
+                    sm_store_id=sm_id,
+                    ukm_store_id=ukm_id,
+                    role_id=role_id_int,
+                    qr_data="",
+                    error_message=f"{stage}: {human_msg}",
+                    raw_request={"raw_body": body} if body else None,
+                )
+            except Exception:
+                pass
 
         try:
             data = json.loads(body)
@@ -3331,6 +3450,39 @@ def get_qr_code_by_employee_id(request):
         )
 
         send_telegram_log("\n".join(msg_lines))
+        try:
+            try:
+                raw_request = json.loads(body) if body else None
+            except Exception:
+                raw_request = {"raw_body": body}
+
+    
+            for link in ukm_links_all:
+                store_id = int(link['storeid'])         
+                role_for_store = int(link['roleid'])
+
+                info = stores_map.get(store_id)
+                sm_id = info['smstore'] if info else None
+
+                log_qr_issue(
+                    endpoint='get_qr_code_by_employee_id',
+                    method='BY_INN',
+                    status='ok',
+                    user=user,
+                    employee_inn=plain_inn,
+                    employee_fio=fio,
+                    tg_id=user.tg_id or "",
+                    phone_raw=phone_raw,
+                    phone_normalized=phone_norm or "",
+                    sm_store_id=sm_id,
+                    ukm_store_id=store_id,
+                    role_id=role_for_store,
+                    qr_data=new_password,
+                    error_message="",
+                    raw_request=raw_request,
+                )
+        except Exception:
+            pass
 
         return JsonResponse({'status': 'ok', 'qr_data': new_password})
 
@@ -3609,171 +3761,548 @@ def delete_cashier(request):
 def employee_identification(request):
     """
     POST /employee-identification/
-    Тело:
+
+    ВХОД (JSON, пример):
     {
-      "inn": "1234567890",          # 10/12 цифр
+      "inn": "7536207278",
       "fio": "Иванов Иван Иванович",
-      "mx": "137",                  # id магазина, строкой
-      "datetime": "24.09.2025 8:45:00"
+      "storeId": 514,        # SMSTORE (Supermag)
+      "roleId": 1,
+      "phone": "8 (924) 000-00-00",
+      "datetime": "24.09.2025 8:45:00",
+      "direction": "IN"      # или "OUT" / "ENTER" / "EXIT" и т.п.
     }
 
-    Никаких записей в БД. Только валидация, нормализация и отправка в 1С.
-    Все ключевые ошибки и результат отправки логируются в Telegram (ADMIN_CHAT).
+    Логика:
+      1) Валидация/нормализация входных данных.
+      2) Подготовка payload для 1С и отправка через _post_to_onec().
+      3) На любой ошибке:
+         • красивый лог в Telegram
+         • запись в qr_issue_logs со статусом 'error'.
+      4) На успехе:
+         • красивый лог в Telegram
+         • запись в qr_issue_logs со статусом 'ok'.
     """
     if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
-
-    body = ""
-    try:
-        body = request.body.decode('utf-8') if request.body else "{}"
-
-        # Telegram-хелпер для ошибок
-        def _tg_error(stage: str,
-                     human_msg: str,
-                     inn_raw: str = "",
-                     fio_raw: str = "",
-                     mx_raw: str = "",
-                     dt_raw: str = "",
-                     raw_body: str = "") -> None:
-            lines = [
-                "❌ Ошибка при отправке идентификации сотрудника в 1С",
-                f"🔁 Этап: {stage}",
-                f"ℹ️ Причина: {human_msg}",
-                "",
-                "📨 Контекст запроса:",
-                f"  • ИНН (сырое значение): {inn_raw or '—'}",
-                f"  • ФИО (сырое значение): {fio_raw or '—'}",
-                f"  • MX (код магазина, сырое): {mx_raw or '—'}",
-                f"  • Datetime (сырое значение): {dt_raw or '—'}",
-            ]
-            if raw_body:
-                short_body = raw_body if len(raw_body) <= 1000 else raw_body[:1000] + "…"
-                lines.extend(["", "📦 Сырой JSON-запрос:", short_body])
-            send_telegram_log("\n".join(lines))
-
-        # парсинг JSON
-        try:
-            data = json.loads(body)
-        except Exception as e:
-            logger.error(f"[EMP_IDENT] JSON parse error: {e}; body={body!r}")
-            _tg_error("Парсинг JSON", f"Некорректный JSON: {e}", raw_body=body)
-            return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
-
-        inn_raw = (data.get("inn") or "").strip()
-        fio_raw = (data.get("fio") or "").strip()
-        mx_raw  = (data.get("mx")  or data.get("storeid") or "").strip()
-        dt_raw  = (data.get("datetime") or data.get("Datetime") or "").strip()
-
-        # валидации/нормализация (без записи в БД) 
-
-        # ИНН
-        try:
-            inn_plain = ensure_plain_inn(inn_raw)
-        except Exception as e:
-            msg = f"Некорректный ИНН: {e}"
-            logger.error(f"[EMP_IDENT] {msg}")
-            _tg_error("Валидация ИНН", msg,
-                      inn_raw=inn_raw, fio_raw=fio_raw,
-                      mx_raw=mx_raw, dt_raw=dt_raw,
-                      raw_body=body)
-            return JsonResponse({'status': 'error', 'message': msg}, status=400)
-
-        # ФИО
-        if not fio_raw:
-            msg = "Пустой FIO"
-            logger.error(f"[EMP_IDENT] {msg}")
-            _tg_error("Валидация входных данных", msg,
-                      inn_raw=inn_plain, fio_raw=fio_raw,
-                      mx_raw=mx_raw, dt_raw=dt_raw,
-                      raw_body=body)
-            return JsonResponse({'status': 'error', 'message': msg}, status=400)
-
-        # MX
-        if not mx_raw:
-            msg = "Пустой MX (id магазина)"
-            logger.error(f"[EMP_IDENT] {msg}")
-            _tg_error("Валидация входных данных", msg,
-                      inn_raw=inn_plain, fio_raw=fio_raw,
-                      mx_raw=mx_raw, dt_raw=dt_raw,
-                      raw_body=body)
-            return JsonResponse({'status': 'error', 'message': msg}, status=400)
-
-        # Datetime
-        try:
-            dt_norm = _parse_and_format_dt(dt_raw) 
-        except Exception as e:
-            msg = f"Некорректная дата/время: {e}"
-            logger.error(f"[EMP_IDENT] {msg}")
-            _tg_error("Валидация даты/времени", msg,
-                      inn_raw=inn_plain, fio_raw=fio_raw,
-                      mx_raw=mx_raw, dt_raw=dt_raw,
-                      raw_body=body)
-            return JsonResponse({'status': 'error', 'message': msg}, status=400)
-
-        onec_payload = {
-            "INN": inn_plain,
-            "FIO": fio_raw,
-            "MX": str(mx_raw),
-            "Datetime": dt_norm,
-        }
-        idem_key = hashlib.sha256(
-            f"{inn_plain}|{fio_raw}|{mx_raw}|{dt_norm}".encode("utf-8")
-        ).hexdigest()
-
-        # запрос в 1С
-        try:
-            status_code, text = _post_to_onec(onec_payload, idem_key)
-        except Exception as e:
-            logger.exception("[EMP_IDENT] Ошибка запроса в 1С")
-            _tg_error("HTTP-запрос в 1С", f"Ошибка запроса в 1С: {e}",
-                      inn_raw=inn_plain, fio_raw=fio_raw,
-                      mx_raw=mx_raw, dt_raw=dt_norm,
-                      raw_body=body)
-            return JsonResponse({'status': 'error', 'message': str(e)}, status=502)
-
-        ok = 200 <= status_code < 300
-        logger.info(f"[1C] POST {ONEC_EMP_IDENT_URL} → {status_code}; payload={onec_payload}")
-
-        short_text = text if len(text) <= 1000 else text[:1000] + "…"
-        header = (
-            "✅ Идентификация сотрудника успешно отправлена в 1С"
-            if ok
-            else "⚠️ 1С вернула ошибку при обработке идентификации сотрудника"
+        return JsonResponse(
+            {'status': 'error', 'message': 'Только POST'},
+            status=405
         )
 
-        msg_lines = [
-            header,
+    raw_body = request.body.decode('utf-8') if request.body else "{}"
+
+    def _log_and_return_error(
+        http_status: int,
+        stage: str,
+        human_msg: str,
+        *,
+        inn_raw: str = "",
+        fio_raw: str = "",
+        smstore_raw: str = "",
+        ukm_store_id: int | None = None,
+        role_raw: str = "",
+        phone_raw: str = "",
+    ) -> JsonResponse:
+        """
+        Общий обработчик ошибок:
+          • шлёт подробный лог в Telegram
+          • пишет строку в qr_issue_logs со статусом 'error'
+          • возвращает JsonResponse с текстом ошибки
+        """
+        # красивый лог в ТГ
+        lines = [
+            "❌ Ошибка при employee_identification",
+            f"🔁 Этап: {stage}",
+            f"ℹ️ Причина: {human_msg}",
             "",
-            "👤 Сотрудник:",
-            f"  • ИНН: {inn_plain}",
-            f"  • ФИО: {fio_raw}",
-            "",
-            "🏬 Магазин и время:",
-            f"  • MX (код магазина): {mx_raw}",
-            f"  • Время (нормализованное): {dt_norm}",
-            "",
-            "📥 Ответ 1С:",
-            f"  • status_code: {status_code}",
-            f"  • body: {short_text}",
+            "📨 Контекст запроса:",
+            f"  • ИНН (сырое): {inn_raw or '—'}",
+            f"  • ФИО (сырое): {fio_raw or '—'}",
+            f"  • storeId (SMSTORE, сырое): {smstore_raw or '—'}",
+            f"  • roleId (сырое): {role_raw or '—'}",
+            f"  • Телефон (сырое): {phone_raw or '—'}",
         ]
-        send_telegram_log("\n".join(msg_lines))
+        if ukm_store_id is not None:
+            lines.append(f"  • ukm4store: {ukm_store_id}")
+        if raw_body:
+            short_body = raw_body if len(raw_body) <= 1000 else raw_body[:1000] + "…"
+            lines.extend(["", "📦 Сырой JSON-запрос:", short_body])
 
-        return JsonResponse({
-            "status": "ok" if ok else "error",
-            "onec_status_code": status_code,
-            "onec_response": text,
-            "payload": onec_payload
-        }, status=200 if ok else 502)
+        send_telegram_log("\n".join(lines))
 
-    except Exception as e:
-        logger.exception("employee_identification error")
+        # подготовка полей для записи в qr_issue_logs
         try:
-            send_telegram_log(
-                "💥 Критическая ошибка при обработке запроса идентификации сотрудника в 1С\n"
-                f"{e}\n\n"
-                "📦 Сырой JSON-запрос:\n"
-                f"{body}"
+            sm_id_int = int(smstore_raw) if str(smstore_raw).isdigit() else None
+        except Exception:
+            sm_id_int = None
+
+        try:
+            role_int = int(role_raw) if str(role_raw).isdigit() else None
+        except Exception:
+            role_int = None
+
+        phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
+
+        try:
+            log_qr_issue(
+                endpoint='employee_identification',
+                method='EMP_IDENT',
+                status='error',
+                user=None,
+                employee_inn=inn_raw or "",
+                employee_fio=fio_raw or "",
+                tg_id="",
+                phone_raw=phone_raw or "",
+                phone_normalized=phone_norm or "",
+                sm_store_id=sm_id_int,
+                ukm_store_id=ukm_store_id,
+                role_id=role_int,
+                qr_data="",
+                error_message=f"{stage}: {human_msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
             )
         except Exception:
-            pass
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+            # падать тут нельзя
+            logger.exception("[EMP_IDENT] Ошибка при записи в qr_issue_logs")
+
+        return JsonResponse(
+            {'status': 'error', 'message': human_msg},
+            status=http_status
+        )
+
+    # --- 1. Парсинг JSON ---
+    try:
+        data = json.loads(raw_body)
+    except Exception as e:
+        logger.error(f"[EMP_IDENT] JSON parse error: {e}; body={raw_body!r}")
+        return _log_and_return_error(
+            400,
+            "Парсинг JSON",
+            f"Некорректный JSON: {e}",
+        )
+
+    # --- 2. Вытаскиваем поля из запроса ---
+    inn_raw   = (data.get('inn') or data.get('employee_id') or "").strip()
+    fio_raw   = (data.get('fio') or data.get('FIO') or "").strip()
+    smstore_raw = str(data.get('storeId') or data.get('smstore') or "").strip()
+    role_raw  = str(data.get('roleId') or data.get('roleid') or "").strip()
+    phone_raw = (data.get('phone') or "").strip()
+    dt_raw    = (data.get('datetime') or data.get('event_datetime') or "").strip()
+    direction = str(data.get('direction') or data.get('event') or "").strip()
+
+    logger.info(
+        f"[EMP_IDENT] START: inn={inn_raw!r}, fio={fio_raw!r}, "
+        f"storeId(smstore)={smstore_raw!r}, roleId={role_raw!r}, "
+        f"phone={phone_raw!r}, datetime={dt_raw!r}, direction={direction!r}"
+    )
+
+    # --- 3. Базовая валидация входных полей ---
+    if not inn_raw:
+        return _log_and_return_error(
+            400,
+            "Валидация входных данных",
+            "Не указан ИНН",
+            inn_raw=inn_raw,
+            fio_raw=fio_raw,
+            smstore_raw=smstore_raw,
+            role_raw=role_raw,
+            phone_raw=phone_raw,
+        )
+
+    try:
+        plain_inn = ensure_plain_inn(inn_raw)
+    except Exception as e:
+        logger.error(f"[EMP_IDENT] Bad INN: {e}")
+        return _log_and_return_error(
+            400,
+            "Валидация ИНН",
+            f"Некорректный ИНН: {e}",
+            inn_raw=inn_raw,
+            fio_raw=fio_raw,
+            smstore_raw=smstore_raw,
+            role_raw=role_raw,
+            phone_raw=phone_raw,
+        )
+
+    if not fio_raw:
+        return _log_and_return_error(
+            400,
+            "Валидация входных данных",
+            "Не указано ФИО",
+            inn_raw=plain_inn,
+            fio_raw=fio_raw,
+            smstore_raw=smstore_raw,
+            role_raw=role_raw,
+            phone_raw=phone_raw,
+        )
+    fio = " ".join(fio_raw.split())
+
+    if not smstore_raw:
+        return _log_and_return_error(
+            400,
+            "Валидация входных данных",
+            "Не указан storeId (smstore)",
+            inn_raw=plain_inn,
+            fio_raw=fio,
+            smstore_raw=smstore_raw,
+            role_raw=role_raw,
+            phone_raw=phone_raw,
+        )
+    try:
+        sm_store_id = int(smstore_raw)
+    except ValueError:
+        return _log_and_return_error(
+            400,
+            "Валидация входных данных",
+            "storeId (smstore) должен быть числом",
+            inn_raw=plain_inn,
+            fio_raw=fio,
+            smstore_raw=smstore_raw,
+            role_raw=role_raw,
+            phone_raw=phone_raw,
+        )
+
+    if not role_raw:
+        return _log_and_return_error(
+            400,
+            "Валидация входных данных",
+            "Не указан roleId",
+            inn_raw=plain_inn,
+            fio_raw=fio,
+            smstore_raw=str(sm_store_id),
+            role_raw=role_raw,
+            phone_raw=phone_raw,
+        )
+    try:
+        role_id = int(role_raw)
+    except ValueError:
+        return _log_and_return_error(
+            400,
+            "Валидация входных данных",
+            "roleId должен быть числом",
+            inn_raw=plain_inn,
+            fio_raw=fio,
+            smstore_raw=str(sm_store_id),
+            role_raw=role_raw,
+            phone_raw=phone_raw,
+        )
+
+    # Нормализация телефона (если есть)
+    phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
+
+    # Маппинг SMSTORE → ukm4store, чтобы записать его в лог
+    store_obj = Store.objects.filter(smstore=sm_store_id).first()
+    ukm_store_id = None
+    if store_obj and store_obj.ukm4store is not None:
+        try:
+            ukm_store_id = int(store_obj.ukm4store)
+        except (TypeError, ValueError):
+            ukm_store_id = None
+
+    # Парсим дату/время события (если нужно слать в 1С красивым форматом)
+    event_dt_str = None
+    if dt_raw:
+        try:
+            event_dt_str = _parse_and_format_dt(dt_raw)
+        except Exception as e:
+            return _log_and_return_error(
+                400,
+                "Валидация даты/времени",
+                f"Некорректная дата/время: {e}",
+                inn_raw=plain_inn,
+                fio_raw=fio,
+                smstore_raw=str(sm_store_id),
+                ukm_store_id=ukm_store_id,
+                role_raw=str(role_id),
+                phone_raw=phone_raw,
+            )
+
+    # Пытаемся найти пользователя в PG, чтобы связать запись
+    user_obj = User.objects.filter(employee_id=plain_inn).first()
+
+    # --- 4. Собираем payload для 1С ---
+    onec_payload = {
+        # уникальный идентификатор сотрудника (20-символный хэш ИНН)
+        "EmployeeID": encrypt_inn20(plain_inn),
+        "INN": plain_inn,
+        "FIO": fio,
+        "StoreId": sm_store_id,
+        "StoreName": store_obj.name if store_obj else "",
+        "RoleId": role_id,
+        "Phone": phone_norm or phone_raw,
+        "Direction": direction,
+    }
+    if event_dt_str:
+        onec_payload["EventDatetime"] = event_dt_str
+
+    # Идемпотентный ключ для 1С (чтобы не задвоить запись, если агент пошлёт повтор)
+    idem_key = f"empident-{plain_inn}-{sm_store_id}-{event_dt_str or ''}-{direction or ''}"
+
+    # --- 5. Отправка в 1С ---
+    try:
+        status_1c, text_1c = _post_to_onec(onec_payload, idem_key=idem_key)
+    except Exception as e:
+        logger.exception(f"[EMP_IDENT] Ошибка запроса в 1С: {e}")
+        return _log_and_return_error(
+            500,
+            "Запрос в 1С",
+            f"Ошибка запроса в 1С: {e}",
+            inn_raw=plain_inn,
+            fio_raw=fio,
+            smstore_raw=str(sm_store_id),
+            ukm_store_id=ukm_store_id,
+            role_raw=str(role_id),
+            phone_raw=phone_raw,
+        )
+
+    # --- 6. Анализ ответа 1С и логирование ---
+    ok_1c = (200 <= status_1c < 300)
+
+    # Лог в Telegram (в любом случае)
+    resp_short = text_1c if len(text_1c) <= 1000 else text_1c[:1000] + "…"
+    tg_lines = [
+        "📡 Результат employee_identification → 1С",
+        "",
+        "👤 Сотрудник:",
+        f"  • ФИО: {fio}",
+        f"  • ИНН: {plain_inn}",
+        f"  • user_id (PostgreSQL): {user_obj.id if user_obj else '—'}",
+        "",
+        "🏬 Магазин:",
+        f"  • storeId (SMSTORE): {sm_store_id}",
+        f"  • ukm4store: {ukm_store_id if ukm_store_id is not None else '—'}",
+        f"  • Name: {store_obj.name if store_obj else '—'}",
+        "",
+        "⚙️ Параметры события:",
+        f"  • direction: {direction or '—'}",
+        f"  • datetime: {event_dt_str or dt_raw or '—'}",
+        "",
+        "📲 Телефон:",
+        f"  • raw: {phone_raw or '—'}",
+        f"  • normalized: {phone_norm or '—'}",
+        "",
+        "🔗 1С:",
+        f"  • HTTP статус: {status_1c}",
+        f"  • Тело (обрезано): {resp_short}",
+    ]
+    send_telegram_log("\n".join(tg_lines))
+
+    # Запись в qr_issue_logs
+    try:
+        log_qr_issue(
+            endpoint='employee_identification',
+            method=direction or 'EMP_IDENT',
+            status='ok' if ok_1c else 'error',
+            user=user_obj,
+            employee_inn=plain_inn,
+            employee_fio=fio,
+            tg_id=user_obj.tg_id if user_obj and user_obj.tg_id else "",
+            phone_raw=phone_raw or "",
+            phone_normalized=phone_norm or "",
+            sm_store_id=sm_store_id,
+            ukm_store_id=ukm_store_id,
+            role_id=role_id,
+            qr_data="",  # тут нет генерации QR, просто фиксируем факт идентификации
+            error_message="" if ok_1c else f"1С вернула статус {status_1c}",
+            raw_request={
+                "request": data,
+                "onec_payload": onec_payload,
+                "onec_status": status_1c,
+                "onec_response": text_1c,
+            },
+        )
+    except Exception:
+        logger.exception("[EMP_IDENT] Ошибка при записи успеха/ошибки в qr_issue_logs")
+
+    # --- 7. Ответ клиенту ---
+    if not ok_1c:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'message': f'1С ответила со статусом {status_1c}',
+                'onec_status': status_1c,
+                'onec_body': text_1c,
+            },
+            status=500
+        )
+
+    return JsonResponse(
+        {
+            'status': 'ok',
+            'onec_status': status_1c,
+            'onec_body': text_1c,
+        }
+    )
+    
+# @csrf_exempt
+# def employee_identification(request):
+#     """
+#     POST /employee-identification/
+#     Тело:
+#     {
+#       "inn": "1234567890",          # 10/12 цифр
+#       "fio": "Иванов Иван Иванович",
+#       "mx": "137",                  # id магазина, строкой
+#       "datetime": "24.09.2025 8:45:00"
+#     }
+
+#     Никаких записей в БД. Только валидация, нормализация и отправка в 1С.
+#     Все ключевые ошибки и результат отправки логируются в Telegram (ADMIN_CHAT).
+#     """
+#     if request.method != 'POST':
+#         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+#     body = ""
+#     try:
+#         body = request.body.decode('utf-8') if request.body else "{}"
+
+#         # Telegram-хелпер для ошибок
+#         def _tg_error(stage: str,
+#                      human_msg: str,
+#                      inn_raw: str = "",
+#                      fio_raw: str = "",
+#                      mx_raw: str = "",
+#                      dt_raw: str = "",
+#                      raw_body: str = "") -> None:
+#             lines = [
+#                 "❌ Ошибка при отправке идентификации сотрудника в 1С",
+#                 f"🔁 Этап: {stage}",
+#                 f"ℹ️ Причина: {human_msg}",
+#                 "",
+#                 "📨 Контекст запроса:",
+#                 f"  • ИНН (сырое значение): {inn_raw or '—'}",
+#                 f"  • ФИО (сырое значение): {fio_raw or '—'}",
+#                 f"  • MX (код магазина, сырое): {mx_raw or '—'}",
+#                 f"  • Datetime (сырое значение): {dt_raw or '—'}",
+#             ]
+#             if raw_body:
+#                 short_body = raw_body if len(raw_body) <= 1000 else raw_body[:1000] + "…"
+#                 lines.extend(["", "📦 Сырой JSON-запрос:", short_body])
+#             send_telegram_log("\n".join(lines))
+
+#         # парсинг JSON
+#         try:
+#             data = json.loads(body)
+#         except Exception as e:
+#             logger.error(f"[EMP_IDENT] JSON parse error: {e}; body={body!r}")
+#             _tg_error("Парсинг JSON", f"Некорректный JSON: {e}", raw_body=body)
+#             return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
+
+#         inn_raw = (data.get("inn") or "").strip()
+#         fio_raw = (data.get("fio") or "").strip()
+#         mx_raw  = (data.get("mx")  or data.get("storeid") or "").strip()
+#         dt_raw  = (data.get("datetime") or data.get("Datetime") or "").strip()
+
+#         # валидации/нормализация (без записи в БД) 
+
+#         # ИНН
+#         try:
+#             inn_plain = ensure_plain_inn(inn_raw)
+#         except Exception as e:
+#             msg = f"Некорректный ИНН: {e}"
+#             logger.error(f"[EMP_IDENT] {msg}")
+#             _tg_error("Валидация ИНН", msg,
+#                       inn_raw=inn_raw, fio_raw=fio_raw,
+#                       mx_raw=mx_raw, dt_raw=dt_raw,
+#                       raw_body=body)
+#             return JsonResponse({'status': 'error', 'message': msg}, status=400)
+
+#         # ФИО
+#         if not fio_raw:
+#             msg = "Пустой FIO"
+#             logger.error(f"[EMP_IDENT] {msg}")
+#             _tg_error("Валидация входных данных", msg,
+#                       inn_raw=inn_plain, fio_raw=fio_raw,
+#                       mx_raw=mx_raw, dt_raw=dt_raw,
+#                       raw_body=body)
+#             return JsonResponse({'status': 'error', 'message': msg}, status=400)
+
+#         # MX
+#         if not mx_raw:
+#             msg = "Пустой MX (id магазина)"
+#             logger.error(f"[EMP_IDENT] {msg}")
+#             _tg_error("Валидация входных данных", msg,
+#                       inn_raw=inn_plain, fio_raw=fio_raw,
+#                       mx_raw=mx_raw, dt_raw=dt_raw,
+#                       raw_body=body)
+#             return JsonResponse({'status': 'error', 'message': msg}, status=400)
+
+#         # Datetime
+#         try:
+#             dt_norm = _parse_and_format_dt(dt_raw) 
+#         except Exception as e:
+#             msg = f"Некорректная дата/время: {e}"
+#             logger.error(f"[EMP_IDENT] {msg}")
+#             _tg_error("Валидация даты/времени", msg,
+#                       inn_raw=inn_plain, fio_raw=fio_raw,
+#                       mx_raw=mx_raw, dt_raw=dt_raw,
+#                       raw_body=body)
+#             return JsonResponse({'status': 'error', 'message': msg}, status=400)
+
+#         onec_payload = {
+#             "INN": inn_plain,
+#             "FIO": fio_raw,
+#             "MX": str(mx_raw),
+#             "Datetime": dt_norm,
+#         }
+#         idem_key = hashlib.sha256(
+#             f"{inn_plain}|{fio_raw}|{mx_raw}|{dt_norm}".encode("utf-8")
+#         ).hexdigest()
+
+#         # запрос в 1С
+#         try:
+#             status_code, text = _post_to_onec(onec_payload, idem_key)
+#         except Exception as e:
+#             logger.exception("[EMP_IDENT] Ошибка запроса в 1С")
+#             _tg_error("HTTP-запрос в 1С", f"Ошибка запроса в 1С: {e}",
+#                       inn_raw=inn_plain, fio_raw=fio_raw,
+#                       mx_raw=mx_raw, dt_raw=dt_norm,
+#                       raw_body=body)
+#             return JsonResponse({'status': 'error', 'message': str(e)}, status=502)
+
+#         ok = 200 <= status_code < 300
+#         logger.info(f"[1C] POST {ONEC_EMP_IDENT_URL} → {status_code}; payload={onec_payload}")
+
+#         short_text = text if len(text) <= 1000 else text[:1000] + "…"
+#         header = (
+#             "✅ Идентификация сотрудника успешно отправлена в 1С"
+#             if ok
+#             else "⚠️ 1С вернула ошибку при обработке идентификации сотрудника"
+#         )
+
+#         msg_lines = [
+#             header,
+#             "",
+#             "👤 Сотрудник:",
+#             f"  • ИНН: {inn_plain}",
+#             f"  • ФИО: {fio_raw}",
+#             "",
+#             "🏬 Магазин и время:",
+#             f"  • MX (код магазина): {mx_raw}",
+#             f"  • Время (нормализованное): {dt_norm}",
+#             "",
+#             "📥 Ответ 1С:",
+#             f"  • status_code: {status_code}",
+#             f"  • body: {short_text}",
+#         ]
+#         send_telegram_log("\n".join(msg_lines))
+
+#         return JsonResponse({
+#             "status": "ok" if ok else "error",
+#             "onec_status_code": status_code,
+#             "onec_response": text,
+#             "payload": onec_payload
+#         }, status=200 if ok else 502)
+
+#     except Exception as e:
+#         logger.exception("employee_identification error")
+#         try:
+#             send_telegram_log(
+#                 "💥 Критическая ошибка при обработке запроса идентификации сотрудника в 1С\n"
+#                 f"{e}\n\n"
+#                 "📦 Сырой JSON-запрос:\n"
+#                 f"{body}"
+#             )
+#         except Exception:
+#             pass
+#         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
