@@ -3762,20 +3762,21 @@ def employee_identification(request):
     """
     POST /employee-identification/
 
-    ВХОД (JSON, пример):
+    ВХОД (JSON, совместим со старой версией):
     {
       "inn": "7536207278",              # или "employee_id"
       "fio": "Иванов Иван Иванович",    # или "FIO"
       "storeId": 514,                   # или "smstore" или старый "mx"
-      "roleId": 1,                      # или "roleid"
-      "phone": "8 (924) 000-00-00",
       "datetime": "24.09.2025 8:45:00", # или "Datetime" или "event_datetime"
+      // необязательные:
+      "phone": "8 (924) 000-00-00",
       "direction": "IN"                 # или "OUT" / "ENTER" / "EXIT" / "event"
+      // "roleId" / "roleid" — можно не передавать, оно тут не нужно
     }
 
     Логика:
-      1) Валидация/нормализация входных данных.
-      2) Подготовка payload для 1С *в старом формате* (INN/FIO/MX/Datetime).
+      1) Валидация/нормализация входных данных (как в старой версии).
+      2) Подготовка payload для 1С в старом формате: INN/FIO/MX/Datetime.
       3) На любой ошибке:
          • красивый лог в Telegram
          • запись в qr_issue_logs со статусом 'error'.
@@ -3800,7 +3801,6 @@ def employee_identification(request):
         fio_raw: str = "",
         smstore_raw: str = "",
         ukm_store_id: int | None = None,
-        role_raw: str = "",
         phone_raw: str = "",
     ) -> JsonResponse:
         """
@@ -3819,7 +3819,6 @@ def employee_identification(request):
             f"  • ИНН (сырое): {inn_raw or '—'}",
             f"  • ФИО (сырое): {fio_raw or '—'}",
             f"  • storeId / mx (сырое): {smstore_raw or '—'}",
-            f"  • roleId (сырое): {role_raw or '—'}",
             f"  • Телефон (сырое): {phone_raw or '—'}",
         ]
         if ukm_store_id is not None:
@@ -3836,11 +3835,6 @@ def employee_identification(request):
         except Exception:
             sm_id_int = None
 
-        try:
-            role_int = int(role_raw) if str(role_raw).isdigit() else None
-        except Exception:
-            role_int = None
-
         phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
 
         try:
@@ -3848,7 +3842,7 @@ def employee_identification(request):
                 endpoint='employee_identification',
                 method='EMP_IDENT',
                 status='error',
-                user=None,
+                user=None,  # при ошибке пользователя можем ещё не знать
                 employee_inn=inn_raw or "",
                 employee_fio=fio_raw or "",
                 tg_id="",
@@ -3856,8 +3850,8 @@ def employee_identification(request):
                 phone_normalized=phone_norm or "",
                 sm_store_id=sm_id_int,
                 ukm_store_id=ukm_store_id,
-                role_id=role_int,
-                qr_data="",
+                role_id=None,          # роль для этого эндпоинта не используется
+                qr_data="",            # тут QR не генерируем
                 error_message=f"{stage}: {human_msg}",
                 raw_request={"raw_body": raw_body} if raw_body else None,
             )
@@ -3885,15 +3879,14 @@ def employee_identification(request):
     inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
     fio_raw = (data.get('fio') or data.get('FIO') or "").strip()
 
-    # тут добавили поддержку старого "mx"
+    # поддержка storeId / smstore / mx (старое поле)
     smstore_raw = str(
         data.get('storeId')
         or data.get('smstore')
-        or data.get('mx')          # ← старое поле
+        or data.get('mx')
         or ""
     ).strip()
 
-    role_raw = str(data.get('roleId') or data.get('roleid') or "").strip()
     phone_raw = (data.get('phone') or "").strip()
 
     # поддержка и "datetime", и "Datetime", и "event_datetime"
@@ -3905,15 +3898,16 @@ def employee_identification(request):
     )
     dt_raw = dt_raw.strip()
 
+    # направление вход/выход — опционально
     direction = str(data.get('direction') or data.get('event') or "").strip()
 
     logger.info(
         f"[EMP_IDENT] START: inn={inn_raw!r}, fio={fio_raw!r}, "
-        f"storeId/mx={smstore_raw!r}, roleId={role_raw!r}, "
-        f"phone={phone_raw!r}, datetime={dt_raw!r}, direction={direction!r}"
+        f"storeId/mx={smstore_raw!r}, phone={phone_raw!r}, "
+        f"datetime={dt_raw!r}, direction={direction!r}"
     )
 
-    # --- 3. Базовая валидация входных полей ---
+    # --- 3. Базовая валидация входных полей (как в старой версии) ---
     if not inn_raw:
         return _log_and_return_error(
             400,
@@ -3922,7 +3916,6 @@ def employee_identification(request):
             inn_raw=inn_raw,
             fio_raw=fio_raw,
             smstore_raw=smstore_raw,
-            role_raw=role_raw,
             phone_raw=phone_raw,
         )
 
@@ -3937,7 +3930,6 @@ def employee_identification(request):
             inn_raw=inn_raw,
             fio_raw=fio_raw,
             smstore_raw=smstore_raw,
-            role_raw=role_raw,
             phone_raw=phone_raw,
         )
 
@@ -3949,7 +3941,6 @@ def employee_identification(request):
             inn_raw=plain_inn,
             fio_raw=fio_raw,
             smstore_raw=smstore_raw,
-            role_raw=role_raw,
             phone_raw=phone_raw,
         )
     fio = " ".join(fio_raw.split())
@@ -3962,41 +3953,14 @@ def employee_identification(request):
             inn_raw=plain_inn,
             fio_raw=fio,
             smstore_raw=smstore_raw,
-            role_raw=role_raw,
             phone_raw=phone_raw,
         )
 
-    # для логов и Store пробуем привести к int, но для 1С MX оставим как строку
+    # для Store/ukm4store пробуем привести к int, для 1С MX остаётся строкой
     try:
         sm_store_id_int = int(smstore_raw)
     except ValueError:
-        # int не обязателен для 1С, но для Store и ukm4store тогда не будет
         sm_store_id_int = None
-
-    if not role_raw:
-        return _log_and_return_error(
-            400,
-            "Валидация входных данных",
-            "Не указан roleId",
-            inn_raw=plain_inn,
-            fio_raw=fio,
-            smstore_raw=smstore_raw,
-            role_raw=role_raw,
-            phone_raw=phone_raw,
-        )
-    try:
-        role_id = int(role_raw)
-    except ValueError:
-        return _log_and_return_error(
-            400,
-            "Валидация входных данных",
-            "roleId должен быть числом",
-            inn_raw=plain_inn,
-            fio_raw=fio,
-            smstore_raw=smstore_raw,
-            role_raw=role_raw,
-            phone_raw=phone_raw,
-        )
 
     # Нормализация телефона (если есть)
     phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
@@ -4022,7 +3986,6 @@ def employee_identification(request):
             fio_raw=fio,
             smstore_raw=smstore_raw,
             ukm_store_id=ukm_store_id,
-            role_raw=str(role_id),
             phone_raw=phone_raw,
         )
 
@@ -4037,33 +4000,30 @@ def employee_identification(request):
             fio_raw=fio,
             smstore_raw=smstore_raw,
             ukm_store_id=ukm_store_id,
-            role_raw=str(role_id),
             phone_raw=phone_raw,
         )
 
-    # Пытаемся найти пользователя в PG, чтобы связать запись
+    # Пытаемся найти пользователя в PG, чтобы связать запись (если есть)
     user_obj = User.objects.filter(employee_id=plain_inn).first()
 
     # --- 4. Собираем payload для 1С в старом формате ---
-    # важно: 1С всё ещё ждёт INN/FIO/MX/Datetime
     onec_payload = {
         "INN": plain_inn,
         "FIO": fio,
-        "MX": smstore_raw,          # как раньше — строкой
-        "Datetime": event_dt_str,   # как раньше — нормализованная дата/время
+        "MX": smstore_raw,        # как раньше — строкой
+        "Datetime": event_dt_str, # как раньше — нормализованная дата/время
     }
 
-    # Дополнительные новые поля можно положить в Extra, если 1С к ним готова,
-    # но старую обработку это не ломает — она может просто игнорировать Extra.
-    extra = {
-        "EmployeeID": encrypt_inn20(plain_inn),
-        "StoreId": sm_store_id_int,
-        "StoreName": store_obj.name if store_obj else "",
-        "RoleId": role_id,
-        "Phone": phone_norm or phone_raw,
-        "Direction": direction,
-    }
-    onec_payload["Extra"] = extra
+    # Доп.инфа — только в Extra, старую обработку это не ломает
+    if phone_norm or direction or sm_store_id_int is not None or store_obj:
+        extra = {
+            "EmployeeID": encrypt_inn20(plain_inn),
+            "StoreId": sm_store_id_int,
+            "StoreName": store_obj.name if store_obj else "",
+            "Phone": phone_norm or phone_raw,
+            "Direction": direction,
+        }
+        onec_payload["Extra"] = extra
 
     # Идемпотентный ключ (как раньше — по ИНН/ФИО/магазину/дате)
     idem_key = hashlib.sha256(
@@ -4083,7 +4043,6 @@ def employee_identification(request):
             fio_raw=fio,
             smstore_raw=smstore_raw,
             ukm_store_id=ukm_store_id,
-            role_raw=str(role_id),
             phone_raw=phone_raw,
         )
 
@@ -4134,8 +4093,8 @@ def employee_identification(request):
             phone_normalized=phone_norm or "",
             sm_store_id=sm_store_id_int,
             ukm_store_id=ukm_store_id,
-            role_id=role_id,
-            qr_data="",  # тут нет генерации QR, просто фиксируем факт идентификации
+            role_id=None,   # для этого эндпоинта роль не пишем
+            qr_data="",     # факт идентификации, а не выдача QR
             error_message="" if ok_1c else f"1С вернула статус {status_1c}",
             raw_request={
                 "request": data,
