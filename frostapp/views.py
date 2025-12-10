@@ -3764,24 +3764,24 @@ def employee_identification(request):
 
     ВХОД (JSON, пример):
     {
-      "inn": "7536207278",
-      "fio": "Иванов Иван Иванович",
-      "storeId": 514,        # SMSTORE (Supermag)
-      "roleId": 1,
+      "inn": "7536207278",              # или "employee_id"
+      "fio": "Иванов Иван Иванович",    # или "FIO"
+      "storeId": 514,                   # или "smstore" или старый "mx"
+      "roleId": 1,                      # или "roleid"
       "phone": "8 (924) 000-00-00",
-      "datetime": "24.09.2025 8:45:00",
-      "direction": "IN"      # или "OUT" / "ENTER" / "EXIT" и т.п.
+      "datetime": "24.09.2025 8:45:00", # или "Datetime" или "event_datetime"
+      "direction": "IN"                 # или "OUT" / "ENTER" / "EXIT" / "event"
     }
 
     Логика:
       1) Валидация/нормализация входных данных.
-      2) Подготовка payload для 1С и отправка через _post_to_onec().
+      2) Подготовка payload для 1С *в старом формате* (INN/FIO/MX/Datetime).
       3) На любой ошибке:
          • красивый лог в Telegram
          • запись в qr_issue_logs со статусом 'error'.
       4) На успехе:
          • красивый лог в Telegram
-         • запись в qr_issue_logs со статусом 'ok'.
+         • запись в qr_issue_logs со статусом 'ok'/'error' в зависимости от ответа 1С.
     """
     if request.method != 'POST':
         return JsonResponse(
@@ -3818,7 +3818,7 @@ def employee_identification(request):
             "📨 Контекст запроса:",
             f"  • ИНН (сырое): {inn_raw or '—'}",
             f"  • ФИО (сырое): {fio_raw or '—'}",
-            f"  • storeId (SMSTORE, сырое): {smstore_raw or '—'}",
+            f"  • storeId / mx (сырое): {smstore_raw or '—'}",
             f"  • roleId (сырое): {role_raw or '—'}",
             f"  • Телефон (сырое): {phone_raw or '—'}",
         ]
@@ -3881,18 +3881,35 @@ def employee_identification(request):
             f"Некорректный JSON: {e}",
         )
 
-    # --- 2. Вытаскиваем поля из запроса ---
-    inn_raw   = (data.get('inn') or data.get('employee_id') or "").strip()
-    fio_raw   = (data.get('fio') or data.get('FIO') or "").strip()
-    smstore_raw = str(data.get('storeId') or data.get('smstore') or "").strip()
-    role_raw  = str(data.get('roleId') or data.get('roleid') or "").strip()
+    # --- 2. Вытаскиваем поля из запроса (совместимость со старым и новым форматами) ---
+    inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
+    fio_raw = (data.get('fio') or data.get('FIO') or "").strip()
+
+    # тут добавили поддержку старого "mx"
+    smstore_raw = str(
+        data.get('storeId')
+        or data.get('smstore')
+        or data.get('mx')          # ← старое поле
+        or ""
+    ).strip()
+
+    role_raw = str(data.get('roleId') or data.get('roleid') or "").strip()
     phone_raw = (data.get('phone') or "").strip()
-    dt_raw    = (data.get('datetime') or data.get('event_datetime') or "").strip()
+
+    # поддержка и "datetime", и "Datetime", и "event_datetime"
+    dt_raw = (
+        data.get('datetime')
+        or data.get('Datetime')
+        or data.get('event_datetime')
+        or ""
+    )
+    dt_raw = dt_raw.strip()
+
     direction = str(data.get('direction') or data.get('event') or "").strip()
 
     logger.info(
         f"[EMP_IDENT] START: inn={inn_raw!r}, fio={fio_raw!r}, "
-        f"storeId(smstore)={smstore_raw!r}, roleId={role_raw!r}, "
+        f"storeId/mx={smstore_raw!r}, roleId={role_raw!r}, "
         f"phone={phone_raw!r}, datetime={dt_raw!r}, direction={direction!r}"
     )
 
@@ -3941,26 +3958,20 @@ def employee_identification(request):
         return _log_and_return_error(
             400,
             "Валидация входных данных",
-            "Не указан storeId (smstore)",
+            "Не указан storeId / mx (smstore)",
             inn_raw=plain_inn,
             fio_raw=fio,
             smstore_raw=smstore_raw,
             role_raw=role_raw,
             phone_raw=phone_raw,
         )
+
+    # для логов и Store пробуем привести к int, но для 1С MX оставим как строку
     try:
-        sm_store_id = int(smstore_raw)
+        sm_store_id_int = int(smstore_raw)
     except ValueError:
-        return _log_and_return_error(
-            400,
-            "Валидация входных данных",
-            "storeId (smstore) должен быть числом",
-            inn_raw=plain_inn,
-            fio_raw=fio,
-            smstore_raw=smstore_raw,
-            role_raw=role_raw,
-            phone_raw=phone_raw,
-        )
+        # int не обязателен для 1С, но для Store и ukm4store тогда не будет
+        sm_store_id_int = None
 
     if not role_raw:
         return _log_and_return_error(
@@ -3969,7 +3980,7 @@ def employee_identification(request):
             "Не указан roleId",
             inn_raw=plain_inn,
             fio_raw=fio,
-            smstore_raw=str(sm_store_id),
+            smstore_raw=smstore_raw,
             role_raw=role_raw,
             phone_raw=phone_raw,
         )
@@ -3982,7 +3993,7 @@ def employee_identification(request):
             "roleId должен быть числом",
             inn_raw=plain_inn,
             fio_raw=fio,
-            smstore_raw=str(sm_store_id),
+            smstore_raw=smstore_raw,
             role_raw=role_raw,
             phone_raw=phone_raw,
         )
@@ -3991,52 +4002,73 @@ def employee_identification(request):
     phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
 
     # Маппинг SMSTORE → ukm4store, чтобы записать его в лог
-    store_obj = Store.objects.filter(smstore=sm_store_id).first()
     ukm_store_id = None
-    if store_obj and store_obj.ukm4store is not None:
-        try:
-            ukm_store_id = int(store_obj.ukm4store)
-        except (TypeError, ValueError):
-            ukm_store_id = None
+    store_obj = None
+    if sm_store_id_int is not None:
+        store_obj = Store.objects.filter(smstore=sm_store_id_int).first()
+        if store_obj and store_obj.ukm4store is not None:
+            try:
+                ukm_store_id = int(store_obj.ukm4store)
+            except (TypeError, ValueError):
+                ukm_store_id = None
 
-    # Парсим дату/время события (если нужно слать в 1С красивым форматом)
-    event_dt_str = None
-    if dt_raw:
-        try:
-            event_dt_str = _parse_and_format_dt(dt_raw)
-        except Exception as e:
-            return _log_and_return_error(
-                400,
-                "Валидация даты/времени",
-                f"Некорректная дата/время: {e}",
-                inn_raw=plain_inn,
-                fio_raw=fio,
-                smstore_raw=str(sm_store_id),
-                ukm_store_id=ukm_store_id,
-                role_raw=str(role_id),
-                phone_raw=phone_raw,
-            )
+    # Парсим дату/время события (для 1С, как раньше)
+    if not dt_raw:
+        return _log_and_return_error(
+            400,
+            "Валидация даты/времени",
+            "Не указан datetime",
+            inn_raw=plain_inn,
+            fio_raw=fio,
+            smstore_raw=smstore_raw,
+            ukm_store_id=ukm_store_id,
+            role_raw=str(role_id),
+            phone_raw=phone_raw,
+        )
+
+    try:
+        event_dt_str = _parse_and_format_dt(dt_raw)  # тот же формат, что в старой функции
+    except Exception as e:
+        return _log_and_return_error(
+            400,
+            "Валидация даты/времени",
+            f"Некорректная дата/время: {e}",
+            inn_raw=plain_inn,
+            fio_raw=fio,
+            smstore_raw=smstore_raw,
+            ukm_store_id=ukm_store_id,
+            role_raw=str(role_id),
+            phone_raw=phone_raw,
+        )
 
     # Пытаемся найти пользователя в PG, чтобы связать запись
     user_obj = User.objects.filter(employee_id=plain_inn).first()
 
-    # --- 4. Собираем payload для 1С ---
+    # --- 4. Собираем payload для 1С в старом формате ---
+    # важно: 1С всё ещё ждёт INN/FIO/MX/Datetime
     onec_payload = {
-        # уникальный идентификатор сотрудника (20-символный хэш ИНН)
-        "EmployeeID": encrypt_inn20(plain_inn),
         "INN": plain_inn,
         "FIO": fio,
-        "StoreId": sm_store_id,
+        "MX": smstore_raw,          # как раньше — строкой
+        "Datetime": event_dt_str,   # как раньше — нормализованная дата/время
+    }
+
+    # Дополнительные новые поля можно положить в Extra, если 1С к ним готова,
+    # но старую обработку это не ломает — она может просто игнорировать Extra.
+    extra = {
+        "EmployeeID": encrypt_inn20(plain_inn),
+        "StoreId": sm_store_id_int,
         "StoreName": store_obj.name if store_obj else "",
         "RoleId": role_id,
         "Phone": phone_norm or phone_raw,
         "Direction": direction,
     }
-    if event_dt_str:
-        onec_payload["EventDatetime"] = event_dt_str
+    onec_payload["Extra"] = extra
 
-    # Идемпотентный ключ для 1С (чтобы не задвоить запись, если агент пошлёт повтор)
-    idem_key = f"empident-{plain_inn}-{sm_store_id}-{event_dt_str or ''}-{direction or ''}"
+    # Идемпотентный ключ (как раньше — по ИНН/ФИО/магазину/дате)
+    idem_key = hashlib.sha256(
+        f"{plain_inn}|{fio}|{smstore_raw}|{event_dt_str}".encode("utf-8")
+    ).hexdigest()
 
     # --- 5. Отправка в 1С ---
     try:
@@ -4049,7 +4081,7 @@ def employee_identification(request):
             f"Ошибка запроса в 1С: {e}",
             inn_raw=plain_inn,
             fio_raw=fio,
-            smstore_raw=str(sm_store_id),
+            smstore_raw=smstore_raw,
             ukm_store_id=ukm_store_id,
             role_raw=str(role_id),
             phone_raw=phone_raw,
@@ -4069,7 +4101,8 @@ def employee_identification(request):
         f"  • user_id (PostgreSQL): {user_obj.id if user_obj else '—'}",
         "",
         "🏬 Магазин:",
-        f"  • storeId (SMSTORE): {sm_store_id}",
+        f"  • MX (из запроса): {smstore_raw}",
+        f"  • storeId (SMSTORE int): {sm_store_id_int if sm_store_id_int is not None else '—'}",
         f"  • ukm4store: {ukm_store_id if ukm_store_id is not None else '—'}",
         f"  • Name: {store_obj.name if store_obj else '—'}",
         "",
@@ -4096,10 +4129,10 @@ def employee_identification(request):
             user=user_obj,
             employee_inn=plain_inn,
             employee_fio=fio,
-            tg_id=user_obj.tg_id if user_obj and user_obj.tg_id else "",
+            tg_id=getattr(user_obj, "tg_id", "") if user_obj else "",
             phone_raw=phone_raw or "",
             phone_normalized=phone_norm or "",
-            sm_store_id=sm_store_id,
+            sm_store_id=sm_store_id_int,
             ukm_store_id=ukm_store_id,
             role_id=role_id,
             qr_data="",  # тут нет генерации QR, просто фиксируем факт идентификации
