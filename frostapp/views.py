@@ -240,22 +240,43 @@ def log_qr_issue(
     Никакие ошибки наружу не выкидывает.
     """
     try:
+        # приведение к строке всего, что может оказаться int/None
+        endpoint_str = str(endpoint or "")
+        method_str = str(method or "")
+        status_str = str(status or "")
+
+        employee_inn_str = str(employee_inn or "")
+        employee_fio_str = str(employee_fio or "")
+
+        tg_id_str = "" if tg_id is None else str(tg_id)
+        phone_raw_str = "" if phone_raw is None else str(phone_raw)
+        phone_norm_str = "" if phone_normalized is None else str(phone_normalized)
+
+        qr_data_str = "" if qr_data is None else str(qr_data)
+        error_message_str = "" if error_message is None else str(error_message)
+
+        # raw_request в JSONField/текст
+        if isinstance(raw_request, dict):
+            raw_request_value = raw_request
+        else:
+            raw_request_value = None
+
         QRIssueLog.objects.create(
-            endpoint=endpoint,
-            method=method,
-            status=status,
+            endpoint=endpoint_str,
+            method=method_str,
+            status=status_str,
             user=user,
-            employee_inn=employee_inn or "",
-            employee_fio=employee_fio or "",
-            tg_id=(tg_id or "")[:32],
-            phone_raw=(phone_raw or "")[:32],
-            phone_normalized=(phone_normalized or "")[:32],
+            employee_inn=employee_inn_str or "",
+            employee_fio=employee_fio_str or "",
+            tg_id=tg_id_str[:32],
+            phone_raw=phone_raw_str[:32],
+            phone_normalized=phone_norm_str[:32],
             sm_store_id=sm_store_id,
             ukm_store_id=ukm_store_id,
             role_id=role_id,
-            qr_data=qr_data or "",
-            error_message=error_message or "",
-            raw_request=raw_request if isinstance(raw_request, dict) else None,
+            qr_data=qr_data_str or "",
+            error_message=error_message_str or "",
+            raw_request=raw_request_value,
         )
     except Exception as e:
         logger.error(f"[QR/DBLOG] Ошибка записи в qr_issue_logs: {e}", exc_info=True)
