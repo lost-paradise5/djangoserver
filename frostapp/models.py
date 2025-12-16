@@ -226,6 +226,9 @@ class QRIssueLog(models.Model):
     error_message = models.TextField(blank=True, null=True)
     raw_request   = models.JSONField(blank=True, null=True)
 
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+
     class Meta:
         managed = False
         db_table = 'qr_issue_logs'
