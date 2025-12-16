@@ -175,6 +175,20 @@ SESSION_TTL_MINUTES = 10
 MAX_PIN_ATTEMPTS = 3     
 
 
+def _to_float_or_none(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+
 def send_telegram_log(message: str) -> None:
     """
     Отправка читаемых, многострочных логов в несколько Telegram-чатов администраторов.
@@ -245,6 +259,8 @@ def log_qr_issue(
     qr_data: str = "",
     error_message: str = "",
     raw_request: Optional[dict] = None,
+    latitude: Optional[float] = None,  
+    longitude: Optional[float] = None,
 ) -> None:
     """
     Запись отдельной строки в qr_issue_logs.
@@ -265,6 +281,9 @@ def log_qr_issue(
 
         qr_data_str = "" if qr_data is None else str(qr_data)
         error_message_str = "" if error_message is None else str(error_message)
+        
+        lat_val = _to_float_or_none(latitude) 
+        lon_val = _to_float_or_none(longitude)   
 
         # raw_request в JSONField/текст
         if isinstance(raw_request, dict):
@@ -288,6 +307,8 @@ def log_qr_issue(
             qr_data=qr_data_str or "",
             error_message=error_message_str or "",
             raw_request=raw_request_value,
+            latitude=lat_val, 
+            longitude=lon_val, 
         )
     except Exception as e:
         logger.error(f"[QR/DBLOG] Ошибка записи в qr_issue_logs: {e}", exc_info=True)
@@ -3792,6 +3813,8 @@ def employee_identification(request):
         )
 
     raw_body = request.body.decode('utf-8') if request.body else "{}"
+    lat_val: float | None = None
+    lon_val: float | None = None
 
     def _log_and_return_error(
         http_status: int,
@@ -3821,6 +3844,8 @@ def employee_identification(request):
             f"  • ФИО (сырое): {fio_raw or '—'}",
             f"  • storeId / mx (сырое): {smstore_raw or '—'}",
             f"  • Телефон (сырое): {phone_raw or '—'}",
+            f"  • latitude: {lat_val if lat_val is not None else '—'}",
+            f"  • longitude: {lon_val if lon_val is not None else '—'}",
         ]
         if ukm_store_id is not None:
             lines.append(f"  • ukm4store: {ukm_store_id}")
@@ -3855,6 +3880,8 @@ def employee_identification(request):
                 qr_data="",       
                 error_message=f"{stage}: {human_msg}",
                 raw_request={"raw_body": raw_body} if raw_body else None,
+                latitude=lat_val,
+                longitude=lon_val,
             )
         except Exception:
       
@@ -3875,6 +3902,10 @@ def employee_identification(request):
             "Парсинг JSON",
             f"Некорректный JSON: {e}",
         )
+        
+    # 1.1 Координаты (опционально)
+    lat_val = _to_float_or_none(data.get("latitude"))
+    lon_val = _to_float_or_none(data.get("longitude"))
 
     # 2. Вытаскиваем поля из запроса (совместимость со старым и новым форматами)
     inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
@@ -3905,7 +3936,8 @@ def employee_identification(request):
     logger.info(
         f"[EMP_IDENT] START: inn={inn_raw!r}, fio={fio_raw!r}, "
         f"storeId/mx={smstore_raw!r}, phone={phone_raw!r}, "
-        f"datetime={dt_raw!r}, direction={direction!r}"
+        f"datetime={dt_raw!r}, direction={direction!r},"
+        f"latitude={lat_val!r}, longitude={lon_val!r}"
     )
 
     # 3. Базовая валидация входных полей (как в старой версии)
@@ -4103,6 +4135,8 @@ def employee_identification(request):
                 "onec_status": status_1c,
                 "onec_response": text_1c,
             },
+            latitude=lat_val,
+            longitude=lon_val,
         )
     except Exception:
         logger.exception("[EMP_IDENT] Ошибка при записи успеха/ошибки в qr_issue_logs")
