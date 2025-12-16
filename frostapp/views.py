@@ -226,54 +226,7 @@ def send_telegram_log(message: str) -> None:
                         timeout=5,
                     )
     except Exception as e:
-        logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)
-# def send_telegram_log(message: str) -> None:
-#     """
-#     Отправка читаемых, многострочных логов в Telegram-чат администратора.
-
-#     Особенности:
-#       • Не роняет основной поток при ошибках.
-#       • Длинные сообщения режет по ~4000 символов.
-#       • Обрезает лишние пробелы по краям.
-#       • Отключает превью ссылок, чтобы логи не раздувались.
-#     """
-#     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
-#         return
-
-#     text = (message or "").strip()
-#     if not text:
-#         text = "(пустое сообщение лога)"
-
-#     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-#     max_len = 4000
-
-#     try:
-#         if len(text) <= max_len:
-#             requests.post(
-#                 url,
-#                 json={
-#                     "chat_id": TELEGRAM_ADMIN_CHAT_ID,
-#                     "text": text,
-#                     "disable_web_page_preview": True,
-#                 },
-#                 timeout=5,
-#             )
-#         else:
-#             # режем по кускам
-#             for i in range(0, len(text), max_len):
-#                 part = text[i:i + max_len]
-#                 requests.post(
-#                     url,
-#                     json={
-#                         "chat_id": TELEGRAM_ADMIN_CHAT_ID,
-#                         "text": part,
-#                         "disable_web_page_preview": True,
-#                     },
-#                     timeout=5,
-#                 )
-#     except Exception as e:
-#         logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)
-        
+        logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)     
         
 def log_qr_issue(
     *,
@@ -724,27 +677,6 @@ def build_full_ukm5_xml_for_store(store_id: int) -> Optional[str]:
                     next_new_id = 1
             cashier_id = next_new_id
             next_new_id += 1
-        # cashier_id = get_trm_employee_id(plain_inn, fio)
-        # if cashier_id is None:
-        #     if next_new_id is None:
-        #         try:
-        #             ukm_conn = connect_ukm()
-        #             cur = ukm_conn.cursor()
-        #             cur.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
-        #             row = cur.fetchone() or {}
-        #             next_new_id = row.get("next_id") or 1
-        #             cur.close()
-        #             ukm_conn.close()
-        #             logger.info(f"[XML/FULL] trm_in_users: base next_id={next_new_id}")
-        #         except Exception as e:
-        #             logger.error(
-        #                 f"[XML/FULL] Ошибка получения next_id из trm_in_users: {e}",
-        #                 exc_info=True
-        #             )
-        #             if next_new_id is None:
-        #                 next_new_id = 1
-        #     cashier_id = next_new_id
-        #     next_new_id += 1
 
         c_el = ET.SubElement(root, "cashier")
         ET.SubElement(c_el, "roleId").text = str(link.roleid)
@@ -753,13 +685,6 @@ def build_full_ukm5_xml_for_store(store_id: int) -> Optional[str]:
         ET.SubElement(c_el, "INN").text = plain_inn
         ET.SubElement(c_el, "password").text = password_plain
 
-    # tree = ET.ElementTree(root)
-    # tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-
-    # logger.info(
-    #     f"[XML/FULL] Готов полный storeCashiers для storeid={store_id}: {xml_path}"
-    # )
-    # return xml_path
     _write_xml_with_declaration(xml_path, root, ensure_base=True)
 
     logger.info(
@@ -956,16 +881,6 @@ def inspect_trm_in_users(
         except Exception:
             pass
 
-# def connect_ukm():
-#     return pymysql.connect(
-#         host="192.168.17.234",
-#         user="ukminfo",
-#         password="CtHDbCGK.C",
-#         database="ukmserver",
-#         charset="utf8mb4",
-#         cursorclass=pymysql.cursors.DictCursor
-#     )
-
 def get_trm_employee_id(
     plain_inn: str,
     fio: str,
@@ -1075,28 +990,7 @@ def resolve_cashier_id_for_store(store_id: int, plain_inn: str, fio: str) -> tup
 
     next_id = trm_dbg.get("next_id_all") or 1
     return int(next_id), resolved_host, False, trm_dbg
-# def get_trm_employee_id(plain_inn: str, fio: str) -> int | None:
-#     conn = connect_ukm()
-#     cur  = conn.cursor()
-#     cur.execute(
-#         "SELECT id FROM trm_in_users WHERE user_inn=%s AND name=%s",
-#         (plain_inn, fio)                    
-#     )
-#     row = cur.fetchone()
-#     cur.close(); conn.close()
-#     return row["id"] if row else None
 
-
-def connect_converter():
-    return pymysql.connect(
-        host="192.168.17.234",
-        port=3306,
-        user="user1C",
-        password="852654",
-        database="import4staffbonus",
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor
-    )
     
 def _calc_next_signal_version(cur) -> int:
     """
@@ -1114,94 +1008,13 @@ def _calc_next_signal_version(cur) -> int:
         max_ver = 0
     return max_ver + 1
 
-
-def _write_converter_user_and_signal(
-    cashier_id: int,
-    plain_inn: str,
-    fio: str,
-    password_plain: str,
-    store_id: int,
-    role_id: int
-) -> None:
+def _write_converter_user_and_signal(*args, **kwargs) -> None:
     """
-    Запись в конвертер (БД import4staffbonus):
-      • users  – тот же пароль, что и в PG (с префиксом KS, БЕЗ OLD_PASSWORD)
-      • signal – версия по счётчику 'busy', как в import4.signal
-
-    Структура таблицы users может отличаться, поэтому читаем список колонок через SHOW COLUMNS
-    и заполняем только те поля, которые реально существуют.
+    import4staffbonus (старый конвертер) отключён.
+    Оставлено как no-op, чтобы не падать, если где-то остался вызов.
     """
-    conv = cur = None
-    try:
-        conv = connect_converter()
-        cur = conv.cursor()
-
-        # Версия по счётчику 'busy'
-        base_version = _calc_next_signal_version(cur)
-        logger.info(
-            f"[CONVERTER] base_version={base_version} (по MAX(signal.version)) "
-            f"для cashier_id={cashier_id}"
-        )
-
-        # Выясняем структуру таблицы users
-        cur.execute("SHOW COLUMNS FROM `users`")
-        cols_rows = cur.fetchall() or []
-        col_names = [r['Field'] for r in cols_rows]
-        logger.info(f"[CONVERTER] users columns: {col_names}")
-
-        values_map = {}
-
-        if 'id' in col_names:
-            values_map['id'] = cashier_id
-        if 'store' in col_names:
-            values_map['store'] = store_id
-        if 'name' in col_names:
-            values_map['name'] = fio
-        if 'inn' in col_names:
-            values_map['inn'] = plain_inn
-        if 'password' in col_names:
-            # ВАЖНО: тот же пароль, что в open_in_system/qr_code (с префиксом KS, БЕЗ OLD_PASSWORD)
-            values_map['password'] = password_plain
-        if 'role_id' in col_names:
-            values_map['role_id'] = role_id
-        if 'version' in col_names:
-            values_map['version'] = base_version
-        if 'deleted' in col_names:
-            values_map['deleted'] = 0
-
-        if not values_map:
-            logger.warning("[CONVERTER] Структура users неожиданная (нет знакомых полей) – пропускаем INSERT")
-        else:
-            columns_sql = ", ".join(f"`{k}`" for k in values_map.keys())
-            placeholders = ", ".join(["%s"] * len(values_map))
-            sql = f"INSERT INTO `users` ({columns_sql}) VALUES ({placeholders})"
-            cur.execute(sql, list(values_map.values()))
-            logger.info(
-                f"[CONVERTER] users row inserted: store={store_id}, "
-                f"id={cashier_id}, version={base_version}"
-            )
-
-        # signal: incr / version
-        cur.execute("INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)", (base_version,))
-        logger.info(f"[CONVERTER] signal row inserted: incr/{base_version}")
-
-        conv.commit()
-    except Exception as e:
-        logger.error(f"[CONVERTER] Error while inserting users/signal: {e}", exc_info=True)
-        if conv:
-            try:
-                conv.rollback()
-            except Exception:
-                pass
-    finally:
-        try:
-            if cur:
-                cur.close()
-            if conv:
-                conv.close()
-        except Exception:
-            pass
-
+    logger.info("[CONVERTER] import4staffbonus отключён — пропускаю запись users/signal")
+    return
 
 def generate_qr_string(inn: str, salt: str = "INDIVIDUAL_SALT") -> str:
     expiration = (datetime.datetime.utcnow() + datetime.timedelta(days=1)
@@ -3284,16 +3097,6 @@ def get_qr_code_by_tg(request):
                 password_plain=new_password,
             )
 
-            # Конвертер
-            _write_converter_user_and_signal(
-                cashier_id=cashier_id_for_store,
-                plain_inn=plain_inn,
-                fio=fio,
-                password_plain=new_password,
-                store_id=sid,
-                role_id=role_id,
-            )
-
             s_obj = store_map.get(str(sid))
             per_store_results.append({
                 "ukm_storeid": sid,
@@ -3612,14 +3415,6 @@ def get_qr_code_by_employee_id(request):
                 plain_inn=plain_inn,
                 fio=fio,
                 password_plain=new_password,
-            )
-            _write_converter_user_and_signal(
-                cashier_id=cashier_id_for_store,
-                plain_inn=plain_inn,
-                fio=fio,
-                password_plain=new_password,
-                store_id=sid,
-                role_id=r_id,
             )
 
             s_obj = store_map.get(str(sid))
@@ -4057,12 +3852,12 @@ def employee_identification(request):
                 sm_store_id=sm_id_int,
                 ukm_store_id=ukm_store_id,
                 role_id=None,          # роль для этого эндпоинта не используется
-                qr_data="",            # тут QR не генерируем
+                qr_data="",       
                 error_message=f"{stage}: {human_msg}",
                 raw_request={"raw_body": raw_body} if raw_body else None,
             )
         except Exception:
-            # падать тут нельзя
+      
             logger.exception("[EMP_IDENT] Ошибка при записи в qr_issue_logs")
 
         return JsonResponse(
@@ -4070,7 +3865,7 @@ def employee_identification(request):
             status=http_status
         )
 
-    # --- 1. Парсинг JSON ---
+    # 1. Парсинг JSON
     try:
         data = json.loads(raw_body)
     except Exception as e:
@@ -4081,7 +3876,7 @@ def employee_identification(request):
             f"Некорректный JSON: {e}",
         )
 
-    # --- 2. Вытаскиваем поля из запроса (совместимость со старым и новым форматами) ---
+    # 2. Вытаскиваем поля из запроса (совместимость со старым и новым форматами)
     inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
     fio_raw = (data.get('fio') or data.get('FIO') or "").strip()
 
@@ -4113,7 +3908,7 @@ def employee_identification(request):
         f"datetime={dt_raw!r}, direction={direction!r}"
     )
 
-    # --- 3. Базовая валидация входных полей (как в старой версии) ---
+    # 3. Базовая валидация входных полей (как в старой версии)
     if not inn_raw:
         return _log_and_return_error(
             400,
@@ -4182,7 +3977,7 @@ def employee_identification(request):
             except (TypeError, ValueError):
                 ukm_store_id = None
 
-    # Парсим дату/время события (для 1С, как раньше)
+    # Парсим дату/время события
     if not dt_raw:
         return _log_and_return_error(
             400,
@@ -4196,7 +3991,7 @@ def employee_identification(request):
         )
 
     try:
-        event_dt_str = _parse_and_format_dt(dt_raw)  # тот же формат, что в старой функции
+        event_dt_str = _parse_and_format_dt(dt_raw)
     except Exception as e:
         return _log_and_return_error(
             400,
@@ -4212,12 +4007,12 @@ def employee_identification(request):
     # Пытаемся найти пользователя в PG, чтобы связать запись (если есть)
     user_obj = User.objects.filter(employee_id=plain_inn).first()
 
-    # --- 4. Собираем payload для 1С в старом формате ---
+    # 4. Собираем payload для 1С в старом формате 
     onec_payload = {
         "INN": plain_inn,
         "FIO": fio,
-        "MX": smstore_raw,        # как раньше — строкой
-        "Datetime": event_dt_str, # как раньше — нормализованная дата/время
+        "MX": smstore_raw,  
+        "Datetime": event_dt_str, 
     }
 
     # Доп.инфа — только в Extra, старую обработку это не ломает
@@ -4236,7 +4031,7 @@ def employee_identification(request):
         f"{plain_inn}|{fio}|{smstore_raw}|{event_dt_str}".encode("utf-8")
     ).hexdigest()
 
-    # --- 5. Отправка в 1С ---
+    # 5. Отправка в 1С
     try:
         status_1c, text_1c = _post_to_onec(onec_payload, idem_key=idem_key)
     except Exception as e:
