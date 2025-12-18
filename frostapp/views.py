@@ -24,6 +24,14 @@ from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Depa
 
 _HEX = set("0123456789abcdefABCDEF")
 UKM5_FULL_XML_STORE_ID = 2013
+TRM_ID_MAX = 2147483647
+
+TRM_SMALL_MIN = int(os.getenv("TRM_SMALL_MIN", "10000"))   
+TRM_SMALL_MAX = int(os.getenv("TRM_SMALL_MAX", "99999")) 
+if TRM_SMALL_MIN < 4:
+    TRM_SMALL_MIN = 4
+if TRM_SMALL_MAX >= TRM_ID_MAX:
+    TRM_SMALL_MAX = TRM_ID_MAX - 1
 
 
 
@@ -961,25 +969,72 @@ def get_trm_employee_id(
         
 def get_next_trm_employee_id(*, store_id: Optional[int | str] = None, host: Optional[str] = None) -> int:
     """
-    Берёт следующий свободный id по trm_in_users на нужном ukmserver (host/store_id).
+    Следующий id для trm_in_users.
+    Берём MAX(id) только в диапазоне TRM_SMALL_MIN..TRM_SMALL_MAX (пятизначные),
+    чтобы выбросы 2147483*** не ломали выдачу.
+    Используем GET_LOCK() чтобы два параллельных запроса не выдали одинаковый id.
     """
     conn = cur = None
+    lock_key = None
+    got_lock = False
+
     try:
         conn = connect_ukm(host=host, store_id=store_id)
         cur = conn.cursor()
-        cur.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM trm_in_users")
-        row = cur.fetchone() or {}
-        val = row.get("next_id") or 1
+
+        # Лок на конкретный ukm-host (чтобы не конфликтовать между разными ukmserver)
+        resolved_host, _ = _resolve_ukmserver_host(host=host, store_id=store_id)
+        lock_key = f"trm_id_alloc:{resolved_host}"
+
         try:
-            return int(val)
+            cur.execute("SELECT GET_LOCK(%s, %s) AS l", (lock_key, 5))
+            got_lock = int((cur.fetchone() or {}).get("l") or 0) == 1
         except Exception:
-            return 1
+            got_lock = False  # если GET_LOCK запрещён — продолжим без него (хуже, но не упадём)
+
+        # max в “нормальном” диапазоне (пятизначные)
+        cur.execute(
+            "SELECT COALESCE(MAX(id), 0) AS max_id "
+            "FROM trm_in_users "
+            "WHERE id BETWEEN %s AND %s",
+            (TRM_SMALL_MIN, TRM_SMALL_MAX),
+        )
+        row = cur.fetchone() or {}
+        max_small = int(row.get("max_id") or 0)
+
+        candidate = max(TRM_SMALL_MIN, max_small + 1)
+
+        if candidate > TRM_SMALL_MAX:
+            raise RuntimeError(
+                f"Исчерпан диапазон id [{TRM_SMALL_MIN}..{TRM_SMALL_MAX}] в trm_in_users. "
+                f"Нужно расширять диапазон или менять стратегию."
+            )
+
+        # На всякий — проверим что candidate реально свободен (при гонках без lock)
+        cur.execute("SELECT 1 AS x FROM trm_in_users WHERE id=%s LIMIT 1", (candidate,))
+        if cur.fetchone():
+            # если занято — поднимаемся вверх, пока не найдём свободный (в рамках small-range)
+            while candidate <= TRM_SMALL_MAX:
+                candidate += 1
+                cur.execute("SELECT 1 AS x FROM trm_in_users WHERE id=%s LIMIT 1", (candidate,))
+                if not cur.fetchone():
+                    break
+            if candidate > TRM_SMALL_MAX:
+                raise RuntimeError(
+                    f"Не удалось найти свободный id в диапазоне [{TRM_SMALL_MIN}..{TRM_SMALL_MAX}]."
+                )
+
+        return int(candidate)
+
     finally:
         try:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
+            if cur and got_lock and lock_key:
+                cur.execute("SELECT RELEASE_LOCK(%s)", (lock_key,))
+        except Exception:
+            pass
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
         except Exception:
             pass
         
@@ -1009,7 +1064,9 @@ def resolve_cashier_id_for_store(store_id: int, plain_inn: str, fio: str) -> tup
     if found_id is not None:
         return int(found_id), resolved_host, True, trm_dbg
 
-    next_id = trm_dbg.get("next_id_all") or 1
+    next_id = get_next_trm_employee_id(store_id=store_id, host=resolved_host)
+    trm_dbg["allocated_id"] = next_id
+    trm_dbg["allocated_range"] = f"{TRM_SMALL_MIN}..{TRM_SMALL_MAX}"
     return int(next_id), resolved_host, False, trm_dbg
 
     
