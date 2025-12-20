@@ -2987,7 +2987,37 @@ def agent_auth_verify_pin(request):
 
 
 
+def _get_existing_open_password(
+    *,
+    user_id: int,
+    system_id: int = 9
+) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    READ-ONLY.
+    Возвращает (password, username, open_in_system_id) из open_in_system
+    для user_id + system_id.
 
+    • status НЕ проверяем.
+    • Если записей несколько — берём последнюю по id и пишем warning.
+    """
+    rows = list(
+        OpenInSystem.objects
+        .filter(user_id=user_id, system_id=system_id)
+        .order_by("-id")[:2] 
+    )
+    if not rows:
+        return None, None, None
+
+    if len(rows) > 1:
+        logger.warning(
+            f"[OPEN_IN_SYSTEM] Несколько записей для user_id={user_id}, system_id={system_id}. "
+            f"Возвращаю последнюю по id."
+        )
+
+    row = rows[0]
+    password = (row.password or "").strip() or None
+    username = (row.username or "").strip() or None
+    return password, username, row.id
 
 
 
@@ -3002,18 +3032,22 @@ def agent_auth_verify_pin(request):
 @csrf_exempt
 def get_qr_code_by_tg(request):
     """
-    POST {"tg_id": "..."} -> выдаёт новый qr_data (пароль KS...).
+    READ-ONLY.
+
+    POST {"tg_id": "..."} -> возвращает существующий open_in_system.password (system_id=9)
 
     Делает:
       - находит пользователя по tg_id
       - валидирует employee_id как ИНН
-      - обновляет пароль в PG (QRCode + OpenInSystem) через _set_password_pg()
-      - для каждого магазина пользователя:
-          * подбирает cashier_id на нужном ukmserver (resolve_cashier_id_for_store)
-          * пишет в UKM4 (import4.users+signal) и UKM5 XML (_update_store_mysql_and_xml_for_single_store)
-          * пишет в конвертер import4staffbonus.users+signal (_write_converter_user_and_signal)
-      - пишет QRIssueLog отдельно по каждой связке store/role
-      - шлёт админ-лог в Telegram (send_telegram_log)
+      - проверяет ukm_users
+      - читает существующий open_in_system.password (system_id=9) и возвращает
+      - пишет QRIssueLog по каждой связке store/role
+      - шлёт админ-лог в Telegram (TELEGRAM_ADMIN_CHAT_IDS)
+
+    НЕ делает:
+      - НЕ обновляет QRCode / OpenInSystem / UKMUser
+      - НЕ пишет в MySQL import4.users/signal
+      - НЕ обновляет XML UKM5
     """
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
@@ -3024,9 +3058,9 @@ def get_qr_code_by_tg(request):
         try:
             data = json.loads(raw_body)
         except Exception as e:
-            logger.error(f"[QR/TG] JSON parse error: {e}; body={raw_body!r}")
+            logger.error(f"[QR/TG/RO] JSON parse error: {e}; body={raw_body!r}")
             send_telegram_log(
-                "❌ Ошибка при выдаче QR по TG\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
                 f"Этап: Парсинг JSON\nПричина: {e}\n\n"
                 f"Сырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
             )
@@ -3051,7 +3085,7 @@ def get_qr_code_by_tg(request):
 
         if not tg_id:
             msg = "Не указан tg_id"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по TG\nЭтап: Валидация\nПричина: {msg}\n\n{raw_body[:1000]}")
+            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR по TG\nЭтап: Валидация\nПричина: {msg}")
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
                 method="BY_TG",
@@ -3071,7 +3105,7 @@ def get_qr_code_by_tg(request):
         user = User.objects.filter(tg_id=tg_id).first()
         if not user:
             msg = f"Пользователь с tg_id={tg_id!r} не найден"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по TG\nЭтап: Поиск пользователя\nПричина: {msg}")
+            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR по TG\nЭтап: Поиск пользователя\nПричина: {msg}")
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
                 method="BY_TG",
@@ -3096,7 +3130,7 @@ def get_qr_code_by_tg(request):
         except Exception as e:
             msg = f"Некорректный employee_id (ИНН) у user_id={user.id}: {e}"
             send_telegram_log(
-                "❌ Ошибка при выдаче QR по TG\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
                 f"Этап: Валидация ИНН\nПричина: {msg}\n\n"
                 f"tg_id={tg_id}\nuser_id={user.id}\nФИО={fio or '—'}\nemployee_id={employee_id_raw!r}"
             )
@@ -3116,13 +3150,11 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": f"Некорректный employee_id: {e}"}, status=400)
 
-        ukm_links = list(
-            UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid")
-        )
+        ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
         if not ukm_links:
             msg = f"Нет записей ukm_users для user_id={user.id}"
             send_telegram_log(
-                "❌ Ошибка при выдаче QR по TG\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n\n"
                 f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\ntg_id={tg_id}"
             )
@@ -3142,11 +3174,32 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": "Для пользователя нет записей в ukm_users"}, status=404)
 
-        # Новый пароль/QR
-        new_password = build_user_password(plain_inn)
-        _set_password_pg(user, new_password)
+        # open_in_system.password (READ-ONLY)
+        password, open_username, open_row_id = _get_existing_open_password(user_id=user.id, system_id=9)
+        if not password:
+            msg = f"Нет password в open_in_system (system_id=9) для user_id={user.id}"
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
+                f"Этап: Чтение open_in_system\nПричина: {msg}\n\n"
+                f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\ntg_id={tg_id}"
+            )
+            log_qr_issue(
+                endpoint="get_qr_code_by_tg",
+                method="BY_TG",
+                status="error",
+                user=user,
+                tg_id=tg_id,
+                employee_inn=plain_inn,
+                employee_fio=fio,
+                phone_raw=user.phone or "",
+                phone_normalized=normalize_phone_ru(user.phone or "") or "",
+                qr_data="",
+                error_message=f"open_in_system: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
+            return JsonResponse({"status": "error", "message": "У пользователя нет сохранённого QR (open_in_system)"}, status=404)
 
-        # Для логов/таблицы: подтянем mapping ukm4store -> Store
+        # Для логов/ответа: mapping ukm4store -> Store
         ukm_store_ids_str = [str(int(x["storeid"])) for x in ukm_links if str(x.get("storeid", "")).isdigit()]
         store_map = {
             str(s.ukm4store).strip(): s
@@ -3156,39 +3209,21 @@ def get_qr_code_by_tg(request):
         per_store_results = []
         for link in ukm_links:
             sid = int(link["storeid"])
-            role_id = int(link["roleid"])
-
-            try:
-                cashier_id_for_store, ukm_host, found_in_trm, trm_dbg = resolve_cashier_id_for_store(
-                    sid, plain_inn, fio
-                )
-            except Exception as e:
-                cashier_id_for_store, ukm_host, found_in_trm, trm_dbg = 1, None, False, {"error": str(e)}
-
-            # UKM4/UKM5
-            _update_store_mysql_and_xml_for_single_store(
-                store_id=sid,
-                cashier_id=cashier_id_for_store,
-                role_id=role_id,
-                plain_inn=plain_inn,
-                fio=fio,
-                password_plain=new_password,
-            )
-
+            role_id_db = int(link["roleid"])
             s_obj = store_map.get(str(sid))
             per_store_results.append({
                 "ukm_storeid": sid,
                 "smstore": getattr(s_obj, "smstore", None),
                 "store_name": getattr(s_obj, "name", "") if s_obj else "",
-                "roleid": role_id,
-                "cashier_id": int(cashier_id_for_store),
-                "ukm_host": ukm_host,
-                "found_in_trm": bool(found_in_trm),
+                "roleid": role_id_db,
+                "cashier_id": None,
+                "ukm_host": None,
+                "found_in_trm": None,
             })
 
-        # Telegram-лог (аккуратно, без “последнего store”)
+        # Telegram-лог
         lines = [
-            "✅ QR-код успешно сгенерирован или обновлён по Telegram ID",
+            "✅ QR-код возвращён из базы (READ-ONLY) по Telegram ID",
             "",
             "👤 Сотрудник:",
             f"  • Telegram ID: {tg_id}",
@@ -3199,19 +3234,16 @@ def get_qr_code_by_tg(request):
             "🏬 Магазины (ukm_users):",
         ]
         for r in per_store_results:
-            lines.append(
-                f"  • ukm_storeid={r['ukm_storeid']}, smstore={r['smstore']}, "
-                f"roleId={r['roleid']}, cashier_id={r['cashier_id']}, "
-                f"ukm_host={r['ukm_host'] or '—'}, in_trm={1 if r['found_in_trm'] else 0}"
-            )
+            lines.append(f"  • ukm_storeid={r['ukm_storeid']}, smstore={r['smstore']}, roleId={r['roleid']}")
         lines += [
             "",
-            "🔐 Новый QR (строка):",
-            new_password,
+            "🔐 QR (из open_in_system.password):",
+            password,
+            f"open_in_system.id={open_row_id}, username={open_username or '—'}",
         ]
         send_telegram_log("\n".join(lines))
 
-        # Таблица логов (по каждой связке store/role)
+        # QRIssueLog по каждой связке store/role
         phone_norm = normalize_phone_ru(user.phone or "") or ""
         try:
             raw_req = json.loads(raw_body) if raw_body else None
@@ -3232,23 +3264,23 @@ def get_qr_code_by_tg(request):
                 sm_store_id=r["smstore"],
                 ukm_store_id=r["ukm_storeid"],
                 role_id=r["roleid"],
-                qr_data=new_password,
+                qr_data=password,
                 error_message="",
                 raw_request=raw_req,
             )
 
         return JsonResponse({
             "status": "ok",
-            "qr_data": new_password,
+            "qr_data": password,
             "user_id": user.id,
             "stores": per_store_results,
         })
 
     except Exception as e:
-        logger.exception("[QR/TG] Unexpected error")
+        logger.exception("[QR/TG/RO] Unexpected error")
         try:
             send_telegram_log(
-                "💥 Критическая ошибка при выдаче QR по TG\n"
+                "💥 Критическая ошибка (READ-ONLY) при выдаче QR по TG\n"
                 f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
             )
         except Exception:
@@ -3258,6 +3290,8 @@ def get_qr_code_by_tg(request):
 @csrf_exempt
 def get_qr_code_by_employee_id(request):
     """
+    READ-ONLY.
+
     POST:
     {
       "inn": "7536207278",
@@ -3268,13 +3302,19 @@ def get_qr_code_by_employee_id(request):
     }
 
     Делает:
-      - валидирует INN/FIO/storeId(roleId)
+      - валидирует INN/FIO/storeId/roleId
       - маппит smstore -> ukm4store через таблицу Store
-      - находит пользователя по INN (несколько стратегий), НЕ создаёт “пустого” юзера (чтобы не сломать NOT NULL)
-      - если для этого ukm4store нет UKMUser — создаёт/обновляет (role/version)
-      - регенерирует пароль и обновляет PG (_set_password_pg)
-      - обновляет ВСЕ магазины этого пользователя так же, как get_qr_code_by_tg
-      - пишет QRIssueLog по каждому магазину
+      - ищет пользователя в users по ИНН (как раньше: plain + sha + sha20)
+      - проверяет, что у пользователя есть записи ukm_users
+      - (опционально) проверяет, что запрошенный ukm4store есть среди ukm_users
+      - читает существующий open_in_system.password (system_id=9) и возвращает
+      - пишет QRIssueLog (по каждому магазину пользователя)
+      - шлёт админ-лог в Telegram (TELEGRAM_ADMIN_CHAT_IDS)
+
+    НЕ делает:
+      - НЕ обновляет QRCode / OpenInSystem / UKMUser
+      - НЕ пишет в MySQL import4.users/signal
+      - НЕ обновляет XML UKM5
     """
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
@@ -3285,9 +3325,9 @@ def get_qr_code_by_employee_id(request):
         try:
             data = json.loads(raw_body)
         except Exception as e:
-            logger.error(f"[QR/EMP] JSON parse error: {e}; body={raw_body!r}")
+            logger.error(f"[QR/EMP/RO] JSON parse error: {e}; body={raw_body!r}")
             send_telegram_log(
-                "❌ Ошибка при выдаче QR по ИНН\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Парсинг JSON\nПричина: {e}\n\n"
                 f"Сырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
             )
@@ -3319,13 +3359,34 @@ def get_qr_code_by_employee_id(request):
         # INN
         if not inn_raw:
             msg = "Не указан inn"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}\n\n{raw_body[:1000]}")
+            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}")
+            log_qr_issue(
+                endpoint="get_qr_code_by_employee_id",
+                method="BY_INN",
+                status="error",
+                user=None,
+                employee_inn="",
+                employee_fio=fio_raw,
+                tg_id="",
+                phone_raw=phone_raw,
+                phone_normalized=normalize_phone_ru(phone_raw) or "",
+                sm_store_id=int(store_raw) if store_raw.isdigit() else None,
+                ukm_store_id=None,
+                role_id=int(role_raw) if role_raw.isdigit() else None,
+                qr_data="",
+                error_message=f"Валидация: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
             return JsonResponse({"status": "error", "message": msg}, status=400)
+
         try:
             plain_inn = ensure_plain_inn(inn_raw)
         except Exception as e:
             msg = f"Некорректный ИНН: {e}"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по ИНН\nЭтап: Валидация ИНН\nПричина: {msg}\ninn={inn_raw!r}")
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Валидация ИНН\nПричина: {msg}\ninn={inn_raw!r}"
+            )
             log_qr_issue(
                 endpoint="get_qr_code_by_employee_id",
                 method="BY_INN",
@@ -3348,31 +3409,63 @@ def get_qr_code_by_employee_id(request):
         # FIO
         if not fio_raw:
             msg = "Не указано fio"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}\ninn={plain_inn}")
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Валидация\nПричина: {msg}\ninn={plain_inn}"
+            )
+            log_qr_issue(
+                endpoint="get_qr_code_by_employee_id",
+                method="BY_INN",
+                status="error",
+                user=None,
+                employee_inn=plain_inn,
+                employee_fio="",
+                tg_id="",
+                phone_raw=phone_raw,
+                phone_normalized=normalize_phone_ru(phone_raw) or "",
+                sm_store_id=int(store_raw) if store_raw.isdigit() else None,
+                ukm_store_id=None,
+                role_id=int(role_raw) if role_raw.isdigit() else None,
+                qr_data="",
+                error_message=f"Валидация: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
             return JsonResponse({"status": "error", "message": msg}, status=400)
         fio = " ".join(fio_raw.split()).strip()
 
         # storeId(smstore)
         if not store_raw or not store_raw.isdigit():
             msg = "Некорректный storeId (smstore)"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}\nstoreId={store_raw!r}")
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Валидация\nПричина: {msg}\nstoreId={store_raw!r}"
+            )
+            log_qr_issue(
+                endpoint="get_qr_code_by_employee_id",
+                method="BY_INN",
+                status="error",
+                user=None,
+                employee_inn=plain_inn,
+                employee_fio=fio,
+                tg_id="",
+                phone_raw=phone_raw,
+                phone_normalized=normalize_phone_ru(phone_raw) or "",
+                sm_store_id=None,
+                ukm_store_id=None,
+                role_id=int(role_raw) if role_raw.isdigit() else None,
+                qr_data="",
+                error_message=f"Валидация: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
             return JsonResponse({"status": "error", "message": msg}, status=400)
         sm_store_id = int(store_raw)
 
         # roleId
         if not role_raw or not role_raw.isdigit():
             msg = "Некорректный roleId"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}\nroleId={role_raw!r}")
-            return JsonResponse({"status": "error", "message": msg}, status=400)
-        role_id = int(role_raw)
-
-        # smstore -> ukm4store
-        store_obj = Store.objects.filter(smstore=sm_store_id).first()
-        if not store_obj or store_obj.ukm4store is None:
-            msg = "Магазин не найден в stores или не указан ukm4store"
             send_telegram_log(
-                "❌ Ошибка при выдаче QR по ИНН\n"
-                f"Этап: Маппинг smstore→ukm4store\nПричина: {msg}\nsmstore={sm_store_id}"
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Валидация\nПричина: {msg}\nroleId={role_raw!r}"
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_employee_id",
@@ -3386,41 +3479,23 @@ def get_qr_code_by_employee_id(request):
                 phone_normalized=normalize_phone_ru(phone_raw) or "",
                 sm_store_id=sm_store_id,
                 ukm_store_id=None,
-                role_id=role_id,
+                role_id=None,
                 qr_data="",
-                error_message=f"Маппинг smstore→ukm4store: {msg}",
+                error_message=f"Валидация: {msg}",
                 raw_request={"raw_body": raw_body} if raw_body else None,
             )
             return JsonResponse({"status": "error", "message": msg}, status=400)
+        role_id_req = int(role_raw)
 
-        try:
-            ukm_store_id = int(str(store_obj.ukm4store).strip())
-        except Exception:
-            msg = f"Некорректный ukm4store в stores для smstore={sm_store_id}: {store_obj.ukm4store!r}"
-            send_telegram_log(f"❌ Ошибка при выдаче QR по ИНН\nЭтап: Маппинг\nПричина: {msg}")
-            return JsonResponse({"status": "error", "message": "Некорректное значение ukm4store"}, status=400)
-
-        # phone
         phone_norm = normalize_phone_ru(phone_raw) or ""
 
-        # Находим пользователя (поддержим разные варианты хранения INN)
-        inn_sha = hashlib.sha256(plain_inn.encode("utf-8")).hexdigest()
-        inn_sha20 = inn_sha[:20]
-
-        user = (
-            User.objects.filter(employee_id=plain_inn).first()
-            or User.objects.filter(encrypted_inn=plain_inn).first()
-            or User.objects.filter(employee_id=inn_sha).first()
-            or User.objects.filter(encrypted_inn=inn_sha).first()
-            or User.objects.filter(employee_id=inn_sha20).first()
-            or User.objects.filter(encrypted_inn=inn_sha20).first()
-        )
-        if not user:
-            msg = f"Пользователь с INN={plain_inn} не найден в PostgreSQL"
+        # smstore -> ukm4store
+        store_obj = Store.objects.filter(smstore=sm_store_id).first()
+        if not store_obj or store_obj.ukm4store is None:
+            msg = "Магазин не найден в stores или не указан ukm4store"
             send_telegram_log(
-                "❌ Ошибка при выдаче QR по ИНН\n"
-                f"Этап: Поиск пользователя\nПричина: {msg}\n"
-                f"inn={plain_inn}\nfio={fio}\nsmstore={sm_store_id} (ukm4store={ukm_store_id})"
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Маппинг smstore→ukm4store\nПричина: {msg}\nsmstore={sm_store_id}"
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_employee_id",
@@ -3433,41 +3508,146 @@ def get_qr_code_by_employee_id(request):
                 phone_raw=phone_raw,
                 phone_normalized=phone_norm,
                 sm_store_id=sm_store_id,
-                ukm_store_id=ukm_store_id,
-                role_id=role_id,
+                ukm_store_id=None,
+                role_id=role_id_req,
+                qr_data="",
+                error_message=f"Маппинг smstore→ukm4store: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
+            return JsonResponse({"status": "error", "message": msg}, status=400)
+
+        try:
+            ukm_store_id_req = int(str(store_obj.ukm4store).strip())
+        except Exception:
+            msg = "Некорректное значение ukm4store"
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Маппинг smstore→ukm4store\nПричина: {msg}\nsmstore={sm_store_id}"
+            )
+            return JsonResponse({"status": "error", "message": msg}, status=400)
+
+        # Поиск пользователя (как было — несколько стратегий)
+        inn_sha = hashlib.sha256(plain_inn.encode("utf-8")).hexdigest()
+        inn_sha20 = inn_sha[:20]
+        user = (
+            User.objects.filter(employee_id=plain_inn).first()
+            or User.objects.filter(encrypted_inn=plain_inn).first()
+            or User.objects.filter(employee_id=inn_sha).first()
+            or User.objects.filter(encrypted_inn=inn_sha).first()
+            or User.objects.filter(employee_id=inn_sha20).first()
+            or User.objects.filter(encrypted_inn=inn_sha20).first()
+        )
+        if not user:
+            msg = f"Пользователь с INN={plain_inn} не найден в PostgreSQL"
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Поиск пользователя\nПричина: {msg}\n"
+                f"inn={plain_inn}\nfio={fio}\nsmstore={sm_store_id} (ukm4store={ukm_store_id_req})"
+            )
+            log_qr_issue(
+                endpoint="get_qr_code_by_employee_id",
+                method="BY_INN",
+                status="error",
+                user=None,
+                employee_inn=plain_inn,
+                employee_fio=fio,
+                tg_id="",
+                phone_raw=phone_raw,
+                phone_normalized=phone_norm,
+                sm_store_id=sm_store_id,
+                ukm_store_id=ukm_store_id_req,
+                role_id=role_id_req,
                 qr_data="",
                 error_message=f"Поиск пользователя: {msg}",
                 raw_request={"raw_body": raw_body} if raw_body else None,
             )
             return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
-        # PG-изменения (ukm_users + пароль)
-        with transaction.atomic():
-            # подправим ФИО/телефон при необходимости (не обязательно, но полезно)
-            upd_fields = []
-            if fio and (not (user.full_name or "").strip()):
-                user.full_name = fio
-                upd_fields.append("full_name")
-            if phone_raw and (not (user.phone or "").strip()):
-                user.phone = phone_raw
-                upd_fields.append("phone")
-            if upd_fields:
-                user.save(update_fields=upd_fields + ["updated_at"] if hasattr(user, "updated_at") else upd_fields)
-
-            link = UKMUser.objects.filter(user=user, storeid=ukm_store_id).first()
-            if link:
-                # если роль изменилась — обновим
-                if int(link.roleid) != int(role_id):
-                    link.roleid = role_id
-                    link.save(update_fields=["roleid"])
-            else:
-                UKMUser.objects.create(user=user, storeid=ukm_store_id, roleid=role_id, version=1)
-
-            new_password = build_user_password(plain_inn)
-            _set_password_pg(user, new_password)
-
-        # Все магазины пользователя — обновляем ВЕЗДЕ
+        # ukm_users (READ-ONLY): просто читаем
         ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
+        if not ukm_links:
+            msg = f"Нет записей ukm_users для user_id={user.id}"
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Проверка доступов\nПричина: {msg}\n"
+                f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}\nsmstore={sm_store_id} (ukm4store={ukm_store_id_req})"
+            )
+            log_qr_issue(
+                endpoint="get_qr_code_by_employee_id",
+                method="BY_INN",
+                status="error",
+                user=user,
+                employee_inn=plain_inn,
+                employee_fio=fio,
+                tg_id=str(getattr(user, "tg_id", "") or ""),
+                phone_raw=phone_raw,
+                phone_normalized=phone_norm,
+                sm_store_id=sm_store_id,
+                ukm_store_id=ukm_store_id_req,
+                role_id=role_id_req,
+                qr_data="",
+                error_message=f"Проверка доступов: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
+            return JsonResponse({"status": "error", "message": "Для пользователя нет записей в ukm_users"}, status=404)
+
+        # Проверим, что запрошенный магазин есть в ukm_users (ничего не меняем)
+        has_requested_store = any(int(x["storeid"]) == int(ukm_store_id_req) for x in ukm_links if str(x.get("storeid", "")).isdigit())
+        if not has_requested_store:
+            msg = f"У пользователя нет доступа к ukm4store={ukm_store_id_req} (запрошен smstore={sm_store_id})"
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Проверка доступов\nПричина: {msg}\n"
+                f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}"
+            )
+            log_qr_issue(
+                endpoint="get_qr_code_by_employee_id",
+                method="BY_INN",
+                status="error",
+                user=user,
+                employee_inn=plain_inn,
+                employee_fio=fio,
+                tg_id=str(getattr(user, "tg_id", "") or ""),
+                phone_raw=phone_raw,
+                phone_normalized=phone_norm,
+                sm_store_id=sm_store_id,
+                ukm_store_id=ukm_store_id_req,
+                role_id=role_id_req,
+                qr_data="",
+                error_message=f"Проверка доступов: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
+            return JsonResponse({"status": "error", "message": msg}, status=403)
+
+        # open_in_system.password (READ-ONLY)
+        password, open_username, open_row_id = _get_existing_open_password(user_id=user.id, system_id=9)
+        if not password:
+            msg = f"Нет password в open_in_system (system_id=9) для user_id={user.id}"
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                f"Этап: Чтение open_in_system\nПричина: {msg}\n\n"
+                f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}"
+            )
+            log_qr_issue(
+                endpoint="get_qr_code_by_employee_id",
+                method="BY_INN",
+                status="error",
+                user=user,
+                employee_inn=plain_inn,
+                employee_fio=fio,
+                tg_id=str(getattr(user, "tg_id", "") or ""),
+                phone_raw=phone_raw,
+                phone_normalized=phone_norm,
+                sm_store_id=sm_store_id,
+                ukm_store_id=ukm_store_id_req,
+                role_id=role_id_req,
+                qr_data="",
+                error_message=f"open_in_system: {msg}",
+                raw_request={"raw_body": raw_body} if raw_body else None,
+            )
+            return JsonResponse({"status": "error", "message": "У пользователя нет сохранённого QR (open_in_system)"}, status=404)
+
+        # Store map для вывода/логов
         ukm_store_ids_str = [str(int(x["storeid"])) for x in ukm_links if str(x.get("storeid", "")).isdigit()]
         store_map = {
             str(s.ukm4store).strip(): s
@@ -3475,62 +3655,62 @@ def get_qr_code_by_employee_id(request):
         }
 
         per_store_results = []
+        role_mismatch_notes = []
         for l in ukm_links:
             sid = int(l["storeid"])
-            r_id = int(l["roleid"])
-
-            try:
-                cashier_id_for_store, ukm_host, found_in_trm, trm_dbg = resolve_cashier_id_for_store(
-                    sid, plain_inn, fio
-                )
-            except Exception as e:
-                cashier_id_for_store, ukm_host, found_in_trm, trm_dbg = 1, None, False, {"error": str(e)}
-
-            _update_store_mysql_and_xml_for_single_store(
-                store_id=sid,
-                cashier_id=cashier_id_for_store,
-                role_id=r_id,
-                plain_inn=plain_inn,
-                fio=fio,
-                password_plain=new_password,
-            )
-
+            role_id_db = int(l["roleid"])
             s_obj = store_map.get(str(sid))
+
+            if sid == int(ukm_store_id_req) and role_id_db != int(role_id_req):
+                role_mismatch_notes.append(f"requested_role={role_id_req} != ukm_users.roleid={role_id_db} (ukm_storeid={sid})")
+
             per_store_results.append({
                 "ukm_storeid": sid,
                 "smstore": getattr(s_obj, "smstore", None),
                 "store_name": getattr(s_obj, "name", "") if s_obj else "",
-                "roleid": r_id,
-                "cashier_id": int(cashier_id_for_store),
-                "ukm_host": ukm_host,
-                "found_in_trm": bool(found_in_trm),
+                "roleid": role_id_db,
+                "cashier_id": None,
+                "ukm_host": None,
+                "found_in_trm": None,
             })
 
         # Telegram-лог
+        fio_db = " ".join(((user.full_name or "").split())) if (user.full_name or "").strip() else ""
+        fio_match = (fio_db == fio) if fio_db else None
+
         lines = [
-            "✅ QR-код успешно сгенерирован или обновлён по ИНН сотрудника",
+            "✅ QR-код возвращён из базы (READ-ONLY) по ИНН сотрудника",
             "",
             "👤 Сотрудник:",
             f"  • user_id (PostgreSQL): {user.id}",
-            f"  • ФИО: {fio}",
+            f"  • ФИО (запрос): {fio}",
+            f"  • ФИО (users.full_name): {fio_db or '—'}",
+            f"  • fio_match: {fio_match if fio_match is not None else '—'}",
             f"  • ИНН: {plain_inn}",
             f"  • phone_raw: {phone_raw or '—'}",
             f"  • phone_norm: {phone_norm or '—'}",
             "",
-            f"🏬 Запрошенный магазин: smstore={sm_store_id} → ukm4store={ukm_store_id}, roleId={role_id}",
+            f"🏬 Запрошенный магазин: smstore={sm_store_id} → ukm4store={ukm_store_id_req}, roleId={role_id_req}",
+        ]
+        if role_mismatch_notes:
+            lines += ["", "⚠️ Несовпадение roleId:", *[f"  • {x}" for x in role_mismatch_notes]]
+
+        lines += [
             "",
-            "🔁 Обновлено по всем магазинам пользователя:",
+            "📌 Магазины пользователя (ukm_users):",
         ]
         for r in per_store_results:
-            lines.append(
-                f"  • ukm_storeid={r['ukm_storeid']}, smstore={r['smstore']}, "
-                f"roleId={r['roleid']}, cashier_id={r['cashier_id']}, "
-                f"ukm_host={r['ukm_host'] or '—'}, in_trm={1 if r['found_in_trm'] else 0}"
-            )
-        lines += ["", "🔐 Новый QR (строка):", new_password]
+            lines.append(f"  • ukm_storeid={r['ukm_storeid']}, smstore={r['smstore']}, roleId={r['roleid']}")
+
+        lines += [
+            "",
+            "🔐 QR (из open_in_system.password):",
+            password,
+            f"open_in_system.id={open_row_id}, username={open_username or '—'}",
+        ]
         send_telegram_log("\n".join(lines))
 
-        # QRIssueLog по каждому магазину
+        # Логи в таблицу (по каждому магазину)
         try:
             raw_req = json.loads(raw_body) if raw_body else None
         except Exception:
@@ -3545,33 +3725,33 @@ def get_qr_code_by_employee_id(request):
                 employee_inn=plain_inn,
                 employee_fio=fio,
                 tg_id=str(getattr(user, "tg_id", "") or ""),
-                phone_raw=phone_raw or (user.phone or ""),
-                phone_normalized=phone_norm or (normalize_phone_ru(user.phone or "") or ""),
+                phone_raw=phone_raw,
+                phone_normalized=phone_norm,
                 sm_store_id=r["smstore"],
                 ukm_store_id=r["ukm_storeid"],
                 role_id=r["roleid"],
-                qr_data=new_password,
+                qr_data=password,
                 error_message="",
                 raw_request=raw_req,
             )
 
         return JsonResponse({
             "status": "ok",
-            "qr_data": new_password,
+            "qr_data": password,
             "user_id": user.id,
             "requested": {
                 "smstore": sm_store_id,
-                "ukm4store": ukm_store_id,
-                "roleid": role_id,
+                "ukm4store": ukm_store_id_req,
+                "roleid": role_id_req,
             },
             "stores": per_store_results,
         })
 
     except Exception as e:
-        logger.exception("[QR/EMP] Unexpected error")
+        logger.exception("[QR/EMP/RO] Unexpected error")
         try:
             send_telegram_log(
-                "💥 Критическая ошибка при выдаче QR по ИНН\n"
+                "💥 Критическая ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
             )
         except Exception:
