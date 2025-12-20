@@ -24,6 +24,22 @@ from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Depa
 
 _HEX = set("0123456789abcdefABCDEF")
 UKM5_FULL_XML_STORE_ID = 2013
+def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
+    raw = os.getenv(name, default_csv) or ""
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+
+            pass
+    return out
+
+
+UKM5_FULL_XML_STORE_IDS: set[int] = _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", "2013,9016,1003")
 TRM_ID_MAX = 2147483647
 
 TRM_SMALL_MIN = int(os.getenv("TRM_SMALL_MIN", "10000"))   
@@ -1139,9 +1155,11 @@ def _update_store_mysql_and_xml_for_single_store(
     """
     Обновляет кассира по ОДНОМУ магазину:
       • UKM4 (MySQL import4.users + import4.signal)
-      • UKM5 (XML storeCashiers_...)
-    Пароль в MySQL – OLD_PASSWORD(mysql_pwd(password_plain)).
-    Пароль в XML – тот же, что в PG (с префиксом KS).
+      • UKM5 (XML storeCashiers_... если магазин UKM5)
+
+    ВАЖНО:
+      • Для магазинов из UKM5_FULL_XML_STORE_IDS делаем ПОЛНУЮ пересборку XML,
+        а не точечный upsert одного кассира.
     """
     logger.info(
         f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
@@ -1153,21 +1171,21 @@ def _update_store_mysql_and_xml_for_single_store(
     is_ukm5 = info.get("is_ukm5", False)
     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
 
+    # -------------------------
     # UKM4 / MySQL import4
+    # -------------------------
     if ukm4ip:
         conv = cur = None
         try:
             conv = connect_store_mysql(ukm4ip)
             cur = conv.cursor()
 
-            # Версию берём как (COUNT(signal='busy') + 1)
             base_version = _calc_next_signal_version(cur)
             logger.info(
                 f"[QR/EMP] Store {store_id} ({ukm4ip}): next version={base_version} "
                 f"(по MAX(signal.version))"
             )
 
-            # Вставляем users (password = OLD_PASSWORD(без 'KS'))
             cur.execute("""
                 INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
                 VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
@@ -1180,23 +1198,19 @@ def _update_store_mysql_and_xml_for_single_store(
                 role_id,
                 base_version
             ))
-            logger.info(
-                f"[QR/EMP] Store {store_id} ({ukm4ip}): users inserted "
-                f"(id={cashier_id}, role_id={role_id}, version={base_version})"
-            )
 
-            # Сигнал 'incr'
-            cur.execute("INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)", (base_version,))
-            logger.info(
-                f"[QR/EMP] Store {store_id} ({ukm4ip}): signal inserted incr/{base_version}"
+            cur.execute(
+                "INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)",
+                (base_version,)
             )
 
             conv.commit()
-        except Exception as e:
-            logger.error(
-                f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}",
-                exc_info=True
+            logger.info(
+                f"[QR/EMP] Store {store_id} ({ukm4ip}): OK users+signal "
+                f"(id={cashier_id}, role_id={role_id}, version={base_version})"
             )
+        except Exception as e:
+            logger.error(f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}", exc_info=True)
             if conv:
                 try:
                     conv.rollback()
@@ -1204,61 +1218,55 @@ def _update_store_mysql_and_xml_for_single_store(
                     pass
         finally:
             try:
-                if cur:
-                    cur.close()
-                if conv:
-                    conv.close()
+                if cur: cur.close()
+                if conv: conv.close()
             except Exception:
                 pass
     else:
-        logger.error(
-            f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal"
-        )
+        logger.error(f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal")
 
+    # -------------------------
     # UKM5 / XML
-    if is_ukm5:
-        # Для магазина 2013 всегда пересобираем ПОЛНЫЙ XML
-        if store_id == UKM5_FULL_XML_STORE_ID:
-            try:
-                xml_path = build_full_ukm5_xml_for_store(store_id)
-                logger.info(
-                    f"[QR/EMP] Store {store_id}: полный XML для УКМ-5 пересобран: {xml_path}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"[QR/EMP] Store {store_id}: ошибка при полной пересборке XML/UKM5: {e}",
-                    exc_info=True
-                )
-        else:
-            # Для остальных магазинов оставляем старое поведение (upsert по одному кассиру)
-            try:
-                xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
+    # -------------------------
+    if not is_ukm5:
+        return
 
-                changed = False
-                for cash_el in list(root.findall("cashier")):
-                    if cash_el.findtext("INN") == plain_inn:
-                        root.remove(cash_el)
-                        changed = True
-                if changed:
-                    logger.info(
-                        f"[QR/EMP] Store {store_id}: старые записи <cashier> "
-                        f"с INN={plain_inn} удалены из {xml_path}"
-                    )
+    # Полная пересборка XML для “спец” магазинов
+    if int(store_id) in UKM5_FULL_XML_STORE_IDS:
+        try:
+            xml_path = build_full_ukm5_xml_for_store(store_id)
+            logger.info(f"[QR/EMP] Store {store_id}: полный XML пересобран: {xml_path}")
+        except Exception as e:
+            logger.error(
+                f"[QR/EMP] Store {store_id}: ошибка полной пересборки XML/UKM5: {e}",
+                exc_info=True
+            )
+        return
 
-                cash_el = ET.SubElement(root, "cashier")
-                ET.SubElement(cash_el, "roleId").text = str(role_id)
-                ET.SubElement(cash_el, "id").text = str(cashier_id)
-                ET.SubElement(cash_el, "name").text = fio
-                ET.SubElement(cash_el, "INN").text = plain_inn
-                ET.SubElement(cash_el, "password").text = password_plain
+    # Остальные UKM5 — точечное обновление одного кассира
+    try:
+        xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
 
-                _write_xml_with_declaration(xml_path, root, ensure_base=True)
-                logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
-            except Exception as e:
-                logger.error(
-                    f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}",
-                    exc_info=True
-                )
+        # удаляем старые записи этого INN
+        changed = False
+        for cash_el in list(root.findall("cashier")):
+            if (cash_el.findtext("INN") or "").strip() == plain_inn:
+                root.remove(cash_el)
+                changed = True
+        if changed:
+            logger.info(f"[QR/EMP] Store {store_id}: удалены старые cashier с INN={plain_inn} из {xml_path}")
+
+        cash_el = ET.SubElement(root, "cashier")
+        ET.SubElement(cash_el, "roleId").text = str(role_id)
+        ET.SubElement(cash_el, "id").text = str(cashier_id)
+        ET.SubElement(cash_el, "name").text = fio
+        ET.SubElement(cash_el, "INN").text = plain_inn
+        ET.SubElement(cash_el, "password").text = password_plain
+
+        _write_xml_with_declaration(xml_path, root, ensure_base=True)
+        logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
+    except Exception as e:
+        logger.error(f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}", exc_info=True)
             
             
             
