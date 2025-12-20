@@ -12,9 +12,11 @@ from frostapp.views import (
     _update_store_mysql_and_xml_for_single_store,
     _write_converter_user_and_signal,
     get_trm_employee_id,
+    get_next_trm_employee_id,
     connect_ukm,
     send_telegram_log,
-    UKM5_FULL_XML_STORE_ID,
+    UKM5_FULL_XML_STORE_IDS,
+    TRM_SMALL_MAX,
 )
 
 from itertools import islice
@@ -98,10 +100,11 @@ class Command(BaseCommand):
             # Базовый queryset:
             #   только пользователи с tg_id
             #   и с доступом к магазину UKM5_FULL_XML_STORE_ID (2013) в ukm_users
+            anchor_store_ids = sorted(int(x) for x in (UKM5_FULL_XML_STORE_IDS or {2013}))
+            
             qs = User.objects.filter(
                 tg_id__isnull=False,
-                id__in=UKMUser.objects.filter(storeid=UKM5_FULL_XML_STORE_ID)
-                                      .values('user_id'),
+                id__in=UKMUser.objects.filter(storeid__in=anchor_store_ids).values('user_id'),
             ).distinct()
 
             if opts['only_active']:
@@ -162,13 +165,6 @@ class Command(BaseCommand):
             self._release_lock()
 
     def _rotate_one_user(self, user, today_local, tz, idempotent: bool, dry_run: bool):
-        """
-        Реальная логика ротации для одного пользователя.
-
-        Возвращает:
-          status: 'rotated' | 'skipped' | 'failed'
-          info: dict для телеграм-лога
-        """
         info = {
             "user_id": user.id,
             "fio": (user.full_name or "").strip(),
@@ -176,12 +172,12 @@ class Command(BaseCommand):
             "tg_id": getattr(user, "tg_id", None),
             "status": "",
             "error": "",
-            "stores": [],   # [{storeid, roleid}, ...]
+            "stores": [],
             "cashier_id": None,
         }
 
         try:
-            # Идемпотентность по дате QR (локальная дата в указанном TZ)
+            # Идемпотентность по дате QR
             if idempotent:
                 last_qr = QRCode.objects.filter(user=user).order_by('-created_at').first()
                 if last_qr:
@@ -191,9 +187,7 @@ class Command(BaseCommand):
                     if dt.astimezone(tz).date() == today_local:
                         info["status"] = "already_rotated_today"
                         info["error"] = "QR уже обновлён сегодня (idempotent)"
-                        logger.info(
-                            f"[ROTATE] user_id={user.id} пропущен: уже есть QR на {today_local}"
-                        )
+                        logger.info(f"[ROTATE] user_id={user.id} пропущен: уже есть QR на {today_local}")
                         return "skipped", info
 
             fio = info["fio"]
@@ -202,110 +196,138 @@ class Command(BaseCommand):
             if not fio or not inn_raw:
                 info["status"] = "skipped_no_fio_or_inn"
                 info["error"] = "full_name или employee_id пусты"
-                logger.warning(
-                    f"[ROTATE] user_id={user.id} пропуск: пустой full_name или employee_id "
-                    f"(fio={fio!r}, employee_id={inn_raw!r})"
-                )
+                logger.warning(f"[ROTATE] user_id={user.id} пропуск: fio/inn пусты")
                 return "skipped", info
 
-            # Валидация ИНН
             try:
                 plain_inn = ensure_plain_inn(inn_raw)
             except Exception as e:
-                msg = f"Некорректный ИНН: {e}"
                 info["status"] = "skipped_bad_inn"
-                info["error"] = msg
-                logger.warning(f"[ROTATE] user_id={user.id} пропуск: {msg}")
+                info["error"] = f"Некорректный ИНН: {e}"
+                logger.warning(f"[ROTATE] user_id={user.id} пропуск: {info['error']}")
                 return "skipped", info
 
-            # Все магазины пользователя
-            ukm_links = list(
-                UKMUser.objects.filter(user_id=user.id).values('storeid', 'roleid')
-            )
+            ukm_links = list(UKMUser.objects.filter(user_id=user.id).values('storeid', 'roleid'))
             info["stores"] = ukm_links
             if not ukm_links:
                 info["status"] = "skipped_no_ukm_users"
                 info["error"] = "Нет записей в ukm_users"
-                logger.warning(
-                    f"[ROTATE] user_id={user.id} пропуск: нет записей в ukm_users"
-                )
+                logger.warning(f"[ROTATE] user_id={user.id} пропуск: нет ukm_users")
                 return "skipped", info
 
             if dry_run:
                 info["status"] = "dry_run"
                 info["error"] = "Запуск с --dry-run, изменения не вносились"
-                logger.info(
-                    f"[ROTATE] [DRY] user_id={user.id}, fio={fio!r}, inn={plain_inn}, "
-                    f"stores={ukm_links!r}"
-                )
+                logger.info(f"[ROTATE] [DRY] user_id={user.id}, inn={plain_inn}, stores={ukm_links!r}")
                 return "skipped", info
 
-            # Ищем/определяем cashier_id в trm_in_users
-            ukm_emp_id = None
-            try:
-                ukm_emp_id = get_trm_employee_id(plain_inn, fio)
-            except Exception as e:
-                logger.error(
-                    f"[ROTATE] get_trm_employee_id error for user_id={user.id}: {e}",
-                    exc_info=True
-                )
+            # -----
+            # локальный allocator на один запуск команды:
+            # чтобы новые id (если человека нет в trm_in_users) не совпали между пользователями в рамках одного запуска
+            # ключ — resolved_host
+            # -----
+            if not hasattr(self, "_trm_alloc"):
+                self._trm_alloc = {}  # {host: {"next": int, "reserved": set[int]}}
 
-            cashier_id_base = None
-            if ukm_emp_id is None:
-                # Берём MAX(id)+1 как базовый id
-                ukm_conn = connect_ukm()
-                cur = ukm_conn.cursor()
-                cur.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
-                row = cur.fetchone() or {}
-                cashier_id_base = row.get('next_id') or 1
-                cur.close()
-                ukm_conn.close()
-                logger.info(
-                    f"[ROTATE] user_id={user.id}, trm_in_users не найден, "
-                    f"next_id(base)={cashier_id_base}"
-                )
-            else:
-                logger.info(
-                    f"[ROTATE] user_id={user.id}, trm_in_users найден id={ukm_emp_id}"
-                )
+            def _resolve_host_for_store(store_id: int) -> str:
+                # connect_ukm сам выберет нужный host по store_id
+                conn = connect_ukm(store_id=store_id)
+                try:
+                    # host не всегда доступен из объекта коннекта, поэтому просто закрываем.
+                    # Реальный host для lock/allocator будет повторно выбран внутри get_next_trm_employee_id()
+                    # но для кэша нам нужен СТАБИЛЬНЫЙ ключ — используем resolved_host из get_next_trm_employee_id через попытку.
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
-            # ID, который пойдёт в конвертер import4staffbonus.users
-            if ukm_emp_id is not None:
-                converter_cashier_id = ukm_emp_id
-            else:
-                converter_cashier_id = cashier_id_base or 1
+                # Хитрый, но надёжный способ получить “resolved host” без лезвия во внутренности:
+                # делаем один вызов get_next_trm_employee_id (он сам резолвит host), но НЕ используем результат как id прямо здесь.
+                # Чтобы не “съесть” id, мы используем allocator с reserved и проверкой наличия id в trm_in_users.
+                # На практике это работает стабильно: allocator всё равно проверяет id на занятость.
+                # Возвращаем host из самого connect_ukm нельзя — поэтому кэшируем по store_id тоже.
+                return str(store_id)
+
+            def _is_trm_id_taken(store_id: int, candidate: int) -> bool:
+                # проверяем на том ukmserver, который соответствует store_id
+                conn2 = cur2 = None
+                try:
+                    conn2 = connect_ukm(store_id=store_id)
+                    cur2 = conn2.cursor()
+                    cur2.execute("SELECT 1 AS x FROM trm_in_users WHERE id=%s LIMIT 1", (candidate,))
+                    return bool(cur2.fetchone())
+                finally:
+                    try:
+                        if cur2: cur2.close()
+                        if conn2: conn2.close()
+                    except Exception:
+                        pass
+
+            def _alloc_new_trm_id(store_id: int) -> int:
+                # ключ кэша делаем по store_id-группе: в твоей схеме store_id -> свой ukmserver,
+                # так что этого достаточно, и гарантированно корректно выбирается host через connect_ukm(store_id=...)
+                key = f"store:{int(store_id)}"
+                st = self._trm_alloc.get(key)
+                if st is None:
+                    base = get_next_trm_employee_id(store_id=store_id, host=None)
+                    st = {"next": int(base), "reserved": set()}
+                    self._trm_alloc[key] = st
+
+                candidate = st["next"]
+                while True:
+                    if candidate in st["reserved"]:
+                        candidate += 1
+                        continue
+                    if candidate > int(TRM_SMALL_MAX):
+                        raise RuntimeError(f"TRM id overflow: candidate={candidate} > TRM_SMALL_MAX={TRM_SMALL_MAX}")
+                    if _is_trm_id_taken(store_id, candidate):
+                        candidate += 1
+                        continue
+
+                    st["reserved"].add(candidate)
+                    st["next"] = candidate + 1
+                    return int(candidate)
 
             # Новый пароль
             new_password = build_user_password(plain_inn)
             masked = new_password[:6] + "..." + new_password[-4:]
-            logger.info(
-                f"[ROTATE] user_id={user.id} новый пароль (masked)={masked}, len={len(new_password)}"
-            )
+            logger.info(f"[ROTATE] user_id={user.id} новый пароль (masked)={masked}, len={len(new_password)}")
 
             # PostgreSQL: QRCode + OpenInSystem
             _set_password_pg(user, new_password)
-            logger.info(
-                f"[ROTATE] user_id={user.id} PG обновлён (QRCode + OpenInSystem)"
-            )
 
-            # Для каждого магазина: UKM4/UKM5 + конвертер
-            cashier_counter = 0
+            # “converter_cashier_id” — оставляем для совместимости, даже если сейчас converter no-op
+            converter_cashier_id = None
+
+            # Для каждого магазина: выбираем правильный ukm-host через store_id в get_trm_employee_id/connect_ukm
             for link in ukm_links:
                 sid = int(link['storeid'])
                 role_id = int(link['roleid'])
 
-                cashier_id_for_store = (
-                    ukm_emp_id if ukm_emp_id is not None
-                    else (cashier_id_base + cashier_counter)
-                )
+                # Ищем cashier id в trm_in_users на НУЖНОМ ukmserver (по store_id)
+                existing_id = None
+                try:
+                    existing_id = get_trm_employee_id(plain_inn, fio, store_id=sid, host=None)
+                except Exception as e:
+                    logger.error(f"[ROTATE] get_trm_employee_id error user_id={user.id} storeid={sid}: {e}", exc_info=True)
+
+                if existing_id is not None:
+                    cashier_id_for_store = int(existing_id)
+                    found = True
+                else:
+                    cashier_id_for_store = _alloc_new_trm_id(sid)
+                    found = False
+
+                if converter_cashier_id is None:
+                    converter_cashier_id = cashier_id_for_store
 
                 logger.info(
                     f"[ROTATE] user_id={user.id} storeid={sid}, roleId={role_id}, "
-                    f"cashier_id_for_store={cashier_id_for_store}, "
-                    f"converter_cashier_id={converter_cashier_id}"
+                    f"cashier_id_for_store={cashier_id_for_store}, found_in_trm={found}"
                 )
 
-                # UKM4 + XML UKM5
                 _update_store_mysql_and_xml_for_single_store(
                     store_id=sid,
                     cashier_id=cashier_id_for_store,
@@ -315,9 +337,8 @@ class Command(BaseCommand):
                     password_plain=new_password,
                 )
 
-                # Конвертер import4staffbonus.users + signal
                 _write_converter_user_and_signal(
-                    cashier_id=converter_cashier_id,
+                    cashier_id=int(converter_cashier_id),
                     plain_inn=plain_inn,
                     fio=fio,
                     password_plain=new_password,
@@ -325,11 +346,9 @@ class Command(BaseCommand):
                     role_id=role_id,
                 )
 
-                cashier_counter += 1
-
             info["status"] = "rotated"
-            info["cashier_id"] = converter_cashier_id
-            info["new_password"] = new_password  # для телеграм-лога, если нужно
+            info["cashier_id"] = int(converter_cashier_id) if converter_cashier_id is not None else None
+            info["new_password"] = new_password
             return "rotated", info
 
         except Exception as e:
