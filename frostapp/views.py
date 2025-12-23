@@ -18,6 +18,8 @@ from django.http import JsonResponse
 from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
+import ipaddress
+import paramiko
 
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog
@@ -182,7 +184,20 @@ if not logger.hasHandlers():
     logger.addHandler(file_handler)
     
     
-    
+
+UKM5_SRV_HOST = os.getenv("UKM5_SRV_HOST", "192.168.17.38")
+UKM5_SRV_USER = os.getenv("UKM5_SRV_USER", "ukminfo")
+UKM5_SRV_PASSWORD = os.getenv("UKM5_SRV_PASSWORD", "CtHDbCGK.C")  
+UKM5_SRV_DB = os.getenv("UKM5_SRV_DB", "srvdata")
+
+SSH_UKM4_ROOT_PASSWORD = os.getenv("SSH_UKM4_ROOT_PASSWORD", "xxxxxx") 
+SSH_UKM4_KSO_PASSWORD  = os.getenv("SSH_UKM4_KSO_PASSWORD", "xxxxxx") 
+SSH_UKM5_PASSWORD      = os.getenv("SSH_UKM5_PASSWORD", "xxxxxx")   
+
+POS_SSH_PORT = int(os.getenv("POS_SSH_PORT", "22"))
+POS_REBOOT_ALLOWED_NETS_RAW = os.getenv("POS_REBOOT_ALLOWED_NETS", "10.0.0.0/8,192.168.0.0/16") 
+
+
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
@@ -4405,4 +4420,390 @@ def employee_identification(request):
             'onec_body': text_1c,
         }
     )
-    
+
+
+
+
+
+
+
+
+
+
+def connect_ukm5_srvdata():
+    return pymysql.connect(
+        host=UKM5_SRV_HOST,
+        user=UKM5_SRV_USER,
+        password=UKM5_SRV_PASSWORD,
+        database=UKM5_SRV_DB,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=5,
+        read_timeout=10,
+        write_timeout=10,
+    )
+
+
+def _parse_allowed_nets(raw: str) -> list[ipaddress._BaseNetwork]:
+    out = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(ipaddress.ip_network(part))
+        except Exception:
+            logger.warning(f"[POS] bad net in POS_REBOOT_ALLOWED_NETS: {part!r}")
+    return out
+
+_ALLOWED_NETS = _parse_allowed_nets(POS_REBOOT_ALLOWED_NETS_RAW)
+
+
+def _ip_allowed(ip: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(str(ip).strip())
+    except Exception:
+        return False
+    return any(ip_obj in net for net in _ALLOWED_NETS)
+
+
+def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
+    """
+    Возвращает список касс из UKM4:
+      name, cash_id, ip, is_kso, ukm4=True, ukm5=False
+    """
+    info = get_store_info(smstore)
+    ukm_host = info.get("ukm4ip")  # UKMSERVER
+
+    conn = cur = None
+    items: list[dict] = []
+    try:
+        conn = connect_ukm(host=ukm_host, store_id=smstore)  # store_id тут только для fallback
+        cur = conn.cursor()
+
+        # Один запрос вместо "по каждой кассе отдельные SELECT"
+        cur.execute("""
+            SELECT
+              p.name AS pos_name,
+              p.cash_id AS cash_id,
+              ps.ip AS ip,
+              cg.name AS cg_name,
+              CASE
+                WHEN cg.name IS NULL THEN 0
+                WHEN UPPER(cg.name) LIKE '%КИОСК%' OR UPPER(cg.name) LIKE '%КСО%' THEN 1
+                ELSE 0
+              END AS is_kso
+            FROM trm_in_pos p
+            LEFT JOIN (
+                SELECT cash_id, ip
+                FROM trm_out_pos_state
+                WHERE state = 1
+            ) ps ON ps.cash_id = p.cash_id
+            LEFT JOIN trm_in_configuration_groups cg ON cg.id = p.config_group_id
+            WHERE p.store_id = %s
+              AND p.active = 1
+        """, (int(ukm4_storeid),))
+
+        for row in (cur.fetchall() or []):
+            is_kso = bool(row.get("is_kso"))
+            items.append({
+                "cash_id": row.get("cash_id"),
+                "name": row.get("pos_name") or "",
+                "ip": row.get("ip"),
+                "ukm4": True,
+                "ukm5": False,
+                "is_kso": is_kso,
+                "ssh_user": "ukmclient" if is_kso else "root",
+            })
+
+        return items
+
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+
+def fetch_ukm5_pos_list(*, smstore: int) -> list[dict]:
+    """
+    Возвращает список POS из UKM5 (srvdata):
+      id = guid, name, ip(last_ip_address), ukm5=True, ukm4=False, is_kso=True
+    Если данных нет — вернёт [].
+    """
+    conn = cur = None
+    items: list[dict] = []
+    try:
+        conn = connect_ukm5_srvdata()
+        cur = conn.cursor()
+
+        # Берём store по external_id(smstore) -> pos -> статистика -> last_ip_address
+        cur.execute("""
+            SELECT
+              p.name AS pos_name,
+              p.guid AS guid,
+              cs.last_ip_address AS ip
+            FROM store_external_params sp
+            JOIN pos p ON p.store_id = sp.id
+            LEFT JOIN tm_client_exchange_statistics cs ON cs.client_uid = p.guid
+            WHERE sp.external_id = %s
+              AND p.active = 1
+              AND p.deleted = 0
+        """, (int(smstore),))
+
+        for row in (cur.fetchall() or []):
+            guid = (row.get("guid") or "").strip()
+            if not guid:
+                continue
+            items.append({
+                "cash_id": guid,              # по твоему требованию "id = guid"
+                "name": row.get("pos_name") or "",
+                "ip": row.get("ip"),
+                "ukm4": False,
+                "ukm5": True,
+                "is_kso": True,               # по смыслу это КСО/киоск
+                "ssh_user": "ukm5",
+            })
+
+        return items
+
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+
+def get_devices_for_tg_id(tg_id: str) -> tuple[Optional[User], list[dict]]:
+    """
+    Общая функция: по tg_id собирает список устройств (ukm4 + ukm5).
+    """
+    tg_id = str(tg_id or "").strip()
+    if not tg_id:
+        return None, []
+
+    user = User.objects.filter(tg_id=tg_id).first()
+    if not user:
+        return None, []
+
+    ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
+    if not ukm_links:
+        return user, []
+
+    # уникальные ukm4store из ukm_users
+    store_ids = sorted({int(x["storeid"]) for x in ukm_links if str(x.get("storeid", "")).isdigit()})
+
+    # Подтянем mapping ukm4store -> Store(smstore)
+    store_map = {
+        int(s.ukm4store): s
+        for s in Store.objects.filter(ukm4store__in=store_ids)
+        if s.ukm4store is not None
+    }
+
+    devices: list[dict] = []
+
+    for ukm4_storeid in store_ids:
+        s_obj = store_map.get(int(ukm4_storeid))
+        smstore = getattr(s_obj, "smstore", None)
+
+        # если smstore нет — UKM5 часть не сможем, UKM4 тоже лучше пропустить
+        if smstore is None:
+            logger.warning(f"[POS] stores.smstore not found for ukm4store={ukm4_storeid}")
+            continue
+
+        # 1) UKM4 кассы
+        try:
+            devices.extend(fetch_ukm4_pos_list(ukm4_storeid=int(ukm4_storeid), smstore=int(smstore)))
+        except Exception as e:
+            logger.exception(f"[POS] UKM4 list error ukm4store={ukm4_storeid}, smstore={smstore}: {e}")
+
+        # 2) UKM5 кассы — только если в Oracle магазин помечен как UKM5
+        try:
+            info = get_store_info(int(smstore))
+            if info.get("is_ukm5", False):
+                devices.extend(fetch_ukm5_pos_list(smstore=int(smstore)))
+        except Exception as e:
+            logger.exception(f"[POS] UKM5 list error smstore={smstore}: {e}")
+
+    return user, devices
+
+
+@csrf_exempt
+def pos_list_by_tg(request):
+    """
+    POST {"tg_id":"..."} -> список касс/КСО UKM4 + UKM5 с ip.
+    """
+    if request.method != "POST":
+        return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
+
+    try:
+        body = json.loads(request.body.decode("utf-8") if request.body else "{}")
+    except Exception:
+        return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
+
+    tg_id = str(body.get("tg_id") or "").strip()
+    if not tg_id:
+        return JsonResponse({"status": "error", "message": "Не указан tg_id"}, status=400)
+
+    user, devices = get_devices_for_tg_id(tg_id)
+    if not user:
+        return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
+
+    # Отдадим ровно то, что тебе нужно
+    return JsonResponse({
+        "status": "ok",
+        "tg_id": tg_id,
+        "user_id": user.id,
+        "devices": devices
+    })
+
+
+def _ssh_reboot(ip: str, *, username: str, password: str, use_sudo: bool) -> dict:
+    """
+    Делает reboot по SSH (в Docker).
+    """
+    port = POS_SSH_PORT
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        client.connect(
+            hostname=ip,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10,
+            banner_timeout=10,
+            auth_timeout=10,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+
+        if use_sudo:
+            # сначала пробуем без запроса пароля (если NOPASSWD)
+            stdin, stdout, stderr = client.exec_command("sudo -n reboot", get_pty=True, timeout=10)
+            err = (stderr.read() or b"").decode("utf-8", errors="ignore").strip()
+
+            if err and ("password" in err.lower() or "a password is required" in err.lower()):
+                stdin, stdout, stderr = client.exec_command("sudo -S reboot", get_pty=True, timeout=10)
+                stdin.write(password + "\n")
+                stdin.flush()
+                err = (stderr.read() or b"").decode("utf-8", errors="ignore").strip()
+
+            out = (stdout.read() or b"").decode("utf-8", errors="ignore").strip()
+
+            return {"ok": True, "stdout": out, "stderr": err}
+
+        else:
+            stdin, stdout, stderr = client.exec_command("reboot", timeout=10)
+            out = (stdout.read() or b"").decode("utf-8", errors="ignore").strip()
+            err = (stderr.read() or b"").decode("utf-8", errors="ignore").strip()
+            return {"ok": True, "stdout": out, "stderr": err}
+
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+@csrf_exempt
+def pos_reboot(request):
+    """
+    POST:
+    {
+      "tg_id": "...",
+      "cash_id": "...",     # для логов (необяз.)
+      "name": "...",        # для логов (необяз.)
+      "ip": "10.x.x.x",
+      "ukm4": true/false,
+      "ukm5": true/false,
+      "is_kso": true/false  # важно для UKM4 (root vs ukmclient)
+    }
+    """
+    if request.method != "POST":
+        return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
+
+    try:
+        body = json.loads(request.body.decode("utf-8") if request.body else "{}")
+    except Exception:
+        return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
+
+    tg_id = str(body.get("tg_id") or "").strip()
+    ip = str(body.get("ip") or "").strip()
+    ukm4 = bool(body.get("ukm4"))
+    ukm5 = bool(body.get("ukm5"))
+    is_kso = bool(body.get("is_kso"))  # если не передадут — будет False (т.е. root)
+
+    cash_id = body.get("cash_id")
+    name = body.get("name")
+
+    if not tg_id or not ip:
+        return JsonResponse({"status": "error", "message": "Нужны tg_id и ip"}, status=400)
+
+    if not (ukm4 or ukm5):
+        return JsonResponse({"status": "error", "message": "Нужно указать ukm4=true или ukm5=true"}, status=400)
+
+    if ukm4 and ukm5:
+        return JsonResponse({"status": "error", "message": "Нельзя одновременно ukm4=true и ukm5=true"}, status=400)
+
+    if not _ip_allowed(ip):
+        return JsonResponse({"status": "error", "message": f"IP {ip} запрещён (allowlist)"}, status=403)
+
+    # 1) проверяем пользователя
+    user, devices = get_devices_for_tg_id(tg_id)
+    if not user:
+        return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
+
+    # 2) защита: ребутить можно только те IP, которые реально есть в списке устройств пользователя
+    allowed_ips = {str(d.get("ip") or "").strip() for d in devices if d.get("ip")}
+    if ip not in allowed_ips:
+        return JsonResponse({
+            "status": "error",
+            "message": "Этот IP не найден среди касс пользователя (запрещено)"
+        }, status=403)
+
+    # 3) выбираем ssh-логин и пароль
+    if ukm5:
+        username = "ukm5"
+        password = SSH_UKM5_PASSWORD
+        use_sudo = True
+    else:
+        if is_kso:
+            username = "ukmclient"
+            password = SSH_UKM4_KSO_PASSWORD
+            use_sudo = True
+        else:
+            username = "root"
+            password = SSH_UKM4_ROOT_PASSWORD
+            use_sudo = False
+
+    if not password:
+        return JsonResponse({"status": "error", "message": f"Не задан пароль SSH для {username} (env)"}, status=500)
+
+    # 4) выполняем reboot
+    logger.info(f"[POS/REBOOT] tg_id={tg_id} user_id={user.id} ip={ip} ukm4={ukm4} ukm5={ukm5} is_kso={is_kso} cash_id={cash_id} name={name}")
+    try:
+        res = _ssh_reboot(ip, username=username, password=password, use_sudo=use_sudo)
+        send_telegram_log(
+            "🔁 REBOOT кассы\n"
+            f"tg_id={tg_id}\nuser_id={user.id}\n"
+            f"ip={ip}\nukm4={ukm4} ukm5={ukm5} is_kso={is_kso}\n"
+            f"ssh_user={username}\n"
+            f"cash_id={cash_id}\nname={name}\n"
+            f"stdout={res.get('stdout')}\nstderr={res.get('stderr')}"
+        )
+        return JsonResponse({"status": "ok", "result": res})
+    except Exception as e:
+        logger.exception(f"[POS/REBOOT] error: {e}")
+        send_telegram_log(
+            "❌ Ошибка REBOOT кассы\n"
+            f"tg_id={tg_id}\nuser_id={getattr(user,'id',None)}\n"
+            f"ip={ip}\nukm4={ukm4} ukm5={ukm5} is_kso={is_kso}\n"
+            f"ssh_user={username}\n"
+            f"err={e}"
+        )
+        return JsonResponse({"status": "error", "message": str(e)}, status=500)
