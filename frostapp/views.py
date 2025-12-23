@@ -4438,9 +4438,9 @@ def connect_ukm5_srvdata():
         database=UKM5_SRV_DB,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
-        connect_timeout=5,
-        read_timeout=10,
-        write_timeout=10,
+        connect_timeout=10,
+        read_timeout=30,
+        write_timeout=30,
     )
 
 
@@ -4468,20 +4468,18 @@ def _ip_allowed(ip: str) -> bool:
 
 
 def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
-    """
-    Возвращает список касс из UKM4:
-      name, cash_id, ip, is_kso, ukm4=True, ukm5=False
-    """
     info = get_store_info(smstore)
-    ukm_host = info.get("ukm4ip")  # UKMSERVER
+    ukm_host = info.get("ukm4ip")
 
     conn = cur = None
     items: list[dict] = []
     try:
-        conn = connect_ukm(host=ukm_host, store_id=smstore)  # store_id тут только для fallback
+        conn = connect_ukm(host=ukm_host, store_id=smstore)
         cur = conn.cursor()
 
-        # Один запрос вместо "по каждой кассе отдельные SELECT"
+        kiosk_pat = "%КИОСК%"
+        kso_pat = "%КСО%"
+
         cur.execute("""
             SELECT
               p.name AS pos_name,
@@ -4490,7 +4488,7 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
               cg.name AS cg_name,
               CASE
                 WHEN cg.name IS NULL THEN 0
-                WHEN UPPER(cg.name) LIKE '%КИОСК%' OR UPPER(cg.name) LIKE '%КСО%' THEN 1
+                WHEN UPPER(cg.name) LIKE %s OR UPPER(cg.name) LIKE %s THEN 1
                 ELSE 0
               END AS is_kso
             FROM trm_in_pos p
@@ -4502,7 +4500,7 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
             LEFT JOIN trm_in_configuration_groups cg ON cg.id = p.config_group_id
             WHERE p.store_id = %s
               AND p.active = 1
-        """, (int(ukm4_storeid),))
+        """, (kiosk_pat, kso_pat, int(ukm4_storeid)))
 
         for row in (cur.fetchall() or []):
             is_kso = bool(row.get("is_kso"))
@@ -4517,7 +4515,6 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
             })
 
         return items
-
     finally:
         try:
             if cur: cur.close()
@@ -4527,47 +4524,49 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
 
 
 def fetch_ukm5_pos_list(*, smstore: int) -> list[dict]:
-    """
-    Возвращает список POS из UKM5 (srvdata):
-      id = guid, name, ip(last_ip_address), ukm5=True, ukm4=False, is_kso=True
-    Если данных нет — вернёт [].
-    """
     conn = cur = None
     items: list[dict] = []
     try:
         conn = connect_ukm5_srvdata()
         cur = conn.cursor()
 
-        # Берём store по external_id(smstore) -> pos -> статистика -> last_ip_address
+        cur.execute(
+            "SELECT id FROM store_external_params WHERE external_id=%s LIMIT 1",
+            (int(smstore),)
+        )
+        r = cur.fetchone()
+        if not r or not r.get("id"):
+            return []
+
+        store_internal_id = int(r["id"])
+
         cur.execute("""
             SELECT
               p.name AS pos_name,
               p.guid AS guid,
               cs.last_ip_address AS ip
-            FROM store_external_params sp
-            JOIN pos p ON p.store_id = sp.id
+            FROM pos p
             LEFT JOIN tm_client_exchange_statistics cs ON cs.client_uid = p.guid
-            WHERE sp.external_id = %s
+            WHERE p.store_id = %s
               AND p.active = 1
               AND p.deleted = 0
-        """, (int(smstore),))
+        """, (store_internal_id,))
 
         for row in (cur.fetchall() or []):
             guid = (row.get("guid") or "").strip()
             if not guid:
                 continue
             items.append({
-                "cash_id": guid,              # по твоему требованию "id = guid"
+                "cash_id": guid,
                 "name": row.get("pos_name") or "",
                 "ip": row.get("ip"),
                 "ukm4": False,
                 "ukm5": True,
-                "is_kso": True,               # по смыслу это КСО/киоск
+                "is_kso": True,
                 "ssh_user": "ukm5",
             })
 
         return items
-
     finally:
         try:
             if cur: cur.close()
