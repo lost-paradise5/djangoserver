@@ -4550,16 +4550,21 @@ def fetch_ukm5_pos_list(*, smstore: int) -> list[dict]:
             WHERE p.store_id = %s
               AND p.active = 1
               AND p.deleted = 0
+              AND cs.last_ip_address IS NOT NULL
+              AND cs.last_ip_address <> ''
         """, (store_internal_id,))
 
         for row in (cur.fetchall() or []):
             guid = (row.get("guid") or "").strip()
+            ip = (row.get("ip") or "").strip()
             if not guid:
                 continue
+            if not ip:
+                continue  
             items.append({
                 "cash_id": guid,
                 "name": row.get("pos_name") or "",
-                "ip": row.get("ip"),
+                "ip": ip,
                 "ukm4": False,
                 "ukm5": True,
                 "is_kso": True,
