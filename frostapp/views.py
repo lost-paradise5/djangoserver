@@ -140,7 +140,8 @@ def get_store_info(storeid: int | str) -> dict:
 
         result = {
             "is_ukm5": bool(ukm5val),
-            "ukm4ip": ukm4ip.strip() if isinstance(ukm4ip, str) else ukm4ip
+            "ukm4ip": ukm4ip.strip() if isinstance(ukm4ip, str) else ukm4ip,
+            "smstore": storeloc_id, 
         }
         logger.info(f"[Oracle] Результат для входного {sid_raw}: {result}")
         return result
@@ -4430,6 +4431,52 @@ def employee_identification(request):
 
 
 
+def _human_user_name(user: "User") -> str:
+    """
+    Возвращает человекочитаемое имя инициатора.
+    Подстроено под разные варианты полей.
+    """
+    for attr in ("full_name", "fio", "name", "username", "login"):
+        val = getattr(user, attr, None)
+        if val:
+            s = str(val).strip()
+            if s:
+                return s
+    # fallback
+    return f"user_id={getattr(user, 'id', '—')}"
+
+
+def _pos_kind_label(*, ukm4: bool, ukm5: bool, is_kso: bool) -> str:
+    if ukm4 and is_kso:
+        return "КСО УКМ4"
+    if ukm4 and not is_kso:
+        return "Касса УКМ4"
+    if (not ukm4) and ukm5 and is_kso:
+        return "КСО УКМ5"
+    if (not ukm4) and ukm5 and (not is_kso):
+        return "Касса УКМ5"
+    return "Неизвестный тип"
+
+
+def _device_cmd_hint(*, ukm4: bool, ukm5: bool, is_kso: bool) -> tuple[str, bool]:
+    """
+    Возвращает (команда, use_sudo) как мы реально выполняем reboot.
+    """
+    if ukm5:
+        return ("sudo reboot", True)
+    # ukm4
+    if is_kso:
+        return ("sudo reboot", True)
+    return ("reboot", False)
+
+
+
+
+
+
+
+
+
 def connect_ukm5_srvdata():
     return pymysql.connect(
         host=UKM5_SRV_HOST,
@@ -4467,7 +4514,7 @@ def _ip_allowed(ip: str) -> bool:
     return any(ip_obj in net for net in _ALLOWED_NETS)
 
 
-def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
+def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int, role_id: int | None = None) -> list[dict]:
     info = get_store_info(smstore)
     ukm_host = info.get("ukm4ip")
 
@@ -4504,14 +4551,23 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
 
         for row in (cur.fetchall() or []):
             is_kso = bool(row.get("is_kso"))
+            ip = row.get("ip")
+
+            if not ip or not str(ip).strip():
+                continue
+
             items.append({
                 "cash_id": row.get("cash_id"),
                 "name": row.get("pos_name") or "",
-                "ip": row.get("ip"),
+                "ip": str(ip).strip(),
+
                 "ukm4": True,
                 "ukm5": False,
                 "is_kso": is_kso,
                 "ssh_user": "ukmclient" if is_kso else "root",
+                "ukm_store_id": int(ukm4_storeid),   
+                "sm_store_id": int(smstore),        
+                "role_id": int(role_id) if role_id is not None else None,
             })
 
         return items
@@ -4523,7 +4579,7 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int) -> list[dict]:
             pass
 
 
-def fetch_ukm5_pos_list(*, smstore: int) -> list[dict]:
+def fetch_ukm5_pos_list(*, smstore: int, ukm4_storeid: int, role_id: int | None = None) -> list[dict]:
     conn = cur = None
     items: list[dict] = []
     try:
@@ -4557,18 +4613,24 @@ def fetch_ukm5_pos_list(*, smstore: int) -> list[dict]:
         for row in (cur.fetchall() or []):
             guid = (row.get("guid") or "").strip()
             ip = (row.get("ip") or "").strip()
+
             if not guid:
                 continue
             if not ip:
                 continue  
+
             items.append({
                 "cash_id": guid,
                 "name": row.get("pos_name") or "",
                 "ip": ip,
+
                 "ukm4": False,
                 "ukm5": True,
                 "is_kso": True,
                 "ssh_user": "ukm5",
+                "ukm_store_id": int(ukm4_storeid),  
+                "sm_store_id": int(smstore),       
+                "role_id": int(role_id) if role_id is not None else None,
             })
 
         return items
@@ -4581,9 +4643,6 @@ def fetch_ukm5_pos_list(*, smstore: int) -> list[dict]:
 
 
 def get_devices_for_tg_id(tg_id: str) -> tuple[Optional[User], list[dict]]:
-    """
-    Общая функция: по tg_id собирает список устройств (ukm4 + ukm5).
-    """
     tg_id = str(tg_id or "").strip()
     if not tg_id:
         return None, []
@@ -4592,14 +4651,31 @@ def get_devices_for_tg_id(tg_id: str) -> tuple[Optional[User], list[dict]]:
     if not user:
         return None, []
 
-    ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
+    ukm_links = list(
+        UKMUser.objects
+        .filter(user_id=user.id)
+        .values("storeid", "roleid")
+    )
     if not ukm_links:
         return user, []
 
-    # уникальные ukm4store из ukm_users
-    store_ids = sorted({int(x["storeid"]) for x in ukm_links if str(x.get("storeid", "")).isdigit()})
+    # storeid -> roleid (берём первый ненулевой, если есть)
+    roles_by_store: dict[int, int | None] = {}
+    store_ids: list[int] = []
+    for x in ukm_links:
+        sid_raw = x.get("storeid")
+        rid_raw = x.get("roleid")
+        if str(sid_raw).isdigit():
+            sid = int(sid_raw)
+            store_ids.append(sid)
+            if sid not in roles_by_store:
+                roles_by_store[sid] = int(rid_raw) if str(rid_raw).isdigit() else None
 
-    # Подтянем mapping ukm4store -> Store(smstore)
+    store_ids = sorted(set(store_ids))
+    if not store_ids:
+        return user, []
+
+    # ukm4store -> Store из Postgres (если есть)
     store_map = {
         int(s.ukm4store): s
         for s in Store.objects.filter(ukm4store__in=store_ids)
@@ -4609,25 +4685,47 @@ def get_devices_for_tg_id(tg_id: str) -> tuple[Optional[User], list[dict]]:
     devices: list[dict] = []
 
     for ukm4_storeid in store_ids:
+        role_id = roles_by_store.get(ukm4_storeid)
+
+        # 1) smstore пытаемся взять из таблицы Store
         s_obj = store_map.get(int(ukm4_storeid))
         smstore = getattr(s_obj, "smstore", None)
 
-        # если smstore нет — UKM5 часть не сможем, UKM4 тоже лучше пропустить
+        # 2) если нет — пробуем достать smstore через Oracle по ukm4_storeid
         if smstore is None:
-            logger.warning(f"[POS] stores.smstore not found for ukm4store={ukm4_storeid}")
+            try:
+                info_by_ukm = get_store_info(ukm4_storeid)  # умеет маппить REP.UKMStoreId -> STORELOC
+                smstore = info_by_ukm.get("smstore")
+            except Exception:
+                smstore = None
+
+        if smstore is None:
+            logger.warning(f"[POS] smstore not resolved for ukm4store={ukm4_storeid}")
             continue
 
         # 1) UKM4 кассы
         try:
-            devices.extend(fetch_ukm4_pos_list(ukm4_storeid=int(ukm4_storeid), smstore=int(smstore)))
+            devices.extend(
+                fetch_ukm4_pos_list(
+                    ukm4_storeid=int(ukm4_storeid),
+                    smstore=int(smstore),
+                    role_id=role_id,
+                )
+            )
         except Exception as e:
             logger.exception(f"[POS] UKM4 list error ukm4store={ukm4_storeid}, smstore={smstore}: {e}")
 
-        # 2) UKM5 кассы — только если в Oracle магазин помечен как UKM5
+        # 2) UKM5 кассы — только если Oracle магазин помечен как UKM5
         try:
             info = get_store_info(int(smstore))
             if info.get("is_ukm5", False):
-                devices.extend(fetch_ukm5_pos_list(smstore=int(smstore)))
+                devices.extend(
+                    fetch_ukm5_pos_list(
+                        smstore=int(smstore),
+                        ukm4_storeid=int(ukm4_storeid),
+                        role_id=role_id,
+                    )
+                )
         except Exception as e:
             logger.exception(f"[POS] UKM5 list error smstore={smstore}: {e}")
 
@@ -4656,12 +4754,15 @@ def pos_list_by_tg(request):
         return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
     # Отдадим ровно то, что тебе нужно
-    return JsonResponse({
-        "status": "ok",
-        "tg_id": tg_id,
-        "user_id": user.id,
-        "devices": devices
-    })
+    return JsonResponse(
+        {
+            "status": "ok",
+            "tg_id": tg_id,
+            "user_id": user.id,
+            "devices": devices
+        },
+        json_dumps_params={"ensure_ascii": False},
+    )
 
 
 def _ssh_reboot(ip: str, *, username: str, password: str, use_sudo: bool) -> dict:
@@ -4716,18 +4817,6 @@ def _ssh_reboot(ip: str, *, username: str, password: str, use_sudo: bool) -> dic
 
 @csrf_exempt
 def pos_reboot(request):
-    """
-    POST:
-    {
-      "tg_id": "...",
-      "cash_id": "...",     # для логов (необяз.)
-      "name": "...",        # для логов (необяз.)
-      "ip": "10.x.x.x",
-      "ukm4": true/false,
-      "ukm5": true/false,
-      "is_kso": true/false  # важно для UKM4 (root vs ukmclient)
-    }
-    """
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
 
@@ -4738,39 +4827,57 @@ def pos_reboot(request):
 
     tg_id = str(body.get("tg_id") or "").strip()
     ip = str(body.get("ip") or "").strip()
-    ukm4 = bool(body.get("ukm4"))
-    ukm5 = bool(body.get("ukm5"))
-    is_kso = bool(body.get("is_kso"))  # если не передадут — будет False (т.е. root)
 
-    cash_id = body.get("cash_id")
-    name = body.get("name")
+    # эти поля могут присылать, но мы НЕ доверяем им (используем только для сверки/логов)
+    req_ukm4 = body.get("ukm4", None)
+    req_ukm5 = body.get("ukm5", None)
+    req_is_kso = body.get("is_kso", None)
 
     if not tg_id or not ip:
         return JsonResponse({"status": "error", "message": "Нужны tg_id и ip"}, status=400)
 
-    if not (ukm4 or ukm5):
-        return JsonResponse({"status": "error", "message": "Нужно указать ukm4=true или ukm5=true"}, status=400)
-
-    if ukm4 and ukm5:
-        return JsonResponse({"status": "error", "message": "Нельзя одновременно ukm4=true и ukm5=true"}, status=400)
-
     if not _ip_allowed(ip):
         return JsonResponse({"status": "error", "message": f"IP {ip} запрещён (allowlist)"}, status=403)
 
-    # 1) проверяем пользователя
+    # 1) ищем пользователя и все его устройства
     user, devices = get_devices_for_tg_id(tg_id)
     if not user:
         return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
-    # 2) защита: ребутить можно только те IP, которые реально есть в списке устройств пользователя
-    allowed_ips = {str(d.get("ip") or "").strip() for d in devices if d.get("ip")}
-    if ip not in allowed_ips:
-        return JsonResponse({
-            "status": "error",
-            "message": "Этот IP не найден среди касс пользователя (запрещено)"
-        }, status=403)
+    # 2) находим устройство по IP (и берём ВСЮ правду из него)
+    dev = next((d for d in devices if str(d.get("ip") or "").strip() == ip), None)
+    if not dev:
+        return JsonResponse({"status": "error", "message": "Этот IP не найден среди касс пользователя (запрещено)"}, status=403)
 
-    # 3) выбираем ssh-логин и пароль
+    ukm4 = bool(dev.get("ukm4"))
+    ukm5 = bool(dev.get("ukm5"))
+    is_kso = bool(dev.get("is_kso"))
+
+    # сверка если клиент прислал флаги (чтобы не было путаницы)
+    if req_ukm4 is not None and bool(req_ukm4) != ukm4:
+        return JsonResponse({"status": "error", "message": "ukm4 не совпадает с типом кассы пользователя"}, status=400)
+    if req_ukm5 is not None and bool(req_ukm5) != ukm5:
+        return JsonResponse({"status": "error", "message": "ukm5 не совпадает с типом кассы пользователя"}, status=400)
+    if req_is_kso is not None and bool(req_is_kso) != is_kso:
+        return JsonResponse({"status": "error", "message": "is_kso не совпадает с типом кассы пользователя"}, status=400)
+
+    if ukm4 and ukm5:
+        return JsonResponse({"status": "error", "message": "Некорректное устройство: ukm4 и ukm5 одновременно"}, status=500)
+    if not (ukm4 or ukm5):
+        return JsonResponse({"status": "error", "message": "Некорректное устройство: не ukm4 и не ukm5"}, status=500)
+
+    # нормальные поля устройства
+    cash_id = dev.get("cash_id")
+    name = dev.get("name") or ""
+    ssh_user = dev.get("ssh_user") or ""
+    sm_store_id = dev.get("sm_store_id")
+    ukm_store_id = dev.get("ukm_store_id")
+    role_id = dev.get("role_id")
+
+    kind = _pos_kind_label(ukm4=ukm4, ukm5=ukm5, is_kso=is_kso)
+    cmd_hint, use_sudo_hint = _device_cmd_hint(ukm4=ukm4, ukm5=ukm5, is_kso=is_kso)
+
+    # 3) выбираем ssh-логин и пароль (УЖЕ по реальному типу)
     if ukm5:
         username = "ukm5"
         password = SSH_UKM5_PASSWORD
@@ -4788,26 +4895,144 @@ def pos_reboot(request):
     if not password:
         return JsonResponse({"status": "error", "message": f"Не задан пароль SSH для {username} (env)"}, status=500)
 
-    # 4) выполняем reboot
-    logger.info(f"[POS/REBOOT] tg_id={tg_id} user_id={user.id} ip={ip} ukm4={ukm4} ukm5={ukm5} is_kso={is_kso} cash_id={cash_id} name={name}")
+    initiator_name = _human_user_name(user)
+
+    logger.info(
+        f"[POS/REBOOT] start: tg_id={tg_id} user_id={user.id} "
+        f"initiator={initiator_name!r} ip={ip} kind={kind} "
+        f"sm_store_id={sm_store_id} ukm_store_id={ukm_store_id} role_id={role_id} "
+        f"ssh_user={username} cash_id={cash_id} name={name!r}"
+    )
+
+    # 4) выполняем reboot + логируем в QRIssueLog + Telegram
     try:
         res = _ssh_reboot(ip, username=username, password=password, use_sudo=use_sudo)
-        send_telegram_log(
-            "🔁 REBOOT кассы\n"
-            f"tg_id={tg_id}\nuser_id={user.id}\n"
-            f"ip={ip}\nukm4={ukm4} ukm5={ukm5} is_kso={is_kso}\n"
-            f"ssh_user={username}\n"
-            f"cash_id={cash_id}\nname={name}\n"
-            f"stdout={res.get('stdout')}\nstderr={res.get('stderr')}"
+
+        # DB лог
+        log_qr_issue(
+            endpoint="pos_reboot",
+            method="POS_REBOOT",
+            status="ok",
+            user=user,
+            tg_id=tg_id,
+            sm_store_id=int(sm_store_id) if str(sm_store_id).isdigit() else sm_store_id,
+            ukm_store_id=int(ukm_store_id) if str(ukm_store_id).isdigit() else ukm_store_id,
+            role_id=int(role_id) if str(role_id).isdigit() else role_id,
+            employee_inn="",
+            employee_fio="",
+            phone_raw="",
+            phone_normalized="",
+            qr_data="",
+            error_message="",
+            raw_request={
+                "request": body,
+                "device": dev,
+                "ssh_user": username,
+                "ssh_port": POS_SSH_PORT,
+                "cmd": cmd_hint,
+                "result": res,
+            },
         )
-        return JsonResponse({"status": "ok", "result": res})
+
+        # Telegram лог (читабельно)
+        msg_lines = [
+            "🔁 REBOOT кассы",
+            "",
+            "👤 Инициатор:",
+            f"  • {initiator_name}",
+            f"  • user_id: {user.id}",
+            f"  • tg_id: {tg_id}",
+            "",
+            "🏬 Магазин:",
+            f"  • ukm_store_id (ukm_users.storeid): {ukm_store_id if ukm_store_id is not None else '—'}",
+            f"  • sm_store_id (stores.smstore / Oracle STORELOC): {sm_store_id if sm_store_id is not None else '—'}",
+            f"  • role_id: {role_id if role_id is not None else '—'}",
+            "",
+            "💻 Касса:",
+            f"  • Тип: {kind}",
+            f"  • name: {name or '—'}",
+            f"  • cash_id: {cash_id if cash_id is not None else '—'}",
+            f"  • ip: {ip}",
+            "",
+            "🔐 SSH:",
+            f"  • user: {username}",
+            f"  • port: {POS_SSH_PORT}",
+            f"  • cmd: {cmd_hint}",
+            "",
+            "✅ Результат:",
+            f"  • ok: {res.get('ok')}",
+            f"  • stdout: {res.get('stdout') or '—'}",
+            f"  • stderr: {res.get('stderr') or '—'}",
+        ]
+        send_telegram_log("\n".join(msg_lines))
+
+        return JsonResponse(
+            {"status": "ok", "result": res},
+            json_dumps_params={"ensure_ascii": False},
+        )
+
     except Exception as e:
         logger.exception(f"[POS/REBOOT] error: {e}")
-        send_telegram_log(
-            "❌ Ошибка REBOOT кассы\n"
-            f"tg_id={tg_id}\nuser_id={getattr(user,'id',None)}\n"
-            f"ip={ip}\nukm4={ukm4} ukm5={ukm5} is_kso={is_kso}\n"
-            f"ssh_user={username}\n"
-            f"err={e}"
+
+        # DB лог ошибки
+        try:
+            log_qr_issue(
+                endpoint="pos_reboot",
+                method="POS_REBOOT",
+                status="error",
+                user=user,
+                tg_id=tg_id,
+                sm_store_id=int(sm_store_id) if str(sm_store_id).isdigit() else sm_store_id,
+                ukm_store_id=int(ukm_store_id) if str(ukm_store_id).isdigit() else ukm_store_id,
+                role_id=int(role_id) if str(role_id).isdigit() else role_id,
+                employee_inn="",
+                employee_fio="",
+                phone_raw="",
+                phone_normalized="",
+                qr_data="",
+                error_message=str(e),
+                raw_request={
+                    "request": body,
+                    "device": dev,
+                    "ssh_user": username,
+                    "ssh_port": POS_SSH_PORT,
+                    "cmd": cmd_hint,
+                },
+            )
+        except Exception:
+            logger.exception("[POS/REBOOT] failed to write QRIssueLog")
+
+        # Telegram лог ошибки
+        msg_lines = [
+            "❌ Ошибка REBOOT кассы",
+            "",
+            "👤 Инициатор:",
+            f"  • {initiator_name}",
+            f"  • user_id: {user.id}",
+            f"  • tg_id: {tg_id}",
+            "",
+            "🏬 Магазин:",
+            f"  • ukm_store_id: {ukm_store_id if ukm_store_id is not None else '—'}",
+            f"  • sm_store_id: {sm_store_id if sm_store_id is not None else '—'}",
+            f"  • role_id: {role_id if role_id is not None else '—'}",
+            "",
+            "💻 Касса:",
+            f"  • Тип: {kind}",
+            f"  • name: {name or '—'}",
+            f"  • cash_id: {cash_id if cash_id is not None else '—'}",
+            f"  • ip: {ip}",
+            "",
+            "🔐 SSH:",
+            f"  • user: {username}",
+            f"  • port: {POS_SSH_PORT}",
+            f"  • cmd: {cmd_hint}",
+            "",
+            f"🧨 Ошибка: {e}",
+        ]
+        send_telegram_log("\n".join(msg_lines))
+
+        return JsonResponse(
+            {"status": "error", "message": str(e)},
+            status=500,
+            json_dumps_params={"ensure_ascii": False},
         )
-        return JsonResponse({"status": "error", "message": str(e)}, status=500)
