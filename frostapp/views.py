@@ -20,6 +20,10 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
 import ipaddress
 import paramiko
+import csv
+import math
+from collections import defaultdict, Counter
+from pathlib import Path
 
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog
@@ -50,6 +54,31 @@ if TRM_SMALL_MIN < 4:
     TRM_SMALL_MIN = 4
 if TRM_SMALL_MAX >= TRM_ID_MAX:
     TRM_SMALL_MAX = TRM_ID_MAX - 1
+
+
+ONEC_WORKING_EMPLOYEES_URL = os.getenv(
+    "ONEC_WORKING_EMPLOYEES_URL",
+    "http://192.168.17.26/zupcorp_http/hs/API/Get_WorkingEmployees",
+)
+
+ONEC_WORKING_EMPLOYEES_TIMEOUT = int(os.getenv("ONEC_WORKING_EMPLOYEES_TIMEOUT", "180"))
+
+ORACLE_SERVICES_ALL = [
+    "BINUU00","BINUU01","BINUU02","BINUU03","BINUU04","BINUU5","BINUU05","BINUU06","BINUU07","BINUU08","BINUU09",
+    "BINUU10","BINUU011","BINUU11","BINUU12","BINUU14","BINUU15","BINUU16","BINUU17","BINUU18","BINUU21","BINUU22",
+    "BINUU23","BINUU24","BINUU25","BINUU26",
+    "BINCH00","BINCH1","BINCH2","BINCH3","BINCH4","BINCH5","BINCH6","BINCH7","BINCH8","BINCH9","BINCH10","BINCH11",
+    "BINCH12","BINCH13","BINCH14","BINCH15","BINCH16","BINCH17","BINCH18","BINCH19","BINCH20","BINCH21","BINCH22",
+]
+
+# Транслитерация
+_TRANSLIT = {
+    "А":"A","Б":"B","В":"V","Г":"G","Д":"D","Е":"E","Ё":"YO","Ж":"ZH","З":"Z","И":"I","Й":"Y","К":"K","Л":"L",
+    "М":"M","Н":"N","О":"O","П":"P","Р":"R","С":"S","Т":"T","У":"U","Ф":"F","Х":"KH","Ц":"TS","Ч":"CH","Ш":"SH",
+    "Щ":"SHCH","Ъ":"","Ы":"Y","Ь":"","Э":"E","Ю":"YU","Я":"YA",
+}
+
+_LOGIN_SAFE_RE = re.compile(r"[^a-z0-9_]+", re.IGNORECASE)
 
 
 
@@ -5036,3 +5065,434 @@ def pos_reboot(request):
             status=500,
             json_dumps_params={"ensure_ascii": False},
         )
+
+
+
+
+
+
+
+
+
+
+def _custom_transliterate(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    out = []
+    for ch in text:
+        up = ch.upper()
+        if up in _TRANSLIT:
+            mapped = _TRANSLIT[up]
+            # сохраняем регистр примерно, но нам всё равно lower() потом
+            out.append(mapped if ch.isupper() else mapped.lower())
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def _normalize_login_piece(s: str) -> str:
+    s = _custom_transliterate(s).lower()
+    s = s.replace(".", "_").replace("-", "_").replace(" ", "_")
+    s = _LOGIN_SAFE_RE.sub("", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+def _expand_login_variants(login: str) -> set[str]:
+    """
+    Частые расхождения транслита (ё/e/yo и т.п.) — добавим “варианты”,
+    чтобы шанс матчинга был выше.
+    """
+    variants = {login}
+    if "yo" in login:
+        variants.add(login.replace("yo", "e"))
+    if "kh" in login:
+        variants.add(login.replace("kh", "h"))
+    if "ts" in login:
+        variants.add(login.replace("ts", "c"))
+    return {v for v in variants if v}
+
+def _build_candidate_logins(lastname: str, firstname: str, patronymic: str) -> set[str]:
+    ln = _normalize_login_piece(lastname)
+    fn = _normalize_login_piece(firstname)
+    sn = _normalize_login_piece(patronymic)
+
+    out = set()
+    if fn and ln:
+        # 1) i_ivanov
+        out.add(f"{fn[0]}_{ln}")
+        # 2) ivan_ivanov
+        out.add(f"{fn}_{ln}")
+
+        # 3) ivan_i_ivanov (если есть отчество)
+        if sn:
+            out.add(f"{fn}_{sn[0]}_{ln}")
+
+    expanded = set()
+    for x in out:
+        expanded |= _expand_login_variants(x)
+    return expanded
+
+def _is_valid_inn_digits(inn: str) -> bool:
+    inn = (inn or "").strip()
+    return inn.isdigit() and len(inn) in (10, 12)
+
+def _connect_oracle_service(service_name: str):
+    ORA_HOST     = os.getenv("ORACLE_HOST", "192.168.17.239")
+    ORA_PORT     = int(os.getenv("ORACLE_PORT", "1521"))
+    ORA_USER     = os.getenv("ORACLE_USER", "supermag")
+    ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
+    dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=service_name)
+    return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+
+def _fetch_onec_working_employees() -> list[dict]:
+    auth = None
+    if ONEC_USER and ONEC_PASS:
+        auth = (ONEC_USER, ONEC_PASS)
+
+    t0 = time.time()
+    logger.info(f"[INN_SYNC] 1C request: {ONEC_WORKING_EMPLOYEES_URL}")
+    r = requests.get(
+        ONEC_WORKING_EMPLOYEES_URL,
+        auth=auth,
+        timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT,
+        headers={"Accept": "application/json"},
+    )
+    r.raise_for_status()
+    data = r.json()
+    dt = time.time() - t0
+    logger.info(f"[INN_SYNC] 1C employees fetched: {len(data)} in {dt:.1f}s")
+    if not isinstance(data, list):
+        raise ValueError("1C ответ не list[...], проверь API Get_WorkingEmployees")
+    return data
+
+def _build_employee_index(onec_employees: list[dict]):
+    """
+    Вернёт:
+      - login_to_emps: dict[login] -> list[{inn, fio, raw}]
+      - emp_stats: словарь счётчиков
+    """
+    login_to_emps: dict[str, list[dict]] = defaultdict(list)
+
+    stats = Counter()
+    stats["employees_total"] = len(onec_employees)
+
+    for e in onec_employees:
+        inn = str(e.get("ИНН") or "").strip()
+        lastname = str(e.get("Фамилия") or "").strip()
+        firstname = str(e.get("Имя") or "").strip()
+        patronymic = str(e.get("Отчество") or "").strip()
+
+        fio = " ".join([x for x in [lastname, firstname, patronymic] if x]).strip()
+
+        if not fio:
+            stats["employees_no_fio"] += 1
+            continue
+
+        if not _is_valid_inn_digits(inn):
+            stats["employees_bad_inn"] += 1
+            # всё равно можно проиндексировать (иногда ИНН пустой, но логин нужен для диагностики)
+            inn = ""
+
+        cand = _build_candidate_logins(lastname, firstname, patronymic)
+        if not cand:
+            stats["employees_no_login_candidates"] += 1
+            continue
+
+        rec = {"inn": inn, "fio": fio, "raw": e}
+
+        for login in cand:
+            login_to_emps[login].append(rec)
+
+        stats["employees_indexed"] += 1
+
+    # посчитаем конфликты (один логин -> несколько разных людей)
+    ambiguous = 0
+    for login, lst in login_to_emps.items():
+        uniq = {(x.get("inn") or "", x.get("fio") or "") for x in lst}
+        if len(uniq) > 1:
+            ambiguous += 1
+    stats["logins_ambiguous"] = ambiguous
+    stats["logins_total"] = len(login_to_emps)
+
+    return login_to_emps, stats
+
+def _oracle_fetch_smstaff_rows(cur, only_enabled: bool, only_null_inn: bool):
+    where = []
+    if only_enabled:
+        # обычно userenabled = '1' (как в твоём ответе)
+        where.append("(userenabled = '1' OR userenabled = 1)")
+    if only_null_inn:
+        where.append("(inn IS NULL OR TRIM(inn) = '')")
+
+    sql = """
+        SELECT id, surname, serverlogin, inn, userenabled
+        FROM smstaff
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    cur.execute(sql)
+    rows = cur.fetchall()
+    return rows
+
+def _normalize_staff_key(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return ""
+    # serverlogin часто в UPPER; surname часто lower; приводим к lower
+    v = v.replace(".", "_").replace("-", "_").replace(" ", "_")
+    v = v.lower()
+    v = _LOGIN_SAFE_RE.sub("", v)
+    v = re.sub(r"_+", "_", v).strip("_")
+    return v
+
+def sm_sync_inn_from_onec(
+    dry_run: bool = True,
+    overwrite_existing_inn: bool = False,
+    services: list[str] | None = None,
+    only_enabled: bool = True,
+    only_null_inn: bool = True,
+) -> dict:
+    """
+    Главная функция:
+      - dry_run=True: только отчёты, без UPDATE
+      - overwrite_existing_inn=False: не трогаем тех, у кого inn уже заполнен
+      - only_null_inn=True: в Oracle вообще не читаем строки с заполненным inn (быстрее)
+    """
+    services = services or ORACLE_SERVICES_ALL
+
+    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(LOG_DIR) / "inn_sync"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    report_csv = out_dir / f"inn_sync_details_{run_ts}.csv"
+    report_json = out_dir / f"inn_sync_summary_{run_ts}.json"
+
+    onec_employees = _fetch_onec_working_employees()
+    login_to_emps, emp_stats = _build_employee_index(onec_employees)
+
+    summary = {
+        "dry_run": dry_run,
+        "overwrite_existing_inn": overwrite_existing_inn,
+        "only_enabled": only_enabled,
+        "only_null_inn": only_null_inn,
+        "services_requested": services,
+        "employee_index": dict(emp_stats),
+        "db_results": [],
+        "totals": Counter(),
+        "files": {"details_csv": str(report_csv), "summary_json": str(report_json)},
+    }
+
+    # CSV: детальная диагностика
+    with report_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "service", "staff_id", "surname", "serverlogin", "inn_before",
+                "match_key", "match_status", "inn_proposed", "employee_fio",
+                "reason"
+            ],
+        )
+        w.writeheader()
+
+        for service in services:
+            db_stat = Counter()
+            db_stat["service"] = service
+
+            conn = cur = None
+            try:
+                t0 = time.time()
+                conn = _connect_oracle_service(service)
+                cur = conn.cursor()
+                db_stat["connect_ok"] = 1
+
+                rows = _oracle_fetch_smstaff_rows(cur, only_enabled=only_enabled, only_null_inn=only_null_inn)
+                db_stat["staff_rows_scanned"] = len(rows)
+
+                # посчитаем дубли логинов внутри SMSTAFF (для диагностики)
+                staff_keys = []
+                for (sid, surname, serverlogin, inn_before, userenabled) in rows:
+                    sk1 = _normalize_staff_key(serverlogin)
+                    sk2 = _normalize_staff_key(surname)
+                    if sk1: staff_keys.append(sk1)
+                    if sk2 and sk2 != sk1: staff_keys.append(sk2)
+                dup_keys = {k for k, c in Counter(staff_keys).items() if c > 1}
+                db_stat["staff_duplicate_keys"] = len(dup_keys)
+
+                updates = []  # для executemany
+
+                for (sid, surname, serverlogin, inn_before, userenabled) in rows:
+                    inn_before_s = (inn_before or "").strip() if inn_before is not None else ""
+                    if inn_before_s and not overwrite_existing_inn:
+                        db_stat["skip_already_has_inn"] += 1
+                        w.writerow({
+                            "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
+                            "inn_before": inn_before_s,
+                            "match_key": "", "match_status": "skip_has_inn",
+                            "inn_proposed": "", "employee_fio": "", "reason": "already has INN",
+                        })
+                        continue
+
+                    key_server = _normalize_staff_key(serverlogin)
+                    key_surname = _normalize_staff_key(surname)
+
+                    match_key = ""
+                    emps = None
+
+                    # приоритет: serverlogin, потом surname
+                    if key_server and key_server in login_to_emps:
+                        match_key = key_server
+                        emps = login_to_emps[key_server]
+                    elif key_surname and key_surname in login_to_emps:
+                        match_key = key_surname
+                        emps = login_to_emps[key_surname]
+
+                    if not emps:
+                        db_stat["not_found"] += 1
+                        w.writerow({
+                            "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
+                            "inn_before": inn_before_s,
+                            "match_key": "", "match_status": "not_found",
+                            "inn_proposed": "", "employee_fio": "", "reason": "no match in 1C index",
+                        })
+                        continue
+
+                    # Если логин неоднозначен (несколько сотрудников)
+                    uniq_people = {(x.get("inn") or "", x.get("fio") or "") for x in emps}
+                    if len(uniq_people) > 1:
+                        db_stat["ambiguous"] += 1
+                        sample = "; ".join([f"{fio}:{inn}" for (inn, fio) in list(uniq_people)[:5]])
+                        w.writerow({
+                            "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
+                            "inn_before": inn_before_s,
+                            "match_key": match_key, "match_status": "ambiguous",
+                            "inn_proposed": "", "employee_fio": "", "reason": f"multiple employees for login: {sample}",
+                        })
+                        continue
+
+                    (inn_prop, fio_prop) = next(iter(uniq_people))
+                    inn_prop = (inn_prop or "").strip()
+
+                    if not _is_valid_inn_digits(inn_prop):
+                        db_stat["bad_inn_in_1c_match"] += 1
+                        w.writerow({
+                            "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
+                            "inn_before": inn_before_s,
+                            "match_key": match_key, "match_status": "bad_inn",
+                            "inn_proposed": inn_prop, "employee_fio": fio_prop,
+                            "reason": "matched employee has empty/invalid INN in 1C",
+                        })
+                        continue
+
+                    # Если уже то же самое
+                    if inn_before_s and inn_before_s == inn_prop:
+                        db_stat["already_same_inn"] += 1
+                        w.writerow({
+                            "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
+                            "inn_before": inn_before_s,
+                            "match_key": match_key, "match_status": "already_same",
+                            "inn_proposed": inn_prop, "employee_fio": fio_prop,
+                            "reason": "INN already equals proposed",
+                        })
+                        continue
+
+                    # Готовим update
+                    db_stat["matched_ok"] += 1
+                    if match_key in dup_keys:
+                        db_stat["matched_but_staff_key_duplicate"] += 1
+
+                    w.writerow({
+                        "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
+                        "inn_before": inn_before_s,
+                        "match_key": match_key, "match_status": "will_update" if not dry_run else "matched_dry_run",
+                        "inn_proposed": inn_prop, "employee_fio": fio_prop,
+                        "reason": "ok",
+                    })
+
+                    if not dry_run:
+                        updates.append({"inn": inn_prop, "id": sid})
+
+                if not dry_run and updates:
+                    # пачечное обновление
+                    cur.executemany("UPDATE smstaff SET inn = :inn WHERE id = :id", updates)
+                    conn.commit()
+                    db_stat["updated"] = len(updates)
+                else:
+                    db_stat["updated"] = 0
+
+                db_stat["duration_sec"] = round(time.time() - t0, 2)
+
+            except Exception as e:
+                db_stat["connect_ok"] = 0
+                db_stat["error"] = str(e)
+                logger.exception(f"[INN_SYNC] service={service} failed: {e}")
+            finally:
+                try:
+                    if cur: cur.close()
+                    if conn: conn.close()
+                except Exception:
+                    pass
+
+            summary["db_results"].append(dict(db_stat))
+            summary["totals"].update(db_stat)
+
+    # totals -> обычный dict
+    summary["totals"] = dict(summary["totals"])
+
+    # Сохраняем summary json
+    with report_json.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"[INN_SYNC] done. dry_run={dry_run}. CSV={report_csv} JSON={report_json}")
+    return summary
+
+
+@csrf_exempt
+def sm_staff_sync_inn(request):
+    """
+    POST /sm/staff/sync-inn/
+    Body JSON (все поля опциональны):
+    {
+      "dry_run": true, 
+      "overwrite_existing_inn": false,   
+      "only_enabled": true, 
+      "only_null_inn": true,
+      "services": ["BINUU00","BINUU01"] 
+    }
+    """
+    if request.method != "POST":
+        return JsonResponse({"status": "error", "message": "Только POST"}, status=405, json_dumps_params={"ensure_ascii": False})
+
+    try:
+        body = request.body.decode("utf-8") if request.body else "{}"
+        data = json.loads(body or "{}")
+
+        dry_run = bool(data.get("dry_run", True))
+        overwrite_existing_inn = bool(data.get("overwrite_existing_inn", False))
+        only_enabled = bool(data.get("only_enabled", True))
+        only_null_inn = bool(data.get("only_null_inn", True))
+
+        services = data.get("services")
+        if services is not None:
+            if not isinstance(services, list) or not all(isinstance(x, str) for x in services):
+                return JsonResponse({"status": "error", "message": "services должен быть list[str]"}, status=400, json_dumps_params={"ensure_ascii": False})
+            services = [s.strip() for s in services if s and s.strip()]
+
+        result = sm_sync_inn_from_onec(
+            dry_run=dry_run,
+            overwrite_existing_inn=overwrite_existing_inn,
+            services=services,
+            only_enabled=only_enabled,
+            only_null_inn=only_null_inn,
+        )
+
+        return JsonResponse(
+            {"status": "ok", "result": result},
+            json_dumps_params={"ensure_ascii": False, "indent": 2},
+        )
+
+    except Exception as e:
+        logger.exception(f"[INN_SYNC_VIEW] error: {e}")
+        return JsonResponse({"status": "error", "message": str(e)}, status=500, json_dumps_params={"ensure_ascii": False})
+
+
