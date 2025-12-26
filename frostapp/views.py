@@ -5518,7 +5518,7 @@ def sm_sync_inn_from_onec(
                         updates.append({"inn": inn_prop, "id": sid})
 
                 if not dry_run and updates:
-                    batch_size = int(os.getenv("INN_SYNC_UPDATE_BATCH", "100"))
+                    batch_size = int(os.getenv("INN_SYNC_UPDATE_BATCH", "1"))
                     updated_total = 0
                     total_to_update = len(updates)
                     for i in range(0, total_to_update, batch_size):
