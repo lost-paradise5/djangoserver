@@ -71,6 +71,62 @@ ORACLE_SERVICES_ALL = [
     "BINCH12","BINCH13","BINCH14","BINCH15","BINCH16","BINCH17","BINCH18","BINCH19","BINCH20","BINCH21","BINCH22",
 ]
 
+ORACLE_TNS_MAP = {
+    "BINUU00": {"host": "192.168.17.239", "port": 1521, "service_name": "BINUU00"},
+    "BINUU01": {"host": "omega1",         "port": 1521, "service_name": "BINUU01"},
+    "BINUU02": {"host": "epsilon3",       "port": 1521, "service_name": "BINUU02"},
+    "BINUU03": {"host": "omegadb3",       "port": 1521, "service_name": "BINUU03"},
+    "BINUU04": {"host": "omega4",         "port": 1521, "service_name": "BINUU04"},
+    "BINUU5":  {"host": "omega5",         "port": 1521, "service_name": "BINUU5"},
+    "BINUU05": {"host": "delta1",         "port": 1521, "service_name": "BINUU05"},
+    "BINUU06": {"host": "10.30.10.254",   "port": 1521, "service_name": "BINUU06"},
+    "BINUU07": {"host": "10.30.1.254",    "port": 1521, "service_name": "BINUU07"},
+    "BINUU08": {"host": "10.30.8.254",    "port": 1521, "service_name": "BINUU08"},
+    "BINUU09": {"host": "omega9new",      "port": 1521, "service_name": "BINUU09"},
+    "BINUU10": {"host": "omega14",        "port": 1521, "service_name": "BINUU10"},
+    "BINUU011":{"host": "omega11",        "port": 1521, "service_name": "BINUU011"},
+    "BINUU11": {"host": "omega33",        "port": 1521, "service_name": "BINUU11"},
+    "BINUU12": {"host": "epsilon3",       "port": 1521, "service_name": "BINUU12"},
+    "BINUU14": {"host": "epsilon3",       "port": 1521, "service_name": "BINUU14"},
+    "BINUU15": {"host": "omega15",        "port": 1521, "service_name": "BINUU15"},
+    "BINUU16": {"host": "omega16",        "port": 1521, "service_name": "BINUU16"},
+    "BINUU17": {"host": "omega17",        "port": 1521, "service_name": "BINUU17"},
+
+
+    "BINUU18": {"hosts": ["omega18", "omega18_"], "port": 1521, "service_name": "BINUU18"},
+
+    "BINUU21": {"host": "omega21",        "port": 1521, "service_name": "BINUU21"},
+    "BINUU22": {"host": "omega22",        "port": 1521, "service_name": "BINUU22"},
+    "BINUU23": {"host": "omega42",        "port": 1521, "service_name": "BINUU23"},
+    "BINUU24": {"host": "omega24",        "port": 1521, "service_name": "BINUU24"},
+    "BINUU25": {"host": "omega25",        "port": 1521, "service_name": "BINUU25"},
+    "BINUU26": {"host": "omega26",        "port": 1521, "service_name": "BINUU26"},
+
+    "BINCH00": {"host": "192.168.202.253","port": 1521, "service_name": "BINCH00"},
+    "BINCH1":  {"host": "10.50.50.254",   "port": 1521, "service_name": "BINCH1"},
+    "BINCH2":  {"host": "192.168.202.253","port": 1521, "service_name": "BINCH2"},
+    "BINCH3":  {"host": "192.168.202.238","port": 1521, "service_name": "BINCH3"},
+    "BINCH4":  {"host": "192.168.202.249","port": 1521, "service_name": "BINCH4"},
+    "BINCH5":  {"host": "192.168.202.7",  "port": 1521, "service_name": "BINCH5"},
+    "BINCH6":  {"host": "192.168.202.12", "port": 1521, "service_name": "BINCH6"},
+    "BINCH7":  {"host": "delta7",         "port": 1521, "service_name": "BINCH7"},
+    "BINCH8":  {"host": "delta8",         "port": 1521, "service_name": "BINCH8"},
+    "BINCH9":  {"host": "192.168.202.253","port": 1521, "service_name": "BINCH9"},
+    "BINCH10": {"host": "192.168.202.8",  "port": 1521, "service_name": "BINCH10"},
+    "BINCH11": {"host": "192.168.202.253","port": 1521, "service_name": "BINCH11"},
+    "BINCH12": {"host": "192.168.202.249","port": 1521, "service_name": "BINCH12"},
+    "BINCH13": {"host": "192.168.202.253","port": 1521, "service_name": "BINCH13"},
+    "BINCH14": {"host": "192.168.202.13", "port": 1521, "service_name": "BINCH14"},
+    "BINCH15": {"host": "delta15",        "port": 1521, "service_name": "BINCH15"},
+    "BINCH16": {"host": "192.168.202.11", "port": 1521, "service_name": "BINCH16"},
+    "BINCH17": {"host": "192.168.202.249","port": 1521, "service_name": "BINCH17"},
+    "BINCH18": {"host": "192.168.202.249","port": 1521, "service_name": "BINCH18"},
+    "BINCH19": {"host": "192.168.202.238","port": 1521, "service_name": "BINCH19"},
+    "BINCH20": {"host": "192.168.202.249","port": 1521, "service_name": "BINCH20"},
+    "BINCH21": {"host": "192.168.202.249","port": 1521, "service_name": "BINCH21"},
+    "BINCH22": {"host": "192.168.202.253","port": 1521, "service_name": "BINCH22"},
+}
+
 # Транслитерация
 _TRANSLIT = {
     "А":"A","Б":"B","В":"V","Г":"G","Д":"D","Е":"E","Ё":"YO","Ж":"ZH","З":"Z","И":"I","Й":"Y","К":"K","Л":"L",
@@ -5136,13 +5192,63 @@ def _is_valid_inn_digits(inn: str) -> bool:
     inn = (inn or "").strip()
     return inn.isdigit() and len(inn) in (10, 12)
 
-def _connect_oracle_service(service_name: str):
-    ORA_HOST     = os.getenv("ORACLE_HOST", "192.168.17.239")
-    ORA_PORT     = int(os.getenv("ORACLE_PORT", "1521"))
+def _connect_oracle_service(service_key: str):
+    """
+    Подключение к Oracle по service_key (например BINUU01, BINCH12 и т.п.)
+    Использует ORACLE_TNS_MAP: у каждого сервиса свой host/port/service_name.
+
+    Фоллбек:
+      - если service_key нет в ORACLE_TNS_MAP, подключаемся на ORACLE_HOST/ORACLE_PORT и service_name=service_key.
+
+    Также пробуем SID fallback для случаев, когда listener не знает SERVICE_NAME.
+    """
     ORA_USER     = os.getenv("ORACLE_USER", "supermag")
     ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
-    dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=service_name)
-    return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+
+    info = ORACLE_TNS_MAP.get(service_key)
+
+    if not info:
+        host = os.getenv("ORACLE_HOST", "192.168.17.239")
+        port = int(os.getenv("ORACLE_PORT", "1521"))
+        service_name = service_key
+        hosts = [host]
+    else:
+        service_name = (info.get("service_name") or service_key).strip()
+        port = int(info.get("port", 1521))
+        hosts = info.get("hosts") or [info.get("host")]
+        hosts = [h for h in hosts if h]
+
+    last_err = None
+
+    for host in hosts:
+        # 1) SERVICE_NAME
+        try:
+            dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+            logger.info(
+                f"[INN_SYNC][ORACLE] connect service_key={service_key} host={host} port={port} service_name={service_name}"
+            )
+            return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+        except cx_Oracle.DatabaseError as e:
+            last_err = e
+            msg = str(e)
+            logger.warning(
+                f"[INN_SYNC][ORACLE] connect failed (service_name) {service_key}@{host}:{port}/{service_name}: {msg}"
+            )
+
+        # 2) SID fallback
+        try:
+            dsn2 = cx_Oracle.makedsn(host, port, sid=service_name)
+            logger.info(
+                f"[INN_SYNC][ORACLE] retry as SID service_key={service_key} host={host} port={port} sid={service_name}"
+            )
+            return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn2, encoding="UTF-8")
+        except cx_Oracle.DatabaseError as e2:
+            last_err = e2
+            logger.warning(
+                f"[INN_SYNC][ORACLE] connect failed (sid) {service_key}@{host}:{port} sid={service_name}: {e2}"
+            )
+
+    raise last_err or RuntimeError(f"Cannot connect to Oracle service {service_key}")
 
 def _fetch_onec_working_employees() -> list[dict]:
     auth = None
@@ -5279,11 +5385,10 @@ def sm_sync_inn_from_onec(
         "services_requested": services,
         "employee_index": dict(emp_stats),
         "db_results": [],
-        "totals": Counter(),
+        "totals": Counter(),  # только числа
         "files": {"details_csv": str(report_csv), "summary_json": str(report_json)},
     }
 
-    # CSV: детальная диагностика
     with report_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
@@ -5296,35 +5401,39 @@ def sm_sync_inn_from_onec(
         w.writeheader()
 
         for service in services:
-            db_stat = Counter()
-            db_stat["service"] = service
+            db_counts = Counter()               # ✅ только числа
+            db_result = {"service": service}    # ✅ строки отдельно
 
             conn = cur = None
             try:
                 t0 = time.time()
                 conn = _connect_oracle_service(service)
                 cur = conn.cursor()
-                db_stat["connect_ok"] = 1
+                db_counts["connect_ok"] += 1
 
                 rows = _oracle_fetch_smstaff_rows(cur, only_enabled=only_enabled, only_null_inn=only_null_inn)
-                db_stat["staff_rows_scanned"] = len(rows)
+                db_counts["staff_rows_scanned"] += len(rows)
 
-                # посчитаем дубли логинов внутри SMSTAFF (для диагностики)
+                # дубли логинов внутри SMSTAFF
                 staff_keys = []
                 for (sid, surname, serverlogin, inn_before, userenabled) in rows:
                     sk1 = _normalize_staff_key(serverlogin)
                     sk2 = _normalize_staff_key(surname)
-                    if sk1: staff_keys.append(sk1)
-                    if sk2 and sk2 != sk1: staff_keys.append(sk2)
-                dup_keys = {k for k, c in Counter(staff_keys).items() if c > 1}
-                db_stat["staff_duplicate_keys"] = len(dup_keys)
+                    if sk1:
+                        staff_keys.append(sk1)
+                    if sk2 and sk2 != sk1:
+                        staff_keys.append(sk2)
 
-                updates = []  # для executemany
+                dup_keys = {k for k, c in Counter(staff_keys).items() if c > 1}
+                db_counts["staff_duplicate_keys"] += len(dup_keys)
+
+                updates = []
 
                 for (sid, surname, serverlogin, inn_before, userenabled) in rows:
                     inn_before_s = (inn_before or "").strip() if inn_before is not None else ""
+
                     if inn_before_s and not overwrite_existing_inn:
-                        db_stat["skip_already_has_inn"] += 1
+                        db_counts["skip_already_has_inn"] += 1
                         w.writerow({
                             "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
                             "inn_before": inn_before_s,
@@ -5339,7 +5448,6 @@ def sm_sync_inn_from_onec(
                     match_key = ""
                     emps = None
 
-                    # приоритет: serverlogin, потом surname
                     if key_server and key_server in login_to_emps:
                         match_key = key_server
                         emps = login_to_emps[key_server]
@@ -5348,7 +5456,7 @@ def sm_sync_inn_from_onec(
                         emps = login_to_emps[key_surname]
 
                     if not emps:
-                        db_stat["not_found"] += 1
+                        db_counts["not_found"] += 1
                         w.writerow({
                             "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
                             "inn_before": inn_before_s,
@@ -5357,10 +5465,9 @@ def sm_sync_inn_from_onec(
                         })
                         continue
 
-                    # Если логин неоднозначен (несколько сотрудников)
                     uniq_people = {(x.get("inn") or "", x.get("fio") or "") for x in emps}
                     if len(uniq_people) > 1:
-                        db_stat["ambiguous"] += 1
+                        db_counts["ambiguous"] += 1
                         sample = "; ".join([f"{fio}:{inn}" for (inn, fio) in list(uniq_people)[:5]])
                         w.writerow({
                             "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
@@ -5374,7 +5481,7 @@ def sm_sync_inn_from_onec(
                     inn_prop = (inn_prop or "").strip()
 
                     if not _is_valid_inn_digits(inn_prop):
-                        db_stat["bad_inn_in_1c_match"] += 1
+                        db_counts["bad_inn_in_1c_match"] += 1
                         w.writerow({
                             "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
                             "inn_before": inn_before_s,
@@ -5384,9 +5491,8 @@ def sm_sync_inn_from_onec(
                         })
                         continue
 
-                    # Если уже то же самое
                     if inn_before_s and inn_before_s == inn_prop:
-                        db_stat["already_same_inn"] += 1
+                        db_counts["already_same_inn"] += 1
                         w.writerow({
                             "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
                             "inn_before": inn_before_s,
@@ -5396,10 +5502,9 @@ def sm_sync_inn_from_onec(
                         })
                         continue
 
-                    # Готовим update
-                    db_stat["matched_ok"] += 1
+                    db_counts["matched_ok"] += 1
                     if match_key in dup_keys:
-                        db_stat["matched_but_staff_key_duplicate"] += 1
+                        db_counts["matched_but_staff_key_duplicate"] += 1
 
                     w.writerow({
                         "service": service, "staff_id": sid, "surname": surname, "serverlogin": serverlogin,
@@ -5413,33 +5518,37 @@ def sm_sync_inn_from_onec(
                         updates.append({"inn": inn_prop, "id": sid})
 
                 if not dry_run and updates:
-                    # пачечное обновление
                     cur.executemany("UPDATE smstaff SET inn = :inn WHERE id = :id", updates)
                     conn.commit()
-                    db_stat["updated"] = len(updates)
+                    db_counts["updated"] += len(updates)
                 else:
-                    db_stat["updated"] = 0
+                    db_counts["updated"] += 0
 
-                db_stat["duration_sec"] = round(time.time() - t0, 2)
+                db_result["duration_sec"] = round(time.time() - t0, 2)
 
             except Exception as e:
-                db_stat["connect_ok"] = 0
-                db_stat["error"] = str(e)
+                db_counts["connect_fail"] += 1
+                db_result["error"] = str(e)
                 logger.exception(f"[INN_SYNC] service={service} failed: {e}")
+
             finally:
                 try:
-                    if cur: cur.close()
-                    if conn: conn.close()
+                    if cur:
+                        cur.close()
+                    if conn:
+                        conn.close()
                 except Exception:
                     pass
 
-            summary["db_results"].append(dict(db_stat))
-            summary["totals"].update(db_stat)
+            # ✅ В db_results кладём и service/error, и числовые счётчики
+            db_result.update(dict(db_counts))
+            summary["db_results"].append(db_result)
 
-    # totals -> обычный dict
+            # ✅ В totals складываем только числа
+            summary["totals"].update(db_counts)
+
     summary["totals"] = dict(summary["totals"])
 
-    # Сохраняем summary json
     with report_json.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
