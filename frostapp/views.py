@@ -5389,7 +5389,7 @@ def sm_sync_inn_from_onec(
         "files": {"details_csv": str(report_csv), "summary_json": str(report_json)},
     }
 
-    with report_csv.open("w", newline="", encoding="utf-8") as f:
+    with report_csv.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(
             f,
             fieldnames=[
