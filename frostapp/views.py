@@ -138,6 +138,18 @@ _LOGIN_SAFE_RE = re.compile(r"[^a-z0-9_]+", re.IGNORECASE)
 
 
 
+INN_SYNC_PROGRESS_EVERY_ROWS = int(os.getenv("INN_SYNC_PROGRESS_EVERY_ROWS", "2000"))
+INN_SYNC_HEARTBEAT_SEC = int(os.getenv("INN_SYNC_HEARTBEAT_SEC", "30"))
+INN_SYNC_ORACLE_CALL_TIMEOUT_MS = int(os.getenv("INN_SYNC_ORACLE_CALL_TIMEOUT_MS", "120000"))  # 120s
+INN_SYNC_SLOW_STEP_WARN_SEC = float(os.getenv("INN_SYNC_SLOW_STEP_WARN_SEC", "10"))
+
+
+
+
+
+
+
+
 def get_store_info(storeid: int | str) -> dict:
     """
     Возвращает:
@@ -5197,13 +5209,13 @@ def _connect_oracle_service(service_key: str):
     Подключение к Oracle по service_key (например BINUU01, BINCH12 и т.п.)
     Использует ORACLE_TNS_MAP: у каждого сервиса свой host/port/service_name.
 
-    Фоллбек:
-      - если service_key нет в ORACLE_TNS_MAP, подключаемся на ORACLE_HOST/ORACLE_PORT и service_name=service_key.
-
-    Также пробуем SID fallback для случаев, когда listener не знает SERVICE_NAME.
+    Важно:
+      - выставляем conn.callTimeout, чтобы не было "тишины часами" при зависшем execute/commit/fetch.
     """
     ORA_USER     = os.getenv("ORACLE_USER", "supermag")
     ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
+
+    call_timeout_ms = int(os.getenv("INN_SYNC_ORACLE_CALL_TIMEOUT_MS", "120000"))  # 120s
 
     info = ORACLE_TNS_MAP.get(service_key)
 
@@ -5227,12 +5239,17 @@ def _connect_oracle_service(service_key: str):
             logger.info(
                 f"[INN_SYNC][ORACLE] connect service_key={service_key} host={host} port={port} service_name={service_name}"
             )
-            return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+            conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+            try:
+                conn.callTimeout = call_timeout_ms
+                logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host}")
+            except Exception as e:
+                logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key}: {e}")
+            return conn
         except cx_Oracle.DatabaseError as e:
             last_err = e
-            msg = str(e)
             logger.warning(
-                f"[INN_SYNC][ORACLE] connect failed (service_name) {service_key}@{host}:{port}/{service_name}: {msg}"
+                f"[INN_SYNC][ORACLE] connect failed (service_name) {service_key}@{host}:{port}/{service_name}: {e}"
             )
 
         # 2) SID fallback
@@ -5241,7 +5258,13 @@ def _connect_oracle_service(service_key: str):
             logger.info(
                 f"[INN_SYNC][ORACLE] retry as SID service_key={service_key} host={host} port={port} sid={service_name}"
             )
-            return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn2, encoding="UTF-8")
+            conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn2, encoding="UTF-8")
+            try:
+                conn.callTimeout = call_timeout_ms
+                logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host} (SID)")
+            except Exception as e:
+                logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key} (SID): {e}")
+            return conn
         except cx_Oracle.DatabaseError as e2:
             last_err = e2
             logger.warning(
@@ -5360,32 +5383,58 @@ def sm_sync_inn_from_onec(
     only_null_inn: bool = True,
 ) -> dict:
     """
-    Главная функция:
-      - dry_run=True: только отчёты, без UPDATE
-      - overwrite_existing_inn=False: не трогаем тех, у кого inn уже заполнен
-      - only_null_inn=True: в Oracle вообще не читаем строки с заполненным inn (быстрее)
+    Главная функция синхронизации ИНН из 1C в Oracle.smstaff.
+
+    Добавлено:
+      - run_id в логах
+      - тайминги по шагам
+      - heartbeat и прогресс по сканированию
+      - логи "chunk_start/chunk_done" с id диапазоном
+      - rollback при ошибке и продолжение на следующую базу
     """
     services = services or ORACLE_SERVICES_ALL
 
+    # --- настройки логов/прогресса/таймингов из env ---
+    progress_every_rows = int(os.getenv("INN_SYNC_PROGRESS_EVERY_ROWS", "2000"))
+    heartbeat_sec = int(os.getenv("INN_SYNC_HEARTBEAT_SEC", "30"))
+    slow_warn_sec = float(os.getenv("INN_SYNC_SLOW_STEP_WARN_SEC", "10"))
+    batch_size = int(os.getenv("INN_SYNC_UPDATE_BATCH", "1"))
+
+    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
     out_dir = Path(LOG_DIR) / "inn_sync"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     report_csv = out_dir / f"inn_sync_details_{run_ts}.csv"
     report_json = out_dir / f"inn_sync_summary_{run_ts}.json"
 
+    logger.info(
+        f"[INN_SYNC] START run_id={run_id} dry_run={dry_run} overwrite_existing_inn={overwrite_existing_inn} "
+        f"only_enabled={only_enabled} only_null_inn={only_null_inn} batch_size={batch_size} services={len(services)}"
+    )
+    logger.info(f"[INN_SYNC] run_id={run_id} output CSV={report_csv} JSON={report_json}")
+
+    # 1) 1C
     onec_employees = _fetch_onec_working_employees()
+
+    # 2) индекс по логинам
+    t_index = time.time()
     login_to_emps, emp_stats = _build_employee_index(onec_employees)
+    dt_index = time.time() - t_index
+    logger.info(f"[INN_SYNC] run_id={run_id} 1C index built in {dt_index:.1f}s stats={dict(emp_stats)}")
 
     summary = {
+        "run_id": run_id,
         "dry_run": dry_run,
         "overwrite_existing_inn": overwrite_existing_inn,
         "only_enabled": only_enabled,
         "only_null_inn": only_null_inn,
+        "batch_size": batch_size,
         "services_requested": services,
         "employee_index": dict(emp_stats),
         "db_results": [],
-        "totals": Counter(),  # только числа
+        "totals": Counter(),
         "files": {"details_csv": str(report_csv), "summary_json": str(report_json)},
     }
 
@@ -5401,20 +5450,42 @@ def sm_sync_inn_from_onec(
         w.writeheader()
 
         for service in services:
-            db_counts = Counter()               # ✅ только числа
-            db_result = {"service": service}    # ✅ строки отдельно
+            db_counts = Counter()
+            db_result = {"service": service}
 
             conn = cur = None
+            service_start = time.time()
+            logger.info(f"[INN_SYNC] run_id={run_id} service={service} START")
+
             try:
-                t0 = time.time()
+                # connect
                 conn = _connect_oracle_service(service)
                 cur = conn.cursor()
                 db_counts["connect_ok"] += 1
 
+                # небольшая оптимизация чтения (не обязательно, но полезно)
+                try:
+                    cur.arraysize = int(os.getenv("INN_SYNC_ORACLE_ARRAYSIZE", "1000"))
+                except Exception:
+                    pass
+
+                # fetch rows
+                t_fetch = time.time()
                 rows = _oracle_fetch_smstaff_rows(cur, only_enabled=only_enabled, only_null_inn=only_null_inn)
+                dt_fetch = time.time() - t_fetch
                 db_counts["staff_rows_scanned"] += len(rows)
 
-                # дубли логинов внутри SMSTAFF
+                if dt_fetch > slow_warn_sec:
+                    logger.warning(
+                        f"[INN_SYNC] run_id={run_id} service={service} SLOW fetch_rows dt={dt_fetch:.1f}s rows={len(rows)}"
+                    )
+                else:
+                    logger.info(
+                        f"[INN_SYNC] run_id={run_id} service={service} fetch_rows dt={dt_fetch:.1f}s rows={len(rows)}"
+                    )
+
+                # дубли ключей в smstaff
+                t_dups = time.time()
                 staff_keys = []
                 for (sid, surname, serverlogin, inn_before, userenabled) in rows:
                     sk1 = _normalize_staff_key(serverlogin)
@@ -5426,10 +5497,28 @@ def sm_sync_inn_from_onec(
 
                 dup_keys = {k for k, c in Counter(staff_keys).items() if c > 1}
                 db_counts["staff_duplicate_keys"] += len(dup_keys)
+                dt_dups = time.time() - t_dups
+                if dt_dups > slow_warn_sec:
+                    logger.warning(f"[INN_SYNC] run_id={run_id} service={service} SLOW dup_keys dt={dt_dups:.1f}s dup={len(dup_keys)}")
+                else:
+                    logger.info(f"[INN_SYNC] run_id={run_id} service={service} dup_keys dt={dt_dups:.1f}s dup={len(dup_keys)}")
 
                 updates = []
 
+                scanned = 0
+                last_hb = time.time()
+
+                # scan rows
                 for (sid, surname, serverlogin, inn_before, userenabled) in rows:
+                    scanned += 1
+                    now = time.time()
+
+                    if scanned % progress_every_rows == 0:
+                        logger.info(f"[INN_SYNC] run_id={run_id} service={service} scan_progress {scanned}/{len(rows)}")
+                    elif now - last_hb >= heartbeat_sec:
+                        logger.info(f"[INN_SYNC] run_id={run_id} service={service} heartbeat scan scanned={scanned}/{len(rows)}")
+                        last_hb = now
+
                     inn_before_s = (inn_before or "").strip() if inn_before is not None else ""
 
                     if inn_before_s and not overwrite_existing_inn:
@@ -5517,26 +5606,77 @@ def sm_sync_inn_from_onec(
                     if not dry_run:
                         updates.append({"inn": inn_prop, "id": sid})
 
+                logger.info(
+                    f"[INN_SYNC] run_id={run_id} service={service} prepared_updates={len(updates)} "
+                    f"matched_ok={db_counts.get('matched_ok', 0)} not_found={db_counts.get('not_found', 0)} "
+                    f"ambiguous={db_counts.get('ambiguous', 0)} skip_has_inn={db_counts.get('skip_already_has_inn', 0)}"
+                )
+
+                # updates
                 if not dry_run and updates:
-                    batch_size = int(os.getenv("INN_SYNC_UPDATE_BATCH", "1"))
                     updated_total = 0
                     total_to_update = len(updates)
+
+                    chunks_total = (total_to_update + batch_size - 1) // batch_size
+
                     for i in range(0, total_to_update, batch_size):
                         chunk = updates[i:i + batch_size]
-                        cur.executemany("UPDATE smstaff SET inn = :inn WHERE id = :id", chunk)
-                        conn.commit()
+                        first_id = chunk[0]["id"]
+                        last_id = chunk[-1]["id"]
+                        chunk_no = (i // batch_size) + 1
+
+                        logger.info(
+                            f"[INN_SYNC] run_id={run_id} service={service} chunk_start "
+                            f"{chunk_no}/{chunks_total} size={len(chunk)} ids={first_id}-{last_id}"
+                        )
+
+                        t_chunk = time.time()
+                        try:
+                            cur.executemany("UPDATE smstaff SET inn = :inn WHERE id = :id", chunk)
+                            conn.commit()
+                        except Exception as e:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            db_counts["update_failed_chunks"] += 1
+                            logger.exception(
+                                f"[INN_SYNC] run_id={run_id} service={service} chunk_failed "
+                                f"size={len(chunk)} ids={first_id}-{last_id}: {e}"
+                            )
+                            # продолжаем дальше, чтобы не останавливать весь прогон
+                            continue
+
+                        dt_chunk = time.time() - t_chunk
                         updated_total += len(chunk)
-                        logger.info(f"[INN_SYNC] service={service} committed {updated_total}/{total_to_update} updates")
+
+                        if dt_chunk > slow_warn_sec:
+                            logger.warning(
+                                f"[INN_SYNC] run_id={run_id} service={service} chunk_done SLOW dt={dt_chunk:.1f}s "
+                                f"committed {updated_total}/{total_to_update} ids={first_id}-{last_id}"
+                            )
+                        else:
+                            logger.info(
+                                f"[INN_SYNC] run_id={run_id} service={service} chunk_done dt={dt_chunk:.1f}s "
+                                f"committed {updated_total}/{total_to_update} ids={first_id}-{last_id}"
+                            )
+
                     db_counts["updated"] += updated_total
                 else:
                     db_counts["updated"] += 0
 
-                db_result["duration_sec"] = round(time.time() - t0, 2)
+                db_result["duration_sec"] = round(time.time() - service_start, 2)
+
+                logger.info(
+                    f"[INN_SYNC] run_id={run_id} service={service} DONE "
+                    f"updated={db_counts.get('updated', 0)} failed_chunks={db_counts.get('update_failed_chunks', 0)} "
+                    f"duration={db_result['duration_sec']}s"
+                )
 
             except Exception as e:
                 db_counts["connect_fail"] += 1
                 db_result["error"] = str(e)
-                logger.exception(f"[INN_SYNC] service={service} failed: {e}")
+                logger.exception(f"[INN_SYNC] run_id={run_id} service={service} FAILED: {e}")
 
             finally:
                 try:
@@ -5547,11 +5687,8 @@ def sm_sync_inn_from_onec(
                 except Exception:
                     pass
 
-            # ✅ В db_results кладём и service/error, и числовые счётчики
             db_result.update(dict(db_counts))
             summary["db_results"].append(db_result)
-
-            # ✅ В totals складываем только числа
             summary["totals"].update(db_counts)
 
     summary["totals"] = dict(summary["totals"])
@@ -5559,7 +5696,7 @@ def sm_sync_inn_from_onec(
     with report_json.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"[INN_SYNC] done. dry_run={dry_run}. CSV={report_csv} JSON={report_json}")
+    logger.info(f"[INN_SYNC] FINISH run_id={run_id} dry_run={dry_run} CSV={report_csv} JSON={report_json}")
     return summary
 
 
@@ -5567,17 +5704,21 @@ def sm_sync_inn_from_onec(
 def sm_staff_sync_inn(request):
     """
     POST /sm/staff/sync-inn/
-    Body JSON (все поля опциональны):
+    Body JSON:
     {
-      "dry_run": true, 
-      "overwrite_existing_inn": false,   
-      "only_enabled": true, 
+      "dry_run": true,
+      "overwrite_existing_inn": false,
+      "only_enabled": true,
       "only_null_inn": true,
-      "services": ["BINUU00","BINUU01"] 
+      "services": ["BINUU00","BINUU01"]
     }
     """
     if request.method != "POST":
-        return JsonResponse({"status": "error", "message": "Только POST"}, status=405, json_dumps_params={"ensure_ascii": False})
+        return JsonResponse(
+            {"status": "error", "message": "Только POST"},
+            status=405,
+            json_dumps_params={"ensure_ascii": False},
+        )
 
     try:
         body = request.body.decode("utf-8") if request.body else "{}"
@@ -5591,8 +5732,17 @@ def sm_staff_sync_inn(request):
         services = data.get("services")
         if services is not None:
             if not isinstance(services, list) or not all(isinstance(x, str) for x in services):
-                return JsonResponse({"status": "error", "message": "services должен быть list[str]"}, status=400, json_dumps_params={"ensure_ascii": False})
+                return JsonResponse(
+                    {"status": "error", "message": "services должен быть list[str]"},
+                    status=400,
+                    json_dumps_params={"ensure_ascii": False},
+                )
             services = [s.strip() for s in services if s and s.strip()]
+
+        logger.info(
+            f"[INN_SYNC_VIEW] request dry_run={dry_run} overwrite_existing_inn={overwrite_existing_inn} "
+            f"only_enabled={only_enabled} only_null_inn={only_null_inn} services={services or 'ALL'}"
+        )
 
         result = sm_sync_inn_from_onec(
             dry_run=dry_run,
@@ -5609,6 +5759,10 @@ def sm_staff_sync_inn(request):
 
     except Exception as e:
         logger.exception(f"[INN_SYNC_VIEW] error: {e}")
-        return JsonResponse({"status": "error", "message": str(e)}, status=500, json_dumps_params={"ensure_ascii": False})
+        return JsonResponse(
+            {"status": "error", "message": str(e)},
+            status=500,
+            json_dumps_params={"ensure_ascii": False},
+        )
 
 
