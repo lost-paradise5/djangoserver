@@ -5518,9 +5518,16 @@ def sm_sync_inn_from_onec(
                         updates.append({"inn": inn_prop, "id": sid})
 
                 if not dry_run and updates:
-                    cur.executemany("UPDATE smstaff SET inn = :inn WHERE id = :id", updates)
-                    conn.commit()
-                    db_counts["updated"] += len(updates)
+                    batch_size = int(os.getenv("INN_SYNC_UPDATE_BATCH", "100"))
+                    updated_total = 0
+                    total_to_update = len(updates)
+                    for i in range(0, total_to_update, batch_size):
+                        chunk = updates[i:i + batch_size]
+                        cur.executemany("UPDATE smstaff SET inn = :inn WHERE id = :id", chunk)
+                        conn.commit()
+                        updated_total += len(chunk)
+                        logger.info(f"[INN_SYNC] service={service} committed {updated_total}/{total_to_update} updates")
+                    db_counts["updated"] += updated_total
                 else:
                     db_counts["updated"] += 0
 
