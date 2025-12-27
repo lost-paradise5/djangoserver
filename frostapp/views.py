@@ -5774,11 +5774,11 @@ def _oracle_get_table_columns_set(cur, owner: str, table: str) -> set[str]:
         """
         SELECT column_name
         FROM all_tab_columns
-        WHERE owner = :owner
-          AND table_name = :table
+        WHERE owner = :own
+          AND table_name = :tbl
         """,
-        owner=owner.upper(),
-        table=table.upper(),
+        own=owner.upper(),
+        tbl=table.upper(),
     )
     return {str(r[0]).upper() for r in cur.fetchall()}
 
