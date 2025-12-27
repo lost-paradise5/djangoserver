@@ -5766,3 +5766,152 @@ def sm_staff_sync_inn(request):
         )
 
 
+
+
+
+def _normalize_service_key(raw: str) -> str:
+    return (raw or "").strip().upper()
+
+def _is_allowed_service(service_key: str) -> bool:
+    # Жёсткий whitelist: только то, что ты явно описал
+    if service_key in ORACLE_TNS_MAP:
+        return True
+    if service_key in ORACLE_SERVICES_ALL:
+        return True
+    return False
+
+
+@csrf_exempt
+def sm_staff_list_by_db(request):
+    """
+    GET /sm/staff/by-db/?db=BINUU01&limit=100&offset=0&q=иванов&full=0
+
+    Параметры:
+      - db / service / database (обязательный): BINUU00, BINUU01, BINCH8 ...
+      - limit  (по умолчанию 200, максимум 1000)
+      - offset (по умолчанию 0)
+      - q      (поиск по surname/name/serverlogin, опционально)
+      - full   (0/1): 0 -> выбрать основные поля (быстрее), 1 -> SELECT * (тяжелее)
+    """
+    if request.method != "GET":
+        return JsonResponse(
+            {"status": "error", "message": "Только GET"},
+            status=405,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+    try:
+        # --- service/db ---
+        raw_db = (
+            request.GET.get("db")
+            or request.GET.get("service")
+            or request.GET.get("database")
+            or ""
+        )
+        service_key = _normalize_service_key(raw_db)
+
+        if not service_key:
+            return JsonResponse(
+                {"status": "error", "message": "Не передан параметр db (например db=BINUU00)"},
+                status=400,
+                json_dumps_params={"ensure_ascii": False},
+            )
+
+        if not _is_allowed_service(service_key):
+            return JsonResponse(
+                {"status": "error", "message": f"Неизвестная/запрещённая база: {service_key}"},
+                status=400,
+                json_dumps_params={"ensure_ascii": False},
+            )
+
+        # --- pagination ---
+        try:
+            limit = int(request.GET.get("limit", "200"))
+        except ValueError:
+            limit = 200
+        try:
+            offset = int(request.GET.get("offset", "0"))
+        except ValueError:
+            offset = 0
+
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
+
+        # --- search ---
+        q = (request.GET.get("q") or "").strip().lower()
+
+        # --- full toggle ---
+        full = (request.GET.get("full") or "0").strip()
+        full = full in ("1", "true", "True", "yes", "YES")
+
+        # --- SQL ---
+        # Лучше по умолчанию отдавать “полезные” колонки, а не SELECT *
+        if full:
+            sql = "SELECT * FROM smstaff"
+        else:
+            sql = """
+                SELECT
+                    id,
+                    surname,
+                    name,
+                    patronymic,
+                    serverlogin,
+                    inn,
+                    userenabled
+                FROM smstaff
+            """
+
+        binds = {}
+
+        if q:
+            # serverlogin полезно добавлять в поиск, иначе сложно проверять сопоставления
+            sql += """
+                WHERE
+                    LOWER(surname) LIKE :q
+                    OR LOWER(name) LIKE :q
+                    OR LOWER(serverlogin) LIKE :q
+            """
+            binds["q"] = f"%{q}%"
+
+        sql += """
+            ORDER BY surname
+            OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY
+        """
+        binds["off"] = offset
+        binds["lim"] = limit
+
+        conn = cur = None
+        try:
+            logger.info(f"[SM/STAFF_LIST_BY_DB] db={service_key} limit={limit} offset={offset} q={q!r} full={full}")
+            conn = _connect_oracle_service(service_key)
+            cur = conn.cursor()
+            cur.execute(sql, binds)
+            items = _oracle_rows_to_jsonable(cur)
+        finally:
+            try:
+                if cur:
+                    cur.close()
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+        return JsonResponse(
+            {
+                "status": "ok",
+                "db": service_key,
+                "count": len(items),
+                "limit": limit,
+                "offset": offset,
+                "items": items,
+            },
+            json_dumps_params={"ensure_ascii": False, "indent": 2},
+        )
+
+    except Exception as e:
+        logger.exception("[SM/STAFF_LIST_BY_DB] Unexpected error")
+        return JsonResponse(
+            {"status": "error", "message": str(e)},
+            status=500,
+            json_dumps_params={"ensure_ascii": False},
+        )
