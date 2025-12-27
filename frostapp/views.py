@@ -5766,7 +5766,21 @@ def sm_staff_sync_inn(request):
         )
 
 
-
+def _oracle_get_table_columns_set(cur, owner: str, table: str) -> set[str]:
+    """
+    Возвращает set({ 'ID', 'SURNAME', ... }) по all_tab_columns.
+    """
+    cur.execute(
+        """
+        SELECT column_name
+        FROM all_tab_columns
+        WHERE owner = :owner
+          AND table_name = :table
+        """,
+        owner=owner.upper(),
+        table=table.upper(),
+    )
+    return {str(r[0]).upper() for r in cur.fetchall()}
 
 
 def _normalize_service_key(raw: str) -> str:
@@ -5784,14 +5798,12 @@ def _is_allowed_service(service_key: str) -> bool:
 @csrf_exempt
 def sm_staff_list_by_db(request):
     """
-    GET /sm/staff/by-db/?db=BINUU01&limit=100&offset=0&q=иванов&full=0
+    GET /sm/staff/by-db/?db=BINUU00&limit=50&offset=0&q=иванов
 
-    Параметры:
-      - db / service / database (обязательный): BINUU00, BINUU01, BINCH8 ...
-      - limit  (по умолчанию 200, максимум 1000)
-      - offset (по умолчанию 0)
-      - q      (поиск по surname/name/serverlogin, опционально)
-      - full   (0/1): 0 -> выбрать основные поля (быстрее), 1 -> SELECT * (тяжелее)
+    Подключается к Oracle по service_key из ORACLE_TNS_MAP (BINUU00/BINCH8/...),
+    читает smstaff и возвращает список.
+
+    Устойчив к разным схемам: если в smstaff нет patronymic — не используем его в SELECT/WHERE.
     """
     if request.method != "GET":
         return JsonResponse(
@@ -5800,118 +5812,128 @@ def sm_staff_list_by_db(request):
             json_dumps_params={"ensure_ascii": False},
         )
 
-    try:
-        # --- service/db ---
-        raw_db = (
-            request.GET.get("db")
-            or request.GET.get("service")
-            or request.GET.get("database")
-            or ""
+    db = (request.GET.get("db") or request.GET.get("service") or "").strip()
+    if not db:
+        return JsonResponse(
+            {"status": "error", "message": "Не передан параметр db (например db=BINUU00)"},
+            status=400,
+            json_dumps_params={"ensure_ascii": False},
         )
-        service_key = _normalize_service_key(raw_db)
 
-        if not service_key:
-            return JsonResponse(
-                {"status": "error", "message": "Не передан параметр db (например db=BINUU00)"},
-                status=400,
-                json_dumps_params={"ensure_ascii": False},
-            )
+    # Важно: не даём подключаться к произвольному хосту. Только то, что есть в карте.
+    if db not in ORACLE_TNS_MAP:
+        return JsonResponse(
+            {"status": "error", "message": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP."},
+            status=400,
+            json_dumps_params={"ensure_ascii": False},
+        )
 
-        if not _is_allowed_service(service_key):
-            return JsonResponse(
-                {"status": "error", "message": f"Неизвестная/запрещённая база: {service_key}"},
-                status=400,
-                json_dumps_params={"ensure_ascii": False},
-            )
+    # Параметры пагинации
+    try:
+        limit = int(request.GET.get("limit", "200"))
+    except ValueError:
+        limit = 200
+    try:
+        offset = int(request.GET.get("offset", "0"))
+    except ValueError:
+        offset = 0
 
-        # --- pagination ---
-        try:
-            limit = int(request.GET.get("limit", "200"))
-        except ValueError:
-            limit = 200
-        try:
-            offset = int(request.GET.get("offset", "0"))
-        except ValueError:
-            offset = 0
+    limit = max(1, min(limit, 1000))
+    offset = max(0, offset)
 
-        limit = max(1, min(limit, 1000))
-        offset = max(0, offset)
+    q = (request.GET.get("q") or "").strip().lower()
 
-        # --- search ---
-        q = (request.GET.get("q") or "").strip().lower()
+    conn = cur = None
+    try:
+        conn = _connect_oracle_service(db)
+        cur = conn.cursor()
 
-        # --- full toggle ---
-        full = (request.GET.get("full") or "0").strip()
-        full = full in ("1", "true", "True", "yes", "YES")
+        # Узнаём реальный набор колонок в SMSTAFF именно этой базы
+        cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
 
-        # --- SQL ---
-        # Лучше по умолчанию отдавать “полезные” колонки, а не SELECT *
-        if full:
-            sql = "SELECT * FROM smstaff"
-        else:
-            sql = """
-                SELECT
-                    id,
-                    surname,
-                    name,
-                    patronymic,
-                    serverlogin,
-                    inn,
-                    userenabled
-                FROM smstaff
-            """
+        def has(col: str) -> bool:
+            return col.upper() in cols_set
 
+        # Собираем SELECT только из существующих колонок
+        select_parts = []
+        def add_select(col: str):
+            if has(col):
+                select_parts.append(col)
+            else:
+                # чтобы поле всё равно было в JSON с null (удобно фронту/диагностике)
+                select_parts.append(f"NULL AS {col}")
+
+        # Набор “ожидаемых” полей (но они могут отсутствовать)
+        add_select("id")
+        add_select("surname")
+        add_select("name")
+        add_select("patronymic")   # <- безопасно: если нет, будет NULL AS patronymic
+        add_select("serverlogin")
+        add_select("inn")
+        add_select("userenabled")
+
+        sql = f"SELECT {', '.join(select_parts)} FROM smstaff"
         binds = {}
 
+        # WHERE: добавляем условия только по существующим колонкам
+        where = []
         if q:
-            # serverlogin полезно добавлять в поиск, иначе сложно проверять сопоставления
-            sql += """
-                WHERE
-                    LOWER(surname) LIKE :q
-                    OR LOWER(name) LIKE :q
-                    OR LOWER(serverlogin) LIKE :q
-            """
-            binds["q"] = f"%{q}%"
+            like = f"%{q}%"
+            # обычно ищут по фамилии/имени/логину
+            if has("surname"):
+                where.append("LOWER(surname) LIKE :q")
+            if has("name"):
+                where.append("LOWER(name) LIKE :q")
+            if has("patronymic"):
+                where.append("LOWER(patronymic) LIKE :q")
+            if has("serverlogin"):
+                where.append("LOWER(serverlogin) LIKE :q")
 
-        sql += """
-            ORDER BY surname
-            OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY
-        """
+            if where:
+                sql += " WHERE (" + " OR ".join(where) + ")"
+                binds["q"] = like
+
+        # ORDER BY: если нет surname — сортируем по id
+        if has("surname"):
+            sql += " ORDER BY surname"
+        elif has("id"):
+            sql += " ORDER BY id"
+        else:
+            sql += " ORDER BY 1"
+
+        # Пагинация
+        sql += " OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY"
         binds["off"] = offset
         binds["lim"] = limit
 
-        conn = cur = None
-        try:
-            logger.info(f"[SM/STAFF_LIST_BY_DB] db={service_key} limit={limit} offset={offset} q={q!r} full={full}")
-            conn = _connect_oracle_service(service_key)
-            cur = conn.cursor()
-            cur.execute(sql, binds)
-            items = _oracle_rows_to_jsonable(cur)
-        finally:
-            try:
-                if cur:
-                    cur.close()
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+        cur.execute(sql, binds)
+        items = _oracle_rows_to_jsonable(cur)
 
         return JsonResponse(
             {
                 "status": "ok",
-                "db": service_key,
+                "db": db,
                 "count": len(items),
                 "limit": limit,
                 "offset": offset,
+                "columns_present": sorted(list(cols_set)),  # очень помогает дебажить “почему нет поля”
                 "items": items,
             },
             json_dumps_params={"ensure_ascii": False, "indent": 2},
         )
 
     except Exception as e:
-        logger.exception("[SM/STAFF_LIST_BY_DB] Unexpected error")
+        logger.exception(f"[SM/STAFF_BY_DB] error db={db}: {e}")
         return JsonResponse(
-            {"status": "error", "message": str(e)},
+            {"status": "error", "message": str(e), "db": db},
             status=500,
             json_dumps_params={"ensure_ascii": False},
         )
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
