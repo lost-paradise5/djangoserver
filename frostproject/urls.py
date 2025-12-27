@@ -39,6 +39,7 @@ from frostapp.views import (
     pos_list_by_tg,
     pos_reboot,
     sm_staff_sync_inn,
+    sm_staff_list_by_db,
 )
 
 urlpatterns = [
@@ -67,4 +68,5 @@ urlpatterns = [
     path('pos/by_tg/', pos_list_by_tg, name='pos_list_by_tg'),
     path('pos/reboot/', pos_reboot, name='pos_reboot'),
     path('sm/staff/sync-inn/', sm_staff_sync_inn, name='sm_staff_sync_inn'),
+    path('sm/staff/by-db/', sm_staff_list_by_db, name='sm_staff_list_by_db'),
 ]
