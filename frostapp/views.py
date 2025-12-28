@@ -5769,16 +5769,17 @@ def sm_staff_sync_inn(request):
 def _oracle_get_table_columns_set(cur, owner: str, table: str) -> set[str]:
     """
     Возвращает set({ 'ID', 'SURNAME', ... }) по all_tab_columns.
+    Важно: bind-имена делаем "безопасными", чтобы не ловить ORA-01745.
     """
     cur.execute(
         """
         SELECT column_name
         FROM all_tab_columns
-        WHERE owner = :own
-          AND table_name = :tbl
+        WHERE owner = :b_owner
+          AND table_name = :b_table
         """,
-        own=owner.upper(),
-        tbl=table.upper(),
+        b_owner=owner.upper(),
+        b_table=table.upper(),
     )
     return {str(r[0]).upper() for r in cur.fetchall()}
 
@@ -5800,15 +5801,10 @@ def sm_staff_list_by_db(request):
     """
     GET /sm/staff/by-db/?db=BINUU00&limit=50&offset=0&q=иванов&only_enabled=1
 
-    Параметры:
-      - db (обязательный): BINUU00 / BINUU01 / BINCH12 ...
-      - limit (default 200, max 1000)
-      - offset (default 0)
-      - q (опционально): поиск по surname/name/patronymic/serverlogin (что есть в таблице)
-      - only_enabled (default 1): если 1/true -> только userenabled=1, если 0/false -> все
-
-    Устойчив к разным схемам SMSTAFF: если колонки нет — не используем её в WHERE,
-    а в SELECT вернём NULL AS <column>.
+    - db: ключ сервиса из ORACLE_TNS_MAP (BINUU00/BINUU01/BINCH12/...)
+    - only_enabled=1: фильтр (userenabled = 1 OR userenabled='1')
+    - пагинация через ROW_NUMBER() (совместимо с Oracle 11g+)
+    - устойчиво к отсутствующим колонкам (patronymic/name и т.д.)
     """
     if request.method != "GET":
         return JsonResponse(
@@ -5817,7 +5813,7 @@ def sm_staff_list_by_db(request):
             json_dumps_params={"ensure_ascii": False},
         )
 
-    db = (request.GET.get("db") or request.GET.get("service") or "").strip()
+    db = (request.GET.get("db") or request.GET.get("service") or "").strip().upper()
     if not db:
         return JsonResponse(
             {"status": "error", "message": "Не передан параметр db (например db=BINUU00)"},
@@ -5825,10 +5821,10 @@ def sm_staff_list_by_db(request):
             json_dumps_params={"ensure_ascii": False},
         )
 
-    db = _normalize_service_key(db)
-    if not _is_allowed_service(db):
+    # whitelist
+    if db not in ORACLE_TNS_MAP:
         return JsonResponse(
-            {"status": "error", "message": f"База db={db!r} не разрешена (нет в ORACLE_TNS_MAP/ORACLE_SERVICES_ALL)"},
+            {"status": "error", "message": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP."},
             status=400,
             json_dumps_params={"ensure_ascii": False},
         )
@@ -5848,25 +5844,23 @@ def sm_staff_list_by_db(request):
 
     q = (request.GET.get("q") or "").strip().lower()
 
-    # only_enabled
-    raw_only_enabled = (request.GET.get("only_enabled", "1") or "").strip().lower()
-    only_enabled = raw_only_enabled not in ("0", "false", "no", "off", "")
+    # only_enabled: по умолчанию 0 (не фильтровать), если передали 1/true/yes -> фильтровать
+    only_enabled_raw = (request.GET.get("only_enabled") or "").strip().lower()
+    only_enabled = only_enabled_raw in ("1", "true", "yes", "y", "on")
 
     conn = cur = None
     try:
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
 
-        # ВАЖНО: в _oracle_get_table_columns_set bind-имя должно быть без "host" (ORA-01745),
-        # у тебя уже исправлено на :own и :tbl.
+        # какие колонки реально есть в этой базе
         cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
 
         def has(col: str) -> bool:
             return col.upper() in cols_set
 
-        # SELECT-часть: безопасно возвращаем ожидаемые поля (NULL, если колонки нет)
+        # SELECT: если колонки нет — отдаём NULL AS col
         select_parts = []
-
         def add_select(col: str):
             if has(col):
                 select_parts.append(col)
@@ -5881,17 +5875,18 @@ def sm_staff_list_by_db(request):
         add_select("inn")
         add_select("userenabled")
 
-        sql = f"SELECT {', '.join(select_parts)} FROM smstaff"
+        base_sql = f"SELECT {', '.join(select_parts)} FROM smstaff"
         binds = {}
 
-        # WHERE: собираем через AND, поиск q — через OR
-        where_clauses = []
+        where_parts = []
 
-        # только активные
-        if only_enabled and has("userenabled"):
-            where_clauses.append("(userenabled = '1' OR userenabled = 1)")
+        if only_enabled:
+            if has("userenabled"):
+                where_parts.append("(userenabled = '1' OR userenabled = 1)")
+            else:
+                # если вдруг колонки нет — фильтровать нечем
+                pass
 
-        # поиск
         if q:
             like = f"%{q}%"
             or_parts = []
@@ -5905,24 +5900,35 @@ def sm_staff_list_by_db(request):
                 or_parts.append("LOWER(serverlogin) LIKE :q")
 
             if or_parts:
-                where_clauses.append("(" + " OR ".join(or_parts) + ")")
+                where_parts.append("(" + " OR ".join(or_parts) + ")")
                 binds["q"] = like
 
-        if where_clauses:
-            sql += " WHERE " + " AND ".join(where_clauses)
+        if where_parts:
+            base_sql += " WHERE " + " AND ".join(where_parts)
 
-        # ORDER BY
+        # ORDER BY (для ROW_NUMBER)
         if has("surname"):
-            sql += " ORDER BY surname"
+            order_expr = "surname"
         elif has("id"):
-            sql += " ORDER BY id"
+            order_expr = "id"
         else:
-            sql += " ORDER BY 1"
+            order_expr = "1"
 
-        # пагинация
-        sql += " OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY"
-        binds["off"] = offset
-        binds["lim"] = limit
+        # Oracle 11g/12c-safe pagination
+        # rn > offset  AND rn <= offset+limit
+        sql = f"""
+            SELECT *
+            FROM (
+                SELECT t.*, ROW_NUMBER() OVER (ORDER BY {order_expr}) rn
+                FROM (
+                    {base_sql}
+                ) t
+            )
+            WHERE rn > :b_off
+              AND rn <= :b_off_to
+        """
+        binds["b_off"] = offset
+        binds["b_off_to"] = offset + limit
 
         cur.execute(sql, binds)
         items = _oracle_rows_to_jsonable(cur)
@@ -5931,10 +5937,10 @@ def sm_staff_list_by_db(request):
             {
                 "status": "ok",
                 "db": db,
-                "only_enabled": only_enabled,
                 "count": len(items),
                 "limit": limit,
                 "offset": offset,
+                "only_enabled": only_enabled,
                 "columns_present": sorted(list(cols_set)),
                 "items": items,
             },
