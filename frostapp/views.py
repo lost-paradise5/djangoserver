@@ -5798,12 +5798,17 @@ def _is_allowed_service(service_key: str) -> bool:
 @csrf_exempt
 def sm_staff_list_by_db(request):
     """
-    GET /sm/staff/by-db/?db=BINUU00&limit=50&offset=0&q=иванов
+    GET /sm/staff/by-db/?db=BINUU00&limit=50&offset=0&q=иванов&only_enabled=1
 
-    Подключается к Oracle по service_key из ORACLE_TNS_MAP (BINUU00/BINCH8/...),
-    читает smstaff и возвращает список.
+    Параметры:
+      - db (обязательный): BINUU00 / BINUU01 / BINCH12 ...
+      - limit (default 200, max 1000)
+      - offset (default 0)
+      - q (опционально): поиск по surname/name/patronymic/serverlogin (что есть в таблице)
+      - only_enabled (default 1): если 1/true -> только userenabled=1, если 0/false -> все
 
-    Устойчив к разным схемам: если в smstaff нет patronymic — не используем его в SELECT/WHERE.
+    Устойчив к разным схемам SMSTAFF: если колонки нет — не используем её в WHERE,
+    а в SELECT вернём NULL AS <column>.
     """
     if request.method != "GET":
         return JsonResponse(
@@ -5820,15 +5825,15 @@ def sm_staff_list_by_db(request):
             json_dumps_params={"ensure_ascii": False},
         )
 
-    # Важно: не даём подключаться к произвольному хосту. Только то, что есть в карте.
-    if db not in ORACLE_TNS_MAP:
+    db = _normalize_service_key(db)
+    if not _is_allowed_service(db):
         return JsonResponse(
-            {"status": "error", "message": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP."},
+            {"status": "error", "message": f"База db={db!r} не разрешена (нет в ORACLE_TNS_MAP/ORACLE_SERVICES_ALL)"},
             status=400,
             json_dumps_params={"ensure_ascii": False},
         )
 
-    # Параметры пагинации
+    # limit/offset
     try:
         limit = int(request.GET.get("limit", "200"))
     except ValueError:
@@ -5843,31 +5848,35 @@ def sm_staff_list_by_db(request):
 
     q = (request.GET.get("q") or "").strip().lower()
 
+    # only_enabled
+    raw_only_enabled = (request.GET.get("only_enabled", "1") or "").strip().lower()
+    only_enabled = raw_only_enabled not in ("0", "false", "no", "off", "")
+
     conn = cur = None
     try:
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
 
-        # Узнаём реальный набор колонок в SMSTAFF именно этой базы
+        # ВАЖНО: в _oracle_get_table_columns_set bind-имя должно быть без "host" (ORA-01745),
+        # у тебя уже исправлено на :own и :tbl.
         cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
 
         def has(col: str) -> bool:
             return col.upper() in cols_set
 
-        # Собираем SELECT только из существующих колонок
+        # SELECT-часть: безопасно возвращаем ожидаемые поля (NULL, если колонки нет)
         select_parts = []
+
         def add_select(col: str):
             if has(col):
                 select_parts.append(col)
             else:
-                # чтобы поле всё равно было в JSON с null (удобно фронту/диагностике)
                 select_parts.append(f"NULL AS {col}")
 
-        # Набор “ожидаемых” полей (но они могут отсутствовать)
         add_select("id")
         add_select("surname")
         add_select("name")
-        add_select("patronymic")   # <- безопасно: если нет, будет NULL AS patronymic
+        add_select("patronymic")
         add_select("serverlogin")
         add_select("inn")
         add_select("userenabled")
@@ -5875,25 +5884,34 @@ def sm_staff_list_by_db(request):
         sql = f"SELECT {', '.join(select_parts)} FROM smstaff"
         binds = {}
 
-        # WHERE: добавляем условия только по существующим колонкам
-        where = []
+        # WHERE: собираем через AND, поиск q — через OR
+        where_clauses = []
+
+        # только активные
+        if only_enabled and has("userenabled"):
+            where_clauses.append("(userenabled = '1' OR userenabled = 1)")
+
+        # поиск
         if q:
             like = f"%{q}%"
-            # обычно ищут по фамилии/имени/логину
+            or_parts = []
             if has("surname"):
-                where.append("LOWER(surname) LIKE :q")
+                or_parts.append("LOWER(surname) LIKE :q")
             if has("name"):
-                where.append("LOWER(name) LIKE :q")
+                or_parts.append("LOWER(name) LIKE :q")
             if has("patronymic"):
-                where.append("LOWER(patronymic) LIKE :q")
+                or_parts.append("LOWER(patronymic) LIKE :q")
             if has("serverlogin"):
-                where.append("LOWER(serverlogin) LIKE :q")
+                or_parts.append("LOWER(serverlogin) LIKE :q")
 
-            if where:
-                sql += " WHERE (" + " OR ".join(where) + ")"
+            if or_parts:
+                where_clauses.append("(" + " OR ".join(or_parts) + ")")
                 binds["q"] = like
 
-        # ORDER BY: если нет surname — сортируем по id
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(where_clauses)
+
+        # ORDER BY
         if has("surname"):
             sql += " ORDER BY surname"
         elif has("id"):
@@ -5901,7 +5919,7 @@ def sm_staff_list_by_db(request):
         else:
             sql += " ORDER BY 1"
 
-        # Пагинация
+        # пагинация
         sql += " OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY"
         binds["off"] = offset
         binds["lim"] = limit
@@ -5913,10 +5931,11 @@ def sm_staff_list_by_db(request):
             {
                 "status": "ok",
                 "db": db,
+                "only_enabled": only_enabled,
                 "count": len(items),
                 "limit": limit,
                 "offset": offset,
-                "columns_present": sorted(list(cols_set)),  # очень помогает дебажить “почему нет поля”
+                "columns_present": sorted(list(cols_set)),
                 "items": items,
             },
             json_dumps_params={"ensure_ascii": False, "indent": 2},
