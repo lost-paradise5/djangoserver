@@ -584,6 +584,39 @@ _ONEC_SESSION = requests.Session()
 _ONEC_SESSION.headers.update({"Content-Type": "application/json; charset=utf-8"})
 
 
+
+
+
+
+
+_USERS_TTL_COLS_CACHE: dict[str, bool] = {}
+
+def _mysql_users_supports_ttl_cols(cur, cache_key: str) -> bool:
+    """
+    Проверяет наличие колонок start_date/end_date в таблице users текущей MySQL БД.
+    Кэшируем по cache_key (обычно ukm4ip), чтобы не делать SHOW COLUMNS каждый раз.
+    """
+    if cache_key in _USERS_TTL_COLS_CACHE:
+        return _USERS_TTL_COLS_CACHE[cache_key]
+
+    try:
+        cur.execute("SHOW COLUMNS FROM users LIKE 'start_date'")
+        has_start = cur.fetchone() is not None
+
+        cur.execute("SHOW COLUMNS FROM users LIKE 'end_date'")
+        has_end = cur.fetchone() is not None
+
+        ok = bool(has_start and has_end)
+        _USERS_TTL_COLS_CACHE[cache_key] = ok
+        return ok
+
+    except Exception as e:
+        logger.warning(f"[MySQL:{cache_key}] Не смог проверить start_date/end_date в users: {e}")
+        _USERS_TTL_COLS_CACHE[cache_key] = False
+        return False
+
+
+
 def resolve_xml_store_id(raw_store_id: int | str) -> int:
     """
     Преобразует id магазина из УКМ (ukm4store),
@@ -1300,18 +1333,63 @@ def _update_store_mysql_and_xml_for_single_store(
                 f"(по MAX(signal.version))"
             )
 
-            cur.execute("""
-                INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-                VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-            """, (
-                store_id,
-                cashier_id,
-                fio,
-                plain_inn,
-                mysql_pwd(password_plain),
-                role_id,
-                base_version
-            ))
+            ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
+            if ttl_supported:
+                now = timezone.now()
+                start_date = now.date()
+                end_date = (now + datetime.timedelta(days=1)).date()
+
+                cur.execute("""
+                    INSERT INTO users (
+                        store, id, name, inn, password, role_id, version, deleted,
+                        start_date, end_date
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0,
+                        %s, %s
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        name       = VALUES(name),
+                        inn        = VALUES(inn),
+                        password   = VALUES(password),
+                        role_id    = VALUES(role_id),
+                        version    = VALUES(version),
+                        deleted    = 0,
+                        start_date = VALUES(start_date),
+                        end_date   = VALUES(end_date)
+                """, (
+                    store_id,
+                    cashier_id,
+                    fio,
+                    plain_inn,
+                    mysql_pwd(password_plain),
+                    role_id,
+                    base_version,
+                    start_date,
+                    end_date
+                ))
+                logger.info(f"[QR/EMP] Store {store_id} ({ukm4ip}): users TTL cols detected, set {start_date}..{end_date}")
+            else:
+                cur.execute("""
+                    INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+                    VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+                    ON DUPLICATE KEY UPDATE
+                        name     = VALUES(name),
+                        inn      = VALUES(inn),
+                        password = VALUES(password),
+                        role_id  = VALUES(role_id),
+                        version  = VALUES(version),
+                        deleted  = 0
+                """, (
+                    store_id,
+                    cashier_id,
+                    fio,
+                    plain_inn,
+                    mysql_pwd(password_plain),
+                    role_id,
+                    base_version
+                ))
+                logger.info(f"[QR/EMP] Store {store_id} ({ukm4ip}): users TTL cols NOT found, wrote without dates")
 
             cur.execute(
                 "INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)",
@@ -1332,8 +1410,10 @@ def _update_store_mysql_and_xml_for_single_store(
                     pass
         finally:
             try:
-                if cur: cur.close()
-                if conv: conv.close()
+                if cur:
+                    cur.close()
+                if conv:
+                    conv.close()
             except Exception:
                 pass
     else:
@@ -1381,6 +1461,130 @@ def _update_store_mysql_and_xml_for_single_store(
         logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
     except Exception as e:
         logger.error(f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}", exc_info=True)
+        
+# def _update_store_mysql_and_xml_for_single_store(
+#     store_id: int,
+#     cashier_id: int,
+#     role_id: int,
+#     plain_inn: str,
+#     fio: str,
+#     password_plain: str
+# ) -> None:
+#     """
+#     Обновляет кассира по ОДНОМУ магазину:
+#       • UKM4 (MySQL import4.users + import4.signal)
+#       • UKM5 (XML storeCashiers_... если магазин UKM5)
+
+#     ВАЖНО:
+#       • Для магазинов из UKM5_FULL_XML_STORE_IDS делаем ПОЛНУЮ пересборку XML,
+#         а не точечный upsert одного кассира.
+#     """
+#     logger.info(
+#         f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
+#         f"cashier_id={cashier_id}, role_id={role_id}"
+#     )
+
+#     info = get_store_info(store_id)
+#     ukm4ip = info.get("ukm4ip")
+#     is_ukm5 = info.get("is_ukm5", False)
+#     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
+
+#     # -------------------------
+#     # UKM4 / MySQL import4
+#     # -------------------------
+#     if ukm4ip:
+#         conv = cur = None
+#         try:
+#             conv = connect_store_mysql(ukm4ip)
+#             cur = conv.cursor()
+
+#             base_version = _calc_next_signal_version(cur)
+#             logger.info(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): next version={base_version} "
+#                 f"(по MAX(signal.version))"
+#             )
+
+#             cur.execute("""
+#                 INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+#                 VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+#             """, (
+#                 store_id,
+#                 cashier_id,
+#                 fio,
+#                 plain_inn,
+#                 mysql_pwd(password_plain),
+#                 role_id,
+#                 base_version
+#             ))
+
+#             cur.execute(
+#                 "INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)",
+#                 (base_version,)
+#             )
+
+#             conv.commit()
+#             logger.info(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): OK users+signal "
+#                 f"(id={cashier_id}, role_id={role_id}, version={base_version})"
+#             )
+#         except Exception as e:
+#             logger.error(f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}", exc_info=True)
+#             if conv:
+#                 try:
+#                     conv.rollback()
+#                 except Exception:
+#                     pass
+#         finally:
+#             try:
+#                 if cur: cur.close()
+#                 if conv: conv.close()
+#             except Exception:
+#                 pass
+#     else:
+#         logger.error(f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal")
+
+#     # -------------------------
+#     # UKM5 / XML
+#     # -------------------------
+#     if not is_ukm5:
+#         return
+
+#     # Полная пересборка XML для “спец” магазинов
+#     if int(store_id) in UKM5_FULL_XML_STORE_IDS:
+#         try:
+#             xml_path = build_full_ukm5_xml_for_store(store_id)
+#             logger.info(f"[QR/EMP] Store {store_id}: полный XML пересобран: {xml_path}")
+#         except Exception as e:
+#             logger.error(
+#                 f"[QR/EMP] Store {store_id}: ошибка полной пересборки XML/UKM5: {e}",
+#                 exc_info=True
+#             )
+#         return
+
+#     # Остальные UKM5 — точечное обновление одного кассира
+#     try:
+#         xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
+
+#         # удаляем старые записи этого INN
+#         changed = False
+#         for cash_el in list(root.findall("cashier")):
+#             if (cash_el.findtext("INN") or "").strip() == plain_inn:
+#                 root.remove(cash_el)
+#                 changed = True
+#         if changed:
+#             logger.info(f"[QR/EMP] Store {store_id}: удалены старые cashier с INN={plain_inn} из {xml_path}")
+
+#         cash_el = ET.SubElement(root, "cashier")
+#         ET.SubElement(cash_el, "roleId").text = str(role_id)
+#         ET.SubElement(cash_el, "id").text = str(cashier_id)
+#         ET.SubElement(cash_el, "name").text = fio
+#         ET.SubElement(cash_el, "INN").text = plain_inn
+#         ET.SubElement(cash_el, "password").text = password_plain
+
+#         _write_xml_with_declaration(xml_path, root, ensure_base=True)
+#         logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
+#     except Exception as e:
+#         logger.error(f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}", exc_info=True)
             
             
             
@@ -2550,7 +2754,7 @@ def regenerate_qr(user):
     QRCode.objects.create(user=user, qr_data=new_password, created_at=now, expires_at=expiration)
     OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(password=new_password)
 
-    # для id кассира
+    # для id кассира (как было у тебя)
     ukm_conn = connect_ukm()
     ukm_cursor = ukm_conn.cursor()
     ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
@@ -2569,33 +2773,93 @@ def regenerate_qr(user):
         ukm4ip = info.get("ukm4ip")
 
         if ukm4ip:
+            conv = cur = None
             try:
                 conv = connect_store_mysql(ukm4ip)
                 cur = conv.cursor()
 
                 base_version = _calc_next_signal_version(cur)
 
-                cur.execute("""
-                    INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-                    VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-                """, (
-                    sid,
-                    cashier_id,
-                    user.full_name,
-                    user.employee_id,
-                    mysql_pwd(new_password),
-                    ukm_user.roleid,
-                    base_version
-                ))
-                cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
+                ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
+                if ttl_supported:
+                    start_date = now.date()
+                    end_date = expiration.date()
+
+                    cur.execute("""
+                        INSERT INTO users (
+                            store, id, name, inn, password, role_id, version, deleted,
+                            start_date, end_date
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0,
+                            %s, %s
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            name       = VALUES(name),
+                            inn        = VALUES(inn),
+                            password   = VALUES(password),
+                            role_id    = VALUES(role_id),
+                            version    = VALUES(version),
+                            deleted    = 0,
+                            start_date = VALUES(start_date),
+                            end_date   = VALUES(end_date)
+                    """, (
+                        sid,
+                        cashier_id,
+                        user.full_name,
+                        user.employee_id,
+                        mysql_pwd(new_password),
+                        ukm_user.roleid,
+                        base_version,
+                        start_date,
+                        end_date
+                    ))
+                else:
+                    cur.execute("""
+                        INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+                        VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+                        ON DUPLICATE KEY UPDATE
+                            name     = VALUES(name),
+                            inn      = VALUES(inn),
+                            password = VALUES(password),
+                            role_id  = VALUES(role_id),
+                            version  = VALUES(version),
+                            deleted  = 0
+                    """, (
+                        sid,
+                        cashier_id,
+                        user.full_name,
+                        user.employee_id,
+                        mysql_pwd(new_password),
+                        ukm_user.roleid,
+                        base_version
+                    ))
+
+                cur.execute(
+                    "INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)",
+                    (base_version,)
+                )
+
                 conv.commit()
-                conv.close()
                 logger.info(
                     f"[MySQL:{ukm4ip}] Пароль обновлён store={sid}, "
                     f"id={cashier_id}, version={base_version}"
                 )
             except Exception as e:
-                logger.error(f"[MySQL:{ukm4ip}] Ошибка обновления пароля для store={sid}: {e}")
+                logger.error(f"[MySQL:{ukm4ip}] Ошибка обновления пароля для store={sid}: {e}", exc_info=True)
+                if conv:
+                    try:
+                        conv.rollback()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    if cur:
+                        cur.close()
+                    if conv:
+                        conv.close()
+                except Exception:
+                    pass
         else:
             logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
 
@@ -2621,21 +2885,117 @@ def regenerate_qr(user):
                 xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
 
                 for el in list(root.findall("cashier")):
-                    if el.findtext("INN") == user.employee_id:
+                    if (el.findtext("INN") or "").strip() == str(user.employee_id).strip():
                         root.remove(el)
 
                 c_el = ET.SubElement(root, "cashier")
                 ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
                 ET.SubElement(c_el, "id").text = str(next_free_id)
                 ET.SubElement(c_el, "name").text = user.full_name
-                ET.SubElement(c_el, "INN").text = user.employee_id
+                ET.SubElement(c_el, "INN").text = str(user.employee_id).strip()
                 ET.SubElement(c_el, "password").text = new_password
 
                 _write_xml_with_declaration(xml_path, root, ensure_base=True)
                 logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
                 next_free_id += 1
         except Exception as exc:
-            logger.error(f"[XML] Ошибка для {sid}: {exc}")
+            logger.error(f"[XML] Ошибка для {sid}: {exc}", exc_info=True)
+# def regenerate_qr(user):
+#     new_password = build_user_password(user.employee_id)
+#     now = timezone.now()
+#     expiration = now + datetime.timedelta(days=1)
+
+#     # PostgreSQL: QR + open_in_system
+#     QRCode.objects.filter(user=user).delete()
+#     QRCode.objects.create(user=user, qr_data=new_password, created_at=now, expires_at=expiration)
+#     OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(password=new_password)
+
+#     # для id кассира
+#     ukm_conn = connect_ukm()
+#     ukm_cursor = ukm_conn.cursor()
+#     ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+#     cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
+#     ukm_conn.close()
+
+#     ukm_emp_id = get_trm_employee_id(user.employee_id, user.full_name)
+#     ukm_users = list(UKMUser.objects.filter(user_id=user.id))
+#     cashier_counter = 0
+
+#     for ukm_user in ukm_users:
+#         sid = ukm_user.storeid
+#         cashier_id = ukm_emp_id if ukm_emp_id else (cashier_id_base + cashier_counter)
+
+#         info = get_store_info(sid)
+#         ukm4ip = info.get("ukm4ip")
+
+#         if ukm4ip:
+#             try:
+#                 conv = connect_store_mysql(ukm4ip)
+#                 cur = conv.cursor()
+
+#                 base_version = _calc_next_signal_version(cur)
+
+#                 cur.execute("""
+#                     INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+#                     VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+#                 """, (
+#                     sid,
+#                     cashier_id,
+#                     user.full_name,
+#                     user.employee_id,
+#                     mysql_pwd(new_password),
+#                     ukm_user.roleid,
+#                     base_version
+#                 ))
+#                 cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
+#                 conv.commit()
+#                 conv.close()
+#                 logger.info(
+#                     f"[MySQL:{ukm4ip}] Пароль обновлён store={sid}, "
+#                     f"id={cashier_id}, version={base_version}"
+#                 )
+#             except Exception as e:
+#                 logger.error(f"[MySQL:{ukm4ip}] Ошибка обновления пароля для store={sid}: {e}")
+#         else:
+#             logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
+
+#         cashier_counter += 1
+
+#     # XML для UKM5 (обновляем записи)
+#     next_free_id = cashier_id_base + cashier_counter
+
+#     for ukm_user in ukm_users:
+#         sid = ukm_user.storeid
+#         if not is_ukm5_store(sid):
+#             continue
+
+#         try:
+#             if sid == UKM5_FULL_XML_STORE_ID:
+#                 # Для магазина 2013 при смене пароля пересобираем полный XML
+#                 xml_path = build_full_ukm5_xml_for_store(sid)
+#                 logger.info(
+#                     f"[XML] Полный XML пересобран при регенерации QR для storeid={sid}: {xml_path}"
+#                 )
+#             else:
+#                 # Остальные магазины — точечное обновление одного кассира
+#                 xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+
+#                 for el in list(root.findall("cashier")):
+#                     if el.findtext("INN") == user.employee_id:
+#                         root.remove(el)
+
+#                 c_el = ET.SubElement(root, "cashier")
+#                 ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
+#                 ET.SubElement(c_el, "id").text = str(next_free_id)
+#                 ET.SubElement(c_el, "name").text = user.full_name
+#                 ET.SubElement(c_el, "INN").text = user.employee_id
+#                 ET.SubElement(c_el, "password").text = new_password
+
+#                 _write_xml_with_declaration(xml_path, root, ensure_base=True)
+#                 logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
+#                 next_free_id += 1
+#         except Exception as exc:
+#             logger.error(f"[XML] Ошибка для {sid}: {exc}")
 
 
 
@@ -3345,7 +3705,7 @@ def get_qr_code_by_tg(request):
 
         # Telegram-лог
         lines = [
-            "✅ QR-код возвращён из базы (READ-ONLY) по Telegram ID",
+            "✅ QR-код запросили из Telegram-бота",
             "",
             "👤 Сотрудник:",
             f"  • Telegram ID: {tg_id}",
@@ -3801,7 +4161,7 @@ def get_qr_code_by_employee_id(request):
         fio_match = (fio_db == fio) if fio_db else None
 
         lines = [
-            "✅ QR-код возвращён из базы (READ-ONLY) по ИНН сотрудника",
+            "✅ QR-код запрошен из 1С",
             "",
             "👤 Сотрудник:",
             f"  • user_id (PostgreSQL): {user.id}",
@@ -4736,7 +5096,7 @@ def employee_identification(request):
     # Лог в Telegram (в любом случае)
     resp_short = text_1c if len(text_1c) <= 1000 else text_1c[:1000] + "…"
     tg_lines = [
-        "📡 Результат employee_identification → 1С",
+        "📡 Отметка смены",
         "",
         "👤 Сотрудник:",
         f"  • ФИО: {fio}",
@@ -5326,7 +5686,7 @@ def pos_reboot(request):
 
         # Telegram лог (читабельно)
         msg_lines = [
-            "🔁 REBOOT кассы",
+            "🔁 Перезагрузка кассы",
             "",
             "👤 Инициатор:",
             f"  • {initiator_name}",
@@ -5394,7 +5754,7 @@ def pos_reboot(request):
 
         # Telegram лог ошибки
         msg_lines = [
-            "❌ Ошибка REBOOT кассы",
+            "❌ Ошибка перезагрузки кассы",
             "",
             "👤 Инициатор:",
             f"  • {initiator_name}",
