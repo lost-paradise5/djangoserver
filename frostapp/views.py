@@ -21,6 +21,7 @@ from django.utils import timezone
 import ipaddress
 import paramiko
 import csv
+from django.db.models import Q
 import math
 from collections import defaultdict, Counter
 from pathlib import Path
@@ -3883,122 +3884,403 @@ def get_qr_code_by_employee_id(request):
 
 
 
-
 @csrf_exempt
 def update_cashier(request):
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+    if request.method != "POST":
+        return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
 
+    raw_body = ""
     try:
-        data = json.loads(request.body)
+        raw_body = request.body.decode("utf-8") if request.body else "{}"
+        data = json.loads(raw_body)
 
-        plain_inn = ensure_plain_inn(data.get('inn'))
-        fio = data.get('fio')
-        storeids = data.get('storeid')
+        # ---- входные поля (поддержим несколько вариантов названий)
+        inn_raw = str(data.get("inn") or data.get("employee_id") or "").strip()
+        fio_raw = str(data.get("fio") or data.get("full_name") or "").strip()
+        storeids_raw = data.get("storeid") or data.get("storeids") or data.get("stores")
 
-        if not (plain_inn and fio and storeids):
-            return JsonResponse({'status': 'error', 'message': 'inn, fio и storeid обязательны'}, status=400)
+        role_raw = data.get("roleId") or data.get("roleid") or 1
+        try:
+            role_id_req = int(role_raw)
+        except Exception:
+            role_id_req = 1
 
-        store_ids = [int(s.strip()) for s in str(storeids).split(',') if s.strip().isdigit()]
+        plain_inn = ensure_plain_inn(inn_raw)
+        fio = " ".join(fio_raw.split()).strip()
+
+        if not fio:
+            return JsonResponse({"status": "error", "message": "fio обязателен"}, status=400)
+        if not storeids_raw:
+            return JsonResponse({"status": "error", "message": "storeid обязателен"}, status=400)
+
+        store_ids = []
+        if isinstance(storeids_raw, list):
+            for x in storeids_raw:
+                s = str(x).strip()
+                if s.isdigit():
+                    store_ids.append(int(s))
+        else:
+            store_ids = [int(s.strip()) for s in str(storeids_raw).split(",") if s.strip().isdigit()]
+
+        store_ids = sorted(set(store_ids))
         if not store_ids:
-            return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
+            return JsonResponse({"status": "error", "message": "Некорректный storeid"}, status=400)
 
-        user = User.objects.filter(employee_id=plain_inn, full_name=fio).first()
+        # ---- поиск пользователя (plain/sha/sha20) + нормализованное ФИО
+        inn_sha = hashlib.sha256(plain_inn.encode("utf-8")).hexdigest()
+        inn_sha20 = inn_sha[:20]
+
+        fio_norm = fio  # уже нормализован
+        user = (
+            User.objects.filter(full_name__iexact=fio_norm).filter(
+                Q(employee_id=plain_inn) | Q(encrypted_inn=plain_inn) |
+                Q(employee_id=inn_sha)  | Q(encrypted_inn=inn_sha)  |
+                Q(employee_id=inn_sha20)| Q(encrypted_inn=inn_sha20)
+            ).order_by("id").first()
+        )
+
+        # fallback: если ФИО в базе чуть отличается — найдём по ИНН, но проверим руками
         if not user:
-            return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
+            cand = (
+                User.objects.filter(
+                    Q(employee_id=plain_inn) | Q(encrypted_inn=plain_inn) |
+                    Q(employee_id=inn_sha)  | Q(encrypted_inn=inn_sha)  |
+                    Q(employee_id=inn_sha20)| Q(encrypted_inn=inn_sha20)
+                ).order_by("id").first()
+            )
+            if cand:
+                fio_db = " ".join((cand.full_name or "").split()).strip()
+                if fio_db.lower() == fio_norm.lower():
+                    user = cand
 
-        open_rec = OpenInSystem.objects.filter(user_id=user.id, system_id=9).first()
-        if not open_rec:
-            return JsonResponse({'status': 'error', 'message': 'Пароль для пользователя не найден'}, status=500)
-        password_plain = open_rec.password
+        if not user:
+            return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
-        ukm_emp_id = get_trm_employee_id(plain_inn, fio)
+        # ---- добавим недостающие магазины в ukm_users (в Postgres) + сразу ротируем пароль
+        added_storeids: list[int] = []
 
-        existing_storeids = set(UKMUser.objects.filter(user_id=user.id).values_list('storeid', flat=True))
+        with transaction.atomic():
+            # подстрахуемся: employee_id должен быть plain ИНН (иначе ensure_plain_inn на user.employee_id потом ломается в других местах)
+            if (user.employee_id or "").strip() != plain_inn:
+                user.employee_id = plain_inn
+                user.updated_at = timezone.now()
+                user.save(update_fields=["employee_id", "updated_at"])
 
-        ukm_conn = connect_ukm()
-        ukm_cursor = ukm_conn.cursor()
-        ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
-        cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
-        ukm_conn.close()
+            existing_storeids = set(
+                UKMUser.objects.filter(user_id=user.id).values_list("storeid", flat=True)
+            )
 
-        cashier_counter = 0
-        added_storeids = []
+            for sid in store_ids:
+                if sid in existing_storeids:
+                    continue
+                UKMUser.objects.create(
+                    user=user,
+                    roleid=role_id_req,
+                    storeid=sid,
+                    version=1
+                )
+                added_storeids.append(sid)
 
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        xml_dir = os.path.join(base_dir, 'xml')
-        os.makedirs(xml_dir, exist_ok=True)
+            # ВАЖНО: как в rotate_qr_codes.py — всегда генерим новый пароль/QR и пишем в Postgres
+            new_password = build_user_password(plain_inn)
+            _set_password_pg(user, new_password)
 
-        for sid in store_ids:
-            if sid in existing_storeids:
-                logger.info(f"[Пропуск] Доступ уже есть: storeid={sid}")
-                continue
+        # После транзакции перечитываем ВСЕ магазины пользователя (чтобы новый пароль применить везде)
+        ukm_links = list(
+            UKMUser.objects
+            .filter(user_id=user.id)
+            .values("storeid", "roleid")
+        )
+        ukm_links = sorted(
+            [{"storeid": int(x["storeid"]), "roleid": int(x["roleid"])} for x in ukm_links],
+            key=lambda x: x["storeid"]
+        )
 
-            UKMUser.objects.create(user=user, roleid=1, storeid=sid, version=1)
+        if not ukm_links:
+            return JsonResponse({"status": "error", "message": "Нет записей ukm_users у пользователя"}, status=400)
 
-            cashier_id = ukm_emp_id if ukm_emp_id else (cashier_id_base + cashier_counter)
-            cashier_counter += 1
+        # ---- allocator новых trm-id: ключим по resolved_host, чтобы не словить дубль,
+        # если разные storeid попадают на один и тот же ukmserver
+        trm_alloc: dict[str, dict] = {}  # {resolved_host: {"next": int, "reserved": set[int]}}
 
-            info = get_store_info(sid)
-            ukm4ip = info.get("ukm4ip")
-            is_ukm5 = info.get("is_ukm5", False)
-
-            if ukm4ip:
+        def _is_trm_id_taken(resolved_host: str, candidate: int) -> bool:
+            conn2 = cur2 = None
+            try:
+                conn2 = connect_ukm(host=resolved_host, store_id=None)
+                cur2 = conn2.cursor()
+                cur2.execute("SELECT 1 AS x FROM trm_in_users WHERE id=%s LIMIT 1", (candidate,))
+                return bool(cur2.fetchone())
+            finally:
                 try:
-                    conv = connect_store_mysql(ukm4ip)
-                    cur = conv.cursor()
+                    if cur2: cur2.close()
+                    if conn2: conn2.close()
+                except Exception:
+                    pass
 
-                    base_version = _calc_next_signal_version(cur)
+        def _alloc_new_trm_id_for_store(store_id: int) -> tuple[int, str]:
+            resolved_host, _src = _resolve_ukmserver_host(host=None, store_id=store_id)
+            key = str(resolved_host).strip()
 
-                    cur.execute("""
-                        INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-                        VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-                    """, (
-                        sid, cashier_id, fio, plain_inn, mysql_pwd(password_plain), 1, base_version
-                    ))
-                    cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
-                    conv.commit()
-                    conv.close()
-                    logger.info(f"[MySQL:{ukm4ip}] Доступ открыт store={sid}, id={cashier_id}, version={base_version}")
-                except Exception as exc:
-                    logger.error(f"[MySQL:{ukm4ip}] Ошибка для {sid}: {exc}")
-            else:
-                logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
+            st = trm_alloc.get(key)
+            if st is None:
+                base = get_next_trm_employee_id(store_id=store_id, host=key)
+                st = {"next": int(base), "reserved": set()}
+                trm_alloc[key] = st
 
-            if is_ukm5:
-                try:
-                    if sid == UKM5_FULL_XML_STORE_ID:
-                        # Для магазина 2013 всегда пересборка полного XML
-                        xml_path = build_full_ukm5_xml_for_store(sid)
-                        logger.info(
-                            f"[XML] Полный XML пересобран для УКМ5 магазина {sid}: {xml_path}"
-                        )
-                    else:
-                        # Остальные УКМ5 — точечное добавление кассира
-                        xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+            candidate = int(st["next"])
+            while True:
+                if candidate in st["reserved"]:
+                    candidate += 1
+                    continue
+                if candidate > int(TRM_SMALL_MAX):
+                    raise RuntimeError(
+                        f"TRM id overflow: candidate={candidate} > TRM_SMALL_MAX={TRM_SMALL_MAX} (host={key})"
+                    )
+                if _is_trm_id_taken(key, candidate):
+                    candidate += 1
+                    continue
 
-                        c_el = ET.SubElement(root, "cashier")
-                        ET.SubElement(c_el, "roleId").text = "1"
-                        ET.SubElement(c_el, "id").text = str(cashier_id)
-                        ET.SubElement(c_el, "name").text = fio
-                        ET.SubElement(c_el, "INN").text = plain_inn
-                        ET.SubElement(c_el, "password").text = password_plain
+                st["reserved"].add(candidate)
+                st["next"] = candidate + 1
+                return int(candidate), key
 
-                        _write_xml_with_declaration(xml_path, root, ensure_base=True)
-                        logger.info(f"[XML] Обновлён файл {xml_path}")
-                except Exception as exc:
-                    logger.error(f"[XML] Ошибка для {sid}: {exc}")
+        # ---- обновление UKM4/UKM5 по всем магазинам пользователя
+        per_store = []
+        errors = 0
 
-            added_storeids.append(sid)
+        for link in ukm_links:
+            sid = int(link["storeid"])
+            role_id = int(link["roleid"])
 
-        if not added_storeids:
-            return JsonResponse({'status': 'ok', 'message': 'У пользователя уже был доступ ко всем указанным магазинам'})
+            cashier_id = None
+            found_in_trm = False
+            resolved_host = None
 
-        return JsonResponse({'status': 'ok', 'message': 'Доступ открыт', 'added': added_storeids})
+            try:
+                # Ищем на НУЖНОМ ukmserver (через store_id)
+                existing_id = get_trm_employee_id(
+                    plain_inn,
+                    fio_norm,
+                    store_id=sid,
+                    host=None
+                )
+                if existing_id is not None:
+                    cashier_id = int(existing_id)
+                    found_in_trm = True
+                    resolved_host, _ = _resolve_ukmserver_host(host=None, store_id=sid)
+                else:
+                    cashier_id, resolved_host = _alloc_new_trm_id_for_store(sid)
+                    found_in_trm = False
+
+                _update_store_mysql_and_xml_for_single_store(
+                    store_id=sid,
+                    cashier_id=int(cashier_id),
+                    role_id=int(role_id),
+                    plain_inn=plain_inn,
+                    fio=fio_norm,
+                    password_plain=new_password,
+                )
+
+                _write_converter_user_and_signal(
+                    cashier_id=int(cashier_id),
+                    plain_inn=plain_inn,
+                    fio=fio_norm,
+                    password_plain=new_password,
+                    store_id=sid,
+                    role_id=int(role_id),
+                )
+
+                per_store.append({
+                    "storeid": sid,
+                    "roleid": role_id,
+                    "cashier_id": int(cashier_id),
+                    "found_in_trm": found_in_trm,
+                    "ukm_host": str(resolved_host or ""),
+                    "status": "ok",
+                    "error": "",
+                })
+
+            except Exception as e:
+                errors += 1
+                logger.error(f"[UPDATE_CASHIER] storeid={sid} error: {e}", exc_info=True)
+                per_store.append({
+                    "storeid": sid,
+                    "roleid": role_id,
+                    "cashier_id": int(cashier_id) if cashier_id is not None else None,
+                    "found_in_trm": found_in_trm,
+                    "ukm_host": str(resolved_host or ""),
+                    "status": "error",
+                    "error": str(e),
+                })
+
+
+        try:
+            masked = new_password[:6] + "..." + new_password[-4:]
+            lines = [
+                "🔄 update_cashier: ротация QR/пароля + синхронизация магазинов",
+                "",
+                f"👤 user_id={user.id}",
+                f"ФИО='{fio_norm}'",
+                f"ИНН={plain_inn}",
+                f"Новый пароль (masked)={masked} (len={len(new_password)})",
+                "",
+                f"➕ Добавлены магазины: {', '.join(map(str, added_storeids)) if added_storeids else '—'}",
+                f"🏬 Всего магазинов у пользователя (ukm_users): {len(ukm_links)}",
+                f"⚠️ Ошибок по магазинам: {errors}",
+                "",
+                "📋 Детализация:",
+            ]
+            for r in per_store:
+                lines.append(
+                    f"• storeid={r['storeid']} role={r['roleid']} "
+                    f"cashier_id={r['cashier_id'] or '—'} found_in_trm={r['found_in_trm']} "
+                    f"host={r['ukm_host'] or '—'} status={r['status']}"
+                )
+                if r.get("error"):
+                    lines.append(f"    error: {r['error']}")
+            send_telegram_log("\n".join(lines))
+        except Exception as e:
+            logger.error(f"[UPDATE_CASHIER] telegram log failed: {e}", exc_info=True)
+
+        resp = {
+            "status": "ok" if errors == 0 else "partial",
+            "message": "Доступ обновлён и пароль ротирован" if errors == 0 else "Частично выполнено: есть ошибки по магазинам",
+            "user_id": user.id,
+            "inn": plain_inn,
+            "fio": fio_norm,
+            "added_storeids": added_storeids,
+            "rotated": True,
+            "password": new_password,  
+            "stores": per_store,
+        }
+        return JsonResponse(resp, status=200 if errors == 0 else 207)
 
     except Exception as exc:
-        logger.exception("open_access_cashier error")
-        return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
+        logger.exception("[UPDATE_CASHIER] error")
+        try:
+            send_telegram_log(
+                "💥 Ошибка update_cashier\n"
+                f"{exc}\n\n"
+                f"raw_body:\n{raw_body[:1500]}{'…' if len(raw_body) > 1500 else ''}"
+            )
+        except Exception:
+            pass
+        return JsonResponse({"status": "error", "message": str(exc)}, status=500)
+# @csrf_exempt
+# def update_cashier(request):
+#     if request.method != 'POST':
+#         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+
+#     try:
+#         data = json.loads(request.body)
+
+#         plain_inn = ensure_plain_inn(data.get('inn'))
+#         fio = data.get('fio')
+#         storeids = data.get('storeid')
+
+#         if not (plain_inn and fio and storeids):
+#             return JsonResponse({'status': 'error', 'message': 'inn, fio и storeid обязательны'}, status=400)
+
+#         store_ids = [int(s.strip()) for s in str(storeids).split(',') if s.strip().isdigit()]
+#         if not store_ids:
+#             return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
+
+#         user = User.objects.filter(employee_id=plain_inn, full_name=fio).first()
+#         if not user:
+#             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
+
+#         open_rec = OpenInSystem.objects.filter(user_id=user.id, system_id=9).first()
+#         if not open_rec:
+#             return JsonResponse({'status': 'error', 'message': 'Пароль для пользователя не найден'}, status=500)
+#         password_plain = open_rec.password
+
+#         ukm_emp_id = get_trm_employee_id(plain_inn, fio)
+
+#         existing_storeids = set(UKMUser.objects.filter(user_id=user.id).values_list('storeid', flat=True))
+
+#         ukm_conn = connect_ukm()
+#         ukm_cursor = ukm_conn.cursor()
+#         ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
+#         cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
+#         ukm_conn.close()
+
+#         cashier_counter = 0
+#         added_storeids = []
+
+#         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+#         xml_dir = os.path.join(base_dir, 'xml')
+#         os.makedirs(xml_dir, exist_ok=True)
+
+#         for sid in store_ids:
+#             if sid in existing_storeids:
+#                 logger.info(f"[Пропуск] Доступ уже есть: storeid={sid}")
+#                 continue
+
+#             UKMUser.objects.create(user=user, roleid=1, storeid=sid, version=1)
+
+#             cashier_id = ukm_emp_id if ukm_emp_id else (cashier_id_base + cashier_counter)
+#             cashier_counter += 1
+
+#             info = get_store_info(sid)
+#             ukm4ip = info.get("ukm4ip")
+#             is_ukm5 = info.get("is_ukm5", False)
+
+#             if ukm4ip:
+#                 try:
+#                     conv = connect_store_mysql(ukm4ip)
+#                     cur = conv.cursor()
+
+#                     base_version = _calc_next_signal_version(cur)
+
+#                     cur.execute("""
+#                         INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+#                         VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+#                     """, (
+#                         sid, cashier_id, fio, plain_inn, mysql_pwd(password_plain), 1, base_version
+#                     ))
+#                     cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
+#                     conv.commit()
+#                     conv.close()
+#                     logger.info(f"[MySQL:{ukm4ip}] Доступ открыт store={sid}, id={cashier_id}, version={base_version}")
+#                 except Exception as exc:
+#                     logger.error(f"[MySQL:{ukm4ip}] Ошибка для {sid}: {exc}")
+#             else:
+#                 logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
+
+#             if is_ukm5:
+#                 try:
+#                     if sid == UKM5_FULL_XML_STORE_ID:
+#                         # Для магазина 2013 всегда пересборка полного XML
+#                         xml_path = build_full_ukm5_xml_for_store(sid)
+#                         logger.info(
+#                             f"[XML] Полный XML пересобран для УКМ5 магазина {sid}: {xml_path}"
+#                         )
+#                     else:
+#                         # Остальные УКМ5 — точечное добавление кассира
+#                         xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
+
+#                         c_el = ET.SubElement(root, "cashier")
+#                         ET.SubElement(c_el, "roleId").text = "1"
+#                         ET.SubElement(c_el, "id").text = str(cashier_id)
+#                         ET.SubElement(c_el, "name").text = fio
+#                         ET.SubElement(c_el, "INN").text = plain_inn
+#                         ET.SubElement(c_el, "password").text = password_plain
+
+#                         _write_xml_with_declaration(xml_path, root, ensure_base=True)
+#                         logger.info(f"[XML] Обновлён файл {xml_path}")
+#                 except Exception as exc:
+#                     logger.error(f"[XML] Ошибка для {sid}: {exc}")
+
+#             added_storeids.append(sid)
+
+#         if not added_storeids:
+#             return JsonResponse({'status': 'ok', 'message': 'У пользователя уже был доступ ко всем указанным магазинам'})
+
+#         return JsonResponse({'status': 'ok', 'message': 'Доступ открыт', 'added': added_storeids})
+
+#     except Exception as exc:
+#         logger.exception("open_access_cashier error")
+#         return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
 
 
 
