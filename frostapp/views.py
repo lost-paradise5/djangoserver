@@ -3966,20 +3966,30 @@ def update_cashier(request):
                 user.updated_at = timezone.now()
                 user.save(update_fields=["employee_id", "updated_at"])
 
-            existing_storeids = set(
-                UKMUser.objects.filter(user_id=user.id).values_list("storeid", flat=True)
-            )
+            existing_links = {
+                int(x.storeid): x
+                for x in UKMUser.objects
+                    .filter(user_id=user.id, storeid__in=store_ids)
+            }
 
             for sid in store_ids:
-                if sid in existing_storeids:
-                    continue
-                UKMUser.objects.create(
-                    user=user,
-                    roleid=role_id_req,
-                    storeid=sid,
-                    version=1
-                )
-                added_storeids.append(sid)
+                sid = int(sid)
+                link = existing_links.get(sid)
+
+                if link is None:
+                    UKMUser.objects.create(
+                        user=user,
+                        roleid=role_id_req,
+                        storeid=sid,
+                        version=1
+                    )
+                    added_storeids.append(sid)
+                else:
+                    # ✅ если магазин уже есть — обновляем роль
+                    if int(link.roleid or 0) != int(role_id_req):
+                        link.roleid = int(role_id_req)
+                        link.version = 1
+                        link.save(update_fields=["roleid", "version"])
 
             # ВАЖНО: как в rotate_qr_codes.py — всегда генерим новый пароль/QR и пишем в Postgres
             new_password = build_user_password(plain_inn)
@@ -4122,6 +4132,7 @@ def update_cashier(request):
                 f"👤 user_id={user.id}",
                 f"ФИО='{fio_norm}'",
                 f"ИНН={plain_inn}",
+                f"Роль из запроса (role_id_req)={role_id_req}",
                 f"Новый пароль (masked)={masked} (len={len(new_password)})",
                 "",
                 f"➕ Добавлены магазины: {', '.join(map(str, added_storeids)) if added_storeids else '—'}",
