@@ -6645,12 +6645,10 @@ def sm_staff_ui_list(request):
     GET /ui/smstaff/?db=BINUU00&login=ivan&inn=123&only_enabled=1&page=1&page_size=50
     """
     services = _ui_services_list()
-
     db = (request.GET.get("db") or "").strip().upper()
     if not db:
         # по умолчанию первая база
         db = services[0] if services else "BINUU00"
-
     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
         return render(request, "frostapp/smstaff_list.html", {
             "services": services,
@@ -6658,11 +6656,9 @@ def sm_staff_ui_list(request):
             "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
             "items": [],
         })
-
     login = (request.GET.get("login") or "").strip().lower()
     inn = (request.GET.get("inn") or "").strip()
     only_enabled = (request.GET.get("only_enabled") or "").strip().lower() in ("1", "true", "yes", "on")
-
     try:
         page = int(request.GET.get("page", "1"))
     except ValueError:
@@ -6671,27 +6667,21 @@ def sm_staff_ui_list(request):
         page_size = int(request.GET.get("page_size", "50"))
     except ValueError:
         page_size = 50
-
     page = max(1, page)
     page_size = max(10, min(200, page_size))
     offset = (page - 1) * page_size
-
     conn = cur = None
     items = []
     total = 0
     cols_present = []
-
     try:
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
-
         cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
         cols_present = sorted(list(cols_set))
-
         def SEL(col: str) -> str:
             # если колонки нет — отдадим NULL
             return col if _ui_has_col(cols_set, col) else f"NULL AS {col}"
-
         select_sql = ", ".join([
             SEL("id"),
             SEL("surname"),
@@ -6701,33 +6691,25 @@ def sm_staff_ui_list(request):
             SEL("inn"),
             SEL("userenabled"),
         ])
-
         where = []
         binds = {}
-
         if only_enabled and _ui_has_col(cols_set, "userenabled"):
             where.append("(userenabled = '1' OR userenabled = 1)")
-
         if login and _ui_has_col(cols_set, "serverlogin"):
             where.append("LOWER(serverlogin) LIKE :b_login")
             binds["b_login"] = f"%{login}%"
-
         if inn and _ui_has_col(cols_set, "inn"):
             # ищем подстрокой (удобно), но можно заменить на "=" если нужно строго
             where.append("TRIM(inn) LIKE :b_inn")
             binds["b_inn"] = f"%{inn}%"
-
         base_from = f"FROM smstaff"
         if where:
             base_from += " WHERE " + " AND ".join(where)
-
         # total count
         cur.execute(f"SELECT COUNT(*) {base_from}", binds)
         total = int(cur.fetchone()[0])
-
         # ORDER BY для пагинации
         order_expr = "surname" if _ui_has_col(cols_set, "surname") else "id"
-
         sql = f"""
             SELECT *
             FROM (
@@ -6743,10 +6725,8 @@ def sm_staff_ui_list(request):
         binds2 = dict(binds)
         binds2["b_off"] = offset
         binds2["b_to"] = offset + page_size
-
         cur.execute(sql, binds2)
         items = _oracle_rows_to_jsonable(cur)
-
     except Exception as e:
         logger.exception(f"[UI/SMSTAFF] list error db={db}: {e}")
         return render(request, "frostapp/smstaff_list.html", {
@@ -6761,9 +6741,7 @@ def sm_staff_ui_list(request):
             if conn: conn.close()
         except Exception:
             pass
-
     pages = max(1, (total + page_size - 1) // page_size)
-
     # ссылки пагинации с сохранением фильтров
     def page_url(p: int) -> str:
         q = {
@@ -6778,6 +6756,12 @@ def sm_staff_ui_list(request):
         q = {k: v for k, v in q.items() if v not in ("", None)}
         return f"{reverse('sm_staff_ui_list')}?{urlencode(q)}"
 
+    # Вычисление конкретных URL для пагинации
+    first_page_url = page_url(1)
+    prev_page_url = page_url(page - 1) if page > 1 else ''
+    next_page_url = page_url(page + 1) if page < pages else ''
+    last_page_url = page_url(pages)
+
     return render(request, "frostapp/smstaff_list.html", {
         "services": services,
         "db": db,
@@ -6790,7 +6774,11 @@ def sm_staff_ui_list(request):
         "total": total,
         "items": items,
         "cols_present": cols_present,
-        "page_url": page_url,
+        "page_url": page_url,  # Оставляем для других нужд, если требуется
+        "first_page_url": first_page_url,
+        "prev_page_url": prev_page_url,
+        "next_page_url": next_page_url,
+        "last_page_url": last_page_url,
     })
 
 
