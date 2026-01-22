@@ -6744,6 +6744,8 @@ def sm_staff_ui_list(request):
     pages = max(1, (total + page_size - 1) // page_size)
     # ссылки пагинации с сохранением фильтров
     def page_url(p: int) -> str:
+        if p < 1 or p > pages:  # Защита от некорректных значений
+            return ""
         q = {
             "db": db,
             "login": login,
@@ -6757,10 +6759,10 @@ def sm_staff_ui_list(request):
         return f"{reverse('sm_staff_ui_list')}?{urlencode(q)}"
 
     # Вычисление конкретных URL для пагинации
-    first_page_url = page_url(1)
+    first_page_url = page_url(1) if pages > 0 else ''
     prev_page_url = page_url(page - 1) if page > 1 else ''
     next_page_url = page_url(page + 1) if page < pages else ''
-    last_page_url = page_url(pages)
+    last_page_url = page_url(pages) if pages > 0 else ''
 
     return render(request, "frostapp/smstaff_list.html", {
         "services": services,
@@ -6788,6 +6790,13 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: int):
     UI редактирование ИНН:
     GET/POST /ui/smstaff/BINUU00/edit/123/
     """
+    if staff_id <= 0:
+        return render(request, "frostapp/smstaff_edit.html", {
+            "db": db,
+            "staff_id": staff_id,
+            "error": f"Некорректный ID пользователя: {staff_id}. ID должен быть положительным числом.",
+            "row": None,
+        })
     db = (db or "").strip().upper()
     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
         return render(request, "frostapp/smstaff_edit.html", {
