@@ -104,14 +104,14 @@
   <div class="d-flex justify-content-between">
     <div>
       {% if page > 1 %}
-        <a class="btn btn-outline-secondary btn-sm" href="{{ page_url(1) }}">« В начало</a>
-        <a class="btn btn-outline-secondary btn-sm" href="{{ page_url(page|add:"-1") }}">‹ Назад</a>
+        <a class="btn btn-outline-secondary btn-sm" href="{{ first_page_url }}">« В начало</a>
+        <a class="btn btn-outline-secondary btn-sm" href="{{ prev_page_url }}">‹ Назад</a>
       {% endif %}
     </div>
     <div class="d-flex gap-2">
       {% if page < pages %}
-        <a class="btn btn-outline-secondary btn-sm" href="{{ page_url(page|add:"1") }}">Вперёд ›</a>
-        <a class="btn btn-outline-secondary btn-sm" href="{{ page_url(pages) }}">В конец »</a>
+        <a class="btn btn-outline-secondary btn-sm" href="{{ next_page_url }}">Вперёд ›</a>
+        <a class="btn btn-outline-secondary btn-sm" href="{{ last_page_url }}">В конец »</a>
       {% endif %}
     </div>
   </div>
