@@ -25,6 +25,11 @@ from django.db.models import Q
 import math
 from collections import defaultdict, Counter
 from pathlib import Path
+from django.shortcuts import render, redirect
+from django.contrib.admin.views.decorators import staff_member_required
+from django.views.decorators.http import require_http_methods
+from django.urls import reverse
+from django.utils.http import urlencode
 
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog
@@ -6615,3 +6620,287 @@ def sm_staff_list_by_db(request):
                 conn.close()
         except Exception:
             pass
+
+
+
+
+
+
+
+
+
+def _ui_services_list() -> list[str]:
+    # Показываем только те базы, где реально есть host/port в ORACLE_TNS_MAP
+    return sorted(list(ORACLE_TNS_MAP.keys()))
+
+
+def _ui_has_col(cols_set: set[str], col: str) -> bool:
+    return col.upper() in cols_set
+
+
+@staff_member_required
+@require_http_methods(["GET"])
+def sm_staff_ui_list(request):
+    """
+    UI список SMSTAFF по выбранной базе:
+    GET /ui/smstaff/?db=BINUU00&login=ivan&inn=123&only_enabled=1&page=1&page_size=50
+    """
+    services = _ui_services_list()
+
+    db = (request.GET.get("db") or "").strip().upper()
+    if not db:
+        # по умолчанию первая база
+        db = services[0] if services else "BINUU00"
+
+    if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
+        return render(request, "frostapp/smstaff_list.html", {
+            "services": services,
+            "db": db,
+            "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
+            "items": [],
+        })
+
+    login = (request.GET.get("login") or "").strip().lower()
+    inn = (request.GET.get("inn") or "").strip()
+    only_enabled = (request.GET.get("only_enabled") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    try:
+        page = int(request.GET.get("page", "1"))
+    except ValueError:
+        page = 1
+    try:
+        page_size = int(request.GET.get("page_size", "50"))
+    except ValueError:
+        page_size = 50
+
+    page = max(1, page)
+    page_size = max(10, min(200, page_size))
+    offset = (page - 1) * page_size
+
+    conn = cur = None
+    items = []
+    total = 0
+    cols_present = []
+
+    try:
+        conn = _connect_oracle_service(db)
+        cur = conn.cursor()
+
+        cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+        cols_present = sorted(list(cols_set))
+
+        def SEL(col: str) -> str:
+            # если колонки нет — отдадим NULL
+            return col if _ui_has_col(cols_set, col) else f"NULL AS {col}"
+
+        select_sql = ", ".join([
+            SEL("id"),
+            SEL("surname"),
+            SEL("name"),
+            SEL("patronymic"),
+            SEL("serverlogin"),
+            SEL("inn"),
+            SEL("userenabled"),
+        ])
+
+        where = []
+        binds = {}
+
+        if only_enabled and _ui_has_col(cols_set, "userenabled"):
+            where.append("(userenabled = '1' OR userenabled = 1)")
+
+        if login and _ui_has_col(cols_set, "serverlogin"):
+            where.append("LOWER(serverlogin) LIKE :b_login")
+            binds["b_login"] = f"%{login}%"
+
+        if inn and _ui_has_col(cols_set, "inn"):
+            # ищем подстрокой (удобно), но можно заменить на "=" если нужно строго
+            where.append("TRIM(inn) LIKE :b_inn")
+            binds["b_inn"] = f"%{inn}%"
+
+        base_from = f"FROM smstaff"
+        if where:
+            base_from += " WHERE " + " AND ".join(where)
+
+        # total count
+        cur.execute(f"SELECT COUNT(*) {base_from}", binds)
+        total = int(cur.fetchone()[0])
+
+        # ORDER BY для пагинации
+        order_expr = "surname" if _ui_has_col(cols_set, "surname") else "id"
+
+        sql = f"""
+            SELECT *
+            FROM (
+                SELECT t.*, ROW_NUMBER() OVER (ORDER BY {order_expr}) rn
+                FROM (
+                    SELECT {select_sql}
+                    {base_from}
+                ) t
+            )
+            WHERE rn > :b_off
+              AND rn <= :b_to
+        """
+        binds2 = dict(binds)
+        binds2["b_off"] = offset
+        binds2["b_to"] = offset + page_size
+
+        cur.execute(sql, binds2)
+        items = _oracle_rows_to_jsonable(cur)
+
+    except Exception as e:
+        logger.exception(f"[UI/SMSTAFF] list error db={db}: {e}")
+        return render(request, "frostapp/smstaff_list.html", {
+            "services": services,
+            "db": db,
+            "error": str(e),
+            "items": [],
+        })
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+    pages = max(1, (total + page_size - 1) // page_size)
+
+    # ссылки пагинации с сохранением фильтров
+    def page_url(p: int) -> str:
+        q = {
+            "db": db,
+            "login": login,
+            "inn": inn,
+            "only_enabled": "1" if only_enabled else "",
+            "page_size": str(page_size),
+            "page": str(p),
+        }
+        # выкидываем пустые
+        q = {k: v for k, v in q.items() if v not in ("", None)}
+        return f"{reverse('sm_staff_ui_list')}?{urlencode(q)}"
+
+    return render(request, "frostapp/smstaff_list.html", {
+        "services": services,
+        "db": db,
+        "login": login,
+        "inn": inn,
+        "only_enabled": only_enabled,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "total": total,
+        "items": items,
+        "cols_present": cols_present,
+        "page_url": page_url,
+    })
+
+
+@staff_member_required
+@require_http_methods(["GET", "POST"])
+def sm_staff_ui_edit_inn(request, db: str, staff_id: int):
+    """
+    UI редактирование ИНН:
+    GET/POST /ui/smstaff/BINUU00/edit/123/
+    """
+    db = (db or "").strip().upper()
+    if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
+        return render(request, "frostapp/smstaff_edit.html", {
+            "db": db,
+            "staff_id": staff_id,
+            "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
+            "row": None,
+        })
+
+    conn = cur = None
+    row = None
+    error = ""
+    ok = False
+
+    try:
+        conn = _connect_oracle_service(db)
+        cur = conn.cursor()
+
+        cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+
+        if not _ui_has_col(cols_set, "inn"):
+            return render(request, "frostapp/smstaff_edit.html", {
+                "db": db,
+                "staff_id": staff_id,
+                "error": "В этой базе в SMSTAFF нет колонки INN — редактирование невозможно.",
+                "row": None,
+            })
+
+        # забираем текущую строку
+        cur.execute("""
+            SELECT id, surname, name, patronymic, serverlogin, inn, userenabled
+            FROM smstaff
+            WHERE id = :b_id
+        """, b_id=staff_id)
+
+        r = cur.fetchone()
+        if not r:
+            return render(request, "frostapp/smstaff_edit.html", {
+                "db": db,
+                "staff_id": staff_id,
+                "error": f"Пользователь с id={staff_id} не найден в {db}.",
+                "row": None,
+            })
+
+        row = {
+            "id": r[0],
+            "surname": r[1],
+            "name": r[2],
+            "patronymic": r[3],
+            "serverlogin": r[4],
+            "inn": r[5],
+            "userenabled": r[6],
+        }
+
+        if request.method == "POST":
+            new_inn = (request.POST.get("inn") or "").strip()
+
+            # Разрешим очистку ИНН (поставить NULL)
+            if new_inn:
+                if not _is_valid_inn_digits(new_inn):
+                    error = "ИНН должен быть числом длиной 10 или 12."
+                else:
+                    cur.execute("UPDATE smstaff SET inn = :b_inn WHERE id = :b_id", b_inn=new_inn, b_id=staff_id)
+                    conn.commit()
+                    ok = True
+            else:
+                # очистка
+                cur.execute("UPDATE smstaff SET inn = NULL WHERE id = :b_id", b_id=staff_id)
+                conn.commit()
+                ok = True
+
+            # перечитаем после обновления
+            cur.execute("""
+                SELECT id, surname, name, patronymic, serverlogin, inn, userenabled
+                FROM smstaff
+                WHERE id = :b_id
+            """, b_id=staff_id)
+            r2 = cur.fetchone()
+            row["inn"] = r2[5] if r2 else row["inn"]
+
+    except Exception as e:
+        logger.exception(f"[UI/SMSTAFF] edit error db={db} id={staff_id}: {e}")
+        error = str(e)
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+    return render(request, "frostapp/smstaff_edit.html", {
+        "db": db,
+        "staff_id": staff_id,
+        "row": row,
+        "error": error,
+        "ok": ok,
+    })
