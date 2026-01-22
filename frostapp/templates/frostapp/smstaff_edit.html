@@ -12,28 +12,30 @@
     <a class="navbar-brand" href="/ui/smstaff/?db={{ db }}">SMSTAFF</a>
   </div>
 </nav>
-
 <div class="container py-4">
-
   {% if ok %}
     <div class="alert alert-success">ИНН обновлён.</div>
   {% endif %}
-
   {% if error %}
     <div class="alert alert-danger">{{ error }}</div>
   {% endif %}
-
   {% if row %}
     <div class="card">
       <div class="card-header">
-        База: <b>{{ db }}</b> · Пользователь ID: <b>{{ row.id }}</b> · Логин: <code>{{ row.serverlogin }}</code>
+        База: <b>{{ db }}</b> · Пользователь ID: <b>{{ row.id }}</b> 
+        {% if row.serverlogin %}
+          · Логин: <code>{{ row.serverlogin }}</code>
+        {% endif %}
       </div>
       <div class="card-body">
         <p class="mb-2">
-          ФИО: {{ row.surname }} {{ row.name }} {{ row.patronymic }}<br>
-          userenabled: <b>{{ row.userenabled }}</b>
+          {% if row.surname or row.name or row.patronymic %}
+            ФИО: {{ row.surname|default_if_none:"" }} {{ row.name|default_if_none:"" }} {{ row.patronymic|default_if_none:"" }}<br>
+          {% endif %}
+          {% if row.userenabled %}
+            userenabled: <b>{{ row.userenabled }}</b>
+          {% endif %}
         </p>
-
         <form method="post">
           {% csrf_token %}
           <div class="mb-3">
@@ -48,7 +50,6 @@
   {% else %}
     <a class="btn btn-outline-secondary" href="/ui/smstaff/?db={{ db }}">Назад</a>
   {% endif %}
-
 </div>
 </body>
 </html>
