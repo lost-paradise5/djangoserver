@@ -6785,7 +6785,7 @@ def sm_staff_ui_list(request):
 
 
 @require_http_methods(["GET", "POST"])
-def sm_staff_ui_edit_inn(request, db: str, staff_id: str):  # Изменяем аннотацию на str
+def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
     """
     UI редактирование ИНН:
     GET/POST /ui/smstaff/BINUU00/edit/123/
@@ -6813,7 +6813,7 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):  # Изменяем �
     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
         return render(request, "frostapp/smstaff_edit.html", {
             "db": db,
-            "staff_id": staff_id_int,  # Используем преобразованный int
+            "staff_id": staff_id_int,
             "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
             "row": None,
         })
@@ -6836,9 +6836,34 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):  # Изменяем �
                 "row": None,
             })
         
-        # забираем текущую строку (используем staff_id_int)
-        cur.execute("""
-            SELECT id, surname, name, patronymic, serverlogin, inn, userenabled
+        # Динамически формируем SELECT
+        select_cols = []
+        if _ui_has_col(cols_set, "id"):
+            select_cols.append("id")
+        if _ui_has_col(cols_set, "surname"):
+            select_cols.append("surname")
+        if _ui_has_col(cols_set, "name"):
+            select_cols.append("name")
+        if _ui_has_col(cols_set, "patronymic"):
+            select_cols.append("patronymic")
+        if _ui_has_col(cols_set, "serverlogin"):
+            select_cols.append("serverlogin")
+        if _ui_has_col(cols_set, "inn"):
+            select_cols.append("inn")
+        if _ui_has_col(cols_set, "userenabled"):
+            select_cols.append("userenabled")
+        
+        if not select_cols:
+            return render(request, "frostapp/smstaff_edit.html", {
+                "db": db,
+                "staff_id": staff_id_int,
+                "error": "Не найдено ни одной доступной колонки в таблице SMSTAFF.",
+                "row": None,
+            })
+        
+        # забираем текущую строку
+        cur.execute(f"""
+            SELECT {', '.join(select_cols)}
             FROM smstaff
             WHERE id = :b_id
         """, b_id=staff_id_int)
@@ -6852,15 +6877,10 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):  # Изменяем �
                 "row": None,
             })
         
-        row = {
-            "id": r[0],
-            "surname": r[1],
-            "name": r[2],
-            "patronymic": r[3],
-            "serverlogin": r[4],
-            "inn": r[5],
-            "userenabled": r[6],
-        }
+        # Создаем словарь row из результата
+        row = {}
+        for i, col in enumerate(select_cols):
+            row[col] = r[i]
         
         if request.method == "POST":
             new_inn = (request.POST.get("inn") or "").strip()
@@ -6881,13 +6901,15 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):  # Изменяем �
                 ok = True
             
             # перечитаем после обновления
-            cur.execute("""
-                SELECT id, surname, name, patronymic, serverlogin, inn, userenabled
+            cur.execute(f"""
+                SELECT {', '.join(select_cols)}
                 FROM smstaff
                 WHERE id = :b_id
             """, b_id=staff_id_int)
             r2 = cur.fetchone()
-            row["inn"] = r2[5] if r2 else row["inn"]
+            if r2:
+                for i, col in enumerate(select_cols):
+                    row[col] = r2[i]
             
     except Exception as e:
         logger.exception(f"[UI/SMSTAFF] edit error db={db} id={staff_id_int}: {e}")
@@ -6906,7 +6928,7 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):  # Изменяем �
     
     return render(request, "frostapp/smstaff_edit.html", {
         "db": db,
-        "staff_id": staff_id_int,  # Передаем int в шаблон
+        "staff_id": staff_id_int,
         "row": row,
         "error": error,
         "ok": ok,
