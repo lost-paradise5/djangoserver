@@ -89,10 +89,14 @@
             <td><code>{{ r.inn }}</code></td>
             <td>{{ r.userenabled }}</td>
             <td class="text-end">
-              <a class="btn btn-sm btn-outline-primary"
-                 href="{% url 'sm_staff_ui_edit_inn' db=db staff_id=r.id %}">
-                Изменить ИНН
-              </a>
+              {% if r.id > 0 %}
+                <a class="btn btn-sm btn-outline-primary"
+                     href="{% url 'sm_staff_ui_edit_inn' db=db staff_id=r.id %}">
+                    Изменить ИНН
+                </a>
+              {% else %}
+                <span class="text-muted">ID: {{ r.id }}</span>
+              {% endif %}
             </td>
           </tr>
         {% empty %}
