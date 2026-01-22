@@ -6836,40 +6836,34 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
                 "row": None,
             })
         
-        # Динамически формируем SELECT
-        select_cols = []
-        if _ui_has_col(cols_set, "id"):
-            select_cols.append("id")
-        if _ui_has_col(cols_set, "surname"):
-            select_cols.append("surname")
-        if _ui_has_col(cols_set, "name"):
-            select_cols.append("name")
-        if _ui_has_col(cols_set, "patronymic"):
-            select_cols.append("patronymic")
-        if _ui_has_col(cols_set, "serverlogin"):
-            select_cols.append("serverlogin")
-        if _ui_has_col(cols_set, "inn"):
-            select_cols.append("inn")
-        if _ui_has_col(cols_set, "userenabled"):
-            select_cols.append("userenabled")
+        # Определяем какие колонки есть в таблице
+        def SEL(col: str) -> str:
+            return col if _ui_has_col(cols_set, col) else f"NULL AS {col}"
         
-        if not select_cols:
-            return render(request, "frostapp/smstaff_edit.html", {
-                "db": db,
-                "staff_id": staff_id_int,
-                "error": "Не найдено ни одной доступной колонки в таблице SMSTAFF.",
-                "row": None,
-            })
+        # Формируем SELECT с учетом только существующих колонок
+        select_cols = [
+            SEL("id"),
+            SEL("surname"),
+            SEL("name"),
+            SEL("patronymic"),
+            SEL("serverlogin"),
+            SEL("inn"),
+            SEL("userenabled"),
+        ]
         
-        # забираем текущую строку
+        select_sql = ", ".join(select_cols)
+        
+        # Получаем данные пользователя
         cur.execute(f"""
-            SELECT {', '.join(select_cols)}
+            SELECT {select_sql}
             FROM smstaff
             WHERE id = :b_id
         """, b_id=staff_id_int)
         
-        r = cur.fetchone()
-        if not r:
+        # Используем _oracle_rows_to_jsonable для преобразования
+        items = _oracle_rows_to_jsonable(cur)
+        
+        if not items:
             return render(request, "frostapp/smstaff_edit.html", {
                 "db": db,
                 "staff_id": staff_id_int,
@@ -6877,10 +6871,7 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
                 "row": None,
             })
         
-        # Создаем словарь row из результата
-        row = {}
-        for i, col in enumerate(select_cols):
-            row[col] = r[i]
+        row = items[0]  # Получаем первый (и единственный) результат
         
         if request.method == "POST":
             new_inn = (request.POST.get("inn") or "").strip()
@@ -6900,16 +6891,16 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
                 conn.commit()
                 ok = True
             
-            # перечитаем после обновления
+            # Перечитываем данные после обновления
             cur.execute(f"""
-                SELECT {', '.join(select_cols)}
+                SELECT {select_sql}
                 FROM smstaff
                 WHERE id = :b_id
             """, b_id=staff_id_int)
-            r2 = cur.fetchone()
-            if r2:
-                for i, col in enumerate(select_cols):
-                    row[col] = r2[i]
+            
+            updated_items = _oracle_rows_to_jsonable(cur)
+            if updated_items:
+                row = updated_items[0]
             
     except Exception as e:
         logger.exception(f"[UI/SMSTAFF] edit error db={db} id={staff_id_int}: {e}")
