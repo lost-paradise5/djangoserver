@@ -40,6 +40,8 @@ from frostapp.views import (
     pos_reboot,
     sm_staff_sync_inn,
     sm_staff_list_by_db,
+    sm_staff_ui_list,
+    sm_staff_ui_edit_inn,
 )
 
 urlpatterns = [
@@ -69,4 +71,6 @@ urlpatterns = [
     path('pos/reboot/', pos_reboot, name='pos_reboot'),
     path('sm/staff/sync-inn/', sm_staff_sync_inn, name='sm_staff_sync_inn'),
     path('sm/staff/by-db/', sm_staff_list_by_db, name='sm_staff_list_by_db'),
+    path('ui/smstaff/', sm_staff_ui_list, name='sm_staff_ui_list'),
+    path('ui/smstaff/<str:db>/edit/<int:staff_id>/', sm_staff_ui_edit_inn, name='sm_staff_ui_edit_inn'),
 ]
