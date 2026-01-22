@@ -6638,7 +6638,6 @@ def _ui_has_col(cols_set: set[str], col: str) -> bool:
     return col.upper() in cols_set
 
 
-@staff_member_required
 @require_http_methods(["GET"])
 def sm_staff_ui_list(request):
     """
@@ -6795,7 +6794,6 @@ def sm_staff_ui_list(request):
     })
 
 
-@staff_member_required
 @require_http_methods(["GET", "POST"])
 def sm_staff_ui_edit_inn(request, db: str, staff_id: int):
     """
