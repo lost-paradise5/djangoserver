@@ -72,5 +72,7 @@ urlpatterns = [
     path('sm/staff/sync-inn/', sm_staff_sync_inn, name='sm_staff_sync_inn'),
     path('sm/staff/by-db/', sm_staff_list_by_db, name='sm_staff_list_by_db'),
     path('ui/smstaff/', sm_staff_ui_list, name='sm_staff_ui_list'),
-    path('ui/smstaff/<str:db>/edit/<int:staff_id>/', sm_staff_ui_edit_inn, name='sm_staff_ui_edit_inn'),
+    re_path(r'^ui/smstaff/(?P<db>[^/]+)/edit/(?P<staff_id>-?\d+)/$', 
+            sm_staff_ui_edit_inn, 
+            name='sm_staff_ui_edit_inn'),
 ]
