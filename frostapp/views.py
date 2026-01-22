@@ -6785,62 +6785,73 @@ def sm_staff_ui_list(request):
 
 
 @require_http_methods(["GET", "POST"])
-def sm_staff_ui_edit_inn(request, db: str, staff_id: int):
+def sm_staff_ui_edit_inn(request, db: str, staff_id: str):  # Изменяем аннотацию на str
     """
     UI редактирование ИНН:
     GET/POST /ui/smstaff/BINUU00/edit/123/
     """
-    if staff_id <= 0:
+    # Преобразуем staff_id в int и проверяем
+    try:
+        staff_id_int = int(staff_id)
+    except (ValueError, TypeError):
         return render(request, "frostapp/smstaff_edit.html", {
             "db": db,
             "staff_id": staff_id,
-            "error": f"Некорректный ID пользователя: {staff_id}. ID должен быть положительным числом.",
+            "error": f"Некорректный ID пользователя: {staff_id}. ID должен быть числом.",
             "row": None,
         })
+    
+    if staff_id_int <= 0:
+        return render(request, "frostapp/smstaff_edit.html", {
+            "db": db,
+            "staff_id": staff_id_int,
+            "error": f"Некорректный ID пользователя: {staff_id_int}. ID должен быть положительным числом.",
+            "row": None,
+        })
+    
     db = (db or "").strip().upper()
     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
         return render(request, "frostapp/smstaff_edit.html", {
             "db": db,
-            "staff_id": staff_id,
+            "staff_id": staff_id_int,  # Используем преобразованный int
             "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
             "row": None,
         })
-
+    
     conn = cur = None
     row = None
     error = ""
     ok = False
-
+    
     try:
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
-
         cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
-
+        
         if not _ui_has_col(cols_set, "inn"):
             return render(request, "frostapp/smstaff_edit.html", {
                 "db": db,
-                "staff_id": staff_id,
+                "staff_id": staff_id_int,
                 "error": "В этой базе в SMSTAFF нет колонки INN — редактирование невозможно.",
                 "row": None,
             })
-
-        # забираем текущую строку
+        
+        # забираем текущую строку (используем staff_id_int)
         cur.execute("""
             SELECT id, surname, name, patronymic, serverlogin, inn, userenabled
             FROM smstaff
             WHERE id = :b_id
-        """, b_id=staff_id)
-
+        """, b_id=staff_id_int)
+        
         r = cur.fetchone()
         if not r:
             return render(request, "frostapp/smstaff_edit.html", {
                 "db": db,
-                "staff_id": staff_id,
-                "error": f"Пользователь с id={staff_id} не найден в {db}.",
+                "staff_id": staff_id_int,
+                "error": f"Пользователь с id={staff_id_int} не найден в {db}.",
                 "row": None,
             })
-
+        
         row = {
             "id": r[0],
             "surname": r[1],
@@ -6850,35 +6861,36 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: int):
             "inn": r[5],
             "userenabled": r[6],
         }
-
+        
         if request.method == "POST":
             new_inn = (request.POST.get("inn") or "").strip()
-
             # Разрешим очистку ИНН (поставить NULL)
             if new_inn:
                 if not _is_valid_inn_digits(new_inn):
                     error = "ИНН должен быть числом длиной 10 или 12."
                 else:
-                    cur.execute("UPDATE smstaff SET inn = :b_inn WHERE id = :b_id", b_inn=new_inn, b_id=staff_id)
+                    cur.execute("UPDATE smstaff SET inn = :b_inn WHERE id = :b_id", 
+                               b_inn=new_inn, b_id=staff_id_int)
                     conn.commit()
                     ok = True
             else:
                 # очистка
-                cur.execute("UPDATE smstaff SET inn = NULL WHERE id = :b_id", b_id=staff_id)
+                cur.execute("UPDATE smstaff SET inn = NULL WHERE id = :b_id", 
+                           b_id=staff_id_int)
                 conn.commit()
                 ok = True
-
+            
             # перечитаем после обновления
             cur.execute("""
                 SELECT id, surname, name, patronymic, serverlogin, inn, userenabled
                 FROM smstaff
                 WHERE id = :b_id
-            """, b_id=staff_id)
+            """, b_id=staff_id_int)
             r2 = cur.fetchone()
             row["inn"] = r2[5] if r2 else row["inn"]
-
+            
     except Exception as e:
-        logger.exception(f"[UI/SMSTAFF] edit error db={db} id={staff_id}: {e}")
+        logger.exception(f"[UI/SMSTAFF] edit error db={db} id={staff_id_int}: {e}")
         error = str(e)
         try:
             if conn:
@@ -6891,10 +6903,10 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: int):
             if conn: conn.close()
         except Exception:
             pass
-
+    
     return render(request, "frostapp/smstaff_edit.html", {
         "db": db,
-        "staff_id": staff_id,
+        "staff_id": staff_id_int,  # Передаем int в шаблон
         "row": row,
         "error": error,
         "ok": ok,
