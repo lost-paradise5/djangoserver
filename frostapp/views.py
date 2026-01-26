@@ -476,6 +476,17 @@ def vpn_ui_login(request):
                         head_dept_ids.append(did)
 
                 if not head_dept_ids:
+                    # можно тоже логировать факт отказа
+                    send_telegram_log(
+                        "\n".join([
+                            "❌ VPN PIN REQUEST: NOT A HEAD",
+                            f"login: {login}",
+                            f"inn(employeeID): {inn}",
+                            f"bitrix_user_id: {bx_user_id}",
+                            f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                            f"ip: {_client_ip(request)}",
+                        ])
+                    )
                     return render(request, "frostapp/vpn_login.html", {
                         "error": "Вы не руководитель ни одного отдела.",
                         "login": login,
@@ -506,16 +517,51 @@ def vpn_ui_login(request):
                     user_agent=(request.META.get("HTTP_USER_AGENT") or "")[:2000],
                 )
 
+                # ✅ ЛОГ В TELEGRAM: запрос PIN
+                send_telegram_log(
+                    "\n".join([
+                        "🔐 Запрошен ПИН-код для УД",
+                        f"login: {login}",
+                        f"sid: {sess.id}",
+                        f"pin: {pin}",
+                        f"time: {timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
+                        f"expires_at: {timezone.localtime(expires).isoformat(sep=' ', timespec='seconds')}",
+                        f"ip: {sess.ip}",
+                        f"bitrix_user_id: {bx_user_id}",
+                        f"head_department_ids: {head_dept_ids}",
+                    ])
+                )
+
                 # отправляем PIN в битрикс
                 bitrix_send_pin(bx_user_id, pin)
 
+                # ✅ ЛОГ В TELEGRAM: PIN отправлен в Bitrix
+                send_telegram_log(
+                    "\n".join([
+                        "✅ ПИН-код для УД отправлен в Битрикс",
+                        f"login: {login}",
+                        f"sid: {sess.id}",
+                        f"bitrix_user_id: {bx_user_id}",
+                        f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                    ])
+                )
+
                 resp = redirect(f"{reverse('vpn_ui_pin')}?sid={sess.id}")
-                # cookie чтобы sid не таскать руками
                 resp.set_cookie("vpn_sid", str(sess.id), max_age=VPN_SESSION_TTL_MIN * 60, httponly=True, samesite="Lax")
                 return resp
 
             except Exception as e:
                 error = str(e)
+               
+                send_telegram_log(
+                    "\n".join([
+                        "❌ Ошибка при отправке ПИН-кода",
+                        f"login: {login}",
+                        f"error: {error}",
+                        f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                        f"ip: {_client_ip(request)}",
+                    ])
+                )
 
     return render(request, "frostapp/vpn_login.html", {"error": error})
 
@@ -542,18 +588,52 @@ def vpn_ui_pin(request):
                 sess.status = "EXPIRED"
                 sess.save(update_fields=["status"])
                 error = "Слишком много попыток. Сессия истекла."
+
+                send_telegram_log(
+                    "\n".join([
+                        "⛔ ПИН-код истёк (Слишком много попыток)",
+                        f"login: {sess.ad_login}",
+                        f"sid: {sess.id}",
+                        f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                        f"ip: {sess.ip}",
+                    ])
+                )
             else:
                 if _pin_hash(pin, sess.pin_salt) != sess.pin_hash:
                     sess.pin_attempts = sess.pin_attempts + 1
                     sess.save(update_fields=["pin_attempts"])
                     error = "Неверный PIN."
+
+                    send_telegram_log(
+                        "\n".join([
+                            "❌ Введён неверный ПИН-код",
+                            f"login: {sess.ad_login}",
+                            f"sid: {sess.id}",
+                            f"entered_pin: {pin}",
+                            f"attempt: {sess.pin_attempts}/{VPN_MAX_PIN_ATTEMPTS}",
+                            f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                            f"ip: {sess.ip}",
+                        ])
+                    )
                 else:
                     sess.status = "VERIFIED"
                     sess.verified_at = timezone.now()
-                    # продлеваем жизнь сессии после успешного PIN
                     sess.expires_at = timezone.now() + timezone.timedelta(minutes=VPN_SESSION_TTL_MIN)
                     sess.save(update_fields=["status", "verified_at", "expires_at"])
                     ok = True
+
+                    send_telegram_log(
+                        "\n".join([
+                            "✅ Успешный вход в УД (Пин-код введён верно)",
+                            f"login: {sess.ad_login}",
+                            f"sid: {sess.id}",
+                            f"time: {timezone.localtime(sess.verified_at).isoformat(sep=' ', timespec='seconds')}",
+                            f"ip: {sess.ip}",
+                            f"bitrix_user_id: {sess.bitrix_user_id}",
+                            f"head_department_ids: {sess.head_department_ids}",
+                        ])
+                    )
+
                     return redirect(f"{reverse('vpn_ui_users')}?sid={sess.id}")
 
     return render(request, "frostapp/vpn_pin.html", {
@@ -705,7 +785,6 @@ def vpn_ui_users(request):
 @require_http_methods(["POST"])
 @csrf_protect
 def vpn_ui_toggle(request):
-    # ajax: sid + inn + desired (1/0)
     try:
         sess = _get_session_or_403(request, must_verified=True)
     except Exception:
@@ -741,24 +820,119 @@ def vpn_ui_toggle(request):
     user_dn, user_attrs = ad
     currently = ad_is_in_group(user_attrs, group_dn)
 
+    # для лога вытащим логин из AD
+    sam = user_attrs.get("sAMAccountName", [b""])
+    target_ad_login = (sam[0].decode("utf-8", "ignore") if sam else "").strip()
+
     try:
         if desired == "1":
             if currently:
+                send_telegram_log(
+                    "\n".join([
+                        "ℹ️ VPN ACCESS OPEN (NO CHANGE, ALREADY OPEN)",
+                        f"by: {sess.ad_login} (sid={sess.id})",
+                        f"target_inn: {inn}",
+                        f"target_ad_login: {target_ad_login}",
+                        f"target_dn: {user_dn}",
+                        f"group: {VPN_GROUP_CN}",
+                        f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                        f"ip: {sess.ip}",
+                    ])
+                )
                 return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
+
             ad_group_add_member(group_dn, user_dn)
+
+            send_telegram_log(
+                "\n".join([
+                    "✅ Удалённый доступ открыт",
+                    f"by: {sess.ad_login} (sid={sess.id})",
+                    f"target_inn: {inn}",
+                    f"target_ad_login: {target_ad_login}",
+                    f"target_dn: {user_dn}",
+                    f"group: {VPN_GROUP_CN}",
+                    f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                    f"ip: {sess.ip}",
+                ])
+            )
             return JsonResponse({"ok": True, "changed": True, "vpn_open": True})
 
         else:
             if not currently:
+                send_telegram_log(
+                    "\n".join([
+                        "ℹ️ VPN ACCESS CLOSE (NO CHANGE, ALREADY CLOSED)",
+                        f"by: {sess.ad_login} (sid={sess.id})",
+                        f"target_inn: {inn}",
+                        f"target_ad_login: {target_ad_login}",
+                        f"target_dn: {user_dn}",
+                        f"group: {VPN_GROUP_CN}",
+                        f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                        f"ip: {sess.ip}",
+                    ])
+                )
                 return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
+
             ad_group_remove_member(group_dn, user_dn)
+
+            send_telegram_log(
+                "\n".join([
+                    "✅ Удалённый доступ закрыт",
+                    f"by: {sess.ad_login} (sid={sess.id})",
+                    f"target_inn: {inn}",
+                    f"target_ad_login: {target_ad_login}",
+                    f"target_dn: {user_dn}",
+                    f"group: {VPN_GROUP_CN}",
+                    f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                    f"ip: {sess.ip}",
+                ])
+            )
             return JsonResponse({"ok": True, "changed": True, "vpn_open": False})
 
     except ldap.ALREADY_EXISTS:
+        send_telegram_log(
+            "\n".join([
+                "ℹ️ VPN ACCESS OPEN (LDAP ALREADY_EXISTS)",
+                f"by: {sess.ad_login} (sid={sess.id})",
+                f"target_inn: {inn}",
+                f"target_ad_login: {target_ad_login}",
+                f"target_dn: {user_dn}",
+                f"group: {VPN_GROUP_CN}",
+                f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                f"ip: {sess.ip}",
+            ])
+        )
         return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
+
     except ldap.NO_SUCH_ATTRIBUTE:
+        send_telegram_log(
+            "\n".join([
+                "ℹ️ VPN ACCESS CLOSE (LDAP NO_SUCH_ATTRIBUTE)",
+                f"by: {sess.ad_login} (sid={sess.id})",
+                f"target_inn: {inn}",
+                f"target_ad_login: {target_ad_login}",
+                f"target_dn: {user_dn}",
+                f"group: {VPN_GROUP_CN}",
+                f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                f"ip: {sess.ip}",
+            ])
+        )
         return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
+
     except Exception as e:
+        send_telegram_log(
+            "\n".join([
+                "❌ VPN TOGGLE ERROR",
+                f"by: {sess.ad_login} (sid={sess.id})",
+                f"target_inn: {inn}",
+                f"target_ad_login: {target_ad_login}",
+                f"target_dn: {user_dn}",
+                f"group: {VPN_GROUP_CN}",
+                f"error: {str(e)}",
+                f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                f"ip: {sess.ip}",
+            ])
+        )
         return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
 
