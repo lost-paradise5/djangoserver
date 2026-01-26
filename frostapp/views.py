@@ -187,7 +187,7 @@ VPN_GROUP_CN = os.getenv("VPN_GROUP_CN", "mikrotik_vpn")
 VPN_PIN_TTL_MIN = int(os.getenv("VPN_PIN_TTL_MIN", "10"))
 VPN_SESSION_TTL_MIN = int(os.getenv("VPN_SESSION_TTL_MIN", "60"))
 VPN_MAX_PIN_ATTEMPTS = int(os.getenv("VPN_MAX_PIN_ATTEMPTS", "5"))
-
+_INN_RE = re.compile(r"^\d{10}(\d{2})?$")
 
 
 # =========================
