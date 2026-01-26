@@ -5,25 +5,154 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Контроль УД сотрудников</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <style>
+    :root{
+      --ui-bg1:#f4f6f9;
+      --ui-bg2:#eef2f7;
+      --ui-card:#ffffff;
+      --ui-border:rgba(17,24,39,.10);
+      --ui-shadow: 0 10px 28px rgba(16,24,40,.08);
+      --ui-shadow-sm: 0 6px 16px rgba(16,24,40,.06);
+    }
+    body{
+      background: radial-gradient(1200px 600px at 20% 0%, var(--ui-bg2), var(--ui-bg1));
+      color:#111827;
+    }
+    .topbar{
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(8px);
+      background: rgba(244,246,249,.75);
+      border-bottom: 1px solid rgba(17,24,39,.08);
+    }
+    .topbar-inner{
+      padding: .85rem 0;
+    }
+    .title{
+      font-weight: 700;
+      letter-spacing: .01em;
+    }
+    .muted{ color: rgba(17,24,39,.65); }
+
+    .pill{
+      display:inline-flex; align-items:center; gap:.5rem;
+      padding:.35rem .7rem;
+      border-radius: 999px;
+      border: 1px solid rgba(17,24,39,.12);
+      background: #fff;
+      font-size: .92rem;
+    }
+
+    .card{
+      border:1px solid var(--ui-border);
+      box-shadow: var(--ui-shadow-sm);
+      border-radius: 16px;
+      overflow:hidden;
+      background: var(--ui-card);
+    }
+    .card-header{
+      background: linear-gradient(180deg, #0b1220 0%, #101827 100%);
+      color:#fff;
+      border-bottom:1px solid rgba(255,255,255,.08);
+      padding: .85rem 1rem;
+    }
+
+    .table{
+      --bs-table-striped-bg: rgba(13,110,253,.04);
+    }
+    .table thead th{
+      font-weight: 700;
+      color: rgba(17,24,39,.78);
+      background: #f8fafc !important;
+      border-bottom: 1px solid rgba(17,24,39,.10);
+      padding-top: .7rem;
+      padding-bottom: .7rem;
+    }
+    .table tbody td{
+      border-color: rgba(17,24,39,.08);
+      vertical-align: middle;
+    }
+    .table tbody tr:hover{
+      background: rgba(13,110,253,.06);
+    }
+
+    code{
+      background: rgba(17,24,39,.04);
+      border: 1px solid rgba(17,24,39,.08);
+      padding: .12rem .35rem;
+      border-radius: 8px;
+      font-size: .9rem;
+    }
+
+    .badge{
+      border-radius: 999px;
+      padding: .35rem .55rem;
+      font-weight: 700;
+    }
+
+    .switch-wrap{
+      min-width: 190px;
+      display:flex;
+      justify-content:flex-end;
+    }
+    .form-switch .form-check-input{
+      width: 2.8em;
+      height: 1.4em;
+      cursor: pointer;
+    }
+    .vpn-state{
+      min-width: 64px;
+      text-align: left;
+    }
+    .spinner-border{
+      width: 1rem;
+      height: 1rem;
+    }
+    .btn{
+      border-radius: 12px;
+      font-weight: 600;
+    }
+
+    .footer-space{ height: 24px; }
+  </style>
 </head>
-<body class="bg-light">
+
+<body>
+
+<div class="topbar">
+  <div class="container topbar-inner">
+    <div class="d-flex justify-content-between align-items-center gap-3">
+      <div>
+        <div class="title h5 m-0">Удалённый доступ</div>
+        <div class="muted" style="font-size:.92rem;">
+          Вы авторизованы как <b>{{ auth_fio }}</b>
+        </div>
+      </div>
+
+      <div class="d-flex align-items-center gap-2">
+        <span class="pill">
+          <span class="muted">Сессия:</span>
+          <code>{{ sid }}</code>
+        </span>
+        <a class="btn btn-outline-secondary btn-sm" href="{% url 'vpn_ui_login' %}">Выйти</a>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="container py-4">
 
-  <div class="d-flex justify-content-between align-items-center mb-2">
-    <h4 class="m-0">Удалённый доступ</h4>
-    <a class="btn btn-outline-secondary btn-sm" href="{% url 'vpn_ui_login' %}">Выйти</a>
-  </div>
-
-  <div class="text-muted mb-3">
-    Вы авторизованы как <b>{{ auth_fio }}</b>
-  </div>
-
   {% if error %}
-    <div class="alert alert-danger">{{ error }}</div>
+    <div class="alert alert-danger" style="border-radius:12px;">
+      <div class="fw-semibold">Ошибка</div>
+      <div class="small">{{ error }}</div>
+    </div>
   {% endif %}
 
   {% for b in dept_blocks %}
-    <div class="card mb-3 shadow-sm">
+    <div class="card mb-3">
       <div class="card-header">
         <b>Отдел {{ b.dept_title }}</b>
       </div>
@@ -31,40 +160,49 @@
       <div class="card-body p-0">
         <div class="table-responsive">
           <table class="table table-sm table-striped align-middle m-0">
-            <thead class="table-light">
+            <thead>
               <tr>
-                <th>ФИО</th>
-                <th>Должность</th>
-                <th>ИНН</th>
-                <th>AD</th>
-                <th class="text-end">Доступ</th>
+                <th style="min-width:240px;">ФИО</th>
+                <th style="min-width:220px;">Должность</th>
+                <th style="width:140px;">ИНН</th>
+                <th style="min-width:220px;">AD</th>
+                <th class="text-end" style="width:220px;">Доступ</th>
               </tr>
             </thead>
+
             <tbody>
             {% for r in b.rows %}
               <tr data-inn="{{ r.inn }}">
-                <td>{{ r.fio }}</td>
-                <td class="text-muted">{{ r.position|default_if_none:"" }}</td>
+                <td class="fw-semibold">{{ r.fio }}</td>
+
+                <td class="text-muted">
+                  {{ r.position|default_if_none:"" }}
+                </td>
+
                 <td><code>{{ r.inn }}</code></td>
+
                 <td>
                   {% if r.ad_found %}
                     <span class="badge text-bg-success">OK</span>
-                    <span class="text-muted"> {{ r.ad_login }}</span>
+                    <span class="text-muted ms-1">{{ r.ad_login }}</span>
                   {% else %}
                     <span class="badge text-bg-secondary">N/A</span>
-                    <div class="text-danger small">{{ r.ad_err }}</div>
+                    <div class="text-danger small mt-1">{{ r.ad_err }}</div>
                   {% endif %}
                 </td>
+
                 <td class="text-end">
                   {% if r.vpn_known and r.ad_found %}
-                    <div class="form-check form-switch d-inline-flex align-items-center gap-2">
-                      <input class="form-check-input vpn-toggle"
-                             type="checkbox"
-                             {% if r.vpn_open %}checked{% endif %}>
-                      <span class="small vpn-state">
-                        {% if r.vpn_open %}Открыт{% else %}Закрыт{% endif %}
-                      </span>
-                      <span class="spinner-border spinner-border-sm d-none" role="status"></span>
+                    <div class="switch-wrap">
+                      <div class="form-check form-switch d-inline-flex align-items-center gap-2 m-0">
+                        <input class="form-check-input vpn-toggle"
+                               type="checkbox"
+                               {% if r.vpn_open %}checked{% endif %}>
+                        <span class="small vpn-state">
+                          {% if r.vpn_open %}Открыт{% else %}Закрыт{% endif %}
+                        </span>
+                        <span class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
+                      </div>
                     </div>
                   {% else %}
                     <span class="text-muted">—</span>
@@ -75,12 +213,14 @@
               <tr><td colspan="5" class="text-muted p-3">Нет сотрудников</td></tr>
             {% endfor %}
             </tbody>
+
           </table>
         </div>
       </div>
     </div>
   {% endfor %}
 
+  <div class="footer-space"></div>
 </div>
 
 <script>
