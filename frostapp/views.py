@@ -2612,16 +2612,6 @@ def encrypt_inn(inn):
 #     return final_status, missing
 
 def validate_and_create_record(payload, required_fields, action_name="CREATE"):
-    """
-    1) Смотрим payload['data'] (других полей в запросе нет).
-    2) Проверяем наличие всех required_fields.
-    3) Если чего-то не хватает → пишем в queue (status='failed') + только в MODUL_logs.
-    4) Если всё ок → queue (status='pending'), без логирования.
-
-    Дополнительно:
-    - сохраняем исходный ИНН в data['id_compare']
-    - в data['inn'] сохраняем SHA-256 (как раньше)
-    """
     data = payload.get('data', {})
     if not isinstance(data, dict):
         data = {}
@@ -2633,25 +2623,29 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
     attempts = 0
     last_attempt = None
 
-    # Проверяем обязательные поля (до любых преобразований)
-    missing = [f for f in required_fields if not data.get(f)]
+    # --- guid_dep: нормализуем как строку ---
+    if 'guid_dep' in data:
+        gd = data.get('guid_dep')
+        gd = "" if gd is None else str(gd)
+        gd = gd.strip()
+        data['guid_dep'] = gd or None  # пустое -> None (чтобы попало в missing)
 
-    # ИНН: сохраняем чистый в id_compare + хэшируем в inn
+    # --- ИНН: сохраняем чистый в id_compare + хэшируем в inn ---
     raw_inn = data.get('inn')
     if raw_inn:
         try:
-            plain_inn = ensure_plain_inn(str(raw_inn))  
-            data['id_compare'] = plain_inn        
-            data['inn'] = encrypt_inn(plain_inn)      
+            plain_inn = ensure_plain_inn(str(raw_inn))  # 10/12 цифр
+            data['id_compare'] = plain_inn
+            data['inn'] = encrypt_inn(plain_inn)
         except ValueError:
-            missing.append('inn')
-            data.pop('id_compare', None)  # на всякий случай
-    # если raw_inn пустой — missing уже содержит 'inn', если он в required_fields
+            data['inn'] = None
+            data.pop('id_compare', None)
 
+    # Проверяем обязательные поля (после нормализации)
+    missing = [f for f in required_fields if not data.get(f)]
     if missing:
         final_status = 'failed'
 
-    # Создаём запись в queue
     Queue.objects.create(
         data=data,
         attempts=attempts,
@@ -2659,7 +2653,6 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
         last_attempt=last_attempt
     )
 
-    # Если failed → фиксируем только в MODUL_logs
     if final_status == 'failed':
         MODUL_logs.objects.create(
             data={
@@ -2669,6 +2662,64 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
         )
 
     return final_status, missing
+# def validate_and_create_record(payload, required_fields, action_name="CREATE"):
+#     """
+#     1) Смотрим payload['data'] (других полей в запросе нет).
+#     2) Проверяем наличие всех required_fields.
+#     3) Если чего-то не хватает → пишем в queue (status='failed') + только в MODUL_logs.
+#     4) Если всё ок → queue (status='pending'), без логирования.
+
+#     Дополнительно:
+#     - сохраняем исходный ИНН в data['id_compare']
+#     - в data['inn'] сохраняем SHA-256 (как раньше)
+#     """
+#     data = payload.get('data', {})
+#     if not isinstance(data, dict):
+#         data = {}
+#     else:
+#         # чтобы не мутировать исходный payload
+#         data = dict(data)
+
+#     final_status = 'pending'
+#     attempts = 0
+#     last_attempt = None
+
+#     # Проверяем обязательные поля (до любых преобразований)
+#     missing = [f for f in required_fields if not data.get(f)]
+
+#     # ИНН: сохраняем чистый в id_compare + хэшируем в inn
+#     raw_inn = data.get('inn')
+#     if raw_inn:
+#         try:
+#             plain_inn = ensure_plain_inn(str(raw_inn))  
+#             data['id_compare'] = plain_inn        
+#             data['inn'] = encrypt_inn(plain_inn)      
+#         except ValueError:
+#             missing.append('inn')
+#             data.pop('id_compare', None)  # на всякий случай
+#     # если raw_inn пустой — missing уже содержит 'inn', если он в required_fields
+
+#     if missing:
+#         final_status = 'failed'
+
+#     # Создаём запись в queue
+#     Queue.objects.create(
+#         data=data,
+#         attempts=attempts,
+#         status=final_status,
+#         last_attempt=last_attempt
+#     )
+
+#     # Если failed → фиксируем только в MODUL_logs
+#     if final_status == 'failed':
+#         MODUL_logs.objects.create(
+#             data={
+#                 "error": f"Незаполненные поля: {missing}",
+#                 "payload": data
+#             }
+#         )
+
+#     return final_status, missing
 
 
 @csrf_exempt
@@ -2683,7 +2734,7 @@ def queue_create(request):
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name', 'beginwork_date',
+                'guid_dep', 'inn', 'last_name', 'first_name', 'beginwork_date',
                 'organization', 'department', 'bitrix_code', 'subdivision',
                 'position', 'phone', 'birth_date', 'action'
             ]
@@ -2718,7 +2769,7 @@ def queue_update(request):
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name', 'beginwork_date',
+                'guid_dep', 'inn', 'last_name', 'first_name', 'beginwork_date',
                 'organization', 'department', 'bitrix_code', 'subdivision',
                 'position', 'phone', 'birth_date', 'action'
             ]
@@ -2753,7 +2804,7 @@ def queue_block(request):
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name'
+                'guid_dep', 'inn', 'last_name', 'first_name'
             ]
 
             final_status, missing = validate_and_create_record(
@@ -2787,7 +2838,7 @@ def queue_vacation(request):
             payload = json.loads(request.body.decode('utf-8'))
 
             required_fields = [
-                'inn', 'last_name', 'first_name',
+                'guid_dep', 'inn', 'last_name', 'first_name',
                 'start_vacation', 'end_vacation', 'type_vacation'
             ]
 
