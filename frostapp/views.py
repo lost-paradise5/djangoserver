@@ -170,7 +170,7 @@ BITRIX_USER_GET_URL = os.getenv(
 )
 BITRIX_NOTIFY_URL = os.getenv(
     "BITRIX_NOTIFY_URL",
-    "https://gkbin.bitrix24.ru/rest/61518/0ogeiqf5gdy3dot0/im.notify.personal.add.json",
+    "https://gkbin.bitrix24.ru/rest/61518/1ky2jzwneefj1aor/im.notify.personal.add.json",
 )
 
 BITRIX_INN_FIELD = os.getenv("BITRIX_INN_FIELD", "UF_USR_1761723694787")
