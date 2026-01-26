@@ -30,6 +30,7 @@ from django.contrib.admin.views.decorators import staff_member_required
 from django.views.decorators.http import require_http_methods
 from django.urls import reverse
 from django.utils.http import urlencode
+from django.views.decorators.csrf import csrf_protect
 
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog
@@ -6844,63 +6845,74 @@ def sm_staff_ui_list(request):
 
 
 @require_http_methods(["GET", "POST"])
+@csrf_protect
 def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
     """
     UI редактирование ИНН:
-    GET/POST /ui/smstaff/BINUU00/edit/123/
+    GET/POST /ui/smstaff/<db>/edit/<staff_id>/
+    staff_id в urls.py допускает отрицательные (re_path), но мы их отвергаем валидацией.
     """
-    # Преобразуем staff_id в int и проверяем
+
+    # --- normalize db ---
+    db = (db or "").strip().upper()
+
+    # --- parse staff_id ---
     try:
         staff_id_int = int(staff_id)
     except (ValueError, TypeError):
         return render(request, "frostapp/smstaff_edit.html", {
             "db": db,
             "staff_id": staff_id,
-            "error": f"Некорректный ID пользователя: {staff_id}. ID должен быть числом.",
             "row": None,
+            "ok": False,
+            "error": f"Некорректный ID пользователя: {staff_id}. ID должен быть числом.",
         })
-    
+
     if staff_id_int <= 0:
         return render(request, "frostapp/smstaff_edit.html", {
             "db": db,
             "staff_id": staff_id_int,
-            "error": f"Некорректный ID пользователя: {staff_id_int}. ID должен быть положительным числом.",
             "row": None,
+            "ok": False,
+            "error": f"Некорректный ID пользователя: {staff_id_int}. ID должен быть положительным числом.",
         })
-    
-    db = (db or "").strip().upper()
+
+    # --- validate db against map/allowlist ---
     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
         return render(request, "frostapp/smstaff_edit.html", {
             "db": db,
             "staff_id": staff_id_int,
-            "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
             "row": None,
+            "ok": False,
+            "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
         })
-    
+
     conn = cur = None
     row = None
     error = ""
     ok = False
-    
+
     try:
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
+
         cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
-        
+
+        # Без INN редактировать нечего
         if not _ui_has_col(cols_set, "inn"):
             return render(request, "frostapp/smstaff_edit.html", {
                 "db": db,
                 "staff_id": staff_id_int,
-                "error": "В этой базе в SMSTAFF нет колонки INN — редактирование невозможно.",
                 "row": None,
+                "ok": False,
+                "error": "В этой базе в SMSTAFF нет колонки INN — редактирование невозможно.",
             })
-        
-        # Определяем какие колонки есть в таблице
+
         def SEL(col: str) -> str:
+            # если колонки нет — отдадим NULL AS col, чтобы шаблон не ломался
             return col if _ui_has_col(cols_set, col) else f"NULL AS {col}"
-        
-        # Формируем SELECT с учетом только существующих колонок
-        select_cols = [
+
+        select_sql = ", ".join([
             SEL("id"),
             SEL("surname"),
             SEL("name"),
@@ -6908,59 +6920,48 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
             SEL("serverlogin"),
             SEL("inn"),
             SEL("userenabled"),
-        ]
-        
-        select_sql = ", ".join(select_cols)
-        
-        # Получаем данные пользователя
+        ])
+
+        # читаем строку
         cur.execute(f"""
             SELECT {select_sql}
             FROM smstaff
             WHERE id = :b_id
         """, b_id=staff_id_int)
-        
-        # Используем _oracle_rows_to_jsonable для преобразования
+
         items = _oracle_rows_to_jsonable(cur)
-        
         if not items:
             return render(request, "frostapp/smstaff_edit.html", {
                 "db": db,
                 "staff_id": staff_id_int,
-                "error": f"Пользователь с id={staff_id_int} не найден в {db}.",
                 "row": None,
+                "ok": False,
+                "error": f"Пользователь с id={staff_id_int} не найден в {db}.",
             })
-        
-        row = items[0]  # Получаем первый (и единственный) результат
-        
+
+        row = items[0]  # dict с ключами lower-case
+
         if request.method == "POST":
-            new_inn = (request.POST.get("inn") or "").strip()
-            # Разрешим очистку ИНН (поставить NULL)
-            if new_inn:
-                if not _is_valid_inn_digits(new_inn):
-                    error = "ИНН должен быть числом длиной 10 или 12."
-                else:
-                    cur.execute("UPDATE smstaff SET inn = :b_inn WHERE id = :b_id", 
-                               b_inn=new_inn, b_id=staff_id_int)
-                    conn.commit()
-                    ok = True
+            new_inn = (request.POST.get("inn") or "").strip()  
+
+            # Валидация
+            if new_inn and not _is_valid_inn_digits(new_inn):
+                error = "ИНН должен быть числом длиной 10 или 12."
             else:
-                # очистка
-                cur.execute("UPDATE smstaff SET inn = NULL WHERE id = :b_id", 
-                           b_id=staff_id_int)
-                conn.commit()
-                ok = True
-            
-            # Перечитываем данные после обновления
-            cur.execute(f"""
-                SELECT {select_sql}
-                FROM smstaff
-                WHERE id = :b_id
-            """, b_id=staff_id_int)
-            
-            updated_items = _oracle_rows_to_jsonable(cur)
-            if updated_items:
-                row = updated_items[0]
-            
+                login_val = (row.get("serverlogin") or "").strip()
+                if not login_val:
+                    error = "У выбранного пользователя пустой serverlogin — нельзя обновить по всем базам."
+                else:
+                    # Переходим на прогресс-страницу, которая сама пробежит все базы
+                    dbs = _ui_services_list()
+                    return render(request, "frostapp/smstaff_sync_inn.html", {
+                        "start_db": db,
+                        "login": login_val,
+                        "new_inn": new_inn,  # "" => очистка (NULL)
+                        "dbs": dbs,
+                        "return_url": f"/ui/smstaff/?db={db}",
+                    })
+
     except Exception as e:
         logger.exception(f"[UI/SMSTAFF] edit error db={db} id={staff_id_int}: {e}")
         error = str(e)
@@ -6969,13 +6970,16 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
                 conn.rollback()
         except Exception:
             pass
+
     finally:
         try:
-            if cur: cur.close()
-            if conn: conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
-    
+
     return render(request, "frostapp/smstaff_edit.html", {
         "db": db,
         "staff_id": staff_id_int,
@@ -6983,3 +6987,97 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
         "error": error,
         "ok": ok,
     })
+
+
+@require_http_methods(["POST"])
+@csrf_protect
+def sm_staff_ui_sync_inn_one(request):
+    """
+    JSON: обновляет INN по serverlogin в ОДНОЙ базе.
+    Вызывается со страницы прогресса по очереди для каждой базы.
+    body: {"db":"BINUU00","login":"i_ivanov","inn":"123..."}  # inn может быть "" для очистки
+    """
+    try:
+        payload = json.loads(request.body.decode("utf-8") or "{}")
+    except Exception:
+        return JsonResponse({"ok": False, "error": "Некорректный JSON"}, status=400)
+
+    db = (payload.get("db") or "").strip().upper()
+    login = (payload.get("login") or "").strip()
+    inn = (payload.get("inn") or "")
+    inn = (inn.strip() if isinstance(inn, str) else "")
+
+    if not db or db not in ORACLE_TNS_MAP or not _is_allowed_service(db):
+        return JsonResponse({"ok": False, "db": db, "error": "Неизвестная/запрещённая база"}, status=400)
+
+    if not login:
+        return JsonResponse({"ok": False, "db": db, "error": "Пустой login"}, status=400)
+
+    if inn and not _is_valid_inn_digits(inn):
+        return JsonResponse({"ok": False, "db": db, "error": "ИНН должен быть числом длиной 10 или 12"}, status=400)
+
+    conn = cur = None
+    try:
+        conn = _connect_oracle_service(db)
+        cur = conn.cursor()
+
+        cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+
+        if not _ui_has_col(cols_set, "inn"):
+            return JsonResponse({"ok": False, "db": db, "error": "В SMSTAFF нет колонки INN"}, status=400)
+
+        if not _ui_has_col(cols_set, "serverlogin"):
+            return JsonResponse({"ok": False, "db": db, "error": "В SMSTAFF нет колонки SERVERLOGIN"}, status=400)
+
+        # Обновляем по логину (без учёта регистра)
+        if inn:
+            cur.execute(
+                """
+                UPDATE smstaff
+                   SET inn = :b_inn
+                 WHERE LOWER(serverlogin) = LOWER(:b_login)
+                """,
+                b_inn=inn, b_login=login
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE smstaff
+                   SET inn = NULL
+                 WHERE LOWER(serverlogin) = LOWER(:b_login)
+                """,
+                b_login=login
+            )
+
+        affected = int(cur.rowcount or 0)
+        conn.commit()
+
+        # ok=True даже если affected=0 (просто не нашли пользователя в этой базе)
+        level = "success" if affected > 0 else "warning"
+        msg = "Обновлено" if affected > 0 else "Пользователь не найден (0 строк)"
+
+        return JsonResponse({
+            "ok": True,
+            "db": db,
+            "level": level,        # success | warning
+            "affected": affected,
+            "message": msg,
+            "login": login,
+            "inn": inn,
+        })
+
+    except Exception as e:
+        logger.exception(f"[UI/SMSTAFF] sync inn one error db={db} login={login}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return JsonResponse({"ok": False, "db": db, "error": str(e)}, status=500)
+
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
