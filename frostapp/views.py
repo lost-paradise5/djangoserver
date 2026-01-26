@@ -771,6 +771,198 @@ def vpn_ui_toggle(request):
 
 
 
+def _decode_ldap_val(v):
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "ignore")
+    return str(v)
+
+def _attrs_to_dict(attrs: dict) -> dict:
+    out = {}
+    for k, vals in (attrs or {}).items():
+        try:
+            kk = k.decode("utf-8", "ignore") if isinstance(k, bytes) else str(k)
+        except Exception:
+            kk = str(k)
+        if isinstance(vals, (list, tuple)):
+            out[kk] = [_decode_ldap_val(x) for x in vals]
+        else:
+            out[kk] = _decode_ldap_val(vals)
+    return out
+
+def _make_login_filter(login: str) -> str:
+    if "@" in login:
+        return (
+            f"(|(mail={escape_filter_chars(login)})"
+            f"(userPrincipalName={escape_filter_chars(login)}))"
+        )
+    return f"(sAMAccountName={escape_filter_chars(login)})"
+
+def _fetch_user_by_login(conn, login: str):
+    ldap_filter = _make_login_filter(login)
+    attrs = [
+        "distinguishedName",
+        "cn",
+        "sAMAccountName",
+        "userPrincipalName",
+        "mail",
+        "displayName",
+        "givenName",
+        "sn",
+        "employeeID",
+        "department",
+        "title",
+        "company",
+        "telephoneNumber",
+        "mobile",
+        "whenCreated",
+        "whenChanged",
+        "userAccountControl",
+        "memberOf",
+    ]
+    found = conn.search_s(
+        AD_SEARCH_BASE,
+        ldap.SCOPE_SUBTREE,
+        ldap_filter,
+        attrlist=attrs,
+    )
+    found = [x for x in found if x and x[0]]
+    if not found:
+        return None, None, None
+    dn, ad_attrs = found[0]
+    return dn, ad_attrs, ldap_filter
+
+@require_http_methods(["GET", "POST"])
+@csrf_protect
+def ad_ui_lookup(request):
+    """
+    POST action может быть:
+      - action=lookup  : поиск
+      - action=save_employeeid : обновление employeeID
+    """
+    error = ""
+    ok = ""
+    result = None
+
+    login = ""
+    if request.method == "POST":
+        login = (request.POST.get("login") or "").strip()
+    else:
+        login = (request.GET.get("login") or "").strip()
+
+    action = (request.POST.get("action") or "lookup").strip() if request.method == "POST" else "lookup"
+
+    if request.method == "POST":
+        if not login:
+            error = "Введите логин."
+        else:
+            conn = None
+            try:
+                conn = _ad_connect()
+
+                dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
+                if not dn:
+                    error = "Пользователь не найден в AD."
+                else:
+                    # если нужно сохранить employeeID — делаем modify
+                    if action == "save_employeeid":
+                        new_employee_id = (request.POST.get("employeeID") or "").strip()
+
+                        # пусто = удалить employeeID
+                        if new_employee_id:
+                            if not _INN_RE.match(new_employee_id):
+                                error = "employeeID должен быть ИНН из 10 или 12 цифр (или пусто для очистки)."
+                            else:
+                                conn.modify_s(dn, [
+                                    (ldap.MOD_REPLACE, "employeeID", [new_employee_id.encode("utf-8")]),
+                                ])
+                                ok = "employeeID обновлён."
+                        else:
+                            # удалить атрибут (если был)
+                            try:
+                                conn.modify_s(dn, [
+                                    (ldap.MOD_DELETE, "employeeID", None),
+                                ])
+                                ok = "employeeID очищен."
+                            except ldap.NO_SUCH_ATTRIBUTE:
+                                ok = "employeeID уже был пуст."
+
+                        # перечитаем после изменения
+                        dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
+
+                    result = {
+                        "dn": dn,
+                        "login_input": login,
+                        "filter": ldap_filter,
+                        "attrs": _attrs_to_dict(ad_attrs),
+                    }
+
+            except ldap.INSUFFICIENT_ACCESS:
+                error = "Недостаточно прав в AD для изменения employeeID (INSUFFICIENT_ACCESS)."
+            except ldap.INVALID_CREDENTIALS:
+                error = "Неверные учетные данные для подключения к AD."
+            except ldap.SERVER_DOWN:
+                error = "AD недоступен (SERVER_DOWN)."
+            except ldap.LDAPError as e:
+                error = f"LDAP ошибка: {str(e)}"
+            except Exception as e:
+                error = str(e)
+            finally:
+                try:
+                    if conn:
+                        conn.unbind_s()
+                except Exception:
+                    pass
+
+    else:
+        # GET — ничего не ищем, пока не нажмут кнопку,
+        # но если login передали в querystring — можно показать сразу.
+        if login:
+            conn = None
+            try:
+                conn = _ad_connect()
+                dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
+                if not dn:
+                    error = "Пользователь не найден в AD."
+                else:
+                    result = {
+                        "dn": dn,
+                        "login_input": login,
+                        "filter": ldap_filter,
+                        "attrs": _attrs_to_dict(ad_attrs),
+                    }
+            except Exception as e:
+                error = str(e)
+            finally:
+                try:
+                    if conn:
+                        conn.unbind_s()
+                except Exception:
+                    pass
+
+    return render(request, "frostapp/ad_lookup.html", {
+        "error": error,
+        "ok": ok,
+        "result": result,
+        "login_prefill": login,
+    })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
