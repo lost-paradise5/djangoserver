@@ -2561,6 +2561,55 @@ def encrypt_inn(inn):
     hash_object = hashlib.sha256(inn.encode('utf-8'))
     return hash_object.hexdigest()
 
+# def validate_and_create_record(payload, required_fields, action_name="CREATE"):
+#     """
+#     1) Смотрим payload['data'] (других полей в запросе нет).
+#     2) Проверяем наличие всех required_fields.
+#     3) Если чего-то не хватает → пишем в queue (status='failed') + только в MODUL_logs.
+#     4) Если всё ок → queue (status='pending'), без логирования.
+
+#     Возвращает (final_status, missing_fields).
+#     """
+#     data = payload.get('data', {})
+#     if not isinstance(data, dict):
+#         data = {}
+
+#     final_status = 'pending'
+#     attempts = 0
+#     last_attempt = None
+
+#     # Проверяем обязательные поля
+#     missing = [f for f in required_fields if not data.get(f)]
+
+#     # Хэшируем ИНН (если он есть и валиден)
+#     if data.get('inn'):
+#         try:
+#             data['inn'] = encrypt_inn(data['inn'])
+#         except ValueError:
+#             missing.append('inn')
+
+#     if missing:
+#         final_status = 'failed'
+
+#     # Создаём запись в queue
+#     Queue.objects.create(
+#         data=data,
+#         attempts=attempts,
+#         status=final_status,
+#         last_attempt=last_attempt
+#     )
+
+#     # Если failed → фиксируем только в MODUL_logs
+#     if final_status == 'failed':
+#         MODUL_logs.objects.create(
+#             data={                       # JSONB-поле в таблице
+#                 "error": f"Незаполненные поля: {missing}",
+#                 "payload": data
+#             }
+#         )
+
+#     return final_status, missing
+
 def validate_and_create_record(payload, required_fields, action_name="CREATE"):
     """
     1) Смотрим payload['data'] (других полей в запросе нет).
@@ -2568,25 +2617,35 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
     3) Если чего-то не хватает → пишем в queue (status='failed') + только в MODUL_logs.
     4) Если всё ок → queue (status='pending'), без логирования.
 
-    Возвращает (final_status, missing_fields).
+    Дополнительно:
+    - сохраняем исходный ИНН в data['id_compare']
+    - в data['inn'] сохраняем SHA-256 (как раньше)
     """
     data = payload.get('data', {})
     if not isinstance(data, dict):
         data = {}
+    else:
+        # чтобы не мутировать исходный payload
+        data = dict(data)
 
     final_status = 'pending'
     attempts = 0
     last_attempt = None
 
-    # Проверяем обязательные поля
+    # Проверяем обязательные поля (до любых преобразований)
     missing = [f for f in required_fields if not data.get(f)]
 
-    # Хэшируем ИНН (если он есть и валиден)
-    if data.get('inn'):
+    # ИНН: сохраняем чистый в id_compare + хэшируем в inn
+    raw_inn = data.get('inn')
+    if raw_inn:
         try:
-            data['inn'] = encrypt_inn(data['inn'])
+            plain_inn = ensure_plain_inn(str(raw_inn))  
+            data['id_compare'] = plain_inn        
+            data['inn'] = encrypt_inn(plain_inn)      
         except ValueError:
             missing.append('inn')
+            data.pop('id_compare', None)  # на всякий случай
+    # если raw_inn пустой — missing уже содержит 'inn', если он в required_fields
 
     if missing:
         final_status = 'failed'
@@ -2602,7 +2661,7 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
     # Если failed → фиксируем только в MODUL_logs
     if final_status == 'failed':
         MODUL_logs.objects.create(
-            data={                       # JSONB-поле в таблице
+            data={
                 "error": f"Незаполненные поля: {missing}",
                 "payload": data
             }
