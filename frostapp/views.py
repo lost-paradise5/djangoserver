@@ -291,7 +291,7 @@ def bitrix_find_user_by_inn(inn: str) -> dict | None:
     return users[0] if users else None
 
 def bitrix_send_pin(user_id: int, pin: str):
-    msg = f"PIN-код для управления доступом VPN: {pin}. Срок действия: {VPN_PIN_TTL_MIN} минут."
+    msg = f"ПИН-код для входа в контроль удаленного доступа: {pin}. Срок действия: {VPN_PIN_TTL_MIN} минут."
     _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": user_id, "MESSAGE": msg})
 
 
