@@ -7,6 +7,8 @@ import time
 from typing import Tuple, Optional
 import random
 import string
+import ldap
+from ldap.filter import escape_filter_chars
 import datetime
 import uuid
 import pymysql
@@ -14,7 +16,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import cx_Oracle
 import re   
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponseForbidden
 from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
@@ -31,9 +33,9 @@ from django.views.decorators.http import require_http_methods
 from django.urls import reverse
 from django.utils.http import urlencode
 from django.views.decorators.csrf import csrf_protect
+from django.middleware.csrf import get_token
 
-
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession
 
 _HEX = set("0123456789abcdefABCDEF")
 UKM5_FULL_XML_STORE_ID = 2013
@@ -149,6 +151,648 @@ INN_SYNC_PROGRESS_EVERY_ROWS = int(os.getenv("INN_SYNC_PROGRESS_EVERY_ROWS", "20
 INN_SYNC_HEARTBEAT_SEC = int(os.getenv("INN_SYNC_HEARTBEAT_SEC", "30"))
 INN_SYNC_ORACLE_CALL_TIMEOUT_MS = int(os.getenv("INN_SYNC_ORACLE_CALL_TIMEOUT_MS", "120000"))  # 120s
 INN_SYNC_SLOW_STEP_WARN_SEC = float(os.getenv("INN_SYNC_SLOW_STEP_WARN_SEC", "10"))
+
+
+
+
+
+# =========================
+# Config
+# =========================
+
+BITRIX_DEPARTMENT_GET_URL = os.getenv(
+    "BITRIX_DEPARTMENT_GET_URL",
+    "https://gkbin.bitrix24.ru/rest/61518/df8m05y41a99szxh/department.get.json",
+)
+BITRIX_USER_GET_URL = os.getenv(
+    "BITRIX_USER_GET_URL",
+    "https://gkbin.bitrix24.ru/rest/61518/0ogeiqf5gdy3dot0/user.get.json",
+)
+BITRIX_NOTIFY_URL = os.getenv(
+    "BITRIX_NOTIFY_URL",
+    "https://gkbin.bitrix24.ru/rest/61518/0ogeiqf5gdy3dot0/im.notify.personal.add.json",
+)
+
+BITRIX_INN_FIELD = os.getenv("BITRIX_INN_FIELD", "UF_USR_1761723694787")
+
+AD_DOMAIN = os.getenv("AD_DOMAIN", "BINLTD")
+AD_IP = os.getenv("AD_IP", "192.168.17.100")
+AD_USERNAME = os.getenv("AD_USERNAME", "account_adm")
+AD_PASSWORD = os.getenv("AD_PASSWORD", "BIN#FTyghu81@")
+AD_SEARCH_BASE = os.getenv("AD_SEARCH_BASE", "OU=People,DC=binltd,DC=local")
+AD_BASE_DN = os.getenv("AD_BASE_DN", "DC=binltd,DC=local")
+
+VPN_GROUP_CN = os.getenv("VPN_GROUP_CN", "mikrotik_vpn")
+
+VPN_PIN_TTL_MIN = int(os.getenv("VPN_PIN_TTL_MIN", "10"))
+VPN_SESSION_TTL_MIN = int(os.getenv("VPN_SESSION_TTL_MIN", "60"))
+VPN_MAX_PIN_ATTEMPTS = int(os.getenv("VPN_MAX_PIN_ATTEMPTS", "5"))
+
+
+
+# =========================
+# Helpers: hashing/pin/session
+# =========================
+
+def _rand_pin_4() -> str:
+    return f"{random.randint(0, 9999):04d}"
+
+def _rand_salt(n: int = 16) -> str:
+    # 16 bytes hex -> 32 chars
+    return os.urandom(n).hex()
+
+def _pin_hash(pin: str, salt: str) -> str:
+    return hashlib.sha256((salt + ":" + pin).encode("utf-8")).hexdigest()
+
+def _client_ip(request) -> str:
+    xff = request.META.get("HTTP_X_FORWARDED_FOR")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR", "") or ""
+
+def _expire_old_sessions():
+    # мягкая чистка
+    now = timezone.now()
+    VpnAccessSession.objects.filter(expires_at__lt=now).exclude(status="EXPIRED").update(status="EXPIRED")
+
+
+def _get_sid(request) -> str:
+    return (request.GET.get("sid") or request.COOKIES.get("vpn_sid") or "").strip()
+
+def _get_session_or_403(request, must_verified: bool) -> VpnAccessSession:
+    sid = _get_sid(request)
+    if not sid:
+        raise PermissionError("NO_SESSION")
+    try:
+        sess = VpnAccessSession.objects.get(id=sid)
+    except Exception:
+        raise PermissionError("BAD_SESSION")
+
+    now = timezone.now()
+    if sess.expires_at and sess.expires_at < now:
+        if sess.status != "EXPIRED":
+            sess.status = "EXPIRED"
+            sess.save(update_fields=["status"])
+        raise PermissionError("EXPIRED")
+
+    if must_verified and sess.status != "VERIFIED":
+        raise PermissionError("NOT_VERIFIED")
+
+    return sess
+
+
+
+# =========================
+# Helpers: Bitrix
+# =========================
+
+def _bitrix_call(url: str, data: dict, timeout: int = 20) -> dict:
+    r = requests.post(url, data=data, timeout=timeout)
+    r.raise_for_status()
+    js = r.json()
+    if isinstance(js, dict) and js.get("error"):
+        raise RuntimeError(f"Bitrix error: {js.get('error')} {js.get('error_description')}")
+    return js
+
+def bitrix_get_departments() -> list[dict]:
+    js = _bitrix_call(BITRIX_DEPARTMENT_GET_URL, data={})
+    res = js.get("result") or []
+    return res
+
+def bitrix_user_get_all(filter_dict: dict, select_list: list[str] | None = None) -> list[dict]:
+    # pagination: Bitrix часто использует start/next
+    out = []
+    start = 0
+    while True:
+        data = {}
+        for k, v in filter_dict.items():
+            data[f"filter[{k}]"] = v
+        if select_list:
+            # Bitrix принимает select[] повторяющимся параметром
+            for i, f in enumerate(select_list):
+                data[f"select[{i}]"] = f
+        data["start"] = start
+
+        js = _bitrix_call(BITRIX_USER_GET_URL, data=data)
+        chunk = js.get("result") or []
+        out.extend(chunk)
+
+        nxt = js.get("next")
+        if nxt is None:
+            break
+        start = int(nxt)
+    return out
+
+def bitrix_find_user_by_inn(inn: str) -> dict | None:
+    users = bitrix_user_get_all(
+        filter_dict={BITRIX_INN_FIELD: inn},
+        select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME", "UF_DEPARTMENT", BITRIX_INN_FIELD],
+    )
+    return users[0] if users else None
+
+def bitrix_send_pin(user_id: int, pin: str):
+    msg = f"PIN-код для управления доступом VPN: {pin}. Срок действия: {VPN_PIN_TTL_MIN} минут."
+    _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": user_id, "MESSAGE": msg})
+
+
+# =========================
+# Helpers: departments tree
+# =========================
+
+def _dept_index(depts: list[dict]) -> tuple[dict[int, dict], dict[int, list[int]]]:
+    by_id = {}
+    children = {}
+    for d in depts:
+        try:
+            did = int(d.get("ID") or d.get("id"))
+        except Exception:
+            continue
+        by_id[did] = d
+
+    for did, d in by_id.items():
+        try:
+            parent = int(d.get("PARENT") or d.get("parent") or 0)
+        except Exception:
+            parent = 0
+        children.setdefault(parent, []).append(did)
+
+    return by_id, children
+
+def _dept_descendants(root_ids: list[int], children: dict[int, list[int]]) -> list[int]:
+    seen = set()
+    stack = list(root_ids)
+    while stack:
+        x = stack.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        for ch in children.get(x, []):
+            stack.append(ch)
+    return sorted(seen)
+
+def _dept_name(d: dict) -> str:
+    return str(d.get("NAME") or d.get("name") or f"Dept {d.get('ID')}")
+
+def _dept_head_id(d: dict) -> int | None:
+    # в Bitrix обычно UF_HEAD
+    for k in ("UF_HEAD", "ufHead", "HEAD", "head"):
+        if k in d and d.get(k):
+            try:
+                return int(d.get(k))
+            except Exception:
+                return None
+    return None
+
+
+# =========================
+# Helpers: AD (LDAP)
+# =========================
+
+def _ad_connect():
+    ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+    ldap.set_option(ldap.OPT_REFERRALS, 0)
+
+    conn = ldap.initialize(f"ldaps://{AD_IP}:636")
+    conn.protocol_version = 3
+    conn.simple_bind_s(f"{AD_DOMAIN}\\{AD_USERNAME}", AD_PASSWORD)
+    return conn
+
+def _ad_search_one(conn, search_base: str, ldap_filter: str, attrs: list[str]) -> tuple[str, dict] | None:
+    res = conn.search_s(search_base, ldap.SCOPE_SUBTREE, ldap_filter, attrlist=attrs)
+    res = [x for x in res if x and x[0]]
+    if not res:
+        return None
+    dn, at = res[0]
+    return dn, at
+
+def ad_find_by_login(login: str) -> tuple[str, dict] | None:
+    conn = None
+    try:
+        conn = _ad_connect()
+        # сначала sAMAccountName, если ввели mail — пробуем mail/userPrincipalName
+        if "@" in login:
+            f = f"(|(mail={escape_filter_chars(login)})(userPrincipalName={escape_filter_chars(login)}))"
+        else:
+            f = f"(sAMAccountName={escape_filter_chars(login)})"
+        return _ad_search_one(conn, AD_SEARCH_BASE, f, ["displayName", "employeeID", "sAMAccountName", "mail", "memberOf"])
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+def ad_find_by_employee_id(inn: str) -> tuple[str, dict] | None:
+    conn = None
+    try:
+        conn = _ad_connect()
+        f = f"(employeeID={escape_filter_chars(inn)})"
+        return _ad_search_one(conn, AD_SEARCH_BASE, f, ["displayName", "employeeID", "sAMAccountName", "mail", "memberOf"])
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+def ad_find_group_dn(conn, group_cn: str) -> str | None:
+    f = f"(&(objectClass=group)(cn={escape_filter_chars(group_cn)}))"
+    got = _ad_search_one(conn, AD_BASE_DN, f, ["cn"])
+    return got[0] if got else None
+
+def ad_is_in_group(user_attrs: dict, group_dn: str) -> bool:
+    mos = user_attrs.get("memberOf", []) or []
+    mos = [x.decode("utf-8", "ignore").lower() for x in mos]
+    return group_dn.lower() in mos
+
+def ad_group_add_member(group_dn: str, user_dn: str):
+    conn = None
+    try:
+        conn = _ad_connect()
+        mod = [(ldap.MOD_ADD, "member", [user_dn.encode("utf-8")])]
+        conn.modify_s(group_dn, mod)
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+def ad_group_remove_member(group_dn: str, user_dn: str):
+    conn = None
+    try:
+        conn = _ad_connect()
+        mod = [(ldap.MOD_DELETE, "member", [user_dn.encode("utf-8")])]
+        conn.modify_s(group_dn, mod)
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+
+
+# =========================
+# UI: login -> pin -> users
+# =========================
+
+@require_http_methods(["GET", "POST"])
+@csrf_protect
+def vpn_ui_login(request):
+    _expire_old_sessions()
+
+    error = ""
+    if request.method == "POST":
+        login = (request.POST.get("login") or "").strip()
+        if not login:
+            error = "Введите логин."
+        else:
+            try:
+                ad = ad_find_by_login(login)
+                if not ad:
+                    raise RuntimeError("Пользователь не найден в AD.")
+                ad_dn, ad_attrs = ad
+
+                emp = ad_attrs.get("employeeID", [b""])
+                inn = (emp[0].decode("utf-8", "ignore") if emp else "").strip()
+                inn = re.sub(r"\D+", "", inn)
+                if not inn:
+                    raise RuntimeError("В AD у пользователя не заполнен employeeID (ИНН).")
+
+                bx_user = bitrix_find_user_by_inn(inn)
+                if not bx_user:
+                    raise RuntimeError(f"Пользователь не найден в Bitrix по {BITRIX_INN_FIELD}={inn}.")
+
+                bx_user_id = int(bx_user["ID"])
+
+                depts = bitrix_get_departments()
+                by_id, children = _dept_index(depts)
+
+                head_dept_ids = []
+                for did, d in by_id.items():
+                    hid = _dept_head_id(d)
+                    if hid == bx_user_id:
+                        head_dept_ids.append(did)
+
+                if not head_dept_ids:
+                    return render(request, "frostapp/vpn_login.html", {
+                        "error": "Вы не руководитель ни одного отдела.",
+                        "login": login,
+                    })
+
+                pin = _rand_pin_4()
+                salt = _rand_salt(16)
+                ph = _pin_hash(pin, salt)
+
+                now = timezone.now()
+                expires = now + timezone.timedelta(minutes=VPN_PIN_TTL_MIN)
+
+                sess = VpnAccessSession.objects.create(
+                    id=uuid.uuid4(),
+                    status="PENDING_PIN",
+                    ad_login=login,
+                    ad_user_dn=ad_dn,
+                    inn=inn,
+                    bitrix_user_id=bx_user_id,
+                    head_department_ids=head_dept_ids,
+                    pin_salt=salt,
+                    pin_hash=ph,
+                    pin_attempts=0,
+                    created_at=now,
+                    expires_at=expires,
+                    verified_at=None,
+                    ip=_client_ip(request),
+                    user_agent=(request.META.get("HTTP_USER_AGENT") or "")[:2000],
+                )
+
+                # отправляем PIN в битрикс
+                bitrix_send_pin(bx_user_id, pin)
+
+                resp = redirect(f"{reverse('vpn_ui_pin')}?sid={sess.id}")
+                # cookie чтобы sid не таскать руками
+                resp.set_cookie("vpn_sid", str(sess.id), max_age=VPN_SESSION_TTL_MIN * 60, httponly=True, samesite="Lax")
+                return resp
+
+            except Exception as e:
+                error = str(e)
+
+    return render(request, "frostapp/vpn_login.html", {"error": error})
+
+
+@require_http_methods(["GET", "POST"])
+@csrf_protect
+def vpn_ui_pin(request):
+    error = ""
+    ok = False
+    try:
+        sess = _get_session_or_403(request, must_verified=False)
+    except Exception:
+        return redirect(reverse("vpn_ui_login"))
+
+    if sess.status == "EXPIRED":
+        return redirect(reverse("vpn_ui_login"))
+
+    if request.method == "POST":
+        pin = (request.POST.get("pin") or "").strip()
+        if not pin or not pin.isdigit() or len(pin) != 4:
+            error = "PIN должен быть 4 цифры."
+        else:
+            if sess.pin_attempts >= VPN_MAX_PIN_ATTEMPTS:
+                sess.status = "EXPIRED"
+                sess.save(update_fields=["status"])
+                error = "Слишком много попыток. Сессия истекла."
+            else:
+                if _pin_hash(pin, sess.pin_salt) != sess.pin_hash:
+                    sess.pin_attempts = sess.pin_attempts + 1
+                    sess.save(update_fields=["pin_attempts"])
+                    error = "Неверный PIN."
+                else:
+                    sess.status = "VERIFIED"
+                    sess.verified_at = timezone.now()
+                    # продлеваем жизнь сессии после успешного PIN
+                    sess.expires_at = timezone.now() + timezone.timedelta(minutes=VPN_SESSION_TTL_MIN)
+                    sess.save(update_fields=["status", "verified_at", "expires_at"])
+                    ok = True
+                    return redirect(f"{reverse('vpn_ui_users')}?sid={sess.id}")
+
+    return render(request, "frostapp/vpn_pin.html", {
+        "error": error,
+        "sid": str(sess.id),
+        "expires_at": sess.expires_at,
+    })
+
+
+@require_http_methods(["GET"])
+def vpn_ui_users(request):
+    try:
+        sess = _get_session_or_403(request, must_verified=True)
+    except Exception:
+        return redirect(reverse("vpn_ui_login"))
+
+    head_dept_ids = sess.head_department_ids or []
+    if not head_dept_ids:
+        return HttpResponseForbidden("Нет прав.")
+
+    # department tree
+    depts = bitrix_get_departments()
+    by_id, children = _dept_index(depts)
+
+    all_dept_ids = _dept_descendants([int(x) for x in head_dept_ids], children)
+
+    # Bitrix users by departments
+    users_by_dept: dict[int, list[dict]] = {}
+    all_users_map: dict[int, dict] = {}
+
+    for did in all_dept_ids:
+        bx_users = bitrix_user_get_all(
+            filter_dict={"UF_DEPARTMENT": did},
+            select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME", "LOGIN", "UF_DEPARTMENT", BITRIX_INN_FIELD],
+        )
+        users_by_dept[did] = bx_users
+        for u in bx_users:
+            try:
+                all_users_map[int(u["ID"])] = u
+            except Exception:
+                pass
+
+    # Добавим руководителей отделов (на случай если не попали в user.get по UF_DEPARTMENT)
+    for did in all_dept_ids:
+        d = by_id.get(did)
+        if not d:
+            continue
+        hid = _dept_head_id(d)
+        if hid and hid not in all_users_map:
+            extra = bitrix_user_get_all(filter_dict={"ID": hid}, select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME", "LOGIN", "UF_DEPARTMENT", BITRIX_INN_FIELD])
+            if extra:
+                all_users_map[int(extra[0]["ID"])] = extra[0]
+                users_by_dept.setdefault(did, []).append(extra[0])
+
+    # AD group DN (один раз)
+    group_dn = None
+    conn = None
+    try:
+        conn = _ad_connect()
+        group_dn = ad_find_group_dn(conn, VPN_GROUP_CN)
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+    if not group_dn:
+        return render(request, "frostapp/vpn_users.html", {
+            "error": f"Группа безопасности {VPN_GROUP_CN} не найдена в AD.",
+            "dept_blocks": [],
+            "sid": str(sess.id),
+            "csrf": get_token(request),
+        })
+
+    # Собираем отображаемые строки
+    dept_blocks = []
+    for did in all_dept_ids:
+        d = by_id.get(did)
+        dept_title = _dept_name(d) if d else f"Отдел {did}"
+
+        rows = []
+        # дедуп пользователей в отделе
+        seen_uids = set()
+        for u in users_by_dept.get(did, []):
+            try:
+                uid = int(u.get("ID"))
+            except Exception:
+                continue
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+
+            inn = (u.get(BITRIX_INN_FIELD) or "").strip()
+            inn = re.sub(r"\D+", "", inn)
+
+            ad_found = False
+            ad_login = ""
+            ad_dn = ""
+            in_group = None
+            ad_err = ""
+
+            if inn:
+                try:
+                    ad = ad_find_by_employee_id(inn)
+                    if ad:
+                        ad_dn, ad_attrs = ad
+                        ad_found = True
+                        sam = ad_attrs.get("sAMAccountName", [b""])
+                        ad_login = (sam[0].decode("utf-8", "ignore") if sam else "")
+                        in_group = ad_is_in_group(ad_attrs, group_dn)
+                    else:
+                        ad_err = "Не найден в AD по employeeID."
+                except Exception as e:
+                    ad_err = str(e)
+            else:
+                ad_err = f"В Bitrix не заполнено поле {BITRIX_INN_FIELD}."
+
+            fio = " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x])
+
+            rows.append({
+                "bitrix_id": uid,
+                "fio": fio,
+                "bitrix_login": u.get("LOGIN") or "",
+                "inn": inn,
+                "ad_found": ad_found,
+                "ad_login": ad_login,
+                "ad_dn": ad_dn,
+                "vpn_open": bool(in_group) if in_group is not None else False,
+                "vpn_known": (in_group is not None),
+                "ad_err": ad_err,
+            })
+
+        dept_blocks.append({
+            "dept_id": did,
+            "dept_title": dept_title,
+            "rows": rows,
+        })
+
+    return render(request, "frostapp/vpn_users.html", {
+        "error": "",
+        "dept_blocks": dept_blocks,
+        "sid": str(sess.id),
+        "csrf": get_token(request),
+        "group_cn": VPN_GROUP_CN,
+    })
+
+
+@require_http_methods(["POST"])
+@csrf_protect
+def vpn_ui_toggle(request):
+    # ajax: sid + inn + desired (1/0)
+    try:
+        sess = _get_session_or_403(request, must_verified=True)
+    except Exception:
+        return JsonResponse({"ok": False, "error": "NO_SESSION"}, status=403)
+
+    inn = re.sub(r"\D+", "", (request.POST.get("inn") or "").strip())
+    desired = (request.POST.get("desired") or "").strip()  # "1" или "0"
+
+    if not inn:
+        return JsonResponse({"ok": False, "error": "NO_INN"}, status=400)
+    if desired not in ("0", "1"):
+        return JsonResponse({"ok": False, "error": "BAD_DESIRED"}, status=400)
+
+    # group dn
+    conn = None
+    try:
+        conn = _ad_connect()
+        group_dn = ad_find_group_dn(conn, VPN_GROUP_CN)
+        if not group_dn:
+            return JsonResponse({"ok": False, "error": f"GROUP_NOT_FOUND:{VPN_GROUP_CN}"}, status=500)
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+    # user dn
+    ad = ad_find_by_employee_id(inn)
+    if not ad:
+        return JsonResponse({"ok": False, "error": "AD_USER_NOT_FOUND"}, status=404)
+
+    user_dn, user_attrs = ad
+    currently = ad_is_in_group(user_attrs, group_dn)
+
+    try:
+        if desired == "1":
+            if currently:
+                return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
+            ad_group_add_member(group_dn, user_dn)
+            return JsonResponse({"ok": True, "changed": True, "vpn_open": True})
+
+        else:
+            if not currently:
+                return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
+            ad_group_remove_member(group_dn, user_dn)
+            return JsonResponse({"ok": True, "changed": True, "vpn_open": False})
+
+    except ldap.ALREADY_EXISTS:
+        return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
+    except ldap.NO_SUCH_ATTRIBUTE:
+        return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
