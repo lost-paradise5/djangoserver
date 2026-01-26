@@ -232,3 +232,29 @@ class QRIssueLog(models.Model):
     class Meta:
         managed = False
         db_table = 'qr_issue_logs'
+
+
+class VpnAccessSession(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    status = models.CharField(max_length=16) 
+    ad_login = models.CharField(max_length=128)
+    ad_user_dn = models.TextField(null=True, blank=True)
+    inn = models.CharField(max_length=12, null=True, blank=True)
+    bitrix_user_id = models.IntegerField(null=True, blank=True)
+    head_department_ids = models.JSONField(null=True, blank=True)
+
+    pin_salt = models.CharField(max_length=32)
+    pin_hash = models.CharField(max_length=64)
+    pin_attempts = models.IntegerField(default=0)
+
+    created_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    ip = models.CharField(max_length=64, null=True, blank=True)
+    user_agent = models.TextField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "vpn_access_sessions"
