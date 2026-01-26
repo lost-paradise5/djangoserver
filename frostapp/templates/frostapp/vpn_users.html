@@ -9,9 +9,13 @@
 <body class="bg-light">
 <div class="container py-4">
 
-  <div class="d-flex justify-content-between align-items-center mb-3">
-    <h4 class="m-0">Удалённый доступ (группа: <code>{{ group_cn }}</code>)</h4>
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <h4 class="m-0">Удалённый доступ</h4>
     <a class="btn btn-outline-secondary btn-sm" href="{% url 'vpn_ui_login' %}">Выйти</a>
+  </div>
+
+  <div class="text-muted mb-3">
+    Вы авторизованы как <b>{{ auth_fio }}</b>
   </div>
 
   {% if error %}
@@ -21,16 +25,16 @@
   {% for b in dept_blocks %}
     <div class="card mb-3 shadow-sm">
       <div class="card-header">
-        <b>{{ b.dept_title }}</b>
-        <span class="text-muted"> (ID: {{ b.dept_id }})</span>
+        <b>Отдел {{ b.dept_title }}</b>
       </div>
+
       <div class="card-body p-0">
         <div class="table-responsive">
           <table class="table table-sm table-striped align-middle m-0">
             <thead class="table-light">
               <tr>
                 <th>ФИО</th>
-                <th>Битрикс</th>
+                <th>Должность</th>
                 <th>ИНН</th>
                 <th>AD</th>
                 <th class="text-end">Доступ</th>
@@ -40,7 +44,7 @@
             {% for r in b.rows %}
               <tr data-inn="{{ r.inn }}">
                 <td>{{ r.fio }}</td>
-                <td><code>{{ r.bitrix_login }}</code></td>
+                <td class="text-muted">{{ r.position|default_if_none:"" }}</td>
                 <td><code>{{ r.inn }}</code></td>
                 <td>
                   {% if r.ad_found %}
@@ -113,8 +117,7 @@
         const js = await resp.json();
         if (!js.ok) {
           alert("Ошибка: " + (js.error || "unknown"));
-          // откат
-          e.target.checked = !e.target.checked;
+          e.target.checked = !e.target.checked; // откат
         } else {
           state.textContent = js.vpn_open ? "Открыт" : "Закрыт";
         }
