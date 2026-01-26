@@ -294,7 +294,21 @@ def bitrix_send_pin(user_id: int, pin: str):
     msg = f"ПИН-код для входа в контроль удаленного доступа: {pin}. Срок действия: {VPN_PIN_TTL_MIN} минут."
     _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": user_id, "MESSAGE": msg})
 
-
+def _bx_is_active(user: dict) -> bool:
+    """
+    Bitrix: ACTIVE может прилетать как true/false, 1/0, Y/N, пусто.
+    Считаем НЕактивным только явные "0/false/N".
+    Пусто/None -> активный (как ты и просил).
+    """
+    v = user.get("ACTIVE", None)
+    if v is None:
+        return True
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip()
+    if s == "":
+        return True
+    return s.lower() not in ("0", "false", "n", "no", "off")
 # =========================
 # Helpers: departments tree
 # =========================
@@ -654,21 +668,43 @@ def vpn_ui_users(request):
     if not head_dept_ids:
         return HttpResponseForbidden("Нет прав.")
 
-    # department tree
+    #  Кто авторизовался (ФИО) 
+    auth_fio = sess.ad_login
+    try:
+        me = bitrix_user_get_all(
+            filter_dict={"ID": int(sess.bitrix_user_id)},
+            select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME"],
+        )
+        if me:
+            u0 = me[0]
+            auth_fio = " ".join([x for x in [u0.get("LAST_NAME"), u0.get("NAME"), u0.get("SECOND_NAME")] if x]).strip() or auth_fio
+    except Exception:
+        pass
+
+    #  department tree 
     depts = bitrix_get_departments()
     by_id, children = _dept_index(depts)
 
     all_dept_ids = _dept_descendants([int(x) for x in head_dept_ids], children)
 
-    # Bitrix users by departments
+    #  Bitrix users by departments 
     users_by_dept: dict[int, list[dict]] = {}
     all_users_map: dict[int, dict] = {}
 
     for did in all_dept_ids:
         bx_users = bitrix_user_get_all(
             filter_dict={"UF_DEPARTMENT": did},
-            select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME", "LOGIN", "UF_DEPARTMENT", BITRIX_INN_FIELD],
+            select_list=[
+                "ID", "NAME", "LAST_NAME", "SECOND_NAME",
+                "ACTIVE", "WORK_POSITION",
+                "UF_DEPARTMENT",
+                BITRIX_INN_FIELD,
+            ],
         )
+
+        # показываем только активных (ACTIVE: true/false, 1/0, Y/N, пусто)
+        bx_users = [u for u in bx_users if _bx_is_active(u)]
+
         users_by_dept[did] = bx_users
         for u in bx_users:
             try:
@@ -676,19 +712,30 @@ def vpn_ui_users(request):
             except Exception:
                 pass
 
-    # Добавим руководителей отделов (на случай если не попали в user.get по UF_DEPARTMENT)
+    #  Добавим руководителей отделов (если не попали в user.get по UF_DEPARTMENT) 
     for did in all_dept_ids:
         d = by_id.get(did)
         if not d:
             continue
         hid = _dept_head_id(d)
         if hid and hid not in all_users_map:
-            extra = bitrix_user_get_all(filter_dict={"ID": hid}, select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME", "LOGIN", "UF_DEPARTMENT", BITRIX_INN_FIELD])
-            if extra:
-                all_users_map[int(extra[0]["ID"])] = extra[0]
+            extra = bitrix_user_get_all(
+                filter_dict={"ID": hid},
+                select_list=[
+                    "ID", "NAME", "LAST_NAME", "SECOND_NAME",
+                    "ACTIVE", "WORK_POSITION",
+                    "UF_DEPARTMENT",
+                    BITRIX_INN_FIELD,
+                ],
+            )
+            if extra and _bx_is_active(extra[0]):
+                try:
+                    all_users_map[int(extra[0]["ID"])] = extra[0]
+                except Exception:
+                    pass
                 users_by_dept.setdefault(did, []).append(extra[0])
 
-    # AD group DN (один раз)
+    #  AD group DN (один раз) 
     group_dn = None
     conn = None
     try:
@@ -707,17 +754,19 @@ def vpn_ui_users(request):
             "dept_blocks": [],
             "sid": str(sess.id),
             "csrf": get_token(request),
+            "group_cn": VPN_GROUP_CN,
+            "auth_fio": auth_fio,
         })
 
-    # Собираем отображаемые строки
+    #  Собираем отображаемые строки 
     dept_blocks = []
     for did in all_dept_ids:
         d = by_id.get(did)
-        dept_title = _dept_name(d) if d else f"Отдел {did}"
+        dept_title = _dept_name(d) if d else f"{did}"
 
         rows = []
-        # дедуп пользователей в отделе
         seen_uids = set()
+
         for u in users_by_dept.get(did, []):
             try:
                 uid = int(u.get("ID"))
@@ -729,6 +778,8 @@ def vpn_ui_users(request):
 
             inn = (u.get(BITRIX_INN_FIELD) or "").strip()
             inn = re.sub(r"\D+", "", inn)
+
+            position = (u.get("WORK_POSITION") or "").strip()
 
             ad_found = False
             ad_login = ""
@@ -752,12 +803,12 @@ def vpn_ui_users(request):
             else:
                 ad_err = f"В Bitrix не заполнено поле {BITRIX_INN_FIELD}."
 
-            fio = " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x])
+            fio = " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x]).strip()
 
             rows.append({
                 "bitrix_id": uid,
                 "fio": fio,
-                "bitrix_login": u.get("LOGIN") or "",
+                "position": position,
                 "inn": inn,
                 "ad_found": ad_found,
                 "ad_login": ad_login,
@@ -779,6 +830,7 @@ def vpn_ui_users(request):
         "sid": str(sess.id),
         "csrf": get_token(request),
         "group_cn": VPN_GROUP_CN,
+        "auth_fio": auth_fio,
     })
 
 
