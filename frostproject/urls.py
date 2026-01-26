@@ -46,7 +46,8 @@ from frostapp.views import (
     vpn_ui_login,
     vpn_ui_pin,
     vpn_ui_users,
-    vpn_ui_toggle
+    vpn_ui_toggle,
+    ad_ui_lookup
 )
 
 urlpatterns = [
@@ -85,4 +86,5 @@ urlpatterns = [
     path("ui/vpn/pin/", vpn_ui_pin, name="vpn_ui_pin"),
     path("ui/vpn/users/", vpn_ui_users, name="vpn_ui_users"),
     path("ui/vpn/toggle/", vpn_ui_toggle, name="vpn_ui_toggle"),
+    path("ui/ad/lookup/", ad_ui_lookup, name="ad_ui_lookup"),
 ]
