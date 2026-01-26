@@ -42,6 +42,7 @@ from frostapp.views import (
     sm_staff_list_by_db,
     sm_staff_ui_list,
     sm_staff_ui_edit_inn,
+    sm_staff_ui_sync_inn_one,
 )
 
 urlpatterns = [
@@ -75,4 +76,5 @@ urlpatterns = [
     re_path(r'^ui/smstaff/(?P<db>[^/]+)/edit/(?P<staff_id>-?\d+)/$', 
             sm_staff_ui_edit_inn, 
             name='sm_staff_ui_edit_inn'),
+    path('ui/smstaff/sync-inn-one/', sm_staff_ui_sync_inn_one, name='sm_staff_ui_sync_inn_one'),
 ]
