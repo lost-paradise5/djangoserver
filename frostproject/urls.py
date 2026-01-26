@@ -43,6 +43,10 @@ from frostapp.views import (
     sm_staff_ui_list,
     sm_staff_ui_edit_inn,
     sm_staff_ui_sync_inn_one,
+    vpn_ui_login,
+    vpn_ui_pin,
+    vpn_ui_users,
+    vpn_ui_toggle
 )
 
 urlpatterns = [
@@ -77,4 +81,8 @@ urlpatterns = [
             sm_staff_ui_edit_inn, 
             name='sm_staff_ui_edit_inn'),
     path('ui/smstaff/sync-inn-one/', sm_staff_ui_sync_inn_one, name='sm_staff_ui_sync_inn_one'),
+    path("ui/vpn/", vpn_ui_login, name="vpn_ui_login"),
+    path("ui/vpn/pin/", vpn_ui_pin, name="vpn_ui_pin"),
+    path("ui/vpn/users/", vpn_ui_users, name="vpn_ui_users"),
+    path("ui/vpn/toggle/", vpn_ui_toggle, name="vpn_ui_toggle"),
 ]
