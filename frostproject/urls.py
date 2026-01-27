@@ -47,7 +47,12 @@ from frostapp.views import (
     vpn_ui_pin,
     vpn_ui_users,
     vpn_ui_toggle,
-    ad_ui_lookup
+    ad_ui_lookup,
+    ldap_tools_home,
+    ldap_tools_employees,
+    ldap_tools_sync_page,
+    ldap_tools_sync_stream,
+    ldap_tools_sync_log_download,
 )
 
 urlpatterns = [
@@ -87,4 +92,16 @@ urlpatterns = [
     path("ui/vpn/users/", vpn_ui_users, name="vpn_ui_users"),
     path("ui/vpn/toggle/", vpn_ui_toggle, name="vpn_ui_toggle"),
     path("ui/ad/lookup/", ad_ui_lookup, name="ad_ui_lookup"),
+
+    path("ui/ldap-tools/", ldap_tools_home, name="ldap_tools_home"),
+    path("ui/ldap-tools/employees/", ldap_tools_employees, name="ldap_tools_employees"),
+
+    # страница запуска (test/apply)
+    path("ui/ldap-tools/sync/<str:mode>/", ldap_tools_sync_page, name="ldap_tools_sync_page"),
+
+    # SSE поток прогресса
+    path("ui/ldap-tools/sync/<str:mode>/stream/", ldap_tools_sync_stream, name="ldap_tools_sync_stream"),
+
+    # скачать лог
+    path("ui/ldap-tools/sync/log/<str:filename>/", ldap_tools_sync_log_download, name="ldap_tools_sync_log_download"),
 ]
