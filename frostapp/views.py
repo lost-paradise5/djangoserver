@@ -200,7 +200,6 @@ _INN_RE = re.compile(r"^\d{10}(\d{2})?$")
 LDAP_TOOLS_PAGE_SIZE = int(os.getenv("LDAP_TOOLS_PAGE_SIZE", "200"))
 LDAP_EXPORT_PAGE_SIZE = int(os.getenv("LDAP_EXPORT_PAGE_SIZE", "500"))
 LDAP_EXPORT_MAX_TOTAL = int(os.getenv("LDAP_EXPORT_MAX_TOTAL", "20000"))
-INN_SYNC_LOCK_FILE = os.path.join(LOG_DIR, "inn_sync.lock")
 # =========================
 # Helpers: hashing/pin/session
 # =========================
@@ -1375,7 +1374,7 @@ SSH_UKM5_PASSWORD      = os.getenv("SSH_UKM5_PASSWORD", "xxxxxx")
 POS_SSH_PORT = int(os.getenv("POS_SSH_PORT", "22"))
 POS_REBOOT_ALLOWED_NETS_RAW = os.getenv("POS_REBOOT_ALLOWED_NETS", "10.0.0.0/8,192.168.0.0/16") 
 
-
+INN_SYNC_LOCK_FILE = os.path.join(LOG_DIR, "inn_sync.lock")
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
