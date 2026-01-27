@@ -14,9 +14,11 @@ import uuid
 import pymysql
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
+from django.conf import settings
 import cx_Oracle
 import re   
 from django.http import JsonResponse, HttpResponseForbidden
+from django.http import StreamingHttpResponse, FileResponse, HttpResponse
 from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
@@ -30,10 +32,12 @@ from pathlib import Path
 from django.shortcuts import render, redirect
 from django.contrib.admin.views.decorators import staff_member_required
 from django.views.decorators.http import require_http_methods
+from django.views.decorators.cache import never_cache
 from django.urls import reverse
 from django.utils.http import urlencode
 from django.views.decorators.csrf import csrf_protect
 from django.middleware.csrf import get_token
+from ldap.controls.simple import SimplePagedResultsControl
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession
 
@@ -189,7 +193,14 @@ VPN_SESSION_TTL_MIN = int(os.getenv("VPN_SESSION_TTL_MIN", "60"))
 VPN_MAX_PIN_ATTEMPTS = int(os.getenv("VPN_MAX_PIN_ATTEMPTS", "5"))
 _INN_RE = re.compile(r"^\d{10}(\d{2})?$")
 
+# =========================
+# UI: LDAP Tools (employees + sync employeeID from 1C)
+# =========================
 
+LDAP_TOOLS_PAGE_SIZE = int(os.getenv("LDAP_TOOLS_PAGE_SIZE", "200"))
+LDAP_EXPORT_PAGE_SIZE = int(os.getenv("LDAP_EXPORT_PAGE_SIZE", "500"))
+LDAP_EXPORT_MAX_TOTAL = int(os.getenv("LDAP_EXPORT_MAX_TOTAL", "20000"))
+INN_SYNC_LOCK_FILE = os.path.join(LOG_DIR, "inn_sync.lock")
 # =========================
 # Helpers: hashing/pin/session
 # =========================
@@ -8194,3 +8205,483 @@ def sm_staff_ui_sync_inn_one(request):
             if conn: conn.close()
         except Exception:
             pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _uac_is_disabled(uac_val) -> bool:
+    try:
+        uac = int(uac_val)
+        return bool(uac & 0x0002)
+    except Exception:
+        return False
+
+
+def _ad_decode_first(attrs: dict, key: str) -> str:
+    vals = (attrs or {}).get(key, []) or []
+    if not vals:
+        return ""
+    v = vals[0]
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "ignore")
+    return str(v)
+
+
+def _norm_fio_for_match(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("ё", "е")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _fio_from_api_row(row: dict) -> tuple[str, str, str]:
+    # ключи русские, но на всякий случай подстрахуемся
+    ln = (row.get("Фамилия") or row.get("lastname") or row.get("LastName") or "").strip()
+    fn = (row.get("Имя") or row.get("firstname") or row.get("FirstName") or "").strip()
+    sn = (row.get("Отчество") or row.get("patronymic") or row.get("SecondName") or "").strip()
+    return ln, fn, sn
+
+
+def _inn_from_api_row(row: dict) -> str:
+    inn = (row.get("ИНН") or row.get("inn") or row.get("INN") or "").strip()
+    inn = re.sub(r"\D+", "", inn)
+    return inn
+
+
+def _build_candidate_logins_dot(lastname: str, firstname: str, patronymic: str) -> list[str]:
+    """
+    Как _build_candidate_logins, но логины с точками.
+    Плюс добавим ещё несколько частых комбинаций.
+    """
+    base = _build_candidate_logins(lastname, firstname, patronymic)  # вида i_ivanov, ivan_ivanov, ...
+    out = set()
+
+    # 1) заменяем '_' -> '.'
+    for x in base:
+        out.add(x.replace("_", "."))
+
+    # 2) дополнительные варианты (на практике часто встречаются)
+    ln = _normalize_login_piece(lastname)   # даст безопасный кусок
+    fn = _normalize_login_piece(firstname)
+    sn = _normalize_login_piece(patronymic)
+
+    if fn and ln:
+        out.add(f"{fn[0]}.{ln}")        # i.ivanov
+        out.add(f"{fn}.{ln}")          # ivan.ivanov
+        out.add(f"{ln}.{fn[0]}")       # ivanov.i
+        out.add(f"{ln}.{fn}")          # ivanov.ivan
+        out.add(f"{fn[0]}{ln}")        # iivanov (иногда)
+        out.add(f"{fn}{ln}")           # ivanivanov (иногда)
+
+        if sn:
+            out.add(f"{fn[0]}.{sn[0]}.{ln}")   # i.i.ivanov
+            out.add(f"{fn}.{sn[0]}.{ln}")      # ivan.i.ivanov
+            out.add(f"{fn[0]}.{sn}.{ln}")      # i.ivanych.ivanov (редко, но бывает)
+
+    # 3) подчистим пустое
+    out = {x for x in out if x and "." in x or x}  # оставим даже без точки варианты
+    return sorted(out)
+
+
+def _ad_find_by_sam(conn, sam: str, attrs: list[str]) -> list[tuple[str, dict]]:
+    f = f"(sAMAccountName={escape_filter_chars(sam)})"
+    res = conn.search_s(AD_SEARCH_BASE, ldap.SCOPE_SUBTREE, f, attrlist=attrs)
+    return [x for x in res if x and x[0]]
+
+
+def _ad_set_employeeid(conn, user_dn: str, inn: str) -> tuple[bool, str]:
+    """
+    Возвращает (changed, message)
+    """
+    inn = re.sub(r"\D+", "", (inn or "").strip())
+    if not _is_valid_inn_digits(inn):
+        return False, "BAD_INN"
+
+    # читаем текущий
+    cur = conn.search_s(user_dn, ldap.SCOPE_BASE, "(objectClass=*)", attrlist=["employeeID"])
+    cur = [x for x in cur if x and x[0]]
+    current = ""
+    if cur:
+        current = _ad_decode_first(cur[0][1], "employeeID").strip()
+        current = re.sub(r"\D+", "", current)
+
+    if current == inn:
+        return False, "UNCHANGED"
+
+    conn.modify_s(user_dn, [(ldap.MOD_REPLACE, "employeeID", [inn.encode("utf-8")])])
+    return True, f"UPDATED {current or '(empty)'} -> {inn}"
+
+
+def _acquire_sync_lock() -> bool:
+    try:
+        fd = os.open(INN_SYNC_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return False
+
+
+def _release_sync_lock():
+    try:
+        if os.path.exists(INN_SYNC_LOCK_FILE):
+            os.remove(INN_SYNC_LOCK_FILE)
+    except Exception:
+        pass
+
+
+def _one_c_get_working_employees() -> list[dict]:
+    r = requests.get(ONEC_WORKING_EMPLOYEES_URL, timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT)
+    r.raise_for_status()
+    js = r.json()
+    if not isinstance(js, list):
+        raise RuntimeError("1C API вернул не список.")
+    return js
+
+
+@require_http_methods(["GET"])
+@csrf_protect
+def ldap_tools_home(request):
+    return render(request, "frostapp/ldap_tools_home.html", {})
+
+
+@require_http_methods(["GET"])
+@csrf_protect
+def ldap_tools_employees(request):
+    """
+    Показываем сотрудников из LDAP.
+    Чтобы не убить сервер - таблица по основным полям + поиск.
+    Для "все поля" используем твою страницу ad_ui_lookup (с редактированием employeeID).
+    """
+    q = (request.GET.get("q") or "").strip()
+    page = int(request.GET.get("page") or "1")
+    if page < 1:
+        page = 1
+
+    conn = None
+    users = []
+    error = ""
+
+    try:
+        conn = _ad_connect()
+
+        # фильтр: пользователи (не компьютеры). Поиск по логину - подстрока.
+        if q:
+            q_esc = escape_filter_chars(q)
+            flt = f"(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*{q_esc}*))"
+        else:
+            flt = "(&(objectClass=user)(!(objectClass=computer)))"
+
+        attrs = [
+            "sAMAccountName", "displayName", "employeeID", "mail",
+            "title", "department", "whenChanged", "userAccountControl",
+            "distinguishedName",
+        ]
+
+        # Пэйджинг LDAP
+        page_size = LDAP_EXPORT_PAGE_SIZE
+        cookie = b""
+        total = 0
+
+        while True:
+            ctrl = SimplePagedResultsControl(True, size=page_size, cookie=cookie)
+            msgid = conn.search_ext(
+                AD_SEARCH_BASE,
+                ldap.SCOPE_SUBTREE,
+                flt,
+                attrlist=attrs,
+                serverctrls=[ctrl],
+            )
+            rtype, rdata, rmsgid, serverctrls = conn.result3(msgid)
+
+            for dn, at in rdata:
+                if not dn:
+                    continue
+                total += 1
+                if total > LDAP_EXPORT_MAX_TOTAL:
+                    break
+
+                sam = _ad_decode_first(at, "sAMAccountName")
+                disp = _ad_decode_first(at, "displayName")
+                emp = re.sub(r"\D+", "", _ad_decode_first(at, "employeeID"))
+                mail = _ad_decode_first(at, "mail")
+                title = _ad_decode_first(at, "title")
+                dept = _ad_decode_first(at, "department")
+                uac = _ad_decode_first(at, "userAccountControl")
+                disabled = _uac_is_disabled(uac)
+
+                users.append({
+                    "dn": dn,
+                    "sam": sam,
+                    "displayName": disp,
+                    "employeeID": emp,
+                    "mail": mail,
+                    "title": title,
+                    "department": dept,
+                    "disabled": disabled,
+                })
+
+            if total > LDAP_EXPORT_MAX_TOTAL:
+                break
+
+            cookie = b""
+            for sc in serverctrls:
+                if sc.controlType == SimplePagedResultsControl.controlType:
+                    cookie = sc.cookie
+                    break
+            if not cookie:
+                break
+
+    except Exception as e:
+        error = str(e)
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+    # Пагинация уже на нашей стороне (users может быть большим)
+    page_size = LDAP_TOOLS_PAGE_SIZE
+    total = len(users)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_users = users[start:end]
+    pages = max(1, (total + page_size - 1) // page_size)
+
+    return render(request, "frostapp/ldap_employees.html", {
+        "error": error,
+        "q": q,
+        "users": page_users,
+        "page": page,
+        "pages": pages,
+        "total": total,
+        "page_size": page_size,
+    })
+
+
+@require_http_methods(["GET"])
+@csrf_protect
+def ldap_tools_sync_page(request, mode: str):
+    mode = (mode or "").lower()
+    if mode not in ("test", "apply"):
+        return HttpResponse("BAD MODE", status=400)
+    return render(request, "frostapp/ldap_sync.html", {
+        "mode": mode,
+        "is_apply": (mode == "apply"),
+    })
+
+
+@never_cache
+@require_http_methods(["GET"])
+def ldap_tools_sync_stream(request, mode: str):
+    """
+    SSE: отдаём прогресс строками.
+    mode=test -> dry-run (не изменяем employeeID)
+    mode=apply -> реально пишем employeeID
+    """
+    mode = (mode or "").lower()
+    if mode not in ("test", "apply"):
+        return HttpResponse("BAD MODE", status=400)
+
+    apply_changes = (mode == "apply")
+
+    def sse(line: str) -> str:
+        line = (line or "").rstrip("\n")
+        return f"data: {line}\n\n"
+
+    def run():
+        # lock чтобы два запуска не били AD одновременно
+        if not _acquire_sync_lock():
+            yield sse("❌ Уже идёт запуск синхронизации (lock). Повторите позже.")
+            return
+
+        ts = timezone.localtime(timezone.now()).strftime("%Y%m%d_%H%M%S")
+        filename = f"inn_sync_{mode}_{ts}.log"
+        log_path = os.path.join(LOG_DIR, filename)
+
+        def log_write(msg: str):
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg.rstrip("\n") + "\n")
+
+        try:
+            yield sse(f"🚀 Старт: mode={mode}")
+            yield sse(f"📝 Лог: /ui/ldap-tools/sync/log/{filename}/")
+            log_write(f"START mode={mode} at {ts}")
+
+            # 1) грузим сотрудников из 1С
+            yield sse("⏳ Загружаю список сотрудников из 1С...")
+            rows = _one_c_get_working_employees()
+            yield sse(f"✅ 1С вернул записей: {len(rows)}")
+            log_write(f"1C rows: {len(rows)}")
+
+            conn = None
+            try:
+                conn = _ad_connect()
+                yield sse("✅ Подключение к LDAP установлено")
+                log_write("LDAP connected")
+
+                attrs = ["displayName", "employeeID", "sAMAccountName", "distinguishedName"]
+
+                ok = 0
+                skipped = 0
+                notfound = 0
+                ambiguous = 0
+                errors = 0
+                changed = 0
+                unchanged = 0
+
+                for i, row in enumerate(rows, start=1):
+                    inn = _inn_from_api_row(row)
+                    ln, fn, sn = _fio_from_api_row(row)
+
+                    fio_api = " ".join([x for x in [ln, fn, sn] if x]).strip()
+                    if not fio_api or not _is_valid_inn_digits(inn):
+                        skipped += 1
+                        msg = f"[{i}] SKIP: bad data fio='{fio_api}' inn='{inn}'"
+                        yield sse(msg)
+                        log_write(msg)
+                        continue
+
+                    # кандидаты логинов
+                    candidates = _build_candidate_logins_dot(ln, fn, sn)
+
+                    # ищем в AD по логинам + проверяем displayName
+                    matches = []
+                    for sam in candidates:
+                        try:
+                            found = _ad_find_by_sam(conn, sam, attrs)
+                            for dn, at in found:
+                                disp = _ad_decode_first(at, "displayName")
+                                sam_real = _ad_decode_first(at, "sAMAccountName")
+                                matches.append((dn, at, sam_real, disp, sam))
+                        except Exception:
+                            continue
+
+                    if not matches:
+                        notfound += 1
+                        msg = f"[{i}] NOT FOUND: {fio_api} inn={inn} candidates={','.join(candidates[:8])}{'...' if len(candidates)>8 else ''}"
+                        yield sse(msg)
+                        log_write(msg)
+                        continue
+
+                    # фильтрация по displayName
+                    target_disp = _norm_fio_for_match(fio_api)
+                    exact = []
+                    for dn, at, sam_real, disp, sam_try in matches:
+                        if _norm_fio_for_match(disp) == target_disp:
+                            exact.append((dn, at, sam_real, disp, sam_try))
+
+                    chosen = None
+                    if len(exact) == 1:
+                        chosen = exact[0]
+                    elif len(exact) > 1:
+                        ambiguous += 1
+                        msg = f"[{i}] AMBIGUOUS(displayName): {fio_api} inn={inn} -> {len(exact)} accounts"
+                        yield sse(msg)
+                        log_write(msg)
+                        continue
+                    else:
+                        # нет совпадения displayName -> неоднозначно/неверно
+                        ambiguous += 1
+                        msg = f"[{i}] AMBIGUOUS(no displayName match): {fio_api} inn={inn} found={len(matches)}"
+                        yield sse(msg)
+                        log_write(msg)
+                        continue
+
+                    dn, at, sam_real, disp, sam_try = chosen
+                    cur_emp = re.sub(r"\D+", "", _ad_decode_first(at, "employeeID"))
+                    info = f"[{i}] MATCH: {fio_api} -> {sam_real} (try={sam_try}) current_employeeID={cur_emp or '(empty)'} inn={inn}"
+                    yield sse(info)
+                    log_write(info)
+
+                    # обновление
+                    try:
+                        if apply_changes:
+                            ch, m = _ad_set_employeeid(conn, dn, inn)
+                            if m == "UNCHANGED":
+                                unchanged += 1
+                                msg = f"[{i}] OK: UNCHANGED"
+                            else:
+                                changed += 1 if ch else 0
+                                msg = f"[{i}] OK: {m}"
+                            yield sse(msg)
+                            log_write(msg)
+                        else:
+                            # dry-run
+                            if cur_emp == inn:
+                                unchanged += 1
+                                msg = f"[{i}] DRY-RUN: already OK"
+                            else:
+                                changed += 1
+                                msg = f"[{i}] DRY-RUN: would update {cur_emp or '(empty)'} -> {inn}"
+                            yield sse(msg)
+                            log_write(msg)
+
+                        ok += 1
+
+                    except ldap.INSUFFICIENT_ACCESS:
+                        errors += 1
+                        msg = f"[{i}] ERROR: INSUFFICIENT_ACCESS (нет прав на employeeID) dn={dn}"
+                        yield sse(msg)
+                        log_write(msg)
+                    except Exception as e:
+                        errors += 1
+                        msg = f"[{i}] ERROR: {str(e)} dn={dn}"
+                        yield sse(msg)
+                        log_write(msg)
+
+                    if i % 50 == 0:
+                        yield sse(f"… прогресс: {i}/{len(rows)} | ok={ok} notfound={notfound} ambiguous={ambiguous} errors={errors}")
+
+                summary = (
+                    f"🏁 ГОТОВО mode={mode} | total={len(rows)} | ok={ok} | skipped={skipped} | "
+                    f"notfound={notfound} | ambiguous={ambiguous} | errors={errors} | "
+                    f"changed={changed} | unchanged={unchanged}"
+                )
+                yield sse(summary)
+                log_write(summary)
+
+            finally:
+                try:
+                    if conn:
+                        conn.unbind_s()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            msg = f"❌ FATAL: {str(e)}"
+            yield sse(msg)
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+        finally:
+            _release_sync_lock()
+
+    resp = StreamingHttpResponse(run(), content_type="text/event-stream; charset=utf-8")
+    resp["Cache-Control"] = "no-cache"
+    resp["X-Accel-Buffering"] = "no"  # если будет nginx
+    return resp
+
+
+@require_http_methods(["GET"])
+def ldap_tools_sync_log_download(request, filename: str):
+    # простая защита от ../
+    filename = os.path.basename(filename)
+    path = os.path.join(LOG_DIR, filename)
+    if not os.path.exists(path):
+        return HttpResponse("NOT FOUND", status=404)
+    return FileResponse(open(path, "rb"), as_attachment=True, filename=filename)
