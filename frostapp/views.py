@@ -37,7 +37,16 @@ from django.urls import reverse
 from django.utils.http import urlencode
 from django.views.decorators.csrf import csrf_protect
 from django.middleware.csrf import get_token
-from ldap.controls.simple import SimplePagedResultsControl
+try:
+    from ldap.controls.simple import SimplePagedResultsControl
+except Exception:
+    try:
+        from ldap.controls.pagedresults import SimplePagedResultsControl
+    except Exception:
+        try:
+            from ldap.controls.libldap import SimplePagedResultsControl
+        except Exception:
+            SimplePagedResultsControl = None
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession
 
