@@ -8553,8 +8553,9 @@ def ldap_tools_sync_stream(request, mode: str):
                         log_write(msg)
                         continue
 
-                    # кандидаты логинов
+                    # кандидаты логинов (полный список)
                     candidates = _build_candidate_logins_dot(ln, fn, sn)
+                    candidates_str = ",".join(candidates)
 
                     # ищем в AD по логинам + проверяем displayName
                     matches = []
@@ -8570,7 +8571,10 @@ def ldap_tools_sync_stream(request, mode: str):
 
                     if not matches:
                         notfound += 1
-                        msg = f"[{i}] NOT FOUND: {fio_api} inn={inn} candidates={','.join(candidates[:8])}{'...' if len(candidates)>8 else ''}"
+                        msg = (
+                            f"[{i}] NOT FOUND: {fio_api} inn={inn} "
+                            f"candidates=[{candidates_str}]"
+                        )
                         yield sse(msg)
                         log_write(msg)
                         continue
@@ -8582,26 +8586,46 @@ def ldap_tools_sync_stream(request, mode: str):
                         if _norm_fio_for_match(disp) == target_disp:
                             exact.append((dn, at, sam_real, disp, sam_try))
 
+                    # 🔎 для лога: какие логины реально нашлись в AD
+                    found_sams = []
+                    for dn, at, sam_real, disp, sam_try in matches:
+                        found_sams.append(
+                            f"{sam_real}(try={sam_try},displayName='{disp}')"
+                        )
+                    found_str = "; ".join(found_sams)
+
                     chosen = None
                     if len(exact) == 1:
                         chosen = exact[0]
                     elif len(exact) > 1:
                         ambiguous += 1
-                        msg = f"[{i}] AMBIGUOUS(displayName): {fio_api} inn={inn} -> {len(exact)} accounts"
+                        msg = (
+                            f"[{i}] AMBIGUOUS(displayName): {fio_api} inn={inn} "
+                            f"exact={len(exact)} found_total={len(matches)} "
+                            f"found=[{found_str}] "
+                            f"candidates=[{candidates_str}]"
+                        )
                         yield sse(msg)
                         log_write(msg)
                         continue
                     else:
-                        # нет совпадения displayName -> неоднозначно/неверно
                         ambiguous += 1
-                        msg = f"[{i}] AMBIGUOUS(no displayName match): {fio_api} inn={inn} found={len(matches)}"
+                        msg = (
+                            f"[{i}] AMBIGUOUS(no displayName match): {fio_api} inn={inn} "
+                            f"found_total={len(matches)} "
+                            f"found=[{found_str}] "
+                            f"candidates=[{candidates_str}]"
+                        )
                         yield sse(msg)
                         log_write(msg)
                         continue
 
                     dn, at, sam_real, disp, sam_try = chosen
                     cur_emp = re.sub(r"\D+", "", _ad_decode_first(at, "employeeID"))
-                    info = f"[{i}] MATCH: {fio_api} -> {sam_real} (try={sam_try}) current_employeeID={cur_emp or '(empty)'} inn={inn}"
+                    info = (
+                        f"[{i}] MATCH: {fio_api} -> {sam_real} (try={sam_try}) "
+                        f"current_employeeID={cur_emp or '(empty)'} inn={inn}"
+                    )
                     yield sse(info)
                     log_write(info)
 
@@ -8613,7 +8637,8 @@ def ldap_tools_sync_stream(request, mode: str):
                                 unchanged += 1
                                 msg = f"[{i}] OK: UNCHANGED"
                             else:
-                                changed += 1 if ch else 0
+                                if ch:
+                                    changed += 1
                                 msg = f"[{i}] OK: {m}"
                             yield sse(msg)
                             log_write(msg)
@@ -8642,7 +8667,11 @@ def ldap_tools_sync_stream(request, mode: str):
                         log_write(msg)
 
                     if i % 50 == 0:
-                        yield sse(f"… прогресс: {i}/{len(rows)} | ok={ok} notfound={notfound} ambiguous={ambiguous} errors={errors}")
+                        yield sse(
+                            f"… прогресс: {i}/{len(rows)} | ok={ok} skipped={skipped} "
+                            f"notfound={notfound} ambiguous={ambiguous} errors={errors} "
+                            f"changed={changed} unchanged={unchanged}"
+                        )
 
                 summary = (
                     f"🏁 ГОТОВО mode={mode} | total={len(rows)} | ok={ok} | skipped={skipped} | "
@@ -8672,7 +8701,7 @@ def ldap_tools_sync_stream(request, mode: str):
 
     resp = StreamingHttpResponse(run(), content_type="text/event-stream; charset=utf-8")
     resp["Cache-Control"] = "no-cache"
-    resp["X-Accel-Buffering"] = "no"  # если будет nginx
+    resp["X-Accel-Buffering"] = "no"  
     return resp
 
 
