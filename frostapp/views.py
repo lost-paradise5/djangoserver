@@ -8360,8 +8360,9 @@ def ldap_tools_home(request):
 def ldap_tools_employees(request):
     """
     Показываем сотрудников из LDAP.
-    Чтобы не убить сервер - таблица по основным полям + поиск.
-    Для "все поля" используем твою страницу ad_ui_lookup (с редактированием employeeID).
+    Поиск теперь работает по:
+      - sAMAccountName (логин)
+      - displayName (ФИО)
     """
     q = (request.GET.get("q") or "").strip()
     page = int(request.GET.get("page") or "1")
@@ -8375,10 +8376,14 @@ def ldap_tools_employees(request):
     try:
         conn = _ad_connect()
 
-        # фильтр: пользователи (не компьютеры). Поиск по логину - подстрока.
+        # фильтр: пользователи (не компьютеры). Поиск по логину ИЛИ по displayName - подстрока.
         if q:
             q_esc = escape_filter_chars(q)
-            flt = f"(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*{q_esc}*))"
+            flt = (
+                "(&(objectClass=user)"
+                "(!(objectClass=computer))"
+                f"(|(sAMAccountName=*{q_esc}*)(displayName=*{q_esc}*)))"
+            )
         else:
             flt = "(&(objectClass=user)(!(objectClass=computer)))"
 
