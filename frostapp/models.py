@@ -258,3 +258,89 @@ class VpnAccessSession(models.Model):
     class Meta:
         managed = False
         db_table = "vpn_access_sessions"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class AdminBadgeRequest(models.Model):
+    STATUS_CHOICES = [
+        ("NEW", "NEW"),
+        ("STORE_SELECTED", "STORE_SELECTED"),
+        ("PENDING_ADMIN", "PENDING_ADMIN"),
+        ("ACCEPTED", "ACCEPTED"),
+        ("REJECTED", "REJECTED"),
+        ("EXPIRED", "EXPIRED"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default="NEW")
+
+    cashier_user_id = models.IntegerField()
+    cashier_tg_id = models.CharField(max_length=64)
+    cashier_full_name = models.CharField(max_length=255, blank=True, default="")
+
+    store_ids = models.JSONField(null=True, blank=True)   # jsonb
+    storeid = models.IntegerField(null=True, blank=True)
+
+    admin_user_id = models.IntegerField(null=True, blank=True)
+    admin_tg_id = models.CharField(max_length=64, null=True, blank=True)
+    admin_full_name = models.CharField(max_length=255, null=True, blank=True)
+
+    decision = models.CharField(max_length=16, null=True, blank=True) 
+    decided_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+
+    ip = models.CharField(max_length=64, null=True, blank=True)
+    user_agent = models.TextField(null=True, blank=True)
+
+    meta = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        db_table = "admin_badge_requests"
+        managed = False  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
