@@ -12,6 +12,7 @@ from ldap.filter import escape_filter_chars
 import datetime
 import uuid
 import pymysql
+import hmac
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from django.conf import settings
@@ -39,7 +40,7 @@ from django.views.decorators.csrf import csrf_protect
 from django.middleware.csrf import get_token
 from ldap.controls.libldap import SimplePagedResultsControl
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest
 
 _HEX = set("0123456789abcdefABCDEF")
 UKM5_FULL_XML_STORE_ID = 2013
@@ -60,6 +61,9 @@ def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
 
 UKM5_FULL_XML_STORE_IDS: set[int] = _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", "2013,9016,1003")
 TRM_ID_MAX = 2147483647
+
+BADGE_REQ_TTL_MINUTES = int(os.getenv("BADGE_REQ_TTL_MINUTES", "10"))
+TG_BOT_API_TOKEN = os.getenv("TG_BOT_API_TOKEN", "")
 
 TRM_SMALL_MIN = int(os.getenv("TRM_SMALL_MIN", "10000"))   
 TRM_SMALL_MAX = int(os.getenv("TRM_SMALL_MAX", "99999")) 
@@ -8718,3 +8722,605 @@ def ldap_tools_sync_log_download(request, filename: str):
     if not os.path.exists(path):
         return HttpResponse("NOT FOUND", status=404)
     return FileResponse(open(path, "rb"), as_attachment=True, filename=filename)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _client_ip_simple(request) -> str:
+    xff = request.META.get("HTTP_X_FORWARDED_FOR")
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.META.get("REMOTE_ADDR") or "").strip()
+
+
+def _require_bot_token(request) -> bool:
+    """
+    Если TG_BOT_API_TOKEN задан — требуем заголовок X-Bot-Token.
+    Если не задан — не требуем (но лучше задать).
+    """
+    if not TG_BOT_API_TOKEN:
+        return True
+    got = request.headers.get("X-Bot-Token") or request.META.get("HTTP_X_BOT_TOKEN") or ""
+    return hmac.compare_digest(str(got), str(TG_BOT_API_TOKEN))
+
+
+def _json_body_or_400(request):
+    try:
+        raw = request.body.decode("utf-8") if request.body else "{}"
+        data = json.loads(raw or "{}")
+        if not isinstance(data, dict):
+            return None, JsonResponse({"status": "error", "message": "JSON должен быть объектом"}, status=400)
+        return data, None
+    except Exception as e:
+        return None, JsonResponse({"status": "error", "message": f"Некорректный JSON: {e}"}, status=400)
+
+
+def _expire_old_badge_requests():
+    try:
+        now = timezone.now()
+        AdminBadgeRequest.objects.filter(
+            expires_at__lt=now
+        ).exclude(status__in=["ACCEPTED", "REJECTED", "EXPIRED"]).update(status="EXPIRED")
+    except Exception:
+        pass
+
+
+def _tg_send_message(chat_id: str, text: str, reply_markup: dict | None = None) -> bool:
+    """
+    Отправка сообщения в Telegram (можно с inline-кнопками).
+    """
+    chat_id = str(chat_id or "").strip()
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": (text or "").strip(),
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        js = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        return (r.status_code == 200 and js.get("ok") is True)
+    except Exception:
+        return False
+
+
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def tg_admin_badge_start(request):
+    """
+    1) Кассир нажимает "Запросить бейдж админа"
+    POST JSON: { "tg_id": "..." }
+    Ответ: { status, guid, stores:[...], cashier:{id, full_name, tg_id} }
+    """
+    if not _require_bot_token(request):
+        return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
+
+    _expire_old_badge_requests()
+
+    data, err = _json_body_or_400(request)
+    if err:
+        return err
+
+    tg_id = str(data.get("tg_id") or "").strip()
+    if not tg_id:
+        return JsonResponse({"status": "error", "message": "tg_id required"}, status=400)
+
+    user = User.objects.filter(tg_id=tg_id).first()
+    if not user:
+        send_telegram_log(
+            "\n".join([
+                "❌ ADMIN BADGE START: user not found",
+                f"tg_id={tg_id}",
+                f"ip={_client_ip_simple(request)}",
+                f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+            ])
+        )
+        return JsonResponse({"status": "error", "message": "USER_NOT_FOUND"}, status=404)
+
+    store_ids = list(
+        UKMUser.objects.filter(user_id=user.id)
+        .values_list("storeid", flat=True)
+        .distinct()
+    )
+    store_ids = [int(x) for x in store_ids if str(x).isdigit()]
+
+    if not store_ids:
+        send_telegram_log(
+            "\n".join([
+                "❌ ADMIN BADGE START: no ukm_users",
+                f"cashier_user_id={user.id}",
+                f"cashier_fio={user.full_name}",
+                f"cashier_tg_id={tg_id}",
+                f"ip={_client_ip_simple(request)}",
+                f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+            ])
+        )
+        return JsonResponse({"status": "error", "message": "NO_STORES"}, status=404)
+
+    now = timezone.now()
+    req = AdminBadgeRequest.objects.create(
+        status="NEW",
+        cashier_user_id=user.id,
+        cashier_tg_id=tg_id,
+        cashier_full_name=(user.full_name or "").strip(),
+        store_ids=store_ids,
+        storeid=None,
+        admin_user_id=None,
+        admin_tg_id=None,
+        admin_full_name=None,
+        decision=None,
+        decided_at=None,
+        expires_at=now + timezone.timedelta(minutes=BADGE_REQ_TTL_MINUTES),
+        ip=_client_ip_simple(request),
+        user_agent=(request.META.get("HTTP_USER_AGENT") or "")[:2000],
+        meta={"start_payload": data},
+    )
+
+    send_telegram_log(
+        "\n".join([
+            "🪪 ADMIN BADGE: START",
+            f"guid={req.id}",
+            f"cashier_user_id={user.id}",
+            f"cashier_fio={user.full_name}",
+            f"cashier_tg_id={tg_id}",
+            f"stores={store_ids}",
+            f"expires_at={timezone.localtime(req.expires_at).isoformat(sep=' ', timespec='seconds')}",
+            f"ip={req.ip}",
+        ])
+    )
+
+    return JsonResponse({
+        "status": "ok",
+        "guid": str(req.id),
+        "stores": store_ids,
+        "cashier": {
+            "id": user.id,
+            "full_name": (user.full_name or "").strip(),
+            "tg_id": tg_id,
+        },
+        "expires_at": timezone.localtime(req.expires_at).isoformat(sep=' ', timespec='seconds'),
+    })
+
+
+
+
+
+
+
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def tg_admin_badge_admins(request):
+    """
+    2) Кассир выбрал магазин
+    POST JSON: { "tg_id":"...", "guid":"...", "storeid": 514 }
+    Ответ: { status, guid, storeid, admins:[{id, tg_id, full_name, can_notify}] }
+    """
+    if not _require_bot_token(request):
+        return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
+
+    _expire_old_badge_requests()
+
+    data, err = _json_body_or_400(request)
+    if err:
+        return err
+
+    tg_id = str(data.get("tg_id") or "").strip()
+    guid = str(data.get("guid") or "").strip()
+    storeid_raw = data.get("storeid")
+
+    if not tg_id or not guid or storeid_raw is None:
+        return JsonResponse({"status": "error", "message": "tg_id, guid, storeid required"}, status=400)
+
+    try:
+        storeid = int(str(storeid_raw).strip())
+    except Exception:
+        return JsonResponse({"status": "error", "message": "BAD_STOREID"}, status=400)
+
+    try:
+        req = AdminBadgeRequest.objects.get(id=guid)
+    except Exception:
+        return JsonResponse({"status": "error", "message": "GUID_NOT_FOUND"}, status=404)
+
+    if req.status == "EXPIRED" or req.expires_at < timezone.now():
+        return JsonResponse({"status": "error", "message": "EXPIRED"}, status=410)
+
+    if str(req.cashier_tg_id) != tg_id:
+        return JsonResponse({"status": "error", "message": "NOT_YOUR_SESSION"}, status=403)
+
+    allowed_stores = req.store_ids or []
+    if storeid not in allowed_stores:
+        return JsonResponse({"status": "error", "message": "STORE_NOT_ALLOWED"}, status=403)
+
+    # Ищем админов: roleid 11 или 13 по этому storeid
+    admin_user_ids = list(
+        UKMUser.objects.filter(storeid=storeid, roleid__in=[11, 13])
+        .values_list("user_id", flat=True)
+        .distinct()
+    )
+    admin_user_ids = [int(x) for x in admin_user_ids if str(x).isdigit()]
+
+    admins = []
+    if admin_user_ids:
+        qs = User.objects.filter(id__in=admin_user_ids).order_by("full_name")
+        for u in qs:
+            tg_admin = str(getattr(u, "tg_id", "") or "").strip()
+            admins.append({
+                "id": u.id,
+                "tg_id": tg_admin,
+                "full_name": (u.full_name or "").strip(),
+                "can_notify": bool(tg_admin),
+            })
+
+    # сохраняем выбранный магазин
+    req.storeid = storeid
+    req.status = "STORE_SELECTED"
+    req.meta = {**(req.meta or {}), "admins_payload": data, "admins_count": len(admins)}
+    req.save(update_fields=["storeid", "status", "meta"])
+
+    send_telegram_log(
+        "\n".join([
+            "🪪 ADMIN BADGE: STORE SELECTED / ADMINS LIST",
+            f"guid={req.id}",
+            f"cashier_user_id={req.cashier_user_id}",
+            f"cashier_fio={req.cashier_full_name}",
+            f"cashier_tg_id={req.cashier_tg_id}",
+            f"storeid={storeid}",
+            f"admins_found={len(admins)} (roleid in 11,13)",
+            f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+        ])
+    )
+
+    return JsonResponse({
+        "status": "ok",
+        "guid": str(req.id),
+        "storeid": storeid,
+        "admins": admins,
+    })
+
+
+
+
+
+
+
+
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def tg_admin_badge_request(request):
+    """
+    3) Кассир выбрал администратора
+    POST JSON: { "tg_id":"cashier_tg", "guid":"...", "storeid":514, "admin_id":123 }
+    Ответ: { status, guid, message:"WAIT_ADMIN" }
+    """
+    if not _require_bot_token(request):
+        return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
+
+    _expire_old_badge_requests()
+
+    data, err = _json_body_or_400(request)
+    if err:
+        return err
+
+    tg_id = str(data.get("tg_id") or "").strip()
+    guid = str(data.get("guid") or "").strip()
+    storeid_raw = data.get("storeid")
+    admin_id_raw = data.get("admin_id")
+
+    if not tg_id or not guid or storeid_raw is None or admin_id_raw is None:
+        return JsonResponse({"status": "error", "message": "tg_id,guid,storeid,admin_id required"}, status=400)
+
+    try:
+        storeid = int(str(storeid_raw).strip())
+        admin_id = int(str(admin_id_raw).strip())
+    except Exception:
+        return JsonResponse({"status": "error", "message": "BAD_STOREID_OR_ADMIN_ID"}, status=400)
+
+    try:
+        req = AdminBadgeRequest.objects.get(id=guid)
+    except Exception:
+        return JsonResponse({"status": "error", "message": "GUID_NOT_FOUND"}, status=404)
+
+    if req.status == "EXPIRED" or req.expires_at < timezone.now():
+        return JsonResponse({"status": "error", "message": "EXPIRED"}, status=410)
+
+    if str(req.cashier_tg_id) != tg_id:
+        return JsonResponse({"status": "error", "message": "NOT_YOUR_SESSION"}, status=403)
+
+    if not req.storeid or int(req.storeid) != storeid:
+        return JsonResponse({"status": "error", "message": "STORE_NOT_SELECTED_OR_MISMATCH"}, status=400)
+
+    # проверим, что выбранный admin реально админ в этом storeid (role 11/13)
+    is_admin_here = UKMUser.objects.filter(
+        storeid=storeid, roleid__in=[11, 13], user_id=admin_id
+    ).exists()
+    if not is_admin_here:
+        return JsonResponse({"status": "error", "message": "ADMIN_NOT_IN_STORE_OR_BAD_ROLE"}, status=403)
+
+    admin_user = User.objects.filter(id=admin_id).first()
+    if not admin_user:
+        return JsonResponse({"status": "error", "message": "ADMIN_USER_NOT_FOUND"}, status=404)
+
+    admin_tg = str(getattr(admin_user, "tg_id", "") or "").strip()
+    if not admin_tg:
+        # нельзя уведомить — нет tg_id
+        send_telegram_log(
+            "\n".join([
+                "❌ ADMIN BADGE: ADMIN HAS NO TG_ID",
+                f"guid={req.id}",
+                f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
+                f"storeid={storeid}",
+                f"admin_id={admin_user.id}",
+                f"admin_fio={admin_user.full_name}",
+            ])
+        )
+        return JsonResponse({"status": "error", "message": "ADMIN_HAS_NO_TG_ID"}, status=409)
+
+    # красивое имя магазина (если есть)
+    store_name = ""
+    try:
+        st = Store.objects.filter(ukm4store=storeid).first()
+        store_name = (st.name or "").strip() if st else ""
+    except Exception:
+        pass
+
+    # сохраняем админа в сессию
+    req.admin_user_id = admin_user.id
+    req.admin_tg_id = admin_tg
+    req.admin_full_name = (admin_user.full_name or "").strip()
+    req.status = "PENDING_ADMIN"
+    req.meta = {**(req.meta or {}), "request_payload": data}
+    req.save(update_fields=["admin_user_id", "admin_tg_id", "admin_full_name", "status", "meta"])
+
+    # сообщение админу + inline кнопки
+    msg = "\n".join([
+        "🪪 Запрос бейджа администратора",
+        "",
+        f"Кассир: {req.cashier_full_name or '—'} (user_id={req.cashier_user_id})",
+        f"Магазин: {storeid}" + (f" — {store_name}" if store_name else ""),
+        "",
+        f"GUID: {req.id}",
+        "",
+        "Разрешить выдачу бейджа?",
+    ])
+
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Разрешить", "callback_data": f"admin_badge:accept:{req.id}"},
+                {"text": "⛔ Запретить", "callback_data": f"admin_badge:reject:{req.id}"},
+            ]
+        ]
+    }
+
+    ok_send = _tg_send_message(admin_tg, msg, reply_markup=reply_markup)
+
+    send_telegram_log(
+        "\n".join([
+            "🪪 ADMIN BADGE: REQUEST SENT TO ADMIN",
+            f"guid={req.id}",
+            f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
+            f"storeid={storeid}" + (f" ({store_name})" if store_name else ""),
+            f"admin={req.admin_full_name} (user_id={req.admin_user_id}, tg_id={req.admin_tg_id})",
+            f"telegram_send_ok={ok_send}",
+            f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+        ])
+    )
+
+    return JsonResponse({
+        "status": "ok",
+        "guid": str(req.id),
+        "message": "WAIT_ADMIN",
+        "admin": {"id": admin_user.id, "tg_id": admin_tg, "full_name": (admin_user.full_name or "").strip()},
+    })
+
+
+
+
+
+
+
+
+
+
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def tg_admin_badge_decision(request):
+    """
+    4) Админ нажал "Разрешить/Запретить"
+    POST JSON:
+      {
+        "guid":"...",
+        "decision":"accept|reject",
+        "admin_id": 123,
+        "admin_tg_id": "...."
+      }
+
+    Если accept:
+      -> находим пароль админа в open_in_system по user_id=admin_id (system_id=9)
+      -> возвращаем: {status, decision, password, send_to_tg_id: cashier_tg_id, guid}
+    Если reject:
+      -> возвращаем: {status, decision, send_to_tg_id: cashier_tg_id, guid}
+    """
+    if not _require_bot_token(request):
+        return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
+
+    _expire_old_badge_requests()
+
+    data, err = _json_body_or_400(request)
+    if err:
+        return err
+
+    guid = str(data.get("guid") or "").strip()
+    decision = str(data.get("decision") or "").strip().lower()
+    admin_id_raw = data.get("admin_id")
+    admin_tg_id = str(data.get("admin_tg_id") or "").strip()
+
+    if not guid or decision not in ("accept", "reject") or admin_id_raw is None:
+        return JsonResponse({"status": "error", "message": "guid, decision(accept/reject), admin_id required"}, status=400)
+
+    try:
+        admin_id = int(str(admin_id_raw).strip())
+    except Exception:
+        return JsonResponse({"status": "error", "message": "BAD_ADMIN_ID"}, status=400)
+
+    try:
+        req = AdminBadgeRequest.objects.get(id=guid)
+    except Exception:
+        return JsonResponse({"status": "error", "message": "GUID_NOT_FOUND"}, status=404)
+
+    if req.status == "EXPIRED" or req.expires_at < timezone.now():
+        return JsonResponse({"status": "error", "message": "EXPIRED"}, status=410)
+
+    # защита: решение должен принимать только выбранный админ
+    if not req.admin_user_id or int(req.admin_user_id) != int(admin_id):
+        return JsonResponse({"status": "error", "message": "ADMIN_MISMATCH"}, status=403)
+
+    # если передали tg_id админа — сверим (не обязательно, но полезно)
+    if admin_tg_id and req.admin_tg_id and str(req.admin_tg_id) != admin_tg_id:
+        return JsonResponse({"status": "error", "message": "ADMIN_TG_MISMATCH"}, status=403)
+
+    now = timezone.now()
+    req.decision = decision
+    req.decided_at = now
+    req.status = "ACCEPTED" if decision == "accept" else "REJECTED"
+    req.meta = {**(req.meta or {}), "decision_payload": data}
+    req.save(update_fields=["decision", "decided_at", "status", "meta"])
+
+    if decision == "reject":
+        send_telegram_log(
+            "\n".join([
+                "⛔ ADMIN BADGE: REJECTED",
+                f"guid={req.id}",
+                f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
+                f"storeid={req.storeid}",
+                f"admin={req.admin_full_name} (user_id={req.admin_user_id}, tg_id={req.admin_tg_id})",
+                f"time={timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
+            ])
+        )
+        return JsonResponse({
+            "status": "ok",
+            "guid": str(req.id),
+            "decision": "reject",
+            "send_to_tg_id": str(req.cashier_tg_id),
+            "message_to_cashier": "Администратор отклонил запрос бейджа.",
+        })
+
+    # accept -> вытаскиваем пароль админа
+    password, open_username, open_row_id = _get_existing_open_password(user_id=admin_id, system_id=9)
+    if not password:
+        send_telegram_log(
+            "\n".join([
+                "❌ ADMIN BADGE: ACCEPTED but no open_in_system.password",
+                f"guid={req.id}",
+                f"admin_user_id={admin_id}",
+                f"admin_fio={req.admin_full_name}",
+                "Причина: нет пароля в open_in_system (system_id=9)",
+            ])
+        )
+        return JsonResponse({"status": "error", "message": "ADMIN_PASSWORD_NOT_FOUND"}, status=404)
+
+    send_telegram_log(
+        "\n".join([
+            "✅ ADMIN BADGE: ACCEPTED",
+            f"guid={req.id}",
+            f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
+            f"storeid={req.storeid}",
+            f"admin={req.admin_full_name} (user_id={req.admin_user_id}, tg_id={req.admin_tg_id})",
+            f"open_in_system.id={open_row_id}, username={open_username or '—'}",
+            f"time={timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
+        ])
+    )
+
+    return JsonResponse({
+        "status": "ok",
+        "guid": str(req.id),
+        "decision": "accept",
+        "send_to_tg_id": str(req.cashier_tg_id),
+        "password": password,
+        "admin_open_in_system": {
+            "id": open_row_id,
+            "username": open_username,
+            "system_id": 9,
+        }
+    })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
