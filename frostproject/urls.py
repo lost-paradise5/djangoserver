@@ -53,6 +53,10 @@ from frostapp.views import (
     ldap_tools_sync_page,
     ldap_tools_sync_stream,
     ldap_tools_sync_log_download,
+    tg_admin_badge_start,
+    tg_admin_badge_admins,
+    tg_admin_badge_request,
+    tg_admin_badge_decision,
 )
 
 urlpatterns = [
@@ -104,4 +108,10 @@ urlpatterns = [
 
     # скачать лог
     path("ui/ldap-tools/sync/log/<str:filename>/", ldap_tools_sync_log_download, name="ldap_tools_sync_log_download"),
+
+    # Telegram-bot: запрос бейджа админа
+    path('tg/admin-badge/start/', tg_admin_badge_start, name='tg_admin_badge_start'),
+    path('tg/admin-badge/admins/', tg_admin_badge_admins, name='tg_admin_badge_admins'),
+    path('tg/admin-badge/request/', tg_admin_badge_request, name='tg_admin_badge_request'),
+    path('tg/admin-badge/decision/', tg_admin_badge_decision, name='tg_admin_badge_decision'),
 ]
