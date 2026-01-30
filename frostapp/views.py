@@ -268,10 +268,34 @@ def _bitrix_call(url: str, data: dict, timeout: int = 20) -> dict:
         raise RuntimeError(f"Bitrix error: {js.get('error')} {js.get('error_description')}")
     return js
 
+# def bitrix_get_departments() -> list[dict]:
+#     js = _bitrix_call(BITRIX_DEPARTMENT_GET_URL, data={})
+#     res = js.get("result") or []
+#     return res
 def bitrix_get_departments() -> list[dict]:
-    js = _bitrix_call(BITRIX_DEPARTMENT_GET_URL, data={})
-    res = js.get("result") or []
-    return res
+    out: list[dict] = []
+    start = 0
+
+    while True:
+        js = _bitrix_call(BITRIX_DEPARTMENT_GET_URL, data={"start": start})
+
+        chunk = js.get("result") or []
+        if isinstance(chunk, dict):
+            chunk = [chunk]
+
+        if chunk:
+            out.extend(chunk)
+
+        nxt = js.get("next")
+        if nxt is None:
+            break
+
+        try:
+            start = int(nxt)
+        except Exception:
+            break
+
+    return out
 
 def bitrix_user_get_all(filter_dict: dict, select_list: list[str] | None = None) -> list[dict]:
     # pagination: Bitrix часто использует start/next
