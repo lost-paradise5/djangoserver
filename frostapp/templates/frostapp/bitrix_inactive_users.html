@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Bitrix: не заходили > N дней</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    .box { padding: 12px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; vertical-align: top; }
+    th { text-align: left; background: #fafafa; }
+    .muted { color: #666; font-size: 12px; }
+    .bad { color: #b00; font-weight: 600; }
+    .ok { color: #060; font-weight: 600; }
+    .btn { padding: 6px 10px; border: 1px solid #ccc; background: #fff; border-radius: 6px; cursor: pointer; }
+    .btn-danger { border-color: #c66; }
+    .btn-good { border-color: #6c6; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+    label { display: block; font-size: 12px; color: #444; margin-bottom: 4px; }
+    input[type="text"], select { padding: 6px; min-width: 220px; }
+  </style>
+</head>
+<body>
+
+<h2>Bitrix24 — пользователи, которые не заходили более N дней</h2>
+
+<div class="box">
+  <div class="muted">
+    Всего пользователей: <b>{{ total }}</b>,
+    просроченных (по выбранному режиму): <b>{{ overdue_cnt }}</b>,
+    показано строк: <b>{{ rows|length }}</b>
+  </div>
+</div>
+
+<div class="box">
+  <form method="get">
+    <div class="row">
+      <div>
+        <label>Дней без входа/активности</label>
+        <input type="text" name="days" value="{{ days }}">
+      </div>
+
+      <div>
+        <label>Режим</label>
+        <select name="mode">
+          <option value="login" {% if mode == "login" %}selected{% endif %}>по LAST_LOGIN</option>
+          <option value="activity" {% if mode == "activity" %}selected{% endif %}>по LAST_ACTIVITY_DATE</option>
+          <option value="both" {% if mode == "both" %}selected{% endif %}>по обоим (и login, и activity)</option>
+        </select>
+      </div>
+
+      <div>
+        <label>ACTIVE</label>
+        <select name="active">
+          <option value="all" {% if active_filter == "all" %}selected{% endif %}>все</option>
+          <option value="active" {% if active_filter == "active" %}selected{% endif %}>только активные</option>
+          <option value="inactive" {% if active_filter == "inactive" %}selected{% endif %}>только неактивные</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Онлайн</label>
+        <select name="online">
+          <option value="all" {% if online_filter == "all" %}selected{% endif %}>все</option>
+          <option value="online" {% if online_filter == "online" %}selected{% endif %}>только online</option>
+          <option value="offline" {% if online_filter == "offline" %}selected{% endif %}>только offline</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Отдел</label>
+        <select name="dept">
+          <option value="">— любой —</option>
+          {% for d in dept_options %}
+            <option value="{{ d.id }}" {% if dept_id == d.id %}selected{% endif %}>{{ d.id }} — {{ d.name }}</option>
+          {% endfor %}
+        </select>
+        <div class="muted">
+          <label style="display:inline;">
+            <input type="checkbox" name="sub" value="1" {% if include_sub %}checked{% endif %}>
+            включать подотделы
+          </label>
+        </div>
+      </div>
+
+      <div>
+        <label>Поиск (ФИО/email/должность/id)</label>
+        <input type="text" name="q" value="{{ q }}">
+        <div class="muted">
+          <label style="display:inline;">
+            <input type="checkbox" name="only_overdue" value="1" {% if only_overdue %}checked{% endif %}>
+            показывать только просроченных
+          </label>
+        </div>
+      </div>
+
+      <div>
+        <button class="btn" type="submit">Применить</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<div class="box">
+  <form method="post" action="{% url 'bitrix_users_toggle_active' %}">
+    {% csrf_token %}
+    <div class="row">
+      <div>
+        <label>Массовое действие</label>
+        <select name="action">
+          <option value="block">Заблокировать (ACTIVE=N)</option>
+          <option value="unblock">Разблокировать (ACTIVE=Y)</option>
+        </select>
+      </div>
+      <div>
+        <button class="btn btn-danger" type="submit">Применить к отмеченным</button>
+      </div>
+      <div class="muted">Отметь чекбоксы в таблице ниже.</div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width:36px;">✓</th>
+          <th>ID</th>
+          <th>ФИО</th>
+          <th>Email</th>
+          <th>Должность</th>
+          <th>Отделы</th>
+          <th>ACTIVE</th>
+          <th>ONLINE</th>
+          <th>LAST_LOGIN</th>
+          <th>LAST_ACTIVITY</th>
+          <th>Дней (login/activity)</th>
+          <th>Действия</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td><input type="checkbox" name="user_id" value="{{ r.id }}"></td>
+          <td>{{ r.id }}</td>
+          <td>
+            {% if r.overdue %}<span class="bad">●</span>{% else %}<span class="ok">●</span>{% endif %}
+            {{ r.fio|default:"—" }}
+          </td>
+          <td>{{ r.email|default:"—" }}</td>
+          <td>{{ r.position|default:"—" }}</td>
+          <td class="muted">{{ r.dept_names|join:", " }}</td>
+          <td>{% if r.active %}<span class="ok">ACTIVE</span>{% else %}<span class="bad">INACTIVE</span>{% endif %}</td>
+          <td>
+            {% if r.online is True %}<span class="ok">ONLINE</span>
+            {% elif r.online is False %}<span class="bad">OFFLINE</span>
+            {% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td class="muted">{{ r.last_login|default:"—" }}</td>
+          <td class="muted">{{ r.last_activity|default:"—" }}</td>
+          <td class="muted">
+            {{ r.days_login|default:"—" }} / {{ r.days_activity|default:"—" }}
+          </td>
+          <td>
+            <form method="post" action="{% url 'bitrix_users_toggle_active' %}">
+              {% csrf_token %}
+              <input type="hidden" name="user_id" value="{{ r.id }}">
+              {% if r.active %}
+                <input type="hidden" name="action" value="block">
+                <button class="btn btn-danger" type="submit">Заблокировать</button>
+              {% else %}
+                <input type="hidden" name="action" value="unblock">
+                <button class="btn btn-good" type="submit">Разблокировать</button>
+              {% endif %}
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </form>
+</div>
+
+</body>
+</html>
