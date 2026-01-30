@@ -176,6 +176,12 @@ BITRIX_USER_GET_URL = os.getenv(
     "BITRIX_USER_GET_URL",
     "https://gkbin.bitrix24.ru/rest/61518/0ogeiqf5gdy3dot0/user.get.json",
 )
+
+BITRIX_USER_UPDATE_URL = os.getenv(
+    "BITRIX_USER_UPDATE_URL",
+    "https://gkbin.bitrix24.ru/rest/61518/xe5hh9jc83b1p7n4/user.update.json",
+)
+
 BITRIX_NOTIFY_URL = os.getenv(
     "BITRIX_NOTIFY_URL",
     "https://gkbin.bitrix24.ru/rest/61518/1ky2jzwneefj1aor/im.notify.personal.add.json",
@@ -347,6 +353,72 @@ def _bx_is_active(user: dict) -> bool:
     if s == "":
         return True
     return s.lower() not in ("0", "false", "n", "no", "off")
+
+
+
+
+
+
+
+
+def _bx_bool(v) -> bool | None:
+    """
+    Bitrix иногда присылает Y/N, 1/0, true/false, пусто.
+    None возвращаем как None (неизвестно).
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s == "":
+        return None
+    if s in ("y", "yes", "1", "true", "on"):
+        return True
+    if s in ("n", "no", "0", "false", "off"):
+        return False
+    return None
+
+
+def _parse_bx_dt(val: str | None):
+    """
+    Пробуем распарсить даты Bitrix:
+    - 2026-01-31T12:34:56+03:00
+    - 2026-01-31 12:34:56
+    - иногда может быть пусто/None
+    """
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+
+    # isoformat любит "T"
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+
+    dt = None
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except Exception:
+        # запасной вариант: если вдруг прилетит нестандартный формат — просто не падаем
+        return None
+
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, timezone.get_default_timezone())
+    return dt
+
+
+def bitrix_user_update(user_id: int, fields: dict) -> dict:
+    """
+    Обёртка над user.update:
+    user.update: ID + FIELDS[...]
+    """
+    data = {"ID": int(user_id)}
+    for k, v in (fields or {}).items():
+        data[f"FIELDS[{k}]"] = v
+    return _bitrix_call(BITRIX_USER_UPDATE_URL, data=data)
+    
 # =========================
 # Helpers: departments tree
 # =========================
@@ -531,7 +603,7 @@ def vpn_ui_login(request):
                     # можно тоже логировать факт отказа
                     send_telegram_log(
                         "\n".join([
-                            "❌ VPN PIN REQUEST: NOT A HEAD",
+                            "❌ ПОПЫТКА ВХОДА В СИСТЕМУ КОНТРОЛЯ УДАЛЁННОГО ДОСТУПА: Сотрудник не является руководителем отдела в Битрикс24",
                             f"login: {login}",
                             f"inn(employeeID): {inn}",
                             f"bitrix_user_id: {bx_user_id}",
@@ -919,7 +991,7 @@ def vpn_ui_toggle(request):
             if currently:
                 send_telegram_log(
                     "\n".join([
-                        "ℹ️ VPN ACCESS OPEN (NO CHANGE, ALREADY OPEN)",
+                        "ℹ️ Удалённый доступ открыт (Без изменений, уже был открыт)",
                         f"by: {sess.ad_login} (sid={sess.id})",
                         f"target_inn: {inn}",
                         f"target_ad_login: {target_ad_login}",
@@ -951,7 +1023,7 @@ def vpn_ui_toggle(request):
             if not currently:
                 send_telegram_log(
                     "\n".join([
-                        "ℹ️ VPN ACCESS CLOSE (NO CHANGE, ALREADY CLOSED)",
+                        "ℹ️ Удалённый доступ закрыт (Без изменений, уже был закрыт)",
                         f"by: {sess.ad_login} (sid={sess.id})",
                         f"target_inn: {inn}",
                         f"target_ad_login: {target_ad_login}",
@@ -8889,7 +8961,7 @@ def tg_admin_badge_start(request):
     if not user:
         send_telegram_log(
             "\n".join([
-                "❌ ADMIN BADGE START: user not found",
+                "❌ Запрос админского бейджа: пользователь не найден",
                 f"tg_id={tg_id}",
                 f"ip={_client_ip_simple(request)}",
                 f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
@@ -8907,7 +8979,7 @@ def tg_admin_badge_start(request):
     if not store_ids:
         send_telegram_log(
             "\n".join([
-                "❌ ADMIN BADGE START: no ukm_users",
+                "❌ Запрос админского бейджа: Нет в таблице ukm_users",
                 f"cashier_user_id={user.id}",
                 f"cashier_fio={user.full_name}",
                 f"cashier_tg_id={tg_id}",
@@ -8938,7 +9010,7 @@ def tg_admin_badge_start(request):
 
     send_telegram_log(
         "\n".join([
-            "🪪 ADMIN BADGE: START",
+            "🪪 Запрос админского бейджа: Запрошен",
             f"guid={req.id}",
             f"cashier_user_id={user.id}",
             f"cashier_fio={user.full_name}",
@@ -9041,7 +9113,7 @@ def tg_admin_badge_admins(request):
 
     send_telegram_log(
         "\n".join([
-            "🪪 ADMIN BADGE: STORE SELECTED / ADMINS LIST",
+            "🪪 Запрос админского бейджа: Выбор магазинов / Список администраторов",
             f"guid={req.id}",
             f"cashier_user_id={req.cashier_user_id}",
             f"cashier_fio={req.cashier_full_name}",
@@ -9129,7 +9201,7 @@ def tg_admin_badge_request(request):
         # нельзя уведомить — нет tg_id
         send_telegram_log(
             "\n".join([
-                "❌ ADMIN BADGE: ADMIN HAS NO TG_ID",
+                "❌ Запрос админского бейджа: У администратора нет телеграм-бота",
                 f"guid={req.id}",
                 f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
                 f"storeid={storeid}",
@@ -9180,7 +9252,7 @@ def tg_admin_badge_request(request):
 
     send_telegram_log(
         "\n".join([
-            "🪪 ADMIN BADGE: REQUEST SENT TO ADMIN",
+            "🪪 Запрос админского бейджа: Запрос отправлен выбранному администратору",
             f"guid={req.id}",
             f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
             f"storeid={storeid}" + (f" ({store_name})" if store_name else ""),
@@ -9275,7 +9347,7 @@ def tg_admin_badge_decision(request):
     if decision == "reject":
         send_telegram_log(
             "\n".join([
-                "⛔ ADMIN BADGE: REJECTED",
+                "⛔ Запрос админского бейджа: ОТКЛОНЁН",
                 f"guid={req.id}",
                 f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
                 f"storeid={req.storeid}",
@@ -9296,7 +9368,7 @@ def tg_admin_badge_decision(request):
     if not password:
         send_telegram_log(
             "\n".join([
-                "❌ ADMIN BADGE: ACCEPTED but no open_in_system.password",
+                "❌ Запрос админского бейджа: Одобрен, но в таблице нет пароля",
                 f"guid={req.id}",
                 f"admin_user_id={admin_id}",
                 f"admin_fio={req.admin_full_name}",
@@ -9307,7 +9379,7 @@ def tg_admin_badge_decision(request):
 
     send_telegram_log(
         "\n".join([
-            "✅ ADMIN BADGE: ACCEPTED",
+            "✅ Запрос админского бейджа: ОДОБРЕНО",
             f"guid={req.id}",
             f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
             f"storeid={req.storeid}",
@@ -9338,6 +9410,322 @@ def tg_admin_badge_decision(request):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@staff_member_required
+@require_http_methods(["GET"])
+@never_cache
+def bitrix_inactive_users_ui(request):
+    """
+    UI: список пользователей Bitrix, фильтры по "не заходил N дней",
+    показ ACTIVE / IS_ONLINE / LAST_LOGIN / LAST_ACTIVITY_DATE,
+    + массовая/точечная блокировка через отдельный POST endpoint.
+    """
+    # --- фильтры ---
+    try:
+        days = int((request.GET.get("days") or "30").strip())
+    except Exception:
+        days = 30
+    days = max(1, min(days, 3650))
+
+    mode = (request.GET.get("mode") or "login").strip().lower()
+    # login | activity | both
+    if mode not in ("login", "activity", "both"):
+        mode = "login"
+
+    active_filter = (request.GET.get("active") or "all").strip().lower()
+    # all | active | inactive
+    if active_filter not in ("all", "active", "inactive"):
+        active_filter = "all"
+
+    online_filter = (request.GET.get("online") or "all").strip().lower()
+    # all | online | offline
+    if online_filter not in ("all", "online", "offline"):
+        online_filter = "all"
+
+    q = (request.GET.get("q") or "").strip().lower()
+
+    dept_raw = (request.GET.get("dept") or "").strip()
+    include_sub = (request.GET.get("sub") or "") in ("1", "true", "on", "yes", "y")
+
+    only_overdue = (request.GET.get("only_overdue") or "1") in ("1", "true", "on", "yes", "y")
+
+    dept_id = None
+    if dept_raw.isdigit():
+        dept_id = int(dept_raw)
+
+    now = timezone.now()
+    cutoff = now - timezone.timedelta(days=days)
+
+    # --- departments (для фильтра и отображения названий) ---
+    depts = []
+    by_id = {}
+    children = {}
+    try:
+        depts = bitrix_get_departments()
+        by_id, children = _dept_index(depts)
+    except Exception:
+        depts = []
+
+    allowed_dept_ids_set = None
+    if dept_id:
+        if include_sub and children:
+            allowed_dept_ids_set = set(_dept_descendants([dept_id], children))
+        else:
+            allowed_dept_ids_set = {dept_id}
+
+    # --- users ---
+    # Берём с запасом поля. Если каких-то нет — просто будут пустые.
+    select_fields = [
+        "ID", "NAME", "LAST_NAME", "SECOND_NAME",
+        "EMAIL", "WORK_POSITION",
+        "ACTIVE", "IS_ONLINE",
+        "UF_DEPARTMENT",
+        "LAST_LOGIN",
+        "LAST_ACTIVITY_DATE",
+        "DATE_REGISTER",
+    ]
+
+    all_users = bitrix_user_get_all(filter_dict={}, select_list=select_fields)
+
+    rows = []
+    total = 0
+    overdue_cnt = 0
+
+    for u in all_users:
+        total += 1
+
+        # id
+        try:
+            uid = int(u.get("ID"))
+        except Exception:
+            continue
+
+        fio = " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x]).strip()
+        email = (u.get("EMAIL") or "").strip()
+        position = (u.get("WORK_POSITION") or "").strip()
+
+        is_active = _bx_is_active(u)  # твоя функция
+        is_online = _bx_bool(u.get("IS_ONLINE"))
+
+        last_login_dt = _parse_bx_dt(u.get("LAST_LOGIN"))
+        last_act_dt = _parse_bx_dt(u.get("LAST_ACTIVITY_DATE"))
+        reg_dt = _parse_bx_dt(u.get("DATE_REGISTER"))
+
+        # UF_DEPARTMENT может быть list/str
+        raw_depts = u.get("UF_DEPARTMENT")
+        dept_ids = []
+        if isinstance(raw_depts, list):
+            for x in raw_depts:
+                if str(x).isdigit():
+                    dept_ids.append(int(x))
+        elif str(raw_depts).isdigit():
+            dept_ids = [int(raw_depts)]
+
+        # фильтр по отделу
+        if allowed_dept_ids_set is not None:
+            if not set(dept_ids).intersection(allowed_dept_ids_set):
+                continue
+
+        # фильтр ACTIVE
+        if active_filter == "active" and not is_active:
+            continue
+        if active_filter == "inactive" and is_active:
+            continue
+
+        # фильтр ONLINE
+        if online_filter == "online" and is_online is not True:
+            continue
+        if online_filter == "offline" and is_online is not False:
+            continue
+
+        # фильтр по строке
+        if q:
+            hay = " ".join([str(uid), fio, email, position]).lower()
+            if q not in hay:
+                continue
+
+        # “просрочка”
+        stale_login = (last_login_dt is None) or (last_login_dt < cutoff)
+        stale_act = (last_act_dt is None) or (last_act_dt < cutoff)
+
+        if mode == "login":
+            overdue = stale_login
+        elif mode == "activity":
+            overdue = stale_act
+        else:
+            overdue = stale_login and stale_act
+
+        if overdue:
+            overdue_cnt += 1
+        if only_overdue and not overdue:
+            continue
+
+        def _days_ago(dt):
+            if not dt:
+                return None
+            try:
+                return (now - dt).days
+            except Exception:
+                return None
+
+        dept_names = []
+        for did in dept_ids:
+            d = by_id.get(did)
+            dept_names.append(_dept_name(d) if d else str(did))
+
+        rows.append({
+            "id": uid,
+            "fio": fio,
+            "email": email,
+            "position": position,
+            "active": is_active,
+            "online": is_online,
+            "last_login": last_login_dt,
+            "last_activity": last_act_dt,
+            "date_register": reg_dt,
+            "days_login": _days_ago(last_login_dt),
+            "days_activity": _days_ago(last_act_dt),
+            "dept_ids": dept_ids,
+            "dept_names": dept_names,
+            "overdue": overdue,
+        })
+
+    # сортировка: сначала самые “давние”
+    rows.sort(key=lambda r: (r["days_login"] is None, r["days_login"] if r["days_login"] is not None else 10**9), reverse=True)
+
+    # dropdown отделов
+    dept_options = []
+    for did, d in sorted(by_id.items(), key=lambda x: x[0]):
+        dept_options.append({"id": did, "name": _dept_name(d)})
+
+    return render(request, "frostapp/bitrix_inactive_users.html", {
+        "rows": rows,
+        "total": total,
+        "overdue_cnt": overdue_cnt,
+        "days": days,
+        "mode": mode,
+        "active_filter": active_filter,
+        "online_filter": online_filter,
+        "only_overdue": only_overdue,
+        "q": q,
+        "dept_id": dept_id,
+        "include_sub": include_sub,
+        "dept_options": dept_options,
+        "csrf": get_token(request),
+    })
+
+
+
+
+
+
+
+
+@staff_member_required
+@require_http_methods(["POST"])
+@csrf_protect
+def bitrix_users_toggle_active(request):
+    """
+    POST:
+      user_id=123              (один)
+      user_id=1&user_id=2...   (массив)
+      action=block|unblock
+    Делает user.update ACTIVE=N/Y
+    """
+    action = (request.POST.get("action") or "").strip().lower()
+    if action not in ("block", "unblock"):
+        return JsonResponse({"ok": False, "error": "BAD_ACTION"}, status=400)
+
+    ids = request.POST.getlist("user_id")
+    user_ids = []
+    for x in ids:
+        if str(x).isdigit():
+            user_ids.append(int(x))
+
+    if not user_ids:
+        return JsonResponse({"ok": False, "error": "NO_USER_IDS"}, status=400)
+
+    desired = "N" if action == "block" else "Y"
+
+    ok_ids = []
+    bad = []
+
+    for uid in user_ids:
+        try:
+            bitrix_user_update(uid, {"ACTIVE": desired})
+            ok_ids.append(uid)
+        except Exception as e:
+            bad.append({"id": uid, "error": str(e)})
+
+    # при желании — лог в телеграм
+    try:
+        send_telegram_log(
+            "\n".join([
+                "👥 BITRIX USERS TOGGLE ACTIVE",
+                f"by_django_user={getattr(request.user, 'username', 'unknown')}",
+                f"action={action} ACTIVE={desired}",
+                f"ok={len(ok_ids)} bad={len(bad)}",
+                f"ip={_client_ip(request)}",
+                f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+            ])
+        )
+    except Exception:
+        pass
+
+    # Если это обычная форма — редирект назад
+    back = request.META.get("HTTP_REFERER") or reverse("bitrix_inactive_users_ui")
+    if request.headers.get("x-requested-with") == "XMLHttpRequest":
+        return JsonResponse({"ok": True, "updated": ok_ids, "errors": bad})
+
+    # можно прокинуть короткий итог через querystring
+    sep = "&" if "?" in back else "?"
+    return redirect(f"{back}{sep}updated_ok={len(ok_ids)}&updated_bad={len(bad)}")
 
 
 
