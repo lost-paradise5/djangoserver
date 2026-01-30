@@ -9457,7 +9457,6 @@ def tg_admin_badge_decision(request):
 
 
 
-@staff_member_required
 @require_http_methods(["GET"])
 @never_cache
 def bitrix_inactive_users_ui(request):
@@ -9667,7 +9666,6 @@ def bitrix_inactive_users_ui(request):
 
 
 
-@staff_member_required
 @require_http_methods(["POST"])
 @csrf_protect
 def bitrix_users_toggle_active(request):
