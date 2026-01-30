@@ -409,15 +409,61 @@ def _parse_bx_dt(val: str | None):
     return dt
 
 
+def bitrix_user_get_by_id(user_id: int, select_list: list[str] | None = None) -> dict | None:
+    select_list = select_list or ["ID", "ACTIVE", "EMAIL", "NAME", "LAST_NAME", "SECOND_NAME"]
+    users = bitrix_user_get_all(filter_dict={"ID": int(user_id)}, select_list=select_list)
+    return users[0] if users else None
+
+
+def _bx_active_to_bool(v) -> bool | None:
+    """
+    ACTIVE в Bitrix чаще всего: 'Y'/'N', но иногда может быть 1/0, true/false.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("y", "yes", "1", "true", "on"):
+        return True
+    if s in ("n", "no", "0", "false", "off"):
+        return False
+    if s == "":
+        return None
+    return None
+
+
 def bitrix_user_update(user_id: int, fields: dict) -> dict:
     """
-    Обёртка над user.update:
-    user.update: ID + FIELDS[...]
+    Надёжная обёртка user.update:
+    - отправляет и fields[...], и FIELDS[...] (на случай разных ожиданий)
+    - проверяет js["result"]
     """
     data = {"ID": int(user_id)}
+
+    # ✅ максимально совместимый вариант: и fields[], и FIELDS[]
     for k, v in (fields or {}).items():
+        data[f"fields[{k}]"] = v
         data[f"FIELDS[{k}]"] = v
-    return _bitrix_call(BITRIX_USER_UPDATE_URL, data=data)
+
+    js = _bitrix_call(BITRIX_USER_UPDATE_URL, data=data)
+
+    # ✅ проверяем результат
+    res = js.get("result", None)
+
+    ok = False
+    if res is True or res == 1 or res == "1":
+        ok = True
+    elif isinstance(res, dict):
+        # иногда API возвращает вложенные структуры, подстрахуемся
+        r2 = res.get("result")
+        if r2 is True or r2 == 1 or r2 == "1":
+            ok = True
+
+    if not ok:
+        raise RuntimeError(f"user.update returned non-ok result: {res!r}, full={js!r}")
+
+    return js
     
 # =========================
 # Helpers: departments tree
@@ -9674,14 +9720,15 @@ def bitrix_users_toggle_active(request):
       user_id=123              (один)
       user_id=1&user_id=2...   (массив)
       action=block|unblock
-    Делает user.update ACTIVE=N/Y
+
+    Делает user.update ACTIVE=N/Y и ОБЯЗАТЕЛЬНО проверяет, что Bitrix реально поменял значение.
     """
     action = (request.POST.get("action") or "").strip().lower()
     if action not in ("block", "unblock"):
         return JsonResponse({"ok": False, "error": "BAD_ACTION"}, status=400)
 
     ids = request.POST.getlist("user_id")
-    user_ids = []
+    user_ids: list[int] = []
     for x in ids:
         if str(x).isdigit():
             user_ids.append(int(x))
@@ -9690,25 +9737,47 @@ def bitrix_users_toggle_active(request):
         return JsonResponse({"ok": False, "error": "NO_USER_IDS"}, status=400)
 
     desired = "N" if action == "block" else "Y"
+    desired_bool = (desired == "Y")
 
-    ok_ids = []
-    bad = []
+    ok_ids: list[int] = []
+    bad: list[dict] = []
 
     for uid in user_ids:
         try:
-            bitrix_user_update(uid, {"ACTIVE": desired})
+            # 1) update
+            upd_js = bitrix_user_update(uid, {"ACTIVE": desired})
+
+            # 2) verify (перечитываем)
+            after = bitrix_user_get_by_id(uid, select_list=["ID", "ACTIVE"])
+            if not after:
+                raise RuntimeError("VERIFY_FAILED: user.get returned empty")
+
+            after_active_bool = _bx_active_to_bool(after.get("ACTIVE"))
+
+            # Если Bitrix вернул что-то странное (None) — считаем ошибкой верификации
+            if after_active_bool is None:
+                raise RuntimeError(f"VERIFY_FAILED: ACTIVE is unreadable: {after.get('ACTIVE')!r}")
+
+            if after_active_bool != desired_bool:
+                raise RuntimeError(
+                    f"NOT_CHANGED: expected ACTIVE={desired}, got ACTIVE={after.get('ACTIVE')!r}"
+                )
+
             ok_ids.append(uid)
+
         except Exception as e:
             bad.append({"id": uid, "error": str(e)})
 
-    # при желании — лог в телеграм
+    # лог в телеграм (с деталями ошибок, но без простыни)
     try:
+        err_preview = "; ".join([f"{x['id']}:{x['error']}" for x in bad[:5]])
         send_telegram_log(
             "\n".join([
                 "👥 BITRIX USERS TOGGLE ACTIVE",
                 f"by_django_user={getattr(request.user, 'username', 'unknown')}",
-                f"action={action} ACTIVE={desired}",
+                f"action={action} desired_ACTIVE={desired}",
                 f"ok={len(ok_ids)} bad={len(bad)}",
+                f"errors_top5={err_preview or '—'}",
                 f"ip={_client_ip(request)}",
                 f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
             ])
@@ -9716,12 +9785,12 @@ def bitrix_users_toggle_active(request):
     except Exception:
         pass
 
-    # Если это обычная форма — редирект назад
-    back = request.META.get("HTTP_REFERER") or reverse("bitrix_inactive_users_ui")
+    # AJAX
     if request.headers.get("x-requested-with") == "XMLHttpRequest":
         return JsonResponse({"ok": True, "updated": ok_ids, "errors": bad})
 
-    # можно прокинуть короткий итог через querystring
+    # обычная форма
+    back = request.META.get("HTTP_REFERER") or reverse("bitrix_inactive_users_ui")
     sep = "&" if "?" in back else "?"
     return redirect(f"{back}{sep}updated_ok={len(ok_ids)}&updated_bad={len(bad)}")
 
