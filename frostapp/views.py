@@ -266,13 +266,27 @@ def _get_session_or_403(request, must_verified: bool) -> VpnAccessSession:
 # Helpers: Bitrix
 # =========================
 
-def _bitrix_call(url: str, data: dict, timeout: int = 20) -> dict:
-    r = requests.post(url, data=data, timeout=timeout)
-    r.raise_for_status()
-    js = r.json()
-    if isinstance(js, dict) and js.get("error"):
-        raise RuntimeError(f"Bitrix error: {js.get('error')} {js.get('error_description')}")
-    return js
+def _bitrix_call(url: str, data: dict | None = None, json_payload: dict | None = None, timeout: int = 25) -> dict:
+    """
+    Универсальный вызов Bitrix REST.
+    - data -> application/x-www-form-urlencoded
+    - json_payload -> application/json
+    """
+    try:
+        if json_payload is not None:
+            r = requests.post(url, json=json_payload, timeout=timeout)
+        else:
+            r = requests.post(url, data=(data or {}), timeout=timeout)
+
+        r.raise_for_status()
+        js = r.json()
+
+        if isinstance(js, dict) and js.get("error"):
+            raise RuntimeError(f"Bitrix error: {js.get('error')} {js.get('error_description')}")
+
+        return js
+    except Exception as e:
+        raise RuntimeError(f"BITRIX_CALL_FAILED: {e}")
 
 # def bitrix_get_departments() -> list[dict]:
 #     js = _bitrix_call(BITRIX_DEPARTMENT_GET_URL, data={})
@@ -364,7 +378,7 @@ def _bx_is_active(user: dict) -> bool:
 def _bx_bool(v) -> bool | None:
     """
     Bitrix иногда присылает Y/N, 1/0, true/false, пусто.
-    None возвращаем как None (неизвестно).
+    None -> None (неизвестно).
     """
     if v is None:
         return None
@@ -410,6 +424,9 @@ def _parse_bx_dt(val: str | None):
 
 
 def bitrix_user_get_by_id(user_id: int, select_list: list[str] | None = None) -> dict | None:
+    """
+    user.get с filter[ID]=...
+    """
     select_list = select_list or ["ID", "ACTIVE", "EMAIL", "NAME", "LAST_NAME", "SECOND_NAME"]
     users = bitrix_user_get_all(filter_dict={"ID": int(user_id)}, select_list=select_list)
     return users[0] if users else None
@@ -435,36 +452,82 @@ def _bx_active_to_bool(v) -> bool | None:
 
 def bitrix_user_update(user_id: int, fields: dict) -> dict:
     """
-    Надёжная обёртка user.update:
-    - отправляет и fields[...], и FIELDS[...] (на случай разных ожиданий)
-    - проверяет js["result"]
+    Надёжная user.update:
+    1) form-encoded: ID + FIELDS[...]
+    2) fallback JSON: {"ID":..., "fields": {...}}  (на случай отличий на портале/прокси)
+    Возвращает полный JSON ответа.
     """
-    data = {"ID": int(user_id)}
+    user_id = int(user_id)
+    fields = fields or {}
 
-    # ✅ максимально совместимый вариант: и fields[], и FIELDS[]
-    for k, v in (fields or {}).items():
-        data[f"fields[{k}]"] = v
+    # --- попытка 1: form-encoded ---
+    data = {"ID": user_id}
+    for k, v in fields.items():
         data[f"FIELDS[{k}]"] = v
 
     js = _bitrix_call(BITRIX_USER_UPDATE_URL, data=data)
 
-    # ✅ проверяем результат
-    res = js.get("result", None)
+    # Bitrix обычно возвращает {"result": true}
+    if js.get("result") in (True, 1, "1"):
+        return js
 
-    ok = False
-    if res is True or res == 1 or res == "1":
-        ok = True
-    elif isinstance(res, dict):
-        # иногда API возвращает вложенные структуры, подстрахуемся
-        r2 = res.get("result")
-        if r2 is True or r2 == 1 or r2 == "1":
-            ok = True
+    # --- попытка 2: JSON ---
+    js2 = _bitrix_call(BITRIX_USER_UPDATE_URL, json_payload={"ID": user_id, "fields": fields})
 
-    if not ok:
-        raise RuntimeError(f"user.update returned non-ok result: {res!r}, full={js!r}")
+    if js2.get("result") in (True, 1, "1"):
+        return js2
 
-    return js
-    
+    raise RuntimeError(f"user.update returned non-ok: result={js2.get('result')!r}, full={js2!r}")
+
+
+def bitrix_set_user_active_strict(user_id: int, desired_active: bool) -> None:
+    """
+    “Жёсткая” установка ACTIVE:
+    - пробуем разные представления значения
+    - после update перечитываем user.get несколько раз (ретраи), чтобы убедиться, что применилось
+    """
+    uid = int(user_id)
+
+    # разные варианты представления значения для Bitrix
+    if desired_active:
+        candidates = ["Y", "1", True]
+    else:
+        candidates = ["N", "0", False]
+
+    last_after = None
+    last_update_js = None
+
+    for cand in candidates:
+        # 1) update
+        last_update_js = bitrix_user_update(uid, {"ACTIVE": cand})
+
+        # 2) verify (ретраи на случай задержки применения)
+        for delay in (0.0, 0.4, 1.0, 2.0):
+            if delay:
+                time.sleep(delay)
+
+            after = bitrix_user_get_by_id(uid, select_list=["ID", "ACTIVE"])
+            last_after = after
+
+            if not after:
+                continue
+
+            after_bool = _bx_active_to_bool(after.get("ACTIVE"))
+            if after_bool is None:
+                continue
+
+            if after_bool == desired_active:
+                return  # ✅ успех
+
+    # если дошли сюда — не поменялось
+    raise RuntimeError(
+        "NOT_CHANGED: "
+        f"expected ACTIVE={desired_active}, "
+        f"got ACTIVE={None if not last_after else last_after.get('ACTIVE')!r}, "
+        f"last_update_result={None if not last_update_js else last_update_js.get('result')!r}"
+    )
+
+
 # =========================
 # Helpers: departments tree
 # =========================
@@ -9519,17 +9582,14 @@ def bitrix_inactive_users_ui(request):
     days = max(1, min(days, 3650))
 
     mode = (request.GET.get("mode") or "login").strip().lower()
-    # login | activity | both
     if mode not in ("login", "activity", "both"):
         mode = "login"
 
     active_filter = (request.GET.get("active") or "all").strip().lower()
-    # all | active | inactive
     if active_filter not in ("all", "active", "inactive"):
         active_filter = "all"
 
     online_filter = (request.GET.get("online") or "all").strip().lower()
-    # all | online | offline
     if online_filter not in ("all", "online", "offline"):
         online_filter = "all"
 
@@ -9540,22 +9600,18 @@ def bitrix_inactive_users_ui(request):
 
     only_overdue = (request.GET.get("only_overdue") or "1") in ("1", "true", "on", "yes", "y")
 
-    dept_id = None
-    if dept_raw.isdigit():
-        dept_id = int(dept_raw)
+    dept_id = int(dept_raw) if dept_raw.isdigit() else None
 
     now = timezone.now()
     cutoff = now - timezone.timedelta(days=days)
 
-    # --- departments (для фильтра и отображения названий) ---
-    depts = []
-    by_id = {}
-    children = {}
+    # --- departments ---
     try:
         depts = bitrix_get_departments()
         by_id, children = _dept_index(depts)
     except Exception:
         depts = []
+        by_id, children = {}, {}
 
     allowed_dept_ids_set = None
     if dept_id:
@@ -9565,7 +9621,6 @@ def bitrix_inactive_users_ui(request):
             allowed_dept_ids_set = {dept_id}
 
     # --- users ---
-    # Берём с запасом поля. Если каких-то нет — просто будут пустые.
     select_fields = [
         "ID", "NAME", "LAST_NAME", "SECOND_NAME",
         "EMAIL", "WORK_POSITION",
@@ -9585,7 +9640,6 @@ def bitrix_inactive_users_ui(request):
     for u in all_users:
         total += 1
 
-        # id
         try:
             uid = int(u.get("ID"))
         except Exception:
@@ -9595,14 +9649,13 @@ def bitrix_inactive_users_ui(request):
         email = (u.get("EMAIL") or "").strip()
         position = (u.get("WORK_POSITION") or "").strip()
 
-        is_active = _bx_is_active(u)  # твоя функция
+        is_active = _bx_is_active(u)          # твоя функция (как ранее)
         is_online = _bx_bool(u.get("IS_ONLINE"))
 
         last_login_dt = _parse_bx_dt(u.get("LAST_LOGIN"))
         last_act_dt = _parse_bx_dt(u.get("LAST_ACTIVITY_DATE"))
         reg_dt = _parse_bx_dt(u.get("DATE_REGISTER"))
 
-        # UF_DEPARTMENT может быть list/str
         raw_depts = u.get("UF_DEPARTMENT")
         dept_ids = []
         if isinstance(raw_depts, list):
@@ -9612,30 +9665,25 @@ def bitrix_inactive_users_ui(request):
         elif str(raw_depts).isdigit():
             dept_ids = [int(raw_depts)]
 
-        # фильтр по отделу
         if allowed_dept_ids_set is not None:
             if not set(dept_ids).intersection(allowed_dept_ids_set):
                 continue
 
-        # фильтр ACTIVE
         if active_filter == "active" and not is_active:
             continue
         if active_filter == "inactive" and is_active:
             continue
 
-        # фильтр ONLINE
         if online_filter == "online" and is_online is not True:
             continue
         if online_filter == "offline" and is_online is not False:
             continue
 
-        # фильтр по строке
         if q:
             hay = " ".join([str(uid), fio, email, position]).lower()
             if q not in hay:
                 continue
 
-        # “просрочка”
         stale_login = (last_login_dt is None) or (last_login_dt < cutoff)
         stale_act = (last_act_dt is None) or (last_act_dt < cutoff)
 
@@ -9681,13 +9729,13 @@ def bitrix_inactive_users_ui(request):
             "overdue": overdue,
         })
 
-    # сортировка: сначала самые “давние”
-    rows.sort(key=lambda r: (r["days_login"] is None, r["days_login"] if r["days_login"] is not None else 10**9), reverse=True)
+    # ✅ сортировка: больше дней -> выше, None -> вниз
+    def _sort_days(v):
+        return v if isinstance(v, int) else -1
 
-    # dropdown отделов
-    dept_options = []
-    for did, d in sorted(by_id.items(), key=lambda x: x[0]):
-        dept_options.append({"id": did, "name": _dept_name(d)})
+    rows.sort(key=lambda r: _sort_days(r["days_login"]), reverse=True)
+
+    dept_options = [{"id": did, "name": _dept_name(d)} for did, d in sorted(by_id.items(), key=lambda x: x[0])]
 
     return render(request, "frostapp/bitrix_inactive_users.html", {
         "rows": rows,
@@ -9721,61 +9769,37 @@ def bitrix_users_toggle_active(request):
       user_id=1&user_id=2...   (массив)
       action=block|unblock
 
-    Делает user.update ACTIVE=N/Y и ОБЯЗАТЕЛЬНО проверяет, что Bitrix реально поменял значение.
+    Делает user.update ACTIVE и ОБЯЗАТЕЛЬНО проверяет, что Bitrix реально поменял значение.
     """
     action = (request.POST.get("action") or "").strip().lower()
     if action not in ("block", "unblock"):
         return JsonResponse({"ok": False, "error": "BAD_ACTION"}, status=400)
 
     ids = request.POST.getlist("user_id")
-    user_ids: list[int] = []
-    for x in ids:
-        if str(x).isdigit():
-            user_ids.append(int(x))
-
+    user_ids: list[int] = [int(x) for x in ids if str(x).isdigit()]
     if not user_ids:
         return JsonResponse({"ok": False, "error": "NO_USER_IDS"}, status=400)
 
-    desired = "N" if action == "block" else "Y"
-    desired_bool = (desired == "Y")
+    desired_bool = (action == "unblock")
 
     ok_ids: list[int] = []
     bad: list[dict] = []
 
     for uid in user_ids:
         try:
-            # 1) update
-            upd_js = bitrix_user_update(uid, {"ACTIVE": desired})
-
-            # 2) verify (перечитываем)
-            after = bitrix_user_get_by_id(uid, select_list=["ID", "ACTIVE"])
-            if not after:
-                raise RuntimeError("VERIFY_FAILED: user.get returned empty")
-
-            after_active_bool = _bx_active_to_bool(after.get("ACTIVE"))
-
-            # Если Bitrix вернул что-то странное (None) — считаем ошибкой верификации
-            if after_active_bool is None:
-                raise RuntimeError(f"VERIFY_FAILED: ACTIVE is unreadable: {after.get('ACTIVE')!r}")
-
-            if after_active_bool != desired_bool:
-                raise RuntimeError(
-                    f"NOT_CHANGED: expected ACTIVE={desired}, got ACTIVE={after.get('ACTIVE')!r}"
-                )
-
+            bitrix_set_user_active_strict(uid, desired_bool)
             ok_ids.append(uid)
-
         except Exception as e:
             bad.append({"id": uid, "error": str(e)})
 
-    # лог в телеграм (с деталями ошибок, но без простыни)
+    # лог в телеграм (коротко)
     try:
         err_preview = "; ".join([f"{x['id']}:{x['error']}" for x in bad[:5]])
         send_telegram_log(
             "\n".join([
                 "👥 BITRIX USERS TOGGLE ACTIVE",
                 f"by_django_user={getattr(request.user, 'username', 'unknown')}",
-                f"action={action} desired_ACTIVE={desired}",
+                f"action={action} desired_ACTIVE={('Y' if desired_bool else 'N')}",
                 f"ok={len(ok_ids)} bad={len(bad)}",
                 f"errors_top5={err_preview or '—'}",
                 f"ip={_client_ip(request)}",
@@ -9789,7 +9813,7 @@ def bitrix_users_toggle_active(request):
     if request.headers.get("x-requested-with") == "XMLHttpRequest":
         return JsonResponse({"ok": True, "updated": ok_ids, "errors": bad})
 
-    # обычная форма
+    # обычная форма -> обратно
     back = request.META.get("HTTP_REFERER") or reverse("bitrix_inactive_users_ui")
     sep = "&" if "?" in back else "?"
     return redirect(f"{back}{sep}updated_ok={len(ok_ids)}&updated_bad={len(bad)}")
