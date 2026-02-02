@@ -9857,14 +9857,14 @@ def _oracle_dt_to_str(dt):
 def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, exclude_users: set[str]):
     """
     Возвращает список dict’ов по одной базе:
-      username, last_login, created, has_role, staff_id, fio, serverlogin, userenabled, reason
+      username, last_login, created, has_role, staff_id, fio, serverlogin, userenabled, inn, reason
     """
     conn = cur = None
     try:
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
 
-        # какие колонки реально есть
+        # --- колонки реального объекта (таблица/вьюха) ---
         staff_cols = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
         user_cols  = _oracle_get_table_columns_set(cur, owner="SYS", table="DBA_USERS")
 
@@ -9874,72 +9874,125 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
         def has_user(col: str) -> bool:
             return col.upper() in user_cols
 
-        # --- LAST_LOGIN source ---
-        # 1) DBA_USERS.LAST_LOGIN (если есть)
+        # критично для связки
+        if not has_staff("SERVERLOGIN"):
+            return [], "SMSTAFF.SERVERLOGIN отсутствует — нельзя связать с DBA_USERS"
+        if not user_cols:
+            return [], "Нет доступа/описания SYS.DBA_USERS"
+
+        if not has_user("CREATED"):
+            return [], "В SYS.DBA_USERS не найдено поле CREATED — нельзя посчитать 'старше N дней'"
+
+        # --- определяем источник LAST_LOGIN ---
         last_login_expr = None
         audit_join_sql = ""
+        binds = {"b_days": int(days)}
 
         if has_user("LAST_LOGIN"):
             last_login_expr = "du.last_login"
         else:
-            # 2) fallback: DBA_AUDIT_SESSION (если есть timestamp)
-            try:
-                audit_cols = _oracle_get_table_columns_set(cur, owner="SYS", table="DBA_AUDIT_SESSION")
-            except Exception:
-                audit_cols = set()
-
+            # fallback на аудит
+            audit_cols = _oracle_get_table_columns_set(cur, owner="SYS", table="DBA_AUDIT_SESSION")
             ts_col = None
-            if "EXTENDED_TIMESTAMP" in audit_cols:
-                ts_col = "EXTENDED_TIMESTAMP"
-            elif "TIMESTAMP" in audit_cols:
-                ts_col = "TIMESTAMP"
+            for cand in ("EXTENDED_TIMESTAMP", "TIMESTAMP", "NTIMESTAMP#", "TIMESTAMP#"):
+                if cand in audit_cols:
+                    ts_col = cand
+                    break
 
-            if ts_col:
-                # чтобы не читать аудит "за всю историю" (может быть тяжело) — ограничим окно
-                lookback_days = int(os.getenv("SM_AUDIT_LOOKBACK_DAYS", "3650"))  # 10 лет по умолчанию
+            has_audit_username = ("USERNAME" in audit_cols)
+
+            # доп. условия (если есть колонки)
+            action_col = "ACTION_NAME" if "ACTION_NAME" in audit_cols else None
+            ret_col = None
+            for cand in ("RETURN_CODE", "RETURNCODE"):
+                if cand in audit_cols:
+                    ret_col = cand
+                    break
+
+            if ts_col and has_audit_username:
+                lookback_days = int(os.getenv("SM_AUDIT_LOOKBACK_DAYS", "3650"))
+                binds["b_lookback"] = lookback_days
+
+                where_a = [f"{ts_col} >= (SYSTIMESTAMP - NUMTODSINTERVAL(:b_lookback, 'DAY'))"]
+                if action_col:
+                    where_a.append(f"{action_col} = 'LOGON'")
+                if ret_col:
+                    where_a.append(f"{ret_col} = 0")
+
                 audit_join_sql = f"""
                     LEFT JOIN (
                         SELECT
                             username,
                             MAX({ts_col}) AS last_login
                         FROM sys.dba_audit_session
-                        WHERE action_name = 'LOGON'
-                          AND {ts_col} >= (SYSTIMESTAMP - NUMTODSINTERVAL(:b_lookback, 'DAY'))
+                        WHERE {" AND ".join(where_a)}
                         GROUP BY username
                     ) al
                       ON UPPER(al.username) = UPPER(du.username)
                 """
                 last_login_expr = "al.last_login"
             else:
-                # ни LAST_LOGIN, ни аудит — не сможем определить last_login
-                return [], "NO_LAST_LOGIN_SOURCE: DBA_USERS.LAST_LOGIN отсутствует и в DBA_AUDIT_SESSION нет TIMESTAMP/EXTENDED_TIMESTAMP"
+                # last_login нигде не достать — деградируем до NULL
+                last_login_expr = "NULL"
 
-        # --- SELECT части по SMSTAFF (колонки могут отсутствовать) ---
-        sel_name = "ss.name" if has_staff("NAME") else "NULL AS name"
-        sel_pat  = "ss.patronymic" if has_staff("PATRONYMIC") else "NULL AS patronymic"
+        # --- роль SUPERMAG_USER (если доступно) ---
+        role_cols = _oracle_get_table_columns_set(cur, owner="SYS", table="DBA_ROLE_PRIVS")
+        has_role_view = ("GRANTEE" in role_cols and "GRANTED_ROLE" in role_cols)
 
-        # --- Фильтры ---
+        role_join_sql = ""
+        role_expr = "0"
+        if has_role_view:
+            role_join_sql = """
+                LEFT JOIN (
+                    SELECT grantee
+                    FROM sys.dba_role_privs
+                    WHERE UPPER(granted_role) = 'SUPERMAG_USER'
+                ) drp
+                  ON UPPER(du.username) = UPPER(drp.grantee)
+            """
+            role_expr = "NVL2(drp.grantee, 1, 0)"
+
+        # --- поля SMSTAFF (все через проверки) ---
+        sel_staff_id   = "ss.id AS staff_id" if has_staff("ID") else "NULL AS staff_id"
+        sel_surname    = "ss.surname AS surname" if has_staff("SURNAME") else "NULL AS surname"
+        sel_name       = "ss.name AS name" if has_staff("NAME") else "NULL AS name"
+        sel_patronymic = "ss.patronymic AS patronymic" if has_staff("PATRONYMIC") else "NULL AS patronymic"
+        sel_userenabled= "ss.userenabled AS userenabled" if has_staff("USERENABLED") else "NULL AS userenabled"
+        sel_inn        = "ss.inn AS inn" if has_staff("INN") else "NULL AS inn"
+
+        # --- фильтры ---
         q = (q or "").strip().lower()
-        binds = {"b_days": int(days)}
+        where = ["ss.id > 0"]
+        # stale predicate
+        if last_login_expr != "NULL":
+            stale_predicate = f"""
+                (
+                    ({last_login_expr} IS NULL AND du.created < (TRUNC(SYSDATE) - :b_days))
+                    OR
+                    ({last_login_expr} IS NOT NULL AND TRUNC({last_login_expr}) < (TRUNC(SYSDATE) - :b_days))
+                )
+            """
+            order_expr = f"NVL({last_login_expr}, du.created)"
+        else:
+            stale_predicate = "du.created < (TRUNC(SYSDATE) - :b_days)"
+            order_expr = "du.created"
 
-        if ":b_lookback" in audit_join_sql:
-            binds["b_lookback"] = int(os.getenv("SM_AUDIT_LOOKBACK_DAYS", "3650"))
+        where.append(stale_predicate)
 
-        where = []
-
-        # исключения пользователей
+        # exclude users
         if exclude_users:
             for i, u in enumerate(sorted(exclude_users)):
                 binds[f"b_ex{i}"] = u.upper()
                 where.append(f"UPPER(du.username) != :b_ex{i}")
 
-        if only_enabled:
+        # only_enabled (только если колонка есть)
+        if only_enabled and has_staff("USERENABLED"):
             where.append("(ss.userenabled = 1 OR ss.userenabled = '1')")
 
+        # search
         if q:
             binds["b_q"] = f"%{q}%"
-            or_parts = []
-            or_parts.append("LOWER(du.username) LIKE :b_q")
+            or_parts = ["LOWER(du.username) LIKE :b_q"]
             if has_staff("SERVERLOGIN"):
                 or_parts.append("LOWER(ss.serverlogin) LIKE :b_q")
             if has_staff("SURNAME"):
@@ -9948,62 +10001,46 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
                 or_parts.append("LOWER(ss.name) LIKE :b_q")
             if has_staff("PATRONYMIC"):
                 or_parts.append("LOWER(ss.patronymic) LIKE :b_q")
+            if has_staff("INN"):
+                or_parts.append("LOWER(TRIM(ss.inn)) LIKE :b_q")
             where.append("(" + " OR ".join(or_parts) + ")")
 
-        where_sql = (" AND " + " AND ".join(where)) if where else ""
-
-        # --- Условие "не заходил N дней" ---
-        # - если last_login NULL и created < sysdate - N
-        # - если last_login есть и trunc(last_login) < sysdate - N
-        stale_predicate = f"""
-            (
-                ({last_login_expr} IS NULL AND du.created < (TRUNC(SYSDATE) - :b_days))
-                OR
-                ({last_login_expr} IS NOT NULL AND TRUNC({last_login_expr}) < (TRUNC(SYSDATE) - :b_days))
-            )
-        """
+        where_sql = " AND ".join(where)
 
         sql = f"""
             SELECT
-                du.username                                  AS username,
-                {last_login_expr}                            AS last_login,
-                du.created                                   AS created,
-                NVL2(drp.grantee, 1, 0)                      AS has_role,
-                ss.id                                        AS staff_id,
-                ss.surname                                   AS surname,
+                du.username                 AS username,
+                {last_login_expr}           AS last_login,
+                du.created                  AS created,
+                {role_expr}                 AS has_role,
+                {sel_staff_id},
+                {sel_surname},
                 {sel_name},
-                {sel_pat},
-                ss.serverlogin                               AS serverlogin,
-                ss.userenabled                               AS userenabled
+                {sel_patronymic},
+                ss.serverlogin              AS serverlogin,
+                {sel_userenabled},
+                {sel_inn}
             FROM supermag.smstaff ss
             JOIN sys.dba_users du
               ON UPPER(ss.serverlogin) = UPPER(du.username)
-
             {audit_join_sql}
-
-            LEFT JOIN (
-                SELECT grantee
-                FROM sys.dba_role_privs
-                WHERE UPPER(granted_role) = 'SUPERMAG_USER'
-            ) drp
-              ON UPPER(du.username) = UPPER(drp.grantee)
-
-            WHERE
-                ss.id > 0
-                AND {stale_predicate}
-                {where_sql}
-
-            ORDER BY
-                NVL({last_login_expr}, du.created) ASC
+            {role_join_sql}
+            WHERE {where_sql}
+            ORDER BY {order_expr} ASC
         """
 
         cur.execute(sql, binds)
         rows = cur.fetchall()
 
         out = []
-        for (username, last_login, created, has_role, staff_id, surname, name, patronymic, serverlogin, userenabled) in rows:
+        for (username, last_login, created, has_role,
+             staff_id, surname, name, patronymic,
+             serverlogin, userenabled, inn) in rows:
+
             fio = " ".join([x for x in [surname, name, patronymic] if x]).strip()
+            # reason оставляем совместимым с твоим шаблоном
             reason = "never_logged_in" if last_login is None else "stale_login"
+
             out.append({
                 "db": db,
                 "username": (username or "").strip(),
@@ -10014,6 +10051,7 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
                 "fio": fio,
                 "serverlogin": (serverlogin or "").strip(),
                 "userenabled": str(userenabled).strip() if userenabled is not None else "",
+                "inn": (inn or "").strip(),  # ✅ INN
                 "reason": reason,
             })
 
@@ -10025,8 +10063,10 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
 
     finally:
         try:
-            if cur: cur.close()
-            if conn: conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
 
