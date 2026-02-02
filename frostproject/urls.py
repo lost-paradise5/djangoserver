@@ -58,7 +58,9 @@ from frostapp.views import (
     tg_admin_badge_request,
     tg_admin_badge_decision,
     bitrix_inactive_users_ui,
-    bitrix_users_toggle_active
+    bitrix_users_toggle_active,
+    sm_oracle_inactive_users_ui,
+    sm_oracle_users_block,
 )
 
 urlpatterns = [
@@ -118,4 +120,6 @@ urlpatterns = [
     path('tg/admin-badge/decision/', tg_admin_badge_decision, name='tg_admin_badge_decision'),
     path("ui/bitrix/inactive-users/", bitrix_inactive_users_ui, name="bitrix_inactive_users_ui"),
     path("ui/bitrix/inactive-users/toggle/", bitrix_users_toggle_active, name="bitrix_users_toggle_active"),
+    path("ui/sm/oracle-inactive-users/", sm_oracle_inactive_users_ui, name="sm_oracle_inactive_users_ui"),
+    path("ui/sm/oracle-inactive-users/block/", sm_oracle_users_block, name="sm_oracle_users_block"),
 ]
