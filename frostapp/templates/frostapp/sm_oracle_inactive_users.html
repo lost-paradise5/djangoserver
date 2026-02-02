@@ -80,6 +80,7 @@
         <th>DB</th>
         <th>USERNAME</th>
         <th>ФИО (SMSTAFF)</th>
+        <th>INN</th>
         <th>SERVERLOGIN</th>
         <th>STAFF_ID</th>
         <th>USERENABLED</th>
@@ -98,6 +99,7 @@
           <td>{{ r.db }}</td>
           <td><b>{{ r.username }}</b></td>
           <td>{{ r.fio }}</td>
+          <td>{{ r.inn|default:"" }}</td>
           <td>{{ r.serverlogin }}</td>
           <td>{{ r.staff_id }}</td>
           <td>{{ r.userenabled }}</td>
