@@ -9825,5 +9825,370 @@ def bitrix_users_toggle_active(request):
 
 
 
+_ORA_USERNAME_RE = re.compile(r"^[A-Z][A-Z0-9_$#]{0,127}$")  # безопасный whitelist
 
+def _sm_ui_services_list() -> list[str]:
+    # только те базы, которые реально описаны в ORACLE_TNS_MAP
+    return sorted(list(ORACLE_TNS_MAP.keys()))
+
+def _parse_int(v, default: int, mn: int, mx: int) -> int:
+    try:
+        x = int(str(v).strip())
+    except Exception:
+        x = default
+    return max(mn, min(mx, x))
+
+def _client_ip(request) -> str:
+    xff = (request.META.get("HTTP_X_FORWARDED_FOR") or "").split(",")[0].strip()
+    return xff or (request.META.get("REMOTE_ADDR") or "")
+
+def _oracle_dt_to_str(dt):
+    if dt is None:
+        return ""
+    if isinstance(dt, (datetime.datetime, datetime.date)):
+        try:
+            if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
+                dt = datetime.datetime(dt.year, dt.month, dt.day)
+            return dt.isoformat(sep=" ", timespec="seconds")
+        except Exception:
+            return str(dt)
+    return str(dt)
+
+def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, exclude_users: set[str]):
+    """
+    Возвращает список dict’ов по одной базе:
+      username, last_login, created, has_role, staff_id, fio, serverlogin, userenabled, reason
+    """
+    conn = cur = None
+    try:
+        conn = _connect_oracle_service(db)
+        cur = conn.cursor()
+
+        # Фильтр поиска
+        q = (q or "").strip().lower()
+        binds = {"b_days": int(days)}
+
+        where = []
+        # исключаем "супермаг" и любые служебные логины
+        if exclude_users:
+            # Oracle не любит большие IN (...) с bindами по одному — делаем через UPPER != ...
+            # (обычно exclude список маленький)
+            for i, u in enumerate(sorted(exclude_users)):
+                binds[f"b_ex{i}"] = u.upper()
+                where.append(f"UPPER(du.username) != :b_ex{i}")
+
+        # только включенные в SMSTAFF (по желанию)
+        if only_enabled:
+            where.append("(ss.userenabled = 1 OR ss.userenabled = '1')")
+
+        # поиск по логину/ФИО
+        if q:
+            binds["b_q"] = f"%{q}%"
+            where.append("""(
+                LOWER(du.username) LIKE :b_q
+                OR LOWER(ss.serverlogin) LIKE :b_q
+                OR LOWER(ss.surname) LIKE :b_q
+                OR LOWER(ss.name) LIKE :b_q
+                OR LOWER(ss.patronymic) LIKE :b_q
+            )""")
+
+        where_sql = (" AND " + " AND ".join(where)) if where else ""
+
+        # Логика "не заходил N дней":
+        # - last_login NULL и created < sysdate - N
+        # - last_login < sysdate - N
+        sql = f"""
+            SELECT
+                du.username                                      AS username,
+                du.last_login                                    AS last_login,
+                du.created                                       AS created,
+                NVL2(drp.grantee, 1, 0)                          AS has_role,
+                ss.id                                            AS staff_id,
+                ss.surname                                       AS surname,
+                ss.name                                          AS name,
+                ss.patronymic                                    AS patronymic,
+                ss.serverlogin                                   AS serverlogin,
+                ss.userenabled                                   AS userenabled
+            FROM supermag.smstaff ss
+            JOIN sys.dba_users du
+              ON UPPER(ss.serverlogin) = UPPER(du.username)
+            LEFT JOIN (
+                SELECT grantee
+                FROM sys.dba_role_privs
+                WHERE UPPER(granted_role) = 'SUPERMAG_USER'
+            ) drp
+              ON UPPER(du.username) = UPPER(drp.grantee)
+            WHERE
+                ss.id > 0
+                AND (
+                    (du.last_login IS NULL AND du.created < (TRUNC(SYSDATE) - :b_days))
+                    OR
+                    (du.last_login IS NOT NULL AND TRUNC(du.last_login) < (TRUNC(SYSDATE) - :b_days))
+                )
+                {where_sql}
+            ORDER BY
+                NVL(du.last_login, du.created) ASC
+        """
+
+        cur.execute(sql, binds)
+        rows = cur.fetchall()
+
+        out = []
+        for (username, last_login, created, has_role, staff_id, surname, name, patronymic, serverlogin, userenabled) in rows:
+            fio = " ".join([x for x in [surname, name, patronymic] if x]).strip()
+            reason = "never_logged_in" if last_login is None else "stale_login"
+            out.append({
+                "db": db,
+                "username": (username or "").strip(),
+                "last_login": _oracle_dt_to_str(last_login),
+                "created": _oracle_dt_to_str(created),
+                "has_role": int(has_role or 0),
+                "staff_id": int(staff_id) if staff_id is not None else None,
+                "fio": fio,
+                "serverlogin": (serverlogin or "").strip(),
+                "userenabled": str(userenabled).strip() if userenabled is not None else "",
+                "reason": reason,
+            })
+        return out, None
+
+    except Exception as e:
+        logger.exception(f"[SM_LAST_LOGIN] fetch failed db={db}: {e}")
+        return [], str(e)
+
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+
+def _sm_block_users_in_db(db: str, usernames: list[str], dry_run: bool):
+    """
+    Делает:
+      1) UPDATE supermag.smstaff SET userenabled=0 WHERE upper(serverlogin)=upper(username)
+      2) REVOKE SUPERMAG_USER FROM <username>
+    Возвращает: ok(list), bad(list of {username,error}), details(list)
+    """
+    conn = cur = None
+    ok, bad, details = [], [], []
+
+    # нормализация+валидация имён (чтобы безопасно вставлять в DDL)
+    cleaned = []
+    for u in usernames:
+        u2 = (u or "").strip().upper()
+        if not u2:
+            continue
+        if not _ORA_USERNAME_RE.match(u2):
+            bad.append({"username": u2, "error": "BAD_USERNAME_FORMAT"})
+            continue
+        cleaned.append(u2)
+
+    cleaned = sorted(set(cleaned))
+
+    try:
+        conn = _connect_oracle_service(db)
+        cur = conn.cursor()
+
+        for u in cleaned:
+            if dry_run:
+                details.append({"db": db, "username": u, "smstaff_disabled": None, "revoke_role": None, "dry_run": True})
+                ok.append(u)
+                continue
+
+            try:
+                # 1) disable in SMSTAFF
+                cur.execute("""
+                    UPDATE supermag.smstaff
+                       SET userenabled = 0
+                     WHERE UPPER(serverlogin) = :b_u
+                """, b_u=u)
+                smstaff_rows = int(cur.rowcount or 0)
+
+                # 2) revoke role (если роли нет — Oracle может ругнуться; ловим и считаем как "не критично")
+                revoked = False
+                try:
+                    cur.execute(f"REVOKE SUPERMAG_USER FROM {u}")
+                    revoked = True
+                except Exception as re_err:
+                    # бывает ORA-01952 / ORA-01951 и т.п. — роли нет/не выдана
+                    revoked = False
+                    details.append({"db": db, "username": u, "warn": f"REVOKE_FAILED: {re_err}"})
+
+                details.append({
+                    "db": db,
+                    "username": u,
+                    "smstaff_disabled_rows": smstaff_rows,
+                    "revoke_role_ok": revoked,
+                    "dry_run": False
+                })
+                ok.append(u)
+
+            except Exception as one_err:
+                bad.append({"username": u, "error": str(one_err)})
+
+        if not dry_run:
+            conn.commit()
+
+        return ok, bad, details
+
+    except Exception as e:
+        logger.exception(f"[SM_LAST_LOGIN] block failed db={db}: {e}")
+        return [], [{"username": "*", "error": str(e)}], details
+
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+
+@staff_member_required
+@require_http_methods(["GET"])
+@never_cache
+def sm_oracle_inactive_users_ui(request):
+    """
+    UI: список "не заходил N дней" по SYS.DBA_USERS.LAST_LOGIN (в разрезе баз).
+    GET /ui/sm/oracle-inactive-users/?db=BINUU00|ALL&days=30&q=...&only_enabled=1
+    """
+    services = _sm_ui_services_list()
+
+    db = (request.GET.get("db") or "BINUU00").strip().upper()
+    if db != "ALL" and db not in ORACLE_TNS_MAP:
+        db = "BINUU00"
+
+    days = _parse_int(request.GET.get("days"), default=30, mn=1, mx=3650)
+    q = (request.GET.get("q") or "").strip()
+    only_enabled = (request.GET.get("only_enabled") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+    # можно расширить список исключений через env
+    exclude_env = (os.getenv("SM_LASTLOGIN_EXCLUDE_USERS", "S_BUDAYEV,SUPERMAG,SADMIN,SYSTEM,SYS") or "")
+    exclude_users = {x.strip().upper() for x in exclude_env.split(",") if x.strip()}
+
+    rows = []
+    db_errors = {}
+
+    target_dbs = services if db == "ALL" else [db]
+
+    for d in target_dbs:
+        items, err = _sm_fetch_stale_users_in_db(
+            db=d,
+            days=days,
+            only_enabled=only_enabled,
+            q=q,
+            exclude_users=exclude_users
+        )
+        rows.extend(items)
+        if err:
+            db_errors[d] = err
+
+    # сортировка: сначала те, у кого самый старый last_login/created
+    def _sort_key(r):
+        # last_login пустой — используем created
+        x = r.get("last_login") or r.get("created") or ""
+        return x
+
+    rows.sort(key=_sort_key)
+
+    return render(request, "frostapp/sm_oracle_inactive_users.html", {
+        "services": services,
+        "db": db,
+        "days": days,
+        "q": q,
+        "only_enabled": only_enabled,
+        "rows": rows,
+        "db_errors": db_errors,
+        "total": len(rows),
+        "csrf": get_token(request),
+    })
+
+
+@staff_member_required
+@require_http_methods(["POST"])
+@csrf_protect
+def sm_oracle_users_block(request):
+    """
+    POST /ui/sm/oracle-inactive-users/block/
+    Поля:
+      action = test | apply
+      item = "BINUU00|USERNAME" (может быть несколько)
+    """
+    action = (request.POST.get("action") or "").strip().lower()
+    if action not in ("test", "apply"):
+        return JsonResponse({"ok": False, "error": "BAD_ACTION"}, status=400)
+
+    dry_run = (action == "test")
+
+    items = request.POST.getlist("item")
+    pairs = []
+    for it in items:
+        it = (it or "").strip()
+        if "|" not in it:
+            continue
+        db, username = it.split("|", 1)
+        db = (db or "").strip().upper()
+        username = (username or "").strip().upper()
+        if db and username and db in ORACLE_TNS_MAP:
+            pairs.append((db, username))
+
+    if not pairs:
+        return JsonResponse({"ok": False, "error": "NO_ITEMS"}, status=400)
+
+    # группируем по базе
+    by_db = defaultdict(list)
+    for db, u in pairs:
+        by_db[db].append(u)
+
+    all_ok = {}
+    all_bad = {}
+    all_details = []
+
+    for db, usernames in by_db.items():
+        ok, bad, details = _sm_block_users_in_db(db=db, usernames=usernames, dry_run=dry_run)
+        all_ok[db] = ok
+        all_bad[db] = bad
+        all_details.extend(details)
+
+    # телега-лог (если у тебя есть send_telegram_log)
+    try:
+        err_cnt = sum(len(v) for v in all_bad.values())
+        ok_cnt = sum(len(v) for v in all_ok.values())
+        top_errs = []
+        for db, lst in all_bad.items():
+            for e in lst[:3]:
+                top_errs.append(f"{db}:{e.get('username')}:{e.get('error')}")
+            if len(top_errs) >= 5:
+                break
+
+        msg = "\n".join([
+            "🧾 SUPERMAG LAST_LOGIN BLOCK",
+            f"by_django_user={getattr(request.user, 'username', 'unknown')}",
+            f"action={'dry_run' if dry_run else 'apply'}",
+            f"ok={ok_cnt} bad={err_cnt}",
+            f"errors_top5={'; '.join(top_errs) if top_errs else '—'}",
+            f"ip={_client_ip(request)}",
+            f"time={timezone.now().isoformat(sep=' ', timespec='seconds')}",
+        ])
+        try:
+            send_telegram_log(msg)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # AJAX
+    if request.headers.get("x-requested-with") == "XMLHttpRequest":
+        return JsonResponse({
+            "ok": True,
+            "dry_run": dry_run,
+            "updated_ok": all_ok,
+            "errors": all_bad,
+            "details": all_details,
+        }, json_dumps_params={"ensure_ascii": False, "indent": 2})
+
+    # обычный POST -> редирект обратно на список с параметрами
+    back = request.META.get("HTTP_REFERER") or reverse("sm_oracle_inactive_users_ui")
+    sep = "&" if "?" in back else "?"
+    return redirect(f"{back}{sep}done={'test' if dry_run else 'apply'}")
 
