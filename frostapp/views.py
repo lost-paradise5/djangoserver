@@ -4,7 +4,7 @@ import os
 import logging
 import requests
 import time
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any, Iterable
 import random
 import string
 import ldap
@@ -266,12 +266,13 @@ def _get_session_or_403(request, must_verified: bool) -> VpnAccessSession:
 # Helpers: Bitrix
 # =========================
 
-def _bitrix_call(url: str, data: dict | None = None, json_payload: dict | None = None, timeout: int = 25) -> dict:
-    """
-    Универсальный вызов Bitrix REST.
-    - data -> application/x-www-form-urlencoded
-    - json_payload -> application/json
-    """
+
+def _bitrix_call(
+    url: str,
+    data: dict | list[tuple[str, Any]] | None = None,
+    json_payload: dict | None = None,
+    timeout: int = 25,
+) -> dict:
     try:
         if json_payload is not None:
             r = requests.post(url, json=json_payload, timeout=timeout)
@@ -287,11 +288,29 @@ def _bitrix_call(url: str, data: dict | None = None, json_payload: dict | None =
         return js
     except Exception as e:
         raise RuntimeError(f"BITRIX_CALL_FAILED: {e}")
+# def _bitrix_call(url: str, data: dict | None = None, json_payload: dict | None = None, timeout: int = 25) -> dict:
+#     """
+#     Универсальный вызов Bitrix REST.
+#     - data -> application/x-www-form-urlencoded
+#     - json_payload -> application/json
+#     """
+#     try:
+#         if json_payload is not None:
+#             r = requests.post(url, json=json_payload, timeout=timeout)
+#         else:
+#             r = requests.post(url, data=(data or {}), timeout=timeout)
 
-# def bitrix_get_departments() -> list[dict]:
-#     js = _bitrix_call(BITRIX_DEPARTMENT_GET_URL, data={})
-#     res = js.get("result") or []
-#     return res
+#         r.raise_for_status()
+#         js = r.json()
+
+#         if isinstance(js, dict) and js.get("error"):
+#             raise RuntimeError(f"Bitrix error: {js.get('error')} {js.get('error_description')}")
+
+#         return js
+#     except Exception as e:
+#         raise RuntimeError(f"BITRIX_CALL_FAILED: {e}")
+
+
 def bitrix_get_departments() -> list[dict]:
     out: list[dict] = []
     start = 0
@@ -433,9 +452,6 @@ def bitrix_user_get_by_id(user_id: int, select_list: list[str] | None = None) ->
 
 
 def _bx_active_to_bool(v) -> bool | None:
-    """
-    ACTIVE в Bitrix чаще всего: 'Y'/'N', но иногда может быть 1/0, true/false.
-    """
     if v is None:
         return None
     if isinstance(v, bool):
@@ -451,80 +467,81 @@ def _bx_active_to_bool(v) -> bool | None:
 
 
 def bitrix_user_update(user_id: int, fields: dict) -> dict:
-    """
-    Надёжная user.update:
-    1) form-encoded: ID + FIELDS[...]
-    2) fallback JSON: {"ID":..., "fields": {...}}  (на случай отличий на портале/прокси)
-    Возвращает полный JSON ответа.
-    """
-    user_id = int(user_id)
+
+    uid = int(user_id)
     fields = fields or {}
 
-    # --- попытка 1: form-encoded ---
-    data = {"ID": user_id}
+    attempts: list[tuple[str, dict | list[tuple[str, Any]] | None, dict | None]] = []
+
+    # 1) id + fields[KEY]
+    data1: list[tuple[str, Any]] = [("id", str(uid))]
     for k, v in fields.items():
-        data[f"FIELDS[{k}]"] = v
+        data1.append((f"fields[{k}]", v))
+    attempts.append(("form:id+fields[]", data1, None))
 
-    js = _bitrix_call(BITRIX_USER_UPDATE_URL, data=data)
+    # 2) id + FIELDS[KEY]
+    data2: list[tuple[str, Any]] = [("id", str(uid))]
+    for k, v in fields.items():
+        data2.append((f"FIELDS[{k}]", v))
+    attempts.append(("form:id+FIELDS[]", data2, None))
 
-    # Bitrix обычно возвращает {"result": true}
-    if js.get("result") in (True, 1, "1"):
-        return js
+    # 3) ID + FIELDS[KEY]
+    data3: list[tuple[str, Any]] = [("ID", str(uid))]
+    for k, v in fields.items():
+        data3.append((f"FIELDS[{k}]", v))
+    attempts.append(("form:ID+FIELDS[]", data3, None))
 
-    # --- попытка 2: JSON ---
-    js2 = _bitrix_call(BITRIX_USER_UPDATE_URL, json_payload={"ID": user_id, "fields": fields})
+    # 4) JSON: id + fields
+    attempts.append(("json:id+fields", None, {"id": uid, "fields": fields}))
 
-    if js2.get("result") in (True, 1, "1"):
-        return js2
+    # 5) JSON: ID + FIELDS
+    attempts.append(("json:ID+FIELDS", None, {"ID": uid, "FIELDS": fields}))
 
-    raise RuntimeError(f"user.update returned non-ok: result={js2.get('result')!r}, full={js2!r}")
+    last_js = None
+    last_tag = None
+
+    for tag, form_data, json_payload in attempts:
+        last_tag = tag
+        js = _bitrix_call(BITRIX_USER_UPDATE_URL, data=form_data, json_payload=json_payload)
+        last_js = js
+        if js.get("result") in (True, 1, "1"):
+            return js
+
+    raise RuntimeError(f"user.update NON_OK: last_tag={last_tag}, last_js={last_js!r}")
 
 
 def bitrix_set_user_active_strict(user_id: int, desired_active: bool) -> None:
-    """
-    “Жёсткая” установка ACTIVE:
-    - пробуем разные представления значения
-    - после update перечитываем user.get несколько раз (ретраи), чтобы убедиться, что применилось
-    """
+
     uid = int(user_id)
+    desired_str = "Y" if desired_active else "N"
 
-    # разные варианты представления значения для Bitrix
-    if desired_active:
-        candidates = ["Y", "1", True]
-    else:
-        candidates = ["N", "0", False]
+    # 1) update (строго Y/N)
+    upd_js = bitrix_user_update(uid, {"ACTIVE": desired_str})
 
+    # 2) verify with retries (на случай задержек применения)
     last_after = None
-    last_update_js = None
+    for delay in (0.0, 0.5, 1.0, 2.0, 3.0):
+        if delay:
+            time.sleep(delay)
 
-    for cand in candidates:
-        # 1) update
-        last_update_js = bitrix_user_update(uid, {"ACTIVE": cand})
+        after = bitrix_user_get_by_id(uid, select_list=["ID", "ACTIVE"])
+        last_after = after
 
-        # 2) verify (ретраи на случай задержки применения)
-        for delay in (0.0, 0.4, 1.0, 2.0):
-            if delay:
-                time.sleep(delay)
+        if not after:
+            continue
 
-            after = bitrix_user_get_by_id(uid, select_list=["ID", "ACTIVE"])
-            last_after = after
+        after_bool = _bx_active_to_bool(after.get("ACTIVE"))
+        if after_bool is None:
+            continue
 
-            if not after:
-                continue
+        if after_bool == desired_active:
+            return  # ✅ успех
 
-            after_bool = _bx_active_to_bool(after.get("ACTIVE"))
-            if after_bool is None:
-                continue
-
-            if after_bool == desired_active:
-                return  # ✅ успех
-
-    # если дошли сюда — не поменялось
     raise RuntimeError(
         "NOT_CHANGED: "
-        f"expected ACTIVE={desired_active}, "
+        f"expected ACTIVE={desired_active}({desired_str}), "
         f"got ACTIVE={None if not last_after else last_after.get('ACTIVE')!r}, "
-        f"last_update_result={None if not last_update_js else last_update_js.get('result')!r}"
+        f"update_result={upd_js.get('result')!r}"
     )
 
 
