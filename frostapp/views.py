@@ -684,6 +684,192 @@ def ad_group_remove_member(group_dn: str, user_dn: str):
 
 
 # =========================
+# Это для интерфейса по блокировке в AD 
+# =========================
+AD_DISABLE_FLAG = 2  # userAccountControl bit: ACCOUNTDISABLE
+
+
+def _ad_filetime_to_dt(v: Any):
+    """
+    AD FILETIME (100-ns since 1601-01-01 UTC) -> aware datetime (UTC).
+    Возвращает None, если значение пустое/0/битое.
+    """
+    if not v:
+        return None
+    try:
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else None
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", "ignore")
+        s = str(v).strip()
+        if not s:
+            return None
+        n = int(s)
+        if n <= 0:
+            return None
+        epoch = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+        # 100 ns = 0.1 microsecond
+        return epoch + datetime.timedelta(microseconds=n / 10)
+    except Exception:
+        return None
+
+
+def _dt_to_ad_filetime(dt: datetime.datetime) -> int:
+    """
+    aware datetime -> AD FILETIME int
+    """
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, datetime.timezone.utc)
+    dt_utc = dt.astimezone(datetime.timezone.utc)
+    epoch = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+    delta = dt_utc - epoch
+    return int(delta.total_seconds() * 10_000_000)
+
+
+def _ad_uac_is_disabled(uac: int) -> bool:
+    try:
+        return bool(int(uac) & AD_DISABLE_FLAG)
+    except Exception:
+        return False
+
+
+def _ad_build_users_filter(q: str, inactive_days: int | None, inactive_field: str,
+                           include_never: bool, include_disabled: bool) -> str:
+    """
+    Строим LDAP filter под список пользователей.
+    inactive_field: lastLogonTimestamp | lastLogon | lastLogoff
+    """
+    parts = [
+        "(objectCategory=person)",
+        "(objectClass=user)",
+        "(!(objectClass=computer))",
+    ]
+
+    # поиск по строке
+    q = (q or "").strip()
+    if q:
+        qq = escape_filter_chars(q)
+        parts.append(
+            "(|"
+            f"(sAMAccountName=*{qq}*)"
+            f"(displayName=*{qq}*)"
+            f"(mail=*{qq}*)"
+            f"(userPrincipalName=*{qq}*)"
+            f"(employeeID=*{qq}*)"
+            ")"
+        )
+
+    # показать/скрыть disabled
+    if not include_disabled:
+        parts.append(f"(!(userAccountControl:1.2.840.113556.1.4.803:={AD_DISABLE_FLAG}))")
+
+    # фильтр "не входил X дней"
+    if inactive_days is not None and inactive_days > 0:
+        field = inactive_field if inactive_field in ("lastLogonTimestamp", "lastLogon", "lastLogoff") else "lastLogonTimestamp"
+        cutoff = timezone.now() - datetime.timedelta(days=int(inactive_days))
+        cutoff_ft = _dt_to_ad_filetime(cutoff)
+
+        if include_never:
+            # либо атрибут отсутствует, либо значение <= cutoff
+            parts.append(f"(|(!({field}=*))({field}<={cutoff_ft}))")
+        else:
+            parts.append(f"(&({field}=*)({field}<={cutoff_ft}))")
+
+    return "(&" + "".join(parts) + ")"
+
+
+def _ad_paged_users(conn, ldap_filter: str, attrs: list[str], page_size: int, page: int):
+    """
+    Берём страницу page (1..N) через SimplePagedResultsControl.
+    ВАЖНО: для page=N мы “пролистываем” N страниц (AD не даёт offset).
+    """
+    page = max(int(page or 1), 1)
+    page_size = max(min(int(page_size or 100), 500), 10)
+
+    cookie = b""
+    data = []
+    has_next = False
+
+    # пролистываем до нужной страницы
+    for _ in range(page):
+        ctrl = SimplePagedResultsControl(True, size=page_size, cookie=cookie)
+        msgid = conn.search_ext(
+            AD_SEARCH_BASE,
+            ldap.SCOPE_SUBTREE,
+            ldap_filter,
+            attrlist=attrs,
+            serverctrls=[ctrl],
+        )
+        rtype, rdata, rmsgid, serverctrls = conn.result3(msgid)
+
+        # достанем cookie следующей страницы
+        paged_ctrls = [c for c in serverctrls if c.controlType == SimplePagedResultsControl.controlType]
+        cookie = paged_ctrls[0].cookie if paged_ctrls else b""
+
+        data = [x for x in (rdata or []) if x and x[0]]
+        has_next = bool(cookie)
+
+        if not data and not has_next:
+            break
+
+    return data, has_next, page_size
+
+
+def _ad_get_dn_and_uac_by_sam(conn, sam: str):
+    sam = (sam or "").strip()
+    if not sam:
+        return None, None, None
+
+    f = (
+        "(&"
+        "(objectCategory=person)(objectClass=user)"
+        f"(sAMAccountName={escape_filter_chars(sam)})"
+        ")"
+    )
+    res = conn.search_s(AD_SEARCH_BASE, ldap.SCOPE_SUBTREE, f, attrlist=["userAccountControl", "displayName", "mail"])
+    res = [x for x in res if x and x[0]]
+    if not res:
+        return None, None, None
+    dn, at = res[0]
+    uac_raw = (at.get("userAccountControl") or [b"0"])[0]
+    try:
+        uac = int(uac_raw.decode("utf-8", "ignore") if isinstance(uac_raw, bytes) else str(uac_raw))
+    except Exception:
+        uac = 0
+    display = (at.get("displayName") or [b""])[0]
+    display = display.decode("utf-8", "ignore") if isinstance(display, bytes) else str(display)
+    return dn, uac, display
+
+
+def _ad_set_disabled_by_dn(conn, dn: str, uac: int, disabled: bool) -> tuple[bool, int]:
+    """
+    Возвращает (changed, new_uac)
+    """
+    uac = int(uac or 0)
+    new_uac = (uac | AD_DISABLE_FLAG) if disabled else (uac & ~AD_DISABLE_FLAG)
+    if new_uac == uac:
+        return False, new_uac
+
+    conn.modify_s(dn, [
+        (ldap.MOD_REPLACE, "userAccountControl", [str(new_uac).encode("utf-8")]),
+    ])
+    return True, new_uac
+
+
+def _append_qs(url: str, **params) -> str:
+    if "?" in url:
+        return url + "&" + urlencode(params)
+    return url + "?" + urlencode(params)
+
+
+
+
+
+
+
+
+
+# =========================
 # UI: login -> pin -> users
 # =========================
 
@@ -1423,6 +1609,305 @@ def ad_ui_lookup(request):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+@staff_member_required
+@require_http_methods(["GET"])
+@never_cache
+def ad_ui_users(request):
+    """
+    UI: список пользователей AD + фильтр по lastLogon* + пагинация.
+    """
+    q = (request.GET.get("q") or "").strip()
+    inactive_days_raw = (request.GET.get("inactive_days") or "").strip()
+    inactive_field = (request.GET.get("inactive_field") or "lastLogonTimestamp").strip()
+    include_never = (request.GET.get("include_never") or "") in ("1", "true", "on", "yes")
+    include_disabled = (request.GET.get("include_disabled") or "") in ("1", "true", "on", "yes")
+    page = int((request.GET.get("page") or "1").strip() or 1)
+    page_size = int((request.GET.get("page_size") or "100").strip() or 100)
+
+    inactive_days = None
+    if inactive_days_raw:
+        try:
+            inactive_days = max(int(inactive_days_raw), 0)
+        except Exception:
+            inactive_days = None
+
+    ldap_filter = _ad_build_users_filter(
+        q=q,
+        inactive_days=inactive_days,
+        inactive_field=inactive_field,
+        include_never=include_never,
+        include_disabled=include_disabled,
+    )
+
+    attrs = [
+        "distinguishedName",
+        "sAMAccountName",
+        "userPrincipalName",
+        "mail",
+        "displayName",
+        "employeeID",
+        "department",
+        "title",
+        "company",
+        "whenCreated",
+        "whenChanged",
+        "userAccountControl",
+        "lastLogonTimestamp",
+        "lastLogon",
+        "lastLogoff",
+    ]
+
+    rows = []
+    error = (request.GET.get("err") or "").strip()
+    ok = (request.GET.get("ok") or "").strip()
+
+    conn = None
+    try:
+        conn = _ad_connect()
+        data, has_next, page_size = _ad_paged_users(conn, ldap_filter, attrs, page_size, page)
+
+        now_local = timezone.localtime(timezone.now())
+
+        for dn, at in data:
+            def _get1(key: str) -> str:
+                v = (at.get(key) or [b""])[0]
+                if isinstance(v, bytes):
+                    return v.decode("utf-8", "ignore")
+                return str(v or "")
+
+            def _get_dt_filetime(key: str):
+                v = at.get(key)
+                return _ad_filetime_to_dt(v[0] if isinstance(v, (list, tuple)) and v else v)
+
+            sam = _get1("sAMAccountName").strip()
+            display = _get1("displayName").strip()
+            mail = _get1("mail").strip()
+            upn = _get1("userPrincipalName").strip()
+            employee_id = _get1("employeeID").strip()
+            dept = _get1("department").strip()
+            title = _get1("title").strip()
+
+            uac_raw = _get1("userAccountControl").strip()
+            try:
+                uac = int(uac_raw or "0")
+            except Exception:
+                uac = 0
+            disabled = _ad_uac_is_disabled(uac)
+
+            llts = _get_dt_filetime("lastLogonTimestamp")
+            llogon = _get_dt_filetime("lastLogon")
+            llogoff = _get_dt_filetime("lastLogoff")
+
+            # “последняя активность” — максимум из доступных (для удобства отображения)
+            candidates = [x for x in [llts, llogon, llogoff] if x is not None]
+            last_any = max(candidates) if candidates else None
+
+            def _fmt(dt_utc):
+                if not dt_utc:
+                    return ""
+                try:
+                    dt_local = timezone.localtime(dt_utc)
+                except Exception:
+                    dt_local = dt_utc
+                return dt_local.strftime("%Y-%m-%d %H:%M:%S")
+
+            def _days_since(dt_utc):
+                if not dt_utc:
+                    return None
+                try:
+                    dt_local = timezone.localtime(dt_utc)
+                except Exception:
+                    dt_local = dt_utc
+                return (now_local.date() - dt_local.date()).days
+
+            rows.append({
+                "dn": dn,
+                "sam": sam,
+                "display": display,
+                "mail": mail,
+                "upn": upn,
+                "employeeID": employee_id,
+                "department": dept,
+                "title": title,
+                "uac": uac,
+                "disabled": disabled,
+                "lastLogonTimestamp": _fmt(llts),
+                "lastLogon": _fmt(llogon),
+                "lastLogoff": _fmt(llogoff),
+                "lastAny": _fmt(last_any),
+                "daysSince": _days_since(last_any),
+            })
+
+        # prev/next urls
+        base_params = request.GET.copy()
+        base_params.pop("ok", None)
+        base_params.pop("err", None)
+
+        prev_url = None
+        if page > 1:
+            p = base_params.copy()
+            p["page"] = page - 1
+            prev_url = f"{reverse('ad_ui_users')}?{p.urlencode()}"
+
+        next_url = None
+        if has_next:
+            p = base_params.copy()
+            p["page"] = page + 1
+            next_url = f"{reverse('ad_ui_users')}?{p.urlencode()}"
+
+        return render(request, "frostapp/ad_users.html", {
+            "error": error,
+            "ok": ok,
+            "rows": rows,
+            "page": page,
+            "page_size": page_size,
+            "has_next": has_next,
+            "prev_url": prev_url,
+            "next_url": next_url,
+            "filters": {
+                "q": q,
+                "inactive_days": inactive_days_raw,
+                "inactive_field": inactive_field,
+                "include_never": include_never,
+                "include_disabled": include_disabled,
+            },
+            "next_hidden": request.get_full_path(),
+        })
+
+    except ldap.INVALID_CREDENTIALS:
+        return render(request, "frostapp/ad_users.html", {
+            "error": "Неверные учётные данные для AD (INVALID_CREDENTIALS).",
+            "ok": "",
+            "rows": [],
+            "page": page,
+            "page_size": page_size,
+            "prev_url": None,
+            "next_url": None,
+            "filters": {},
+            "next_hidden": request.get_full_path(),
+        })
+    except Exception as e:
+        return render(request, "frostapp/ad_users.html", {
+            "error": str(e),
+            "ok": "",
+            "rows": [],
+            "page": page,
+            "page_size": page_size,
+            "prev_url": None,
+            "next_url": None,
+            "filters": {},
+            "next_hidden": request.get_full_path(),
+        })
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+
+@staff_member_required
+@require_http_methods(["POST"])
+@csrf_protect
+@never_cache
+def ad_ui_users_toggle(request):
+    """
+    Массовая блокировка/разблокировка (disable/enable) выбранных sAMAccountName.
+    """
+    action = (request.POST.get("action") or "").strip()  # disable | enable
+    sams = request.POST.getlist("sam")
+    next_url = (request.POST.get("next") or reverse("ad_ui_users")).strip()
+
+    if action not in ("disable", "enable"):
+        return redirect(_append_qs(next_url, err="BAD_ACTION"))
+
+    if not sams:
+        return redirect(_append_qs(next_url, err="NO_SELECTION"))
+
+    disabled_target = (action == "disable")
+    by_user = getattr(request.user, "username", "unknown")
+    ip = _client_ip(request) if "_client_ip" in globals() else (request.META.get("REMOTE_ADDR") or "")
+
+    conn = None
+    changed = 0
+    skipped = 0
+    failed = 0
+    details = []
+
+    try:
+        conn = _ad_connect()
+
+        for sam in sams:
+            sam = (sam or "").strip()
+            if not sam:
+                continue
+            try:
+                dn, uac, display = _ad_get_dn_and_uac_by_sam(conn, sam)
+                if not dn:
+                    failed += 1
+                    details.append(f"{sam}: NOT_FOUND")
+                    continue
+
+                was_disabled = _ad_uac_is_disabled(uac)
+                if was_disabled == disabled_target:
+                    skipped += 1
+                    details.append(f"{sam} ({display}): NOT_CHANGED")
+                    continue
+
+                ch, new_uac = _ad_set_disabled_by_dn(conn, dn, uac, disabled_target)
+                if ch:
+                    changed += 1
+                    details.append(f"{sam} ({display}): OK -> {'DISABLED' if disabled_target else 'ENABLED'}")
+                else:
+                    skipped += 1
+                    details.append(f"{sam} ({display}): NOT_CHANGED")
+            except ldap.INSUFFICIENT_ACCESS:
+                failed += 1
+                details.append(f"{sam}: INSUFFICIENT_ACCESS")
+            except Exception as e:
+                failed += 1
+                details.append(f"{sam}: ERROR {e}")
+
+        try:
+            head = "👥 AD USERS TOGGLE ACTIVE"
+            lines = [
+                head,
+                f"by_django_user={by_user}",
+                f"action={action}",
+                f"selected={len(sams)} changed={changed} skipped={skipped} failed={failed}",
+                f"ip={ip}",
+                f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+                "",
+                "details_top50:",
+            ]
+            for x in details[:50]:
+                lines.append(x)
+            send_telegram_log("\n".join(lines))
+        except Exception:
+            pass
+
+        if failed:
+            return redirect(_append_qs(next_url, err=f"changed={changed}, failed={failed}"))
+        return redirect(_append_qs(next_url, ok=f"changed={changed}, skipped={skipped}"))
+
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
 
 
 
