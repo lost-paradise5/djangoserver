@@ -277,13 +277,13 @@
           </div>
 
           <div class="col-12 d-flex justify-content-between align-items-center mt-2">
-            <button type="button" class="btn btn-outline-danger btn-sm" id="clearPeriod">Очистить период</button>
-            <div class="text-muted small">Нажмите на поле — откроется календарь и выбор времени.</div>
+            <button type="button" class="btn btn-outline-danger btn-sm" id="clearPeriod">Сброс</button>
+            <div class="text-muted small">Нажмите на поле — откроется выбор времени и даты.</div>
           </div>
         </div>
 
         <div class="alert alert-warning small mt-3 mb-0">
-          При наступлении окончания доступ будет автоматически возвращён (через scheduler).
+          При окончании доступ будет открыт/закрыт автоматически.
         </div>
       </div>
 
@@ -437,10 +437,10 @@
 
     if (ctx.desired === "1") {
       titleEl.textContent = "Открыть удалённый доступ";
-      hintEl.textContent = "Выберите период, на который доступ должен быть открыт. Если оставить пустым — откроется сразу без авто-закрытия.";
+      hintEl.textContent = "Выберите период, на который открыть доступ. Если оставить пустым — откроется сразу без авто-закрытия.";
     } else {
       titleEl.textContent = "Закрыть удалённый доступ";
-      hintEl.textContent = "Выберите период, на который доступ должен быть закрыт. Если оставить пустым — закроется сразу без авто-открытия.";
+      hintEl.textContent = "Выберите период, на который закрыть доступ. Если оставить пустым — закроется сразу без авто-открытия.";
     }
 
     modal.show();
