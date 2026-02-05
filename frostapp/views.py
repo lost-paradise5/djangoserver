@@ -2659,7 +2659,8 @@ def _update_store_mysql_and_xml_for_single_store(
                         role_id    = VALUES(role_id),
                         version    = VALUES(version),
                         deleted    = 0,
-                        start_date = VALUES(start_date),
+                        # start_date = VALUES(start_date),
+                        start_date = VALUES(end_date),
                         end_date   = VALUES(end_date)
                 """, (
                     store_id,
@@ -4215,7 +4216,8 @@ def regenerate_qr(user):
                             role_id    = VALUES(role_id),
                             version    = VALUES(version),
                             deleted    = 0,
-                            start_date = VALUES(start_date),
+                            # start_date = VALUES(start_date),
+                            start_date = VALUES(end_date),
                             end_date   = VALUES(end_date)
                     """, (
                         sid,
