@@ -61,6 +61,8 @@ from frostapp.views import (
     bitrix_users_toggle_active,
     sm_oracle_inactive_users_ui,
     sm_oracle_users_block,
+    ad_ui_users,
+    ad_ui_users_toggle,
 )
 
 urlpatterns = [
@@ -122,4 +124,6 @@ urlpatterns = [
     path("ui/bitrix/inactive-users/toggle/", bitrix_users_toggle_active, name="bitrix_users_toggle_active"),
     path("ui/sm/oracle-inactive-users/", sm_oracle_inactive_users_ui, name="sm_oracle_inactive_users_ui"),
     path("ui/sm/oracle-inactive-users/block/", sm_oracle_users_block, name="sm_oracle_users_block"),
+    path("ui/ad-users/", ad_ui_users, name="ad_ui_users"),
+    path("ui/ad-users/toggle/", ad_ui_users_toggle, name="ad_ui_users_toggle"),
 ]
