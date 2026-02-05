@@ -39,6 +39,8 @@ from django.utils.http import urlencode
 from django.views.decorators.csrf import csrf_protect
 from django.middleware.csrf import get_token
 from ldap.controls.libldap import SimplePagedResultsControl
+import base64
+from urllib.parse import urlencode
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest
 
