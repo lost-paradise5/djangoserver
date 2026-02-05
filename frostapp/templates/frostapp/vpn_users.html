@@ -6,8 +6,9 @@
   <title>Контроль УД сотрудников</title>
 
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <!-- Flatpickr (удобный выбор даты+времени) -->
-  <link href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" rel="stylesheet">
+
+  <!-- Air Datepicker (удобный date+time) -->
+  <link href="https://cdn.jsdelivr.net/npm/air-datepicker@3.5.3/air-datepicker.min.css" rel="stylesheet">
 
   <style>
     :root{
@@ -15,7 +16,6 @@
       --ui-bg2:#eef2f7;
       --ui-card:#ffffff;
       --ui-border:rgba(17,24,39,.10);
-      --ui-shadow: 0 10px 28px rgba(16,24,40,.08);
       --ui-shadow-sm: 0 6px 16px rgba(16,24,40,.06);
     }
     body{
@@ -99,10 +99,16 @@
       line-height: 1.2;
     }
 
-    /* Немного приводим flatpickr к bootstrap-видy */
-    .flatpickr-input[readonly]{
-      background-color: #fff;
-      cursor: pointer;
+    /* Air Datepicker чуть “по-bootstrap” */
+    .air-datepicker{
+      border-radius: 14px !important;
+      border: 1px solid rgba(17,24,39,.10) !important;
+      box-shadow: 0 12px 30px rgba(16,24,40,.10) !important;
+    }
+    .preset-row .btn{
+      border-radius: 999px;
+      padding: .25rem .55rem;
+      font-weight: 700;
     }
   </style>
 </head>
@@ -190,11 +196,17 @@
                           <span class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
                         </div>
 
-                        <div class="text-muted small mt-1 vpn-period-text">
-                          {{ r.vpn_period_text|default:"" }}
+                        <!-- ВАЖНО: текст теперь рендерим на клиенте из ISO (без -8 часов) -->
+                        <div class="text-muted small mt-1 vpn-period-text"
+                             data-kind="{{ r.vpn_period_kind|default:'' }}"
+                             data-start="{{ r.vpn_period_start_iso|default:'' }}"
+                             data-end="{{ r.vpn_period_end_iso|default:'' }}">
                         </div>
-                        <div class="text-muted small vpn-plan-text">
-                          {{ r.vpn_plan_text|default:"" }}
+
+                        <div class="text-muted small vpn-plan-text"
+                             data-kind="{{ r.vpn_plan_kind|default:'' }}"
+                             data-start="{{ r.vpn_plan_start_iso|default:'' }}"
+                             data-end="{{ r.vpn_plan_end_iso|default:'' }}">
                         </div>
 
                       </div>
@@ -220,9 +232,9 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
-<!-- Flatpickr -->
-<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ru.js"></script>
+<!-- Air Datepicker -->
+<script src="https://cdn.jsdelivr.net/npm/air-datepicker@3.5.3/air-datepicker.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/air-datepicker@3.5.3/locale/ru.js"></script>
 
 <!-- Modal: period -->
 <div class="modal fade" id="periodModal" tabindex="-1" aria-hidden="true">
@@ -232,30 +244,45 @@
         <h5 class="modal-title" id="periodTitle">Период доступа</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
       </div>
+
       <div class="modal-body">
         <div class="text-muted small mb-3" id="periodHint"></div>
 
         <div class="row g-2">
           <div class="col-12">
             <label class="form-label">Начало (необязательно)</label>
-            <!-- type=text + flatpickr, чтобы был нормальный выбор времени -->
-            <input class="form-control" type="text" id="startAt" placeholder="Выберите дату и время" readonly>
+            <input class="form-control" type="text" id="startAt" placeholder="Например: 05.02.2026 13:05" autocomplete="off">
             <div class="text-muted small mt-1">Если не заполнено — начнётся сразу.</div>
           </div>
 
           <div class="col-12">
             <label class="form-label">Окончание (необязательно)</label>
-            <input class="form-control" type="text" id="endAt" placeholder="Выберите дату и время" readonly>
+            <input class="form-control" type="text" id="endAt" placeholder="Например: 05.02.2026 15:00" autocomplete="off">
             <div class="text-muted small mt-1">Если заполнить только окончание — начало будет “сейчас”.</div>
+          </div>
+
+          <div class="col-12 mt-2">
+            <div class="d-flex flex-wrap gap-2 preset-row">
+              <span class="text-muted small me-2 align-self-center">Быстро:</span>
+              <button type="button" class="btn btn-outline-secondary btn-sm" data-preset="now-start">Начало: сейчас</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-30">Конец: +30 мин</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-60">Конец: +1 час</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-120">Конец: +2 часа</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-eod">Конец: до конца дня</button>
+            </div>
           </div>
 
           <div class="col-12 d-flex justify-content-between align-items-center mt-2">
             <button type="button" class="btn btn-outline-danger btn-sm" id="clearPeriod">Очистить период</button>
-            <div class="text-muted small">Нажмите на поле — откроется календарь и выбор времени.</div>
+            <div class="text-muted small">Клик по полю — откроется календарь + выбор времени.</div>
           </div>
         </div>
 
+        <div class="alert alert-warning small mt-3 mb-0">
+          При наступлении окончания доступ будет автоматически возвращён (через scheduler).
+        </div>
       </div>
+
       <div class="modal-footer">
         <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Отмена</button>
         <button class="btn btn-primary" type="button" id="savePeriod">Применить</button>
@@ -277,34 +304,131 @@
   const titleEl = document.getElementById("periodTitle");
   const hintEl = document.getElementById("periodHint");
 
-  // Flatpickr: дата+время, без “быстрых подсказок”
-  flatpickr.localize(flatpickr.l10ns.ru);
+  // ---------- helpers: UI datetime ----------
+  const pad2 = (n) => String(n).padStart(2, "0");
 
-  const fpCommon = {
-    enableTime: true,
-    time_24hr: true,
-    // важно: отдаём строку формата 'YYYY-MM-DDTHH:MM' (как раньше)
-    dateFormat: "Y-m-d\\TH:i",
-    allowInput: false,     // чтобы не вводили вручную
-    clickOpens: true,
-    minuteIncrement: 5,
+  // Для бэка: именно local-time строка 'YYYY-MM-DDTHH:MM'
+  function toIsoLocal(dt){
+    if (!dt || isNaN(dt.getTime())) return "";
+    return `${dt.getFullYear()}-${pad2(dt.getMonth()+1)}-${pad2(dt.getDate())}T${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
+  }
+
+  // Для UI: 'dd.mm.yyyy HH:MM'
+  function fmtRu(dt){
+    if (!dt || isNaN(dt.getTime())) return "";
+    return `${pad2(dt.getDate())}.${pad2(dt.getMonth()+1)}.${dt.getFullYear()} ${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
+  }
+
+  // ISO (UTC/+00:00) -> Date (локально, без -8 часов)
+  function parseIsoToLocal(iso){
+    if (!iso) return null;
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    return d;
+  }
+
+  function buildPeriodText(kind, startIso, endIso){
+    const k = (kind || "").toUpperCase();
+    if (k === "BASELINE" || k === "NONE" || !k) return "бессрочно";
+
+    const start = parseIsoToLocal(startIso);
+    const end = parseIsoToLocal(endIso);
+
+    const prefix = (k === "BLOCK") ? "Закрыт: " : "";
+    if (start && end) return `${prefix}с ${fmtRu(start)} по ${fmtRu(end)}`;
+    if (start && !end) return `${prefix}с ${fmtRu(start)} — бессрочно`;
+    return `${prefix}бессрочно`;
+  }
+
+  function buildPlanText(kind, startIso, endIso){
+    const k = (kind || "").toUpperCase();
+    if (!k) return "";
+    const start = parseIsoToLocal(startIso);
+    if (!start) return "";
+
+    const end = parseIsoToLocal(endIso);
+    const action = (k === "OPEN") ? "открыть" : "закрыть";
+
+    if (end) return `Запланировано: ${action} с ${fmtRu(start)} по ${fmtRu(end)}`;
+    return `Запланировано: ${action} с ${fmtRu(start)} — бессрочно`;
+  }
+
+  function renderRowPeriodPlan(row){
+    const periodEl = row.querySelector(".vpn-period-text");
+    const planEl = row.querySelector(".vpn-plan-text");
+    if (periodEl){
+      const txt = buildPeriodText(periodEl.dataset.kind, periodEl.dataset.start, periodEl.dataset.end);
+      periodEl.textContent = txt || "";
+    }
+    if (planEl){
+      const txt = buildPlanText(planEl.dataset.kind, planEl.dataset.start, planEl.dataset.end);
+      planEl.textContent = txt || "";
+    }
+  }
+
+  function renderAll(){
+    document.querySelectorAll("tr[data-inn]").forEach(renderRowPeriodPlan);
+  }
+
+  // ---------- datepickers ----------
+  const dpCommon = {
+    locale: AirDatepickerLocaleRu,
+    timepicker: true,
+    minutesStep: 5,
+    autoClose: true,
+    // красивый ввод/вывод
+    dateFormat: "dd.MM.yyyy",
+    timeFormat: "HH:mm",
+    position: "top left",
   };
 
-  const fpStart = flatpickr(startAtEl, { ...fpCommon });
-  const fpEnd   = flatpickr(endAtEl,   { ...fpCommon });
+  const dpStart = new AirDatepicker(startAtEl, { ...dpCommon });
+  const dpEnd   = new AirDatepicker(endAtEl,   { ...dpCommon });
 
+  // ---------- modal logic ----------
   let pending = null; // { cb, row, desired, inn, bitrixId, spinner, state, prevChecked, _applied }
 
+  function clearPickers(){
+    dpStart.clear();
+    dpEnd.clear();
+    startAtEl.value = "";
+    endAtEl.value = "";
+  }
+
   document.getElementById("clearPeriod").addEventListener("click", () => {
-    fpStart.clear();
-    fpEnd.clear();
+    clearPickers();
+  });
+
+  // быстрые пресеты
+  function setStartNow(){
+    const d = new Date();
+    dpStart.selectDate(d);
+  }
+  function setEndAfterMinutes(min){
+    const d = new Date();
+    d.setMinutes(d.getMinutes() + min);
+    dpEnd.selectDate(d);
+  }
+  function setEndEndOfDay(){
+    const d = new Date();
+    d.setHours(23, 59, 0, 0);
+    dpEnd.selectDate(d);
+  }
+
+  document.querySelectorAll("[data-preset]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const p = btn.getAttribute("data-preset");
+      if (p === "now-start") setStartNow();
+      if (p === "end-30") setEndAfterMinutes(30);
+      if (p === "end-60") setEndAfterMinutes(60);
+      if (p === "end-120") setEndAfterMinutes(120);
+      if (p === "end-eod") setEndEndOfDay();
+    });
   });
 
   function openPeriodModal(ctx){
     pending = ctx;
-
-    fpStart.clear();
-    fpEnd.clear();
+    clearPickers();
 
     if (ctx.desired === "1") {
       titleEl.textContent = "Открыть удалённый доступ";
@@ -342,14 +466,19 @@
       body.set("desired", desired);
       body.set("sid", SID);
 
-      // критично: чтобы на бэке правильно восстановить локальное время пользователя
+      // важное: timezone offset клиента
       body.set("tz_offset_min", String(new Date().getTimezoneOffset()));
 
       if (bitrixId) body.set("bitrix_id", bitrixId);
 
-      // flatpickr кладёт строку в value уже в нужном формате
-      if (startAtEl.value) body.set("start_at", startAtEl.value);
-      if (endAtEl.value) body.set("end_at", endAtEl.value);
+      const startDate = (dpStart.selectedDates && dpStart.selectedDates[0]) ? dpStart.selectedDates[0] : null;
+      const endDate   = (dpEnd.selectedDates && dpEnd.selectedDates[0]) ? dpEnd.selectedDates[0] : null;
+
+      const startIsoLocal = startDate ? toIsoLocal(startDate) : "";
+      const endIsoLocal   = endDate ? toIsoLocal(endDate) : "";
+
+      if (startIsoLocal) body.set("start_at", startIsoLocal);
+      if (endIsoLocal) body.set("end_at", endIsoLocal);
 
       const resp = await fetch(TOGGLE_URL + "?sid=" + encodeURIComponent(SID), {
         method: "POST",
@@ -372,10 +501,22 @@
           cb.checked = !!js.vpn_open;
         }
 
+        // обновим datasets и перерисуем строки
         const periodEl = row.querySelector(".vpn-period-text");
         const planEl = row.querySelector(".vpn-plan-text");
-        if (periodEl && js.vpn_period_text !== undefined) periodEl.textContent = js.vpn_period_text || "";
-        if (planEl && js.vpn_plan_text !== undefined) planEl.textContent = js.vpn_plan_text || "";
+
+        if (periodEl){
+          if (js.vpn_period_kind !== undefined) periodEl.dataset.kind = js.vpn_period_kind || "";
+          if (js.vpn_period_start_iso !== undefined) periodEl.dataset.start = js.vpn_period_start_iso || "";
+          if (js.vpn_period_end_iso !== undefined) periodEl.dataset.end = js.vpn_period_end_iso || "";
+        }
+        if (planEl){
+          if (js.vpn_plan_kind !== undefined) planEl.dataset.kind = js.vpn_plan_kind || "";
+          if (js.vpn_plan_start_iso !== undefined) planEl.dataset.start = js.vpn_plan_start_iso || "";
+          if (js.vpn_plan_end_iso !== undefined) planEl.dataset.end = js.vpn_plan_end_iso || "";
+        }
+
+        renderRowPeriodPlan(row);
       }
     } catch (err) {
       alert("Ошибка запроса: " + err);
@@ -410,6 +551,9 @@
       });
     });
   });
+
+  // первичный рендер периодов/планов (без -8 часов)
+  renderAll();
 </script>
 
 </body>
