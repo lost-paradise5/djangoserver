@@ -344,3 +344,49 @@ class AdminBadgeRequest(models.Model):
 
 
 
+
+
+
+
+
+
+
+class VpnAccessBaseline(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    inn = models.CharField(max_length=12, unique=True)
+    ad_user_dn = models.TextField(null=True, blank=True)
+    ad_login = models.CharField(max_length=128, null=True, blank=True)
+    baseline_member = models.BooleanField(default=False)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "vpn_access_baselines"
+        managed = False
+
+
+class VpnAccessLease(models.Model):
+    id = models.UUIDField(primary_key=True, editable=False)
+
+    lease_type = models.CharField(max_length=8)
+    inn = models.CharField(max_length=12)
+
+    target_bitrix_user_id = models.IntegerField(null=True, blank=True)
+    created_by_ad_login = models.CharField(max_length=128, null=True, blank=True)
+    created_by_bitrix_user_id = models.IntegerField(null=True, blank=True)
+
+    starts_at = models.DateTimeField()
+    ends_at = models.DateTimeField(null=True, blank=True)
+
+    status = models.CharField(max_length=16, default="ACTIVE")  
+    created_at = models.DateTimeField()
+    notify_sent_at = models.DateTimeField(null=True, blank=True)
+
+    meta = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        db_table = "vpn_access_leases"
+        managed = False
+
+
+
