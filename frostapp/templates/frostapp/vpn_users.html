@@ -5,9 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Контроль УД сотрудников</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
-  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-  <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ru.js"></script>
 
   <style>
     :root{
@@ -30,15 +27,9 @@
       background: rgba(244,246,249,.75);
       border-bottom: 1px solid rgba(17,24,39,.08);
     }
-    .topbar-inner{
-      padding: .85rem 0;
-    }
-    .title{
-      font-weight: 700;
-      letter-spacing: .01em;
-    }
+    .topbar-inner{ padding: .85rem 0; }
+    .title{ font-weight: 700; letter-spacing: .01em; }
     .muted{ color: rgba(17,24,39,.65); }
-
 
     .card{
       border:1px solid var(--ui-border);
@@ -54,9 +45,7 @@
       padding: .85rem 1rem;
     }
 
-    .table{
-      --bs-table-striped-bg: rgba(13,110,253,.04);
-    }
+    .table{ --bs-table-striped-bg: rgba(13,110,253,.04); }
     .table thead th{
       font-weight: 700;
       color: rgba(17,24,39,.78);
@@ -69,9 +58,7 @@
       border-color: rgba(17,24,39,.08);
       vertical-align: middle;
     }
-    .table tbody tr:hover{
-      background: rgba(13,110,253,.06);
-    }
+    .table tbody tr:hover{ background: rgba(13,110,253,.06); }
 
     code{
       background: rgba(17,24,39,.04);
@@ -88,7 +75,7 @@
     }
 
     .switch-wrap{
-      min-width: 190px;
+      min-width: 260px;
       display:flex;
       justify-content:flex-end;
     }
@@ -97,20 +84,17 @@
       height: 1.4em;
       cursor: pointer;
     }
-    .vpn-state{
-      min-width: 64px;
-      text-align: left;
-    }
-    .spinner-border{
-      width: 1rem;
-      height: 1rem;
-    }
-    .btn{
-      border-radius: 12px;
-      font-weight: 600;
-    }
+    .vpn-state{ min-width: 84px; text-align: left; }
+    .spinner-border{ width: 1rem; height: 1rem; }
 
+    .btn{ border-radius: 12px; font-weight: 600; }
     .footer-space{ height: 24px; }
+
+    .vpn-period-text, .vpn-plan-text{
+      max-width: 360px;
+      text-align: right;
+      line-height: 1.2;
+    }
   </style>
 </head>
 
@@ -157,7 +141,7 @@
                 <th style="min-width:220px;">Должность</th>
                 <th style="width:140px;">ИНН</th>
                 <th style="min-width:220px;">AD</th>
-                <th class="text-end" style="width:220px;">Доступ</th>
+                <th class="text-end" style="width:320px;">Доступ</th>
               </tr>
             </thead>
 
@@ -186,23 +170,24 @@
                   {% if r.vpn_known and r.ad_found %}
                     <div class="switch-wrap">
                       <div class="d-flex flex-column align-items-end">
+
                         <div class="form-check form-switch d-inline-flex align-items-center gap-2 m-0">
-                          <input class="form-check-input vpn-toggle" type="checkbox" {% if r.vpn_open %}checked{% endif %}>
-                          <span class="small vpn-state">{% if r.vpn_open %}Открыт{% else %}Закрыт{% endif %}</span>
+                          <input class="form-check-input vpn-toggle"
+                                 type="checkbox"
+                                 {% if r.vpn_open %}checked{% endif %}>
+                          <span class="small vpn-state">
+                            {% if r.vpn_open %}Открыт{% else %}Закрыт{% endif %}
+                          </span>
                           <span class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
                         </div>
 
-                        <div class="text-muted small mt-1 vpn-period"
-                           data-kind="{{ r.vpn_period_kind|default:'' }}"
-                           data-start="{{ r.vpn_period_start_iso|default:'' }}"
-                           data-end="{{ r.vpn_period_end_iso|default:'' }}">
+                        <div class="text-muted small mt-1 vpn-period-text">
+                          {{ r.vpn_period_text|default:"" }}
+                        </div>
+                        <div class="text-muted small vpn-plan-text">
+                          {{ r.vpn_plan_text|default:"" }}
                         </div>
 
-                        <div class="text-muted small vpn-plan"
-                           data-kind="{{ r.vpn_plan_kind|default:'' }}"
-                           data-start="{{ r.vpn_plan_start_iso|default:'' }}"
-                           data-end="{{ r.vpn_plan_end_iso|default:'' }}">
-                        </div>
                       </div>
                     </div>
                   {% else %}
@@ -237,27 +222,28 @@
       <div class="modal-body">
         <div class="text-muted small mb-3" id="periodHint"></div>
 
-        <div class="row g-3">
+        <div class="row g-2">
           <div class="col-12">
             <label class="form-label">Начало (необязательно)</label>
-            <input class="form-control" id="startAt" placeholder="Выберите дату и время">
+            <input class="form-control" type="datetime-local" id="startAt">
+            <div class="text-muted small mt-1">Если не заполнено — начнётся сразу.</div>
           </div>
 
-        <div class="col-12">
-          <label class="form-label">Окончание (необязательно)</label>
-          <input class="form-control" id="endAt" placeholder="Выберите дату и время">
+          <div class="col-12">
+            <label class="form-label">Окончание (необязательно)</label>
+            <input class="form-control" type="datetime-local" id="endAt">
+            <div class="text-muted small mt-1">Если заполнить только окончание — начало будет “сейчас”.</div>
+          </div>
+
+          <div class="col-12 d-flex justify-content-between align-items-center mt-2">
+            <button type="button" class="btn btn-outline-danger btn-sm" id="clearPeriod">Очистить период</button>
+            <div class="text-muted small">Выберите дату и время вручную.</div>
+          </div>
         </div>
 
-        <div class="col-12 d-flex justify-content-end">
-          <button type="button" class="btn btn-outline-danger btn-sm" id="clearPeriod">Очистить</button>
+        <div class="alert alert-warning small mt-3 mb-0">
+          При наступлении окончания доступ будет автоматически возвращён (через scheduler).
         </div>
-      </div>
-    </div>
-  
-
-     
-
-  
       </div>
       <div class="modal-footer">
         <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Отмена</button>
@@ -280,99 +266,25 @@
   const titleEl = document.getElementById("periodTitle");
   const hintEl = document.getElementById("periodHint");
 
-  let pending = null;
-
-  // Календарь + время (без ручного ввода)
-  const fpStart = flatpickr(startAtEl, {
-    enableTime: true,
-    time_24hr: true,
-    dateFormat: "Y-m-d\\TH:i",
-    allowInput: false,
-    locale: flatpickr.l10ns.ru
-  });
-  const fpEnd = flatpickr(endAtEl, {
-    enableTime: true,
-    time_24hr: true,
-    dateFormat: "Y-m-d\\TH:i",
-    allowInput: false,
-    locale: flatpickr.l10ns.ru
-  });
+  let pending = null; // { cb, row, desired, inn, bitrixId, spinner, state, prevChecked, _applied }
 
   document.getElementById("clearPeriod").addEventListener("click", () => {
-    fpStart.clear();
-    fpEnd.clear();
+    startAtEl.value = "";
+    endAtEl.value = "";
   });
-
-  function fmtRuFromIso(iso){
-    if (!iso) return "";
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return "";
-    // ru-RU обычно даёт запятую — убираем
-    return d.toLocaleString("ru-RU", {
-      year:"numeric", month:"2-digit", day:"2-digit",
-      hour:"2-digit", minute:"2-digit"
-    }).replace(",", "");
-  }
-
-  function renderRowPeriod(row){
-    const periodEl = row.querySelector(".vpn-period");
-    const planEl = row.querySelector(".vpn-plan");
-    if (periodEl){
-      const kind = periodEl.dataset.kind || "";
-      const s = periodEl.dataset.start || "";
-      const e = periodEl.dataset.end || "";
-
-      let text = "бессрочно";
-      if (kind === "OPEN") {
-        if (s && e) text = `с ${fmtRuFromIso(s)} по ${fmtRuFromIso(e)}`;
-        else if (s && !e) text = `с ${fmtRuFromIso(s)} — бессрочно`;
-        else text = "бессрочно";
-      } else if (kind === "BLOCK") {
-        if (s && e) text = `Закрыт: с ${fmtRuFromIso(s)} по ${fmtRuFromIso(e)}`;
-        else if (s && !e) text = `Закрыт: с ${fmtRuFromIso(s)} — бессрочно`;
-        else text = "Закрыт: бессрочно";
-      } else {
-        text = "бессрочно";
-      }
-      periodEl.textContent = text;
-    }
-
-    if (planEl){
-      const k = planEl.dataset.kind || "";
-      const s2 = planEl.dataset.start || "";
-      const e2 = planEl.dataset.end || "";
-
-      if (!k || !s2) {
-        planEl.textContent = "";
-        planEl.classList.add("d-none");
-      } else {
-        const action = (k === "OPEN") ? "открыть" : "закрыть";
-        let t = `Запланировано: ${action} с ${fmtRuFromIso(s2)}`;
-        if (e2) t += ` по ${fmtRuFromIso(e2)}`;
-        else t += " — бессрочно";
-        planEl.textContent = t;
-        planEl.classList.remove("d-none");
-      }
-    }
-  }
-
-  function renderAll(){
-    document.querySelectorAll("tbody tr").forEach(tr => renderRowPeriod(tr));
-  }
-  document.addEventListener("DOMContentLoaded", renderAll);
-  renderAll();
 
   function openPeriodModal(ctx){
     pending = ctx;
-    fpStart.clear();
-    fpEnd.clear();
+
+    startAtEl.value = "";
+    endAtEl.value = "";
 
     if (ctx.desired === "1") {
       titleEl.textContent = "Открыть удалённый доступ";
-      hintEl.textContent = "";
+      hintEl.textContent = "Выберите период, на который доступ должен быть открыт. Если оставить пустым — откроется сразу без авто-закрытия.";
     } else {
       titleEl.textContent = "Закрыть удалённый доступ";
-      hintEl.textContent = "";
+      hintEl.textContent = "Выберите период, на который доступ должен быть закрыт. Если оставить пустым — закроется сразу без авто-открытия.";
     }
 
     modal.show();
@@ -389,7 +301,8 @@
   document.getElementById("savePeriod").addEventListener("click", async () => {
     if (!pending) return;
 
-    const { cb, desired, inn, bitrixId, spinner, state, row } = pending;
+    const { cb, row, desired, inn, bitrixId, spinner, state, prevChecked } = pending;
+
     pending._applied = true;
     modal.hide();
 
@@ -401,7 +314,10 @@
       body.set("inn", inn);
       body.set("desired", desired);
       body.set("sid", SID);
+
+      // ✅ КРИТИЧНО: передаём tz offset, чтобы время не “уезжало”
       body.set("tz_offset_min", String(new Date().getTimezoneOffset()));
+
       if (bitrixId) body.set("bitrix_id", bitrixId);
 
       if (startAtEl.value) body.set("start_at", startAtEl.value);
@@ -419,41 +335,32 @@
       const js = await resp.json();
       if (!js.ok) {
         alert("Ошибка: " + (js.error || "unknown"));
-        cb.checked = !cb.checked;
+        cb.checked = prevChecked; // точный откат
       } else {
+        // статус в переключателе
         if (js.vpn_open === null || js.vpn_open === undefined) {
           state.textContent = cb.checked ? "Открывается…" : "Закрывается…";
         } else {
           state.textContent = js.vpn_open ? "Открыт" : "Закрыт";
-          cb.checked = js.vpn_open;
+          cb.checked = !!js.vpn_open;
         }
 
-        // обновляем data-* из ответа
-        const periodEl = row.querySelector(".vpn-period");
-        const planEl = row.querySelector(".vpn-plan");
-
-        if (periodEl) {
-          periodEl.dataset.kind = js.vpn_period_kind || "";
-          periodEl.dataset.start = js.vpn_period_start_iso || "";
-          periodEl.dataset.end = js.vpn_period_end_iso || "";
-        }
-        if (planEl) {
-          planEl.dataset.kind = js.vpn_plan_kind || "";
-          planEl.dataset.start = js.vpn_plan_start_iso || "";
-          planEl.dataset.end = js.vpn_plan_end_iso || "";
-        }
-
-        renderRowPeriod(row);
+        // ✅ обновим текст периода/плана, если пришёл
+        const periodEl = row.querySelector(".vpn-period-text");
+        const planEl = row.querySelector(".vpn-plan-text");
+        if (periodEl && js.vpn_period_text !== undefined) periodEl.textContent = js.vpn_period_text || "";
+        if (planEl && js.vpn_plan_text !== undefined) planEl.textContent = js.vpn_plan_text || "";
       }
     } catch (err) {
       alert("Ошибка запроса: " + err);
-      cb.checked = !cb.checked;
+      cb.checked = prevChecked;
     } finally {
       spinner.classList.add("d-none");
       cb.disabled = false;
     }
   });
 
+  // перехватываем toggle -> открываем модалку
   document.querySelectorAll(".vpn-toggle").forEach(cb => {
     cb.addEventListener("change", (e) => {
       const row = e.target.closest("tr");
