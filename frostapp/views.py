@@ -276,19 +276,168 @@ def bitrix_notify_remote_access_open(user_id: int, until_dt=None):
         msg += f"\nСрок: до {lt.strftime('%d.%m.%Y %H:%M')}"
     _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": int(user_id), "MESSAGE": msg})
 
-def _parse_dt_local(val: str | None):
+def _parse_dt_local(val: str | None, tz_offset_min: int | None = None):
+    """
+    val приходит из UI (flatpickr) как 'YYYY-MM-DDTHH:MM' (naive).
+    tz_offset_min = new Date().getTimezoneOffset() (минуты).
+    Мы считаем, что введённое время — ЛОКАЛЬНОЕ время пользователя, и делаем aware с его offset.
+
+    Пример:
+      Stockholm (UTC+1) => getTimezoneOffset() = -60
+      tzinfo будет +01:00
+    """
     if not val:
         return None
     s = str(val).strip()
     if not s:
         return None
+
     try:
         dt = datetime.datetime.fromisoformat(s)
     except Exception:
         return None
-    if timezone.is_naive(dt):
-        dt = timezone.make_aware(dt, timezone.get_default_timezone())
-    return dt
+
+    if timezone.is_aware(dt):
+        return dt
+
+    # naive -> делаем aware в TZ пользователя
+    try:
+        off = int(tz_offset_min or 0)
+    except Exception:
+        off = 0
+
+    # JS offset: local = utc - offset_min; tz = -offset_min
+    tz = datetime.timezone(datetime.timedelta(minutes=-off))
+    return dt.replace(tzinfo=tz)
+
+
+
+
+def _iso(dt):
+    if not dt:
+        return ""
+    # отдаём в ISO; фронт преобразует в локальное время
+    return dt.astimezone(datetime.timezone.utc).isoformat(timespec="minutes")
+
+
+def _fmt_dt_ru(dt) -> str:
+    if not dt:
+        return ""
+    lt = timezone.localtime(dt)
+    return lt.strftime("%d.%m.%Y %H:%M")
+
+def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
+    """
+    Для списка ИНН возвращает:
+      - vpn_period_text: текущий период (активные лизы, иначе baseline/неизвестно) -> 'с ... по ...' или 'бессрочно'
+      - vpn_plan_text: ближайшее запланированное изменение (starts_at > now)
+      - vpn_period_kind: 'OPEN'/'BLOCK'/'BASELINE'/'NONE'
+    """
+    inns = [x for x in set([re.sub(r"\D+", "", (x or "").strip()) for x in inns]) if x]
+    if not inns:
+        return {}
+
+    now = timezone.now()
+
+    active_cond = Q(status="ACTIVE") & Q(starts_at__lte=now) & (Q(ends_at__isnull=True) | Q(ends_at__gt=now))
+    future_cond = Q(status="ACTIVE") & Q(starts_at__gt=now)
+
+    # baseline (как было до управлений)
+    baseline_map = {b.inn: b for b in VpnAccessBaseline.objects.filter(inn__in=inns)}
+
+    # активные лизы
+    leases = list(
+        VpnAccessLease.objects
+        .filter(active_cond, inn__in=inns)
+        .values("inn", "lease_type", "starts_at", "ends_at")
+    )
+
+    by_inn = {inn: {"OPEN": [], "BLOCK": []} for inn in inns}
+    for it in leases:
+        t = it.get("lease_type")
+        inn = it.get("inn")
+        if inn in by_inn and t in ("OPEN", "BLOCK"):
+            by_inn[inn][t].append(it)
+
+    # ближайшее будущее изменение
+    future_rows = list(
+        VpnAccessLease.objects
+        .filter(future_cond, inn__in=inns)
+        .values("inn", "lease_type", "starts_at", "ends_at")
+        .order_by("inn", "starts_at")
+    )
+    next_by_inn: dict[str, dict] = {}
+    for it in future_rows:
+        inn = it["inn"]
+        if inn not in next_by_inn:
+            next_by_inn[inn] = it
+
+    def _period_text(prefix: str, start_dt, end_dt) -> str:
+        # просили: с какой даты/время по какую дату/время; если нет — "бессрочно"
+        if start_dt and end_dt:
+            return f"{prefix}с {_fmt_dt_ru(start_dt)} по {_fmt_dt_ru(end_dt)}"
+        if start_dt and not end_dt:
+            return f"{prefix}с {_fmt_dt_ru(start_dt)} — бессрочно"
+        # если нет данных (нет активных лиз/нет baseline) — бессрочно
+        return f"{prefix}бессрочно"
+
+    out: dict[str, dict] = {}
+
+    for inn in inns:
+        blocks = by_inn[inn]["BLOCK"]
+        opens = by_inn[inn]["OPEN"]
+
+        if blocks:
+            # закрыт пока есть хотя бы один BLOCK
+            starts = min(x["starts_at"] for x in blocks if x["starts_at"])
+            any_inf = any(x["ends_at"] is None for x in blocks)
+            ends = None if any_inf else max(x["ends_at"] for x in blocks if x["ends_at"])
+            out[inn] = {
+                "vpn_period_kind": "BLOCK",
+                "vpn_period_text": _period_text("Закрыт: ", starts, ends),
+            }
+        elif opens:
+            starts = min(x["starts_at"] for x in opens if x["starts_at"])
+            any_inf = any(x["ends_at"] is None for x in opens)
+            ends = None if any_inf else max(x["ends_at"] for x in opens if x["ends_at"])
+            out[inn] = {
+                "vpn_period_kind": "OPEN",
+                "vpn_period_text": _period_text("", starts, ends),
+            }
+        else:
+            base = baseline_map.get(inn)
+            if base:
+                # baseline тоже считаем "информацией": если нет активных лиз — бессрочно
+                out[inn] = {
+                    "vpn_period_kind": "BASELINE",
+                    "vpn_period_text": "бессрочно",
+                }
+            else:
+                out[inn] = {
+                    "vpn_period_kind": "NONE",
+                    "vpn_period_text": "бессрочно",
+                }
+
+        # добавим ближайший план (если есть)
+        nxt = next_by_inn.get(inn)
+        plan_text = ""
+        if nxt:
+            action = "открыть" if nxt["lease_type"] == "OPEN" else "закрыть"
+            s = nxt.get("starts_at")
+            e = nxt.get("ends_at")
+            if s and e:
+                plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} по {_fmt_dt_ru(e)}"
+            elif s and not e:
+                plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} — бессрочно"
+            else:
+                plan_text = ""
+
+        out[inn]["vpn_plan_text"] = plan_text
+
+    return out
+
+
+
 
 
 def vpn_ensure_baseline(inn: str, group_dn: str) -> VpnAccessBaseline:
@@ -1206,7 +1355,6 @@ def vpn_ui_users(request):
     if not head_dept_ids:
         return HttpResponseForbidden("Нет прав.")
 
-    #  Кто авторизовался (ФИО) 
     auth_fio = sess.ad_login
     try:
         me = bitrix_user_get_all(
@@ -1219,13 +1367,10 @@ def vpn_ui_users(request):
     except Exception:
         pass
 
-    #  department tree 
     depts = bitrix_get_departments()
     by_id, children = _dept_index(depts)
-
     all_dept_ids = _dept_descendants([int(x) for x in head_dept_ids], children)
 
-    #  Bitrix users by departments 
     users_by_dept: dict[int, list[dict]] = {}
     all_users_map: dict[int, dict] = {}
 
@@ -1239,10 +1384,7 @@ def vpn_ui_users(request):
                 BITRIX_INN_FIELD,
             ],
         )
-
-        # показываем только активных (ACTIVE: true/false, 1/0, Y/N, пусто)
         bx_users = [u for u in bx_users if _bx_is_active(u)]
-
         users_by_dept[did] = bx_users
         for u in bx_users:
             try:
@@ -1250,7 +1392,6 @@ def vpn_ui_users(request):
             except Exception:
                 pass
 
-    #  Добавим руководителей отделов (если не попали в user.get по UF_DEPARTMENT) 
     for did in all_dept_ids:
         d = by_id.get(did)
         if not d:
@@ -1273,7 +1414,6 @@ def vpn_ui_users(request):
                     pass
                 users_by_dept.setdefault(did, []).append(extra[0])
 
-    #  AD group DN (один раз) 
     group_dn = None
     conn = None
     try:
@@ -1296,8 +1436,9 @@ def vpn_ui_users(request):
             "auth_fio": auth_fio,
         })
 
-    #  Собираем отображаемые строки 
     dept_blocks = []
+    all_inns_set = set()
+
     for did in all_dept_ids:
         d = by_id.get(did)
         dept_title = _dept_name(d) if d else f"{did}"
@@ -1314,18 +1455,16 @@ def vpn_ui_users(request):
                 continue
             seen_uids.add(uid)
 
-            inn = (u.get(BITRIX_INN_FIELD) or "").strip()
-            inn = re.sub(r"\D+", "", inn)
-
+            inn = re.sub(r"\D+", "", (u.get(BITRIX_INN_FIELD) or "").strip())
             position = (u.get("WORK_POSITION") or "").strip()
 
             ad_found = False
             ad_login = ""
-            ad_dn = ""
             in_group = None
             ad_err = ""
 
             if inn:
+                all_inns_set.add(inn)
                 try:
                     ad = ad_find_by_employee_id(inn)
                     if ad:
@@ -1350,17 +1489,27 @@ def vpn_ui_users(request):
                 "inn": inn,
                 "ad_found": ad_found,
                 "ad_login": ad_login,
-                "ad_dn": ad_dn,
                 "vpn_open": bool(in_group) if in_group is not None else False,
                 "vpn_known": (in_group is not None),
                 "ad_err": ad_err,
+
+                # будет заполнено ниже
+                "vpn_period_kind": "NONE",
+                "vpn_period_start_iso": "",
+                "vpn_period_end_iso": "",
+                "vpn_plan_kind": "",
+                "vpn_plan_start_iso": "",
+                "vpn_plan_end_iso": "",
             })
 
-        dept_blocks.append({
-            "dept_id": did,
-            "dept_title": dept_title,
-            "rows": rows,
-        })
+        dept_blocks.append({"dept_id": did, "dept_title": dept_title, "rows": rows})
+
+    period_map = _build_vpn_period_maps_for_ui(sorted(all_inns_set))
+    for b in dept_blocks:
+        for r in b["rows"]:
+            inn = r.get("inn") or ""
+            if inn and inn in period_map:
+                r.update(period_map[inn])
 
     return render(request, "frostapp/vpn_users.html", {
         "error": "",
@@ -1381,8 +1530,14 @@ def vpn_ui_toggle(request):
         return JsonResponse({"ok": False, "error": "NO_SESSION"}, status=403)
 
     inn = re.sub(r"\D+", "", (request.POST.get("inn") or "").strip())
-    desired = (request.POST.get("desired") or "").strip()  # "1" or "0"
+    desired = (request.POST.get("desired") or "").strip()  # "1"/"0"
     bitrix_id_raw = (request.POST.get("bitrix_id") or "").strip()
+
+    try:
+        tz_offset_min = int(request.POST.get("tz_offset_min") or "0")
+    except Exception:
+        tz_offset_min = 0
+
     target_bitrix_id = None
     try:
         if bitrix_id_raw:
@@ -1390,8 +1545,8 @@ def vpn_ui_toggle(request):
     except Exception:
         target_bitrix_id = None
 
-    start_at = _parse_dt_local(request.POST.get("start_at"))
-    end_at = _parse_dt_local(request.POST.get("end_at"))
+    start_at = _parse_dt_local(request.POST.get("start_at"), tz_offset_min)
+    end_at = _parse_dt_local(request.POST.get("end_at"), tz_offset_min)
 
     if not inn:
         return JsonResponse({"ok": False, "error": "NO_INN"}, status=400)
@@ -1403,6 +1558,14 @@ def vpn_ui_toggle(request):
     # если указан только end_at -> start = now
     if end_at and not start_at:
         start_at = now
+
+    # если ничего не указано -> делаем "сейчас бессрочно"
+    if not start_at and not end_at:
+        start_at = now
+        end_at = None
+
+    if end_at and start_at and end_at <= start_at:
+        return JsonResponse({"ok": False, "error": "BAD_PERIOD:end_at must be > start_at"}, status=400)
 
     # group dn
     conn = None
@@ -1418,26 +1581,22 @@ def vpn_ui_toggle(request):
         except Exception:
             pass
 
-    # baseline (фиксируем “как было” перед управлением)
+    # baseline
     try:
         vpn_ensure_baseline(inn, group_dn)
     except Exception as e:
         return JsonResponse({"ok": False, "error": str(e)}, status=404)
 
-    # Если start/end заданы — создаём “лизу”
-    is_scheduled = bool(start_at or end_at)
-    if is_scheduled:
-        lease_type = "OPEN" if desired == "1" else "BLOCK"
+    lease_type = "OPEN" if desired == "1" else "BLOCK"
 
-        # нормализация: если start_at пустая (и end пустая) сюда не попали,
-        # если start пустая, а end тоже пустая — is_scheduled False
-        if not start_at:
-            start_at = now
+    with transaction.atomic():
+        # ✅ АНТИ-КОНФЛИКТ: отменяем ВСЕ активные лизы по этому ИНН,
+        # чтобы старые планы не отработали потом неожиданно.
+        active_qs = VpnAccessLease.objects.select_for_update().filter(inn=inn, status="ACTIVE")
+        cancelled_cnt = active_qs.update(status="CANCELLED")
 
-        if end_at and end_at <= start_at:
-            return JsonResponse({"ok": False, "error": "BAD_PERIOD:end_at must be > start_at"}, status=400)
-
-        VpnAccessLease.objects.create(
+        # создаём новую единственную лизу
+        lease = VpnAccessLease.objects.create(
             id=uuid.uuid4(),
             lease_type=lease_type,
             inn=inn,
@@ -1449,127 +1608,65 @@ def vpn_ui_toggle(request):
             status="ACTIVE",
             created_at=now,
             notify_sent_at=None,
-            meta={
-                "ip": sess.ip,
-                "sid": str(sess.id),
-            },
+            meta={"ip": sess.ip, "sid": str(sess.id), "tz_offset_min": tz_offset_min},
         )
 
-        send_telegram_log(
-            "\n".join([
-                "🗓️ VPN SCHEDULE CREATED",
-                f"by: {sess.ad_login} (sid={sess.id})",
-                f"inn: {inn}",
-                f"lease_type: {lease_type}",
-                f"starts_at: {timezone.localtime(start_at).isoformat(sep=' ', timespec='seconds')}",
-                f"ends_at: {(timezone.localtime(end_at).isoformat(sep=' ', timespec='seconds') if end_at else 'None')}",
-                f"time: {timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
-                f"ip: {sess.ip}",
-            ])
-        )
+    send_telegram_log(
+        "\n".join([
+            "🧩 VPN TOGGLE (ANTI-CONFLICT)",
+            f"by: {sess.ad_login} (sid={sess.id})",
+            f"inn: {inn}",
+            f"lease_type: {lease_type}",
+            f"starts_at: {start_at.isoformat(sep=' ', timespec='minutes') if start_at else 'None'}",
+            f"ends_at: {end_at.isoformat(sep=' ', timespec='minutes') if end_at else 'None'}",
+            f"cancelled_old_active_leases: {cancelled_cnt}",
+            f"time: {timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
+            f"ip: {sess.ip}",
+        ])
+    )
 
-        # Если окно уже началось — применяем сразу (чтобы не ждать воркер)
-        if start_at <= now:
-            try:
-                changed, now_open, effective_until = vpn_apply_state_for_inn(inn, group_dn)
+    # применяем сразу, если окно уже началось
+    if start_at and start_at <= now:
+        try:
+            changed, now_open, effective_until = vpn_apply_state_for_inn(inn, group_dn)
 
-                # если реально стало “открыто” прямо сейчас — уведомим Bitrix (один раз)
-                if changed and now_open:
-                    # определим кому писать: если target_bitrix_id нет — найдём по inn
-                    bx_uid = target_bitrix_id
-                    if not bx_uid:
-                        bx_user = bitrix_find_user_by_inn(inn)
-                        bx_uid = int(bx_user["ID"]) if bx_user else None
+            if changed and now_open:
+                bx_uid = target_bitrix_id
+                if not bx_uid:
+                    bx_user = bitrix_find_user_by_inn(inn)
+                    bx_uid = int(bx_user["ID"]) if bx_user else None
 
-                    if bx_uid:
-                        bitrix_notify_remote_access_open(bx_uid, until_dt=effective_until)
-                        # отметим notify_sent_at у всех активных OPEN, стартовавших до now и ещё не уведомлённых
-                        VpnAccessLease.objects.filter(
-                            inn=inn,
-                            status="ACTIVE",
-                            lease_type="OPEN",
-                            starts_at__lte=now,
-                            notify_sent_at__isnull=True,
-                        ).update(notify_sent_at=now)
+                if bx_uid:
+                    bitrix_notify_remote_access_open(bx_uid, until_dt=effective_until)
+                    VpnAccessLease.objects.filter(
+                        inn=inn,
+                        status="ACTIVE",
+                        lease_type="OPEN",
+                        starts_at__lte=now,
+                        notify_sent_at__isnull=True,
+                    ).update(notify_sent_at=now)
 
-                return JsonResponse({
-                    "ok": True,
-                    "changed": bool(changed),
-                    "vpn_open": bool(now_open) if now_open is not None else False,
-                    "scheduled": True,
-                })
-            except Exception as e:
-                return JsonResponse({"ok": False, "error": str(e)}, status=500)
+            # отдаём UI-данные (ISO) — фронт сам покажет без сдвига времени
+            p = _build_vpn_period_maps_for_ui([inn]).get(inn, {})
+            return JsonResponse({
+                "ok": True,
+                "changed": bool(changed),
+                "vpn_open": bool(now_open) if now_open is not None else False,
+                "scheduled": False,
+                **p,
+            })
+        except Exception as e:
+            return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
-        # окно в будущем — просто сохранили
-        return JsonResponse({"ok": True, "changed": False, "vpn_open": None, "scheduled": True})
-
-    # Иначе — старое поведение “сразу открыть/закрыть” (без авто-отката)
-    ad = ad_find_by_employee_id(inn)
-    if not ad:
-        return JsonResponse({"ok": False, "error": "AD_USER_NOT_FOUND"}, status=404)
-
-    user_dn, user_attrs = ad
-    currently = ad_is_in_group(user_attrs, group_dn)
-
-    sam = user_attrs.get("sAMAccountName", [b""])
-    target_ad_login = (sam[0].decode("utf-8", "ignore") if sam else "").strip()
-
-    try:
-        if desired == "1":
-            if currently:
-                return JsonResponse({"ok": True, "changed": False, "vpn_open": True, "scheduled": False})
-
-            ad_group_add_member(group_dn, user_dn)
-
-            # notify Bitrix (без срока)
-            bx_uid = target_bitrix_id
-            if not bx_uid:
-                bx_user = bitrix_find_user_by_inn(inn)
-                bx_uid = int(bx_user["ID"]) if bx_user else None
-            if bx_uid:
-                bitrix_notify_remote_access_open(bx_uid, until_dt=None)
-
-            send_telegram_log(
-                "\n".join([
-                    "✅ Удалённый доступ открыт (IMMEDIATE)",
-                    f"by: {sess.ad_login} (sid={sess.id})",
-                    f"target_inn: {inn}",
-                    f"target_ad_login: {target_ad_login}",
-                    f"target_dn: {user_dn}",
-                    f"group: {VPN_GROUP_CN}",
-                    f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-                    f"ip: {sess.ip}",
-                ])
-            )
-            return JsonResponse({"ok": True, "changed": True, "vpn_open": True, "scheduled": False})
-
-        else:
-            if not currently:
-                return JsonResponse({"ok": True, "changed": False, "vpn_open": False, "scheduled": False})
-
-            ad_group_remove_member(group_dn, user_dn)
-
-            send_telegram_log(
-                "\n".join([
-                    "✅ Удалённый доступ закрыт (IMMEDIATE)",
-                    f"by: {sess.ad_login} (sid={sess.id})",
-                    f"target_inn: {inn}",
-                    f"target_ad_login: {target_ad_login}",
-                    f"target_dn: {user_dn}",
-                    f"group: {VPN_GROUP_CN}",
-                    f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-                    f"ip: {sess.ip}",
-                ])
-            )
-            return JsonResponse({"ok": True, "changed": True, "vpn_open": False, "scheduled": False})
-
-    except ldap.ALREADY_EXISTS:
-        return JsonResponse({"ok": True, "changed": False, "vpn_open": True, "scheduled": False})
-    except ldap.NO_SUCH_ATTRIBUTE:
-        return JsonResponse({"ok": True, "changed": False, "vpn_open": False, "scheduled": False})
-    except Exception as e:
-        return JsonResponse({"ok": False, "error": str(e)}, status=500)
+    # окно в будущем — не применяем сейчас
+    p = _build_vpn_period_maps_for_ui([inn]).get(inn, {})
+    return JsonResponse({
+        "ok": True,
+        "changed": False,
+        "vpn_open": None,
+        "scheduled": True,
+        **p,
+    })
 # @require_http_methods(["POST"])
 # @csrf_protect
 # def vpn_ui_toggle(request):
