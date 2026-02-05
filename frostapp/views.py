@@ -3681,8 +3681,9 @@ def _update_store_mysql_and_xml_for_single_store(
             ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
             if ttl_supported:
                 now = timezone.now()
-                start_date = now.date()
+                # start_date = now.date()
                 end_date = (now + datetime.timedelta(days=1)).date()
+                start_date = end_date
 
                 cur.execute("""
                     INSERT INTO users (
@@ -5238,8 +5239,9 @@ def regenerate_qr(user):
 
                 ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
                 if ttl_supported:
-                    start_date = now.date()
+                    # start_date = now.date()
                     end_date = expiration.date()
+                    start_date = end_date
 
                     cur.execute("""
                         INSERT INTO users (
