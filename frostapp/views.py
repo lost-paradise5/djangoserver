@@ -269,12 +269,42 @@ def _get_session_or_403(request, must_verified: bool) -> VpnAccessSession:
 # Helpers: Bitrix
 # =========================
 
-def bitrix_notify_remote_access_open(user_id: int, until_dt=None):
+def _fmt_dt_ru_with_tz_offset(dt: datetime.datetime | None, tz_offset_min: int | None = None) -> str:
+    """
+    Форматируем дату в RU 'dd.mm.YYYY HH:MM'.
+    Если tz_offset_min задан (JS getTimezoneOffset), показываем во времени пользователя.
+    Иначе — как раньше через timezone.localtime (настройки Django TIME_ZONE).
+    """
+    if not dt:
+        return ""
+
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, datetime.timezone.utc)
+
+    if tz_offset_min is None:
+        return timezone.localtime(dt).strftime("%d.%m.%Y %H:%M")
+
+    try:
+        off = int(tz_offset_min)
+    except Exception:
+        off = 0
+
+    # JS: getTimezoneOffset() => minutes to add to local to get UTC
+    # tz offset = -off minutes
+    tz = datetime.timezone(datetime.timedelta(minutes=-off))
+    return dt.astimezone(tz).strftime("%d.%m.%Y %H:%M")
+
+def bitrix_notify_remote_access_open(user_id: int, until_dt=None, tz_offset_min: int | None = None):
     msg = f"Вам открыт удаленный доступ.\nИнструкция: {VPN_INSTRUCTION_URL}"
     if until_dt:
-        lt = timezone.localtime(until_dt)
-        msg += f"\nСрок: до {lt.strftime('%d.%m.%Y %H:%M')}"
+        msg += f"\nСрок: до {_fmt_dt_ru_with_tz_offset(until_dt, tz_offset_min)}"
     _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": int(user_id), "MESSAGE": msg})
+# def bitrix_notify_remote_access_open(user_id: int, until_dt=None):
+#     msg = f"Вам открыт удаленный доступ.\nИнструкция: {VPN_INSTRUCTION_URL}"
+#     if until_dt:
+#         lt = timezone.localtime(until_dt)
+#         msg += f"\nСрок: до {lt.strftime('%d.%m.%Y %H:%M')}"
+#     _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": int(user_id), "MESSAGE": msg})
 
 def _parse_dt_local(val: str | None, tz_offset_min: int | None = None):
     """
@@ -326,12 +356,21 @@ def _fmt_dt_ru(dt) -> str:
     lt = timezone.localtime(dt)
     return lt.strftime("%d.%m.%Y %H:%M")
 
+
+
+
+def _iso_utc_minutes(dt: datetime.datetime | None) -> str:
+    if not dt:
+        return ""
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc).isoformat(timespec="minutes")
+
+
 def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
     """
-    Для списка ИНН возвращает:
-      - vpn_period_text: текущий период (активные лизы, иначе baseline/неизвестно) -> 'с ... по ...' или 'бессрочно'
-      - vpn_plan_text: ближайшее запланированное изменение (starts_at > now)
-      - vpn_period_kind: 'OPEN'/'BLOCK'/'BASELINE'/'NONE'
+    Для списка ИНН возвращает данные для UI.
+    ВАЖНО: отдаём ISO (UTC) для start/end, а текст в браузере строим локально (без -8 часов).
     """
     inns = [x for x in set([re.sub(r"\D+", "", (x or "").strip()) for x in inns]) if x]
     if not inns:
@@ -342,10 +381,8 @@ def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
     active_cond = Q(status="ACTIVE") & Q(starts_at__lte=now) & (Q(ends_at__isnull=True) | Q(ends_at__gt=now))
     future_cond = Q(status="ACTIVE") & Q(starts_at__gt=now)
 
-    # baseline (как было до управлений)
     baseline_map = {b.inn: b for b in VpnAccessBaseline.objects.filter(inn__in=inns)}
 
-    # активные лизы
     leases = list(
         VpnAccessLease.objects
         .filter(active_cond, inn__in=inns)
@@ -359,27 +396,18 @@ def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
         if inn in by_inn and t in ("OPEN", "BLOCK"):
             by_inn[inn][t].append(it)
 
-    # ближайшее будущее изменение
     future_rows = list(
         VpnAccessLease.objects
         .filter(future_cond, inn__in=inns)
         .values("inn", "lease_type", "starts_at", "ends_at")
         .order_by("inn", "starts_at")
     )
+
     next_by_inn: dict[str, dict] = {}
     for it in future_rows:
         inn = it["inn"]
         if inn not in next_by_inn:
             next_by_inn[inn] = it
-
-    def _period_text(prefix: str, start_dt, end_dt) -> str:
-        # просили: с какой даты/время по какую дату/время; если нет — "бессрочно"
-        if start_dt and end_dt:
-            return f"{prefix}с {_fmt_dt_ru(start_dt)} по {_fmt_dt_ru(end_dt)}"
-        if start_dt and not end_dt:
-            return f"{prefix}с {_fmt_dt_ru(start_dt)} — бессрочно"
-        # если нет данных (нет активных лиз/нет baseline) — бессрочно
-        return f"{prefix}бессрочно"
 
     out: dict[str, dict] = {}
 
@@ -387,54 +415,170 @@ def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
         blocks = by_inn[inn]["BLOCK"]
         opens = by_inn[inn]["OPEN"]
 
+        period_kind = "NONE"
+        period_start = None
+        period_end = None
+
         if blocks:
-            # закрыт пока есть хотя бы один BLOCK
-            starts = min(x["starts_at"] for x in blocks if x["starts_at"])
-            any_inf = any(x["ends_at"] is None for x in blocks)
-            ends = None if any_inf else max(x["ends_at"] for x in blocks if x["ends_at"])
-            out[inn] = {
-                "vpn_period_kind": "BLOCK",
-                "vpn_period_text": _period_text("Закрыт: ", starts, ends),
-            }
+            period_kind = "BLOCK"
+            starts = [x.get("starts_at") for x in blocks if x.get("starts_at")]
+            period_start = min(starts) if starts else None
+
+            any_inf = any(x.get("ends_at") is None for x in blocks)
+            if any_inf:
+                period_end = None
+            else:
+                ends = [x.get("ends_at") for x in blocks if x.get("ends_at")]
+                period_end = max(ends) if ends else None
+
         elif opens:
-            starts = min(x["starts_at"] for x in opens if x["starts_at"])
-            any_inf = any(x["ends_at"] is None for x in opens)
-            ends = None if any_inf else max(x["ends_at"] for x in opens if x["ends_at"])
-            out[inn] = {
-                "vpn_period_kind": "OPEN",
-                "vpn_period_text": _period_text("", starts, ends),
-            }
+            period_kind = "OPEN"
+            starts = [x.get("starts_at") for x in opens if x.get("starts_at")]
+            period_start = min(starts) if starts else None
+
+            any_inf = any(x.get("ends_at") is None for x in opens)
+            if any_inf:
+                period_end = None
+            else:
+                ends = [x.get("ends_at") for x in opens if x.get("ends_at")]
+                period_end = max(ends) if ends else None
+
         else:
             base = baseline_map.get(inn)
-            if base:
-                # baseline тоже считаем "информацией": если нет активных лиз — бессрочно
-                out[inn] = {
-                    "vpn_period_kind": "BASELINE",
-                    "vpn_period_text": "бессрочно",
-                }
-            else:
-                out[inn] = {
-                    "vpn_period_kind": "NONE",
-                    "vpn_period_text": "бессрочно",
-                }
+            period_kind = "BASELINE" if base else "NONE"
+            period_start = None
+            period_end = None
 
-        # добавим ближайший план (если есть)
+        # план
         nxt = next_by_inn.get(inn)
-        plan_text = ""
+        plan_kind = ""
+        plan_start = None
+        plan_end = None
         if nxt:
-            action = "открыть" if nxt["lease_type"] == "OPEN" else "закрыть"
-            s = nxt.get("starts_at")
-            e = nxt.get("ends_at")
-            if s and e:
-                plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} по {_fmt_dt_ru(e)}"
-            elif s and not e:
-                plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} — бессрочно"
-            else:
-                plan_text = ""
+            plan_kind = nxt.get("lease_type") or ""
+            plan_start = nxt.get("starts_at")
+            plan_end = nxt.get("ends_at")
 
-        out[inn]["vpn_plan_text"] = plan_text
+        out[inn] = {
+            "vpn_period_kind": period_kind,
+            "vpn_period_start_iso": _iso_utc_minutes(period_start),
+            "vpn_period_end_iso": _iso_utc_minutes(period_end),
+            "vpn_plan_kind": plan_kind,
+            "vpn_plan_start_iso": _iso_utc_minutes(plan_start),
+            "vpn_plan_end_iso": _iso_utc_minutes(plan_end),
+        }
 
     return out
+
+# def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
+#     """
+#     Для списка ИНН возвращает:
+#       - vpn_period_text: текущий период (активные лизы, иначе baseline/неизвестно) -> 'с ... по ...' или 'бессрочно'
+#       - vpn_plan_text: ближайшее запланированное изменение (starts_at > now)
+#       - vpn_period_kind: 'OPEN'/'BLOCK'/'BASELINE'/'NONE'
+#     """
+#     inns = [x for x in set([re.sub(r"\D+", "", (x or "").strip()) for x in inns]) if x]
+#     if not inns:
+#         return {}
+
+#     now = timezone.now()
+
+#     active_cond = Q(status="ACTIVE") & Q(starts_at__lte=now) & (Q(ends_at__isnull=True) | Q(ends_at__gt=now))
+#     future_cond = Q(status="ACTIVE") & Q(starts_at__gt=now)
+
+#     # baseline (как было до управлений)
+#     baseline_map = {b.inn: b for b in VpnAccessBaseline.objects.filter(inn__in=inns)}
+
+#     # активные лизы
+#     leases = list(
+#         VpnAccessLease.objects
+#         .filter(active_cond, inn__in=inns)
+#         .values("inn", "lease_type", "starts_at", "ends_at")
+#     )
+
+#     by_inn = {inn: {"OPEN": [], "BLOCK": []} for inn in inns}
+#     for it in leases:
+#         t = it.get("lease_type")
+#         inn = it.get("inn")
+#         if inn in by_inn and t in ("OPEN", "BLOCK"):
+#             by_inn[inn][t].append(it)
+
+#     # ближайшее будущее изменение
+#     future_rows = list(
+#         VpnAccessLease.objects
+#         .filter(future_cond, inn__in=inns)
+#         .values("inn", "lease_type", "starts_at", "ends_at")
+#         .order_by("inn", "starts_at")
+#     )
+#     next_by_inn: dict[str, dict] = {}
+#     for it in future_rows:
+#         inn = it["inn"]
+#         if inn not in next_by_inn:
+#             next_by_inn[inn] = it
+
+#     def _period_text(prefix: str, start_dt, end_dt) -> str:
+#         # просили: с какой даты/время по какую дату/время; если нет — "бессрочно"
+#         if start_dt and end_dt:
+#             return f"{prefix}с {_fmt_dt_ru(start_dt)} по {_fmt_dt_ru(end_dt)}"
+#         if start_dt and not end_dt:
+#             return f"{prefix}с {_fmt_dt_ru(start_dt)} — бессрочно"
+#         # если нет данных (нет активных лиз/нет baseline) — бессрочно
+#         return f"{prefix}бессрочно"
+
+#     out: dict[str, dict] = {}
+
+#     for inn in inns:
+#         blocks = by_inn[inn]["BLOCK"]
+#         opens = by_inn[inn]["OPEN"]
+
+#         if blocks:
+#             # закрыт пока есть хотя бы один BLOCK
+#             starts = min(x["starts_at"] for x in blocks if x["starts_at"])
+#             any_inf = any(x["ends_at"] is None for x in blocks)
+#             ends = None if any_inf else max(x["ends_at"] for x in blocks if x["ends_at"])
+#             out[inn] = {
+#                 "vpn_period_kind": "BLOCK",
+#                 "vpn_period_text": _period_text("Закрыт: ", starts, ends),
+#             }
+#         elif opens:
+#             starts = min(x["starts_at"] for x in opens if x["starts_at"])
+#             any_inf = any(x["ends_at"] is None for x in opens)
+#             ends = None if any_inf else max(x["ends_at"] for x in opens if x["ends_at"])
+#             out[inn] = {
+#                 "vpn_period_kind": "OPEN",
+#                 "vpn_period_text": _period_text("", starts, ends),
+#             }
+#         else:
+#             base = baseline_map.get(inn)
+#             if base:
+#                 # baseline тоже считаем "информацией": если нет активных лиз — бессрочно
+#                 out[inn] = {
+#                     "vpn_period_kind": "BASELINE",
+#                     "vpn_period_text": "бессрочно",
+#                 }
+#             else:
+#                 out[inn] = {
+#                     "vpn_period_kind": "NONE",
+#                     "vpn_period_text": "бессрочно",
+#                 }
+
+#         # добавим ближайший план (если есть)
+#         nxt = next_by_inn.get(inn)
+#         plan_text = ""
+#         if nxt:
+#             action = "открыть" if nxt["lease_type"] == "OPEN" else "закрыть"
+#             s = nxt.get("starts_at")
+#             e = nxt.get("ends_at")
+#             if s and e:
+#                 plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} по {_fmt_dt_ru(e)}"
+#             elif s and not e:
+#                 plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} — бессрочно"
+#             else:
+#                 plan_text = ""
+
+#         out[inn]["vpn_plan_text"] = plan_text
+
+#     return out
 
 
 
@@ -1637,7 +1781,8 @@ def vpn_ui_toggle(request):
                     bx_uid = int(bx_user["ID"]) if bx_user else None
 
                 if bx_uid:
-                    bitrix_notify_remote_access_open(bx_uid, until_dt=effective_until)
+                    # bitrix_notify_remote_access_open(bx_uid, until_dt=effective_until)
+                    bitrix_notify_remote_access_open(bx_uid, until_dt=effective_until, tz_offset_min=tz_offset_min)
                     VpnAccessLease.objects.filter(
                         inn=inn,
                         status="ACTIVE",
