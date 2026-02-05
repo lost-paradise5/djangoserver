@@ -42,7 +42,7 @@ from ldap.controls.libldap import SimplePagedResultsControl
 import base64
 from urllib.parse import urlencode
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease
 
 _HEX = set("0123456789abcdefABCDEF")
 UKM5_FULL_XML_STORE_ID = 2013
@@ -204,7 +204,8 @@ VPN_PIN_TTL_MIN = int(os.getenv("VPN_PIN_TTL_MIN", "10"))
 VPN_SESSION_TTL_MIN = int(os.getenv("VPN_SESSION_TTL_MIN", "60"))
 VPN_MAX_PIN_ATTEMPTS = int(os.getenv("VPN_MAX_PIN_ATTEMPTS", "5"))
 _INN_RE = re.compile(r"^\d{10}(\d{2})?$")
-
+VPN_INSTRUCTION_URL = os.getenv("VPN_INSTRUCTION_URL", "https://gkbin.bitrix24.ru/bitrix/tools/disk/focus.php?folderId=10054660&action=openFolderList&ncc=1")
+VPN_SCHEDULER_LOCK_KEY = int(os.getenv("VPN_SCHEDULER_LOCK_KEY", "778899"))
 # =========================
 # UI: LDAP Tools (employees + sync employeeID from 1C)
 # =========================
@@ -267,6 +268,119 @@ def _get_session_or_403(request, must_verified: bool) -> VpnAccessSession:
 # =========================
 # Helpers: Bitrix
 # =========================
+
+def bitrix_notify_remote_access_open(user_id: int, until_dt=None):
+    msg = f"Вам открыт удаленный доступ.\nИнструкция: {VPN_INSTRUCTION_URL}"
+    if until_dt:
+        lt = timezone.localtime(until_dt)
+        msg += f"\nСрок: до {lt.strftime('%d.%m.%Y %H:%M')}"
+    _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": int(user_id), "MESSAGE": msg})
+
+def _parse_dt_local(val: str | None):
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, timezone.get_default_timezone())
+    return dt
+
+
+def vpn_ensure_baseline(inn: str, group_dn: str) -> VpnAccessBaseline:
+    base = VpnAccessBaseline.objects.filter(inn=inn).first()
+    if base:
+        return base
+
+    ad = ad_find_by_employee_id(inn)
+    if not ad:
+        raise RuntimeError("AD_USER_NOT_FOUND")
+    user_dn, user_attrs = ad
+
+    sam = user_attrs.get("sAMAccountName", [b""])
+    ad_login = (sam[0].decode("utf-8", "ignore") if sam else "").strip()
+    current_member = ad_is_in_group(user_attrs, group_dn)
+
+    now = timezone.now()
+    # Пишем baseline = “как было до любых наших лиз”
+    return VpnAccessBaseline.objects.create(
+        inn=inn,
+        ad_user_dn=user_dn,
+        ad_login=ad_login,
+        baseline_member=bool(current_member),
+        created_at=now,
+        updated_at=now,
+    )
+
+
+
+def vpn_apply_state_for_inn(inn: str, group_dn: str):
+    """
+    Применяет “эффективное состояние” по лизам + baseline.
+    Возвращает (changed, now_open, effective_until).
+    """
+    base = VpnAccessBaseline.objects.filter(inn=inn).first()
+    baseline_member = base.baseline_member if base else None
+
+    desired, effective_until = vpn_get_effective_state(inn, baseline_member)
+
+    # desired None => “не управляем этим пользователем”
+    if desired is None:
+        return False, None, None
+
+    ad = ad_find_by_employee_id(inn)
+    if not ad:
+        raise RuntimeError("AD_USER_NOT_FOUND")
+    user_dn, user_attrs = ad
+
+    currently = ad_is_in_group(user_attrs, group_dn)
+
+    if desired and not currently:
+        ad_group_add_member(group_dn, user_dn)
+        return True, True, effective_until
+
+    if (not desired) and currently:
+        ad_group_remove_member(group_dn, user_dn)
+        return True, False, effective_until
+
+    return False, bool(currently), effective_until
+
+
+
+
+
+
+
+
+
+
+def vpn_get_effective_state(inn: str, baseline_member: bool | None):
+    now = timezone.now()
+    active = Q(status="ACTIVE") & Q(starts_at__lte=now) & (Q(ends_at__isnull=True) | Q(ends_at__gt=now))
+
+    has_block = VpnAccessLease.objects.filter(active, inn=inn, lease_type="BLOCK").exists()
+    if has_block:
+        return False, None  # closed
+
+    open_qs = VpnAccessLease.objects.filter(active, inn=inn, lease_type="OPEN")
+    if open_qs.exists():
+        # effective_until: если есть хоть одна OPEN без ends_at -> бессрочно
+        if open_qs.filter(ends_at__isnull=True).exists():
+            return True, None
+        mx = open_qs.order_by("-ends_at").values_list("ends_at", flat=True).first()
+        return True, mx
+
+    # нет активных лиз
+    if baseline_member is None:
+        return None, None  # не трогаем
+    return bool(baseline_member), None
+
+
+
 
 
 def _bitrix_call(
@@ -1267,12 +1381,28 @@ def vpn_ui_toggle(request):
         return JsonResponse({"ok": False, "error": "NO_SESSION"}, status=403)
 
     inn = re.sub(r"\D+", "", (request.POST.get("inn") or "").strip())
-    desired = (request.POST.get("desired") or "").strip()  # "1" или "0"
+    desired = (request.POST.get("desired") or "").strip()  # "1" or "0"
+    bitrix_id_raw = (request.POST.get("bitrix_id") or "").strip()
+    target_bitrix_id = None
+    try:
+        if bitrix_id_raw:
+            target_bitrix_id = int(bitrix_id_raw)
+    except Exception:
+        target_bitrix_id = None
+
+    start_at = _parse_dt_local(request.POST.get("start_at"))
+    end_at = _parse_dt_local(request.POST.get("end_at"))
 
     if not inn:
         return JsonResponse({"ok": False, "error": "NO_INN"}, status=400)
     if desired not in ("0", "1"):
         return JsonResponse({"ok": False, "error": "BAD_DESIRED"}, status=400)
+
+    now = timezone.now()
+
+    # если указан только end_at -> start = now
+    if end_at and not start_at:
+        start_at = now
 
     # group dn
     conn = None
@@ -1288,7 +1418,93 @@ def vpn_ui_toggle(request):
         except Exception:
             pass
 
-    # user dn
+    # baseline (фиксируем “как было” перед управлением)
+    try:
+        vpn_ensure_baseline(inn, group_dn)
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=404)
+
+    # Если start/end заданы — создаём “лизу”
+    is_scheduled = bool(start_at or end_at)
+    if is_scheduled:
+        lease_type = "OPEN" if desired == "1" else "BLOCK"
+
+        # нормализация: если start_at пустая (и end пустая) сюда не попали,
+        # если start пустая, а end тоже пустая — is_scheduled False
+        if not start_at:
+            start_at = now
+
+        if end_at and end_at <= start_at:
+            return JsonResponse({"ok": False, "error": "BAD_PERIOD:end_at must be > start_at"}, status=400)
+
+        VpnAccessLease.objects.create(
+            id=uuid.uuid4(),
+            lease_type=lease_type,
+            inn=inn,
+            target_bitrix_user_id=target_bitrix_id,
+            created_by_ad_login=sess.ad_login,
+            created_by_bitrix_user_id=sess.bitrix_user_id,
+            starts_at=start_at,
+            ends_at=end_at,
+            status="ACTIVE",
+            created_at=now,
+            notify_sent_at=None,
+            meta={
+                "ip": sess.ip,
+                "sid": str(sess.id),
+            },
+        )
+
+        send_telegram_log(
+            "\n".join([
+                "🗓️ VPN SCHEDULE CREATED",
+                f"by: {sess.ad_login} (sid={sess.id})",
+                f"inn: {inn}",
+                f"lease_type: {lease_type}",
+                f"starts_at: {timezone.localtime(start_at).isoformat(sep=' ', timespec='seconds')}",
+                f"ends_at: {(timezone.localtime(end_at).isoformat(sep=' ', timespec='seconds') if end_at else 'None')}",
+                f"time: {timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
+                f"ip: {sess.ip}",
+            ])
+        )
+
+        # Если окно уже началось — применяем сразу (чтобы не ждать воркер)
+        if start_at <= now:
+            try:
+                changed, now_open, effective_until = vpn_apply_state_for_inn(inn, group_dn)
+
+                # если реально стало “открыто” прямо сейчас — уведомим Bitrix (один раз)
+                if changed and now_open:
+                    # определим кому писать: если target_bitrix_id нет — найдём по inn
+                    bx_uid = target_bitrix_id
+                    if not bx_uid:
+                        bx_user = bitrix_find_user_by_inn(inn)
+                        bx_uid = int(bx_user["ID"]) if bx_user else None
+
+                    if bx_uid:
+                        bitrix_notify_remote_access_open(bx_uid, until_dt=effective_until)
+                        # отметим notify_sent_at у всех активных OPEN, стартовавших до now и ещё не уведомлённых
+                        VpnAccessLease.objects.filter(
+                            inn=inn,
+                            status="ACTIVE",
+                            lease_type="OPEN",
+                            starts_at__lte=now,
+                            notify_sent_at__isnull=True,
+                        ).update(notify_sent_at=now)
+
+                return JsonResponse({
+                    "ok": True,
+                    "changed": bool(changed),
+                    "vpn_open": bool(now_open) if now_open is not None else False,
+                    "scheduled": True,
+                })
+            except Exception as e:
+                return JsonResponse({"ok": False, "error": str(e)}, status=500)
+
+        # окно в будущем — просто сохранили
+        return JsonResponse({"ok": True, "changed": False, "vpn_open": None, "scheduled": True})
+
+    # Иначе — старое поведение “сразу открыть/закрыть” (без авто-отката)
     ad = ad_find_by_employee_id(inn)
     if not ad:
         return JsonResponse({"ok": False, "error": "AD_USER_NOT_FOUND"}, status=404)
@@ -1296,32 +1512,27 @@ def vpn_ui_toggle(request):
     user_dn, user_attrs = ad
     currently = ad_is_in_group(user_attrs, group_dn)
 
-    # для лога вытащим логин из AD
     sam = user_attrs.get("sAMAccountName", [b""])
     target_ad_login = (sam[0].decode("utf-8", "ignore") if sam else "").strip()
 
     try:
         if desired == "1":
             if currently:
-                send_telegram_log(
-                    "\n".join([
-                        "ℹ️ Удалённый доступ открыт (Без изменений, уже был открыт)",
-                        f"by: {sess.ad_login} (sid={sess.id})",
-                        f"target_inn: {inn}",
-                        f"target_ad_login: {target_ad_login}",
-                        f"target_dn: {user_dn}",
-                        f"group: {VPN_GROUP_CN}",
-                        f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-                        f"ip: {sess.ip}",
-                    ])
-                )
-                return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
+                return JsonResponse({"ok": True, "changed": False, "vpn_open": True, "scheduled": False})
 
             ad_group_add_member(group_dn, user_dn)
 
+            # notify Bitrix (без срока)
+            bx_uid = target_bitrix_id
+            if not bx_uid:
+                bx_user = bitrix_find_user_by_inn(inn)
+                bx_uid = int(bx_user["ID"]) if bx_user else None
+            if bx_uid:
+                bitrix_notify_remote_access_open(bx_uid, until_dt=None)
+
             send_telegram_log(
                 "\n".join([
-                    "✅ Удалённый доступ открыт",
+                    "✅ Удалённый доступ открыт (IMMEDIATE)",
                     f"by: {sess.ad_login} (sid={sess.id})",
                     f"target_inn: {inn}",
                     f"target_ad_login: {target_ad_login}",
@@ -1331,29 +1542,17 @@ def vpn_ui_toggle(request):
                     f"ip: {sess.ip}",
                 ])
             )
-            return JsonResponse({"ok": True, "changed": True, "vpn_open": True})
+            return JsonResponse({"ok": True, "changed": True, "vpn_open": True, "scheduled": False})
 
         else:
             if not currently:
-                send_telegram_log(
-                    "\n".join([
-                        "ℹ️ Удалённый доступ закрыт (Без изменений, уже был закрыт)",
-                        f"by: {sess.ad_login} (sid={sess.id})",
-                        f"target_inn: {inn}",
-                        f"target_ad_login: {target_ad_login}",
-                        f"target_dn: {user_dn}",
-                        f"group: {VPN_GROUP_CN}",
-                        f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-                        f"ip: {sess.ip}",
-                    ])
-                )
-                return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
+                return JsonResponse({"ok": True, "changed": False, "vpn_open": False, "scheduled": False})
 
             ad_group_remove_member(group_dn, user_dn)
 
             send_telegram_log(
                 "\n".join([
-                    "✅ Удалённый доступ закрыт",
+                    "✅ Удалённый доступ закрыт (IMMEDIATE)",
                     f"by: {sess.ad_login} (sid={sess.id})",
                     f"target_inn: {inn}",
                     f"target_ad_login: {target_ad_login}",
@@ -1363,53 +1562,166 @@ def vpn_ui_toggle(request):
                     f"ip: {sess.ip}",
                 ])
             )
-            return JsonResponse({"ok": True, "changed": True, "vpn_open": False})
+            return JsonResponse({"ok": True, "changed": True, "vpn_open": False, "scheduled": False})
 
     except ldap.ALREADY_EXISTS:
-        send_telegram_log(
-            "\n".join([
-                "ℹ️ VPN ACCESS OPEN (LDAP ALREADY_EXISTS)",
-                f"by: {sess.ad_login} (sid={sess.id})",
-                f"target_inn: {inn}",
-                f"target_ad_login: {target_ad_login}",
-                f"target_dn: {user_dn}",
-                f"group: {VPN_GROUP_CN}",
-                f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-                f"ip: {sess.ip}",
-            ])
-        )
-        return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
-
+        return JsonResponse({"ok": True, "changed": False, "vpn_open": True, "scheduled": False})
     except ldap.NO_SUCH_ATTRIBUTE:
-        send_telegram_log(
-            "\n".join([
-                "ℹ️ VPN ACCESS CLOSE (LDAP NO_SUCH_ATTRIBUTE)",
-                f"by: {sess.ad_login} (sid={sess.id})",
-                f"target_inn: {inn}",
-                f"target_ad_login: {target_ad_login}",
-                f"target_dn: {user_dn}",
-                f"group: {VPN_GROUP_CN}",
-                f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-                f"ip: {sess.ip}",
-            ])
-        )
-        return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
-
+        return JsonResponse({"ok": True, "changed": False, "vpn_open": False, "scheduled": False})
     except Exception as e:
-        send_telegram_log(
-            "\n".join([
-                "❌ VPN TOGGLE ERROR",
-                f"by: {sess.ad_login} (sid={sess.id})",
-                f"target_inn: {inn}",
-                f"target_ad_login: {target_ad_login}",
-                f"target_dn: {user_dn}",
-                f"group: {VPN_GROUP_CN}",
-                f"error: {str(e)}",
-                f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-                f"ip: {sess.ip}",
-            ])
-        )
         return JsonResponse({"ok": False, "error": str(e)}, status=500)
+# @require_http_methods(["POST"])
+# @csrf_protect
+# def vpn_ui_toggle(request):
+#     try:
+#         sess = _get_session_or_403(request, must_verified=True)
+#     except Exception:
+#         return JsonResponse({"ok": False, "error": "NO_SESSION"}, status=403)
+
+#     inn = re.sub(r"\D+", "", (request.POST.get("inn") or "").strip())
+#     desired = (request.POST.get("desired") or "").strip()  # "1" или "0"
+
+#     if not inn:
+#         return JsonResponse({"ok": False, "error": "NO_INN"}, status=400)
+#     if desired not in ("0", "1"):
+#         return JsonResponse({"ok": False, "error": "BAD_DESIRED"}, status=400)
+
+#     # group dn
+#     conn = None
+#     try:
+#         conn = _ad_connect()
+#         group_dn = ad_find_group_dn(conn, VPN_GROUP_CN)
+#         if not group_dn:
+#             return JsonResponse({"ok": False, "error": f"GROUP_NOT_FOUND:{VPN_GROUP_CN}"}, status=500)
+#     finally:
+#         try:
+#             if conn:
+#                 conn.unbind_s()
+#         except Exception:
+#             pass
+
+#     # user dn
+#     ad = ad_find_by_employee_id(inn)
+#     if not ad:
+#         return JsonResponse({"ok": False, "error": "AD_USER_NOT_FOUND"}, status=404)
+
+#     user_dn, user_attrs = ad
+#     currently = ad_is_in_group(user_attrs, group_dn)
+
+#     # для лога вытащим логин из AD
+#     sam = user_attrs.get("sAMAccountName", [b""])
+#     target_ad_login = (sam[0].decode("utf-8", "ignore") if sam else "").strip()
+
+#     try:
+#         if desired == "1":
+#             if currently:
+#                 send_telegram_log(
+#                     "\n".join([
+#                         "ℹ️ Удалённый доступ открыт (Без изменений, уже был открыт)",
+#                         f"by: {sess.ad_login} (sid={sess.id})",
+#                         f"target_inn: {inn}",
+#                         f"target_ad_login: {target_ad_login}",
+#                         f"target_dn: {user_dn}",
+#                         f"group: {VPN_GROUP_CN}",
+#                         f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+#                         f"ip: {sess.ip}",
+#                     ])
+#                 )
+#                 return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
+
+#             ad_group_add_member(group_dn, user_dn)
+
+#             send_telegram_log(
+#                 "\n".join([
+#                     "✅ Удалённый доступ открыт",
+#                     f"by: {sess.ad_login} (sid={sess.id})",
+#                     f"target_inn: {inn}",
+#                     f"target_ad_login: {target_ad_login}",
+#                     f"target_dn: {user_dn}",
+#                     f"group: {VPN_GROUP_CN}",
+#                     f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+#                     f"ip: {sess.ip}",
+#                 ])
+#             )
+#             return JsonResponse({"ok": True, "changed": True, "vpn_open": True})
+
+#         else:
+#             if not currently:
+#                 send_telegram_log(
+#                     "\n".join([
+#                         "ℹ️ Удалённый доступ закрыт (Без изменений, уже был закрыт)",
+#                         f"by: {sess.ad_login} (sid={sess.id})",
+#                         f"target_inn: {inn}",
+#                         f"target_ad_login: {target_ad_login}",
+#                         f"target_dn: {user_dn}",
+#                         f"group: {VPN_GROUP_CN}",
+#                         f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+#                         f"ip: {sess.ip}",
+#                     ])
+#                 )
+#                 return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
+
+#             ad_group_remove_member(group_dn, user_dn)
+
+#             send_telegram_log(
+#                 "\n".join([
+#                     "✅ Удалённый доступ закрыт",
+#                     f"by: {sess.ad_login} (sid={sess.id})",
+#                     f"target_inn: {inn}",
+#                     f"target_ad_login: {target_ad_login}",
+#                     f"target_dn: {user_dn}",
+#                     f"group: {VPN_GROUP_CN}",
+#                     f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+#                     f"ip: {sess.ip}",
+#                 ])
+#             )
+#             return JsonResponse({"ok": True, "changed": True, "vpn_open": False})
+
+#     except ldap.ALREADY_EXISTS:
+#         send_telegram_log(
+#             "\n".join([
+#                 "ℹ️ VPN ACCESS OPEN (LDAP ALREADY_EXISTS)",
+#                 f"by: {sess.ad_login} (sid={sess.id})",
+#                 f"target_inn: {inn}",
+#                 f"target_ad_login: {target_ad_login}",
+#                 f"target_dn: {user_dn}",
+#                 f"group: {VPN_GROUP_CN}",
+#                 f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+#                 f"ip: {sess.ip}",
+#             ])
+#         )
+#         return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
+
+#     except ldap.NO_SUCH_ATTRIBUTE:
+#         send_telegram_log(
+#             "\n".join([
+#                 "ℹ️ VPN ACCESS CLOSE (LDAP NO_SUCH_ATTRIBUTE)",
+#                 f"by: {sess.ad_login} (sid={sess.id})",
+#                 f"target_inn: {inn}",
+#                 f"target_ad_login: {target_ad_login}",
+#                 f"target_dn: {user_dn}",
+#                 f"group: {VPN_GROUP_CN}",
+#                 f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+#                 f"ip: {sess.ip}",
+#             ])
+#         )
+#         return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
+
+#     except Exception as e:
+#         send_telegram_log(
+#             "\n".join([
+#                 "❌ VPN TOGGLE ERROR",
+#                 f"by: {sess.ad_login} (sid={sess.id})",
+#                 f"target_inn: {inn}",
+#                 f"target_ad_login: {target_ad_login}",
+#                 f"target_dn: {user_dn}",
+#                 f"group: {VPN_GROUP_CN}",
+#                 f"error: {str(e)}",
+#                 f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
+#                 f"ip: {sess.ip}",
+#             ])
+#         )
+#         return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
 
 
