@@ -12003,15 +12003,15 @@ def _build_report_xlsx(now: datetime.datetime,
     wb.remove(wb.active)
 
     # SUMMARY
-    ws = wb.create_sheet("SUMMARY")
-    ws.append(["generated_at", _dt_iso(now)])
-    ws.append(["AD_days", days_ad])
-    ws.append(["SM_days", days_sm])
-    ws.append(["BITRIX_days", days_bx])
+    ws = wb.create_sheet("Общая статистика")
+    ws.append(["Дата формирования", _dt_iso(now)])
+    ws.append(["Active directory дней без входа", days_ad])
+    ws.append(["Супермаг центральная база дней без входа", days_sm])
+    ws.append(["Битрикс дней без входа", days_bx])
     ws.append([])
-    ws.append(["AD_inactive_count", len(ad_rows)])
-    ws.append(["SM_inactive_count", len(sm_rows)])
-    ws.append(["BITRIX_inactive_count", len(bx_rows)])
+    ws.append(["Найдено в AD", len(ad_rows)])
+    ws.append(["Найдено в Супермаг центральный", len(sm_rows)])
+    ws.append(["Найдено в Битрикс", len(bx_rows)])
     ws["A1"].font = Font(bold=True)
     _xlsx_autofit(ws)
 
@@ -12030,7 +12030,7 @@ def _build_report_xlsx(now: datetime.datetime,
     _xlsx_autofit(ws)
 
     # SuperMag
-    ws = wb.create_sheet("SUPERMAG_BINUU00")
+    ws = wb.create_sheet("Супермаг центральный")
     ws.append(["db", "username", "fio", "inn", "serverlogin", "staff_id", "userenabled", "last_login", "created"])
     for r in sm_rows:
         ws.append([
@@ -12044,7 +12044,7 @@ def _build_report_xlsx(now: datetime.datetime,
     _xlsx_autofit(ws)
 
     # Bitrix
-    ws = wb.create_sheet("BITRIX")
+    ws = wb.create_sheet("Битрикс24")
     ws.append(["id", "fio", "email", "position", "inn", "last_login", "last_activity", "days_login", "days_activity"])
     for r in bx_rows:
         ws.append([
@@ -12058,7 +12058,7 @@ def _build_report_xlsx(now: datetime.datetime,
     _xlsx_autofit(ws)
 
     # CROSS_BY_INN
-    ws = wb.create_sheet("CROSS_BY_INN")
+    ws = wb.create_sheet("Сводка по ИНН")
     ws.append(["inn", "fio_best", "ad_sam", "ad_last", "sm_username", "sm_last", "bitrix_id", "bitrix_last"])
     by_inn = {}
 
@@ -12231,7 +12231,21 @@ def inactive_users_report_send_to_bitrix(request):
 
     # 1) collect
     ad_rows = _ad_fetch_inactive_users(days=days_ad, include_never=include_never)
-    sm_rows = _sm_fetch_inactive_users_binu00(days=days_sm, only_enabled=True)
+    # sm_rows = _sm_fetch_inactive_users_binu00(days=days_sm, only_enabled=True)
+    exclude_env = (os.getenv("SM_LASTLOGIN_EXCLUDE_USERS", "S_BUDAYEV,SUPERMAG,SADMIN,SYSTEM,SYS") or "")
+    exclude_users = {x.strip().upper() for x in exclude_env.split(",") if x.strip()}
+
+    items, err = _sm_fetch_stale_users_in_db(
+        db="BINUU00",
+        days=days_sm,
+        only_enabled=True,   # если хотите видеть всех — поставьте False
+        q="",
+        exclude_users=exclude_users
+    )
+    if err:
+        logger.warning(f"[REPORT][SM] BINUU00 error: {err}")
+
+    sm_rows = items
     bx_rows = _bitrix_fetch_inactive_users(days=days_bx)
 
     # 2) build xlsx
