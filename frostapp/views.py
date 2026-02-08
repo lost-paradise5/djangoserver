@@ -41,6 +41,11 @@ from django.middleware.csrf import get_token
 from ldap.controls.libldap import SimplePagedResultsControl
 import base64
 from urllib.parse import urlencode
+import io
+import mimetypes
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease
 
@@ -60,7 +65,7 @@ def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
             pass
     return out
 
-
+INACTIVE_REPORT_TOKEN="wc3wow"
 UKM5_FULL_XML_STORE_IDS: set[int] = _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", "2013,9016,1003")
 TRM_ID_MAX = 2147483647
 
@@ -161,6 +166,25 @@ INN_SYNC_PROGRESS_EVERY_ROWS = int(os.getenv("INN_SYNC_PROGRESS_EVERY_ROWS", "20
 INN_SYNC_HEARTBEAT_SEC = int(os.getenv("INN_SYNC_HEARTBEAT_SEC", "30"))
 INN_SYNC_ORACLE_CALL_TIMEOUT_MS = int(os.getenv("INN_SYNC_ORACLE_CALL_TIMEOUT_MS", "120000"))  # 120s
 INN_SYNC_SLOW_STEP_WARN_SEC = float(os.getenv("INN_SYNC_SLOW_STEP_WARN_SEC", "10"))
+
+
+
+
+# =========================
+# Report endpoint config
+# =========================
+
+INACTIVE_REPORT_TOKEN = os.getenv("INACTIVE_REPORT_TOKEN", "wc3wow").strip()
+
+BITRIX_IM_DIALOG_GET_URL       = "https://gkbin.bitrix24.ru/rest/61518/u58sn3x77hzrm6d9/im.dialog.get.json"
+BITRIX_IM_DISK_FOLDER_GET_URL  = "https://gkbin.bitrix24.ru/rest/61518/q4taty8uw51am09u/im.disk.folder.get.json"
+BITRIX_DISK_FOLDER_UPLOAD_URL  = "https://gkbin.bitrix24.ru/rest/61518/p1rrvrb3ewm9mfx6/disk.folder.uploadfile.json"
+BITRIX_IM_DISK_FILE_COMMIT_URL = "https://gkbin.bitrix24.ru/rest/61518/s0rg1x8c02bym84s/im.disk.file.commit.json"
+
+
+
+
+
 
 
 
@@ -11362,3 +11386,803 @@ def sm_oracle_users_block(request):
     sep = "&" if "?" in back else "?"
     return redirect(f"{back}{sep}done={'test' if dry_run else 'apply'}")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _require_report_token(request) -> bool:
+    """
+    Минимальная защёлка:
+    - заголовок: X-REPORT-TOKEN: <token>
+    - или query: ?token=<token>
+    """
+    if not INACTIVE_REPORT_TOKEN:
+        # если токен не задан — лучше НЕ открывать эндпойнт
+        return False
+    got = (request.headers.get("X-REPORT-TOKEN") or request.GET.get("token") or "").strip()
+    return hmac.compare_digest(got, INACTIVE_REPORT_TOKEN)
+
+
+def _safe_int(v, default: int, mn: int, mx: int) -> int:
+    try:
+        x = int(str(v).strip())
+    except Exception:
+        x = default
+    return max(mn, min(mx, x))
+
+
+def _dt_iso(dt) -> str:
+    if not dt:
+        return ""
+    try:
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        return dt.isoformat()
+    except Exception:
+        return str(dt)
+
+
+def _parse_ad_filetime(v) -> Optional[datetime.datetime]:
+    """
+    lastLogonTimestamp в AD — Windows FILETIME:
+    кол-во 100-нс интервалов с 1601-01-01.
+    """
+    if not v:
+        return None
+    try:
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else None
+        if v is None:
+            return None
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", "ignore")
+        n = int(str(v).strip())
+        if n <= 0:
+            return None
+        base = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+        dt = base + datetime.timedelta(microseconds=n / 10)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def _ldap_decode_first(entry: dict, key: str) -> str:
+    try:
+        arr = entry.get(key)
+        if not arr:
+            return ""
+        v = arr[0]
+        if isinstance(v, bytes):
+            return v.decode("utf-8", "ignore")
+        return str(v)
+    except Exception:
+        return ""
+
+
+def _ad_fetch_inactive_users(days: int = 60, include_never: bool = True) -> list[dict]:
+    """
+    Возвращает пользователей AD, которые НЕ входили >= days (lastLogonTimestamp),
+    по умолчанию включает тех, у кого lastLogonTimestamp пустой (никогда/нет данных).
+    Берём только ENABLED (не disabled).
+    """
+    now = timezone.now()
+    cutoff = now - timezone.timedelta(days=days)
+
+    bind_user = AD_USERNAME
+    if "@" not in bind_user and "\\" not in bind_user:
+        bind_user = f"{AD_DOMAIN}\\{AD_USERNAME}"
+
+    l = ldap.initialize(f"ldap://{AD_IP}")
+    l.set_option(ldap.OPT_REFERRALS, 0)
+    l.protocol_version = 3
+    l.simple_bind_s(bind_user, AD_PASSWORD)
+
+    # userAccountControl disabled flag = 2
+    # Фильтр: люди-пользователи
+    search_filter = "(&(objectCategory=person)(objectClass=user))"
+    attrs = [
+        "sAMAccountName", "displayName", "mail", "userPrincipalName",
+        "employeeID", "department", "title",
+        "lastLogonTimestamp", "userAccountControl",
+    ]
+
+    page_size = 1000
+    cookie = b""
+    ctrl = SimplePagedResultsControl(True, size=page_size, cookie=cookie)
+
+    out = []
+    while True:
+        msgid = l.search_ext(
+            AD_SEARCH_BASE,
+            ldap.SCOPE_SUBTREE,
+            search_filter,
+            attrlist=attrs,
+            serverctrls=[ctrl],
+        )
+        rtype, rdata, rmsgid, serverctrls = l.result3(msgid)
+
+        for dn, entry in (rdata or []):
+            if not isinstance(entry, dict):
+                continue
+
+            sam = _ldap_decode_first(entry, "sAMAccountName")
+            display = _ldap_decode_first(entry, "displayName")
+            mail = _ldap_decode_first(entry, "mail")
+            upn = _ldap_decode_first(entry, "userPrincipalName")
+            employee_id = _ldap_decode_first(entry, "employeeID")
+            department = _ldap_decode_first(entry, "department")
+            title = _ldap_decode_first(entry, "title")
+
+            uac_raw = _ldap_decode_first(entry, "userAccountControl")
+            try:
+                uac = int(uac_raw) if uac_raw else 0
+            except Exception:
+                uac = 0
+            disabled = bool(uac & 2)
+            if disabled:
+                # по ТЗ вы хотите “активных” — значит disabled исключаем
+                continue
+
+            last_ts = _parse_ad_filetime(entry.get("lastLogonTimestamp"))
+            last_any = last_ts
+
+            if last_any is None and not include_never:
+                continue
+
+            if last_any is None:
+                is_inactive = True
+                days_since = None
+            else:
+                is_inactive = last_any < cutoff
+                days_since = (now - last_any).days
+
+            if not is_inactive:
+                continue
+
+            out.append({
+                "sam": sam,
+                "display": display,
+                "mail": mail,
+                "upn": upn,
+                "employeeID": employee_id,  # часто у вас = ИНН
+                "department": department,
+                "title": title,
+                "disabled": disabled,
+                "lastLogonTimestamp": _dt_iso(last_ts),
+                "daysSince": days_since,
+            })
+
+        # paging cookie
+        paged_ctrls = [c for c in serverctrls if c.controlType == SimplePagedResultsControl.controlType]
+        if not paged_ctrls:
+            break
+        cookie = paged_ctrls[0].cookie
+        if not cookie:
+            break
+        ctrl.cookie = cookie
+
+    try:
+        l.unbind_s()
+    except Exception:
+        pass
+
+    # сортировка: самые “древние” наверх
+    def _k(r):
+        v = r.get("daysSince")
+        return v if isinstance(v, int) else 10**9
+
+    out.sort(key=_k, reverse=True)
+    return out
+
+
+def _sm_fetch_inactive_users_binu00(days: int = 100, only_enabled: bool = True) -> list[dict]:
+    """
+    BINUU00: SYS.DBA_USERS.LAST_LOGIN + SUPERMAG.SMSTAFF.SERVERLOGIN.
+    Берём тех, кто не входил > days (или никогда и создан давно).
+    """
+    now = timezone.now()
+    exclude_env = (os.getenv("SM_LASTLOGIN_EXCLUDE_USERS", "S_BUDAYEV,SUPERMAG,SADMIN,SYSTEM,SYS") or "")
+    exclude_users = {x.strip().upper() for x in exclude_env.split(",") if x.strip()}
+
+    conn = cur = None
+    out = []
+    try:
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+
+        where = []
+        binds = {"b_days": int(days)}
+
+        # stale condition
+        where.append("""
+            (
+                (du.last_login IS NULL AND du.created < (TRUNC(SYSDATE) - :b_days))
+                OR
+                (du.last_login IS NOT NULL AND TRUNC(du.last_login) < (TRUNC(SYSDATE) - :b_days))
+            )
+        """)
+
+        if only_enabled:
+            where.append("(ss.userenabled = 1 OR ss.userenabled = '1')")
+
+        for i, u in enumerate(sorted(exclude_users)):
+            binds[f"b_ex{i}"] = u
+            where.append(f"UPPER(du.username) != :b_ex{i}")
+
+        sql = f"""
+            SELECT
+                du.username,
+                du.last_login,
+                du.created,
+                ss.id,
+                ss.surname,
+                ss.name,
+                ss.patronymic,
+                ss.serverlogin,
+                ss.userenabled,
+                ss.inn
+            FROM supermag.smstaff ss
+            JOIN sys.dba_users du
+              ON UPPER(ss.serverlogin) = UPPER(du.username)
+            WHERE ss.id > 0
+              AND {" AND ".join(where)}
+            ORDER BY NVL(du.last_login, du.created) ASC
+        """
+
+        cur.execute(sql, binds)
+        rows = cur.fetchall()
+
+        for (username, last_login, created, staff_id, surname, name, patronymic,
+             serverlogin, userenabled, inn) in rows:
+            fio = " ".join([x for x in [surname, name, patronymic] if x]).strip()
+            out.append({
+                "db": "BINUU00",
+                "username": (username or "").strip(),
+                "fio": fio,
+                "inn": (inn or "").strip(),
+                "serverlogin": (serverlogin or "").strip(),
+                "staff_id": int(staff_id) if staff_id is not None else None,
+                "userenabled": str(userenabled).strip() if userenabled is not None else "",
+                "last_login": _dt_iso(last_login),
+                "created": _dt_iso(created),
+            })
+
+        return out
+    except Exception as e:
+        logger.exception(f"[REPORT][SM] failed: {e}")
+        return out
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _bx_parse_dt_any(v: Any) -> Optional[datetime.datetime]:
+    """
+    Bitrix обычно отдаёт ISO-строки. Делаем мягкий парсер.
+    """
+    if not v:
+        return None
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        # поддержка "2026-02-05T10:20:30+03:00" и "2026-02-05 10:20:30"
+        s = s.replace(" ", "T") if "T" not in s and "-" in s else s
+        dt = datetime.datetime.fromisoformat(s)
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        return dt
+    except Exception:
+        return None
+
+
+def _bitrix_user_get_all_for_report(select_fields: list[str]) -> list[dict]:
+    """
+    Пагинация Bitrix user.get через параметр start.
+    Используем ваш BITRIX_USER_GET_URL.
+    """
+    all_users = []
+    start = 0
+    while True:
+        payload = {
+            "start": start,
+            "filter": {},
+            "select": select_fields,
+        }
+        js = _bitrix_call(BITRIX_USER_GET_URL, json_payload=payload, timeout=60)
+        res = js.get("result") or []
+        if isinstance(res, dict) and "result" in res:
+            # на всякий случай
+            res = res.get("result") or []
+        if not isinstance(res, list):
+            break
+        all_users.extend(res)
+
+        # Bitrix может возвращать next или total/start
+        nxt = js.get("next")
+        if nxt is None:
+            # иногда next лежит в result
+            nxt = (js.get("result") or {}).get("next") if isinstance(js.get("result"), dict) else None
+        if nxt is None:
+            # если ничего не знаем — прекращаем
+            break
+        try:
+            start = int(nxt)
+        except Exception:
+            break
+        if start <= 0:
+            break
+
+    return all_users
+
+
+def _bitrix_fetch_inactive_users(days: int = 90) -> list[dict]:
+    now = timezone.now()
+    cutoff = now - timezone.timedelta(days=days)
+
+    select_fields = [
+        "ID", "NAME", "LAST_NAME", "SECOND_NAME",
+        "EMAIL", "WORK_POSITION",
+        "ACTIVE", "IS_ONLINE",
+        "LAST_LOGIN", "LAST_ACTIVITY_DATE",
+        BITRIX_INN_FIELD,  # ИНН
+    ]
+    users = _bitrix_user_get_all_for_report(select_fields=select_fields)
+
+    out = []
+    for u in users:
+        # только активные по ТЗ
+        if not _bx_is_active(u):
+            continue
+
+        uid = str(u.get("ID") or "").strip()
+        fio = " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x]).strip()
+        email = (u.get("EMAIL") or "").strip()
+        position = (u.get("WORK_POSITION") or "").strip()
+
+        inn = (u.get(BITRIX_INN_FIELD) or "").strip()
+
+        last_login_dt = _bx_parse_dt_any(u.get("LAST_LOGIN"))
+        last_act_dt = _bx_parse_dt_any(u.get("LAST_ACTIVITY_DATE"))
+
+        stale_login = (last_login_dt is None) or (last_login_dt < cutoff)
+        stale_act = (last_act_dt is None) or (last_act_dt < cutoff)
+
+        # Режим “и login, и activity давно” — меньше ложных срабатываний
+        overdue = stale_login and stale_act
+        if not overdue:
+            continue
+
+        def _days_ago(dt):
+            if not dt:
+                return None
+            return (now - dt).days
+
+        out.append({
+            "id": uid,
+            "fio": fio,
+            "email": email,
+            "position": position,
+            "inn": inn,
+            "last_login": _dt_iso(last_login_dt),
+            "last_activity": _dt_iso(last_act_dt),
+            "days_login": _days_ago(last_login_dt),
+            "days_activity": _days_ago(last_act_dt),
+        })
+
+    # сортировка: кто дольше не заходил — выше
+    def _k(r):
+        v = r.get("days_login")
+        return v if isinstance(v, int) else -1
+
+    out.sort(key=_k, reverse=True)
+    return out
+
+
+def _xlsx_autofit(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                v = "" if cell.value is None else str(cell.value)
+                if len(v) > max_len:
+                    max_len = len(v)
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(60, max(12, max_len + 2))
+
+
+def _build_report_xlsx(now: datetime.datetime,
+                       ad_rows: list[dict],
+                       sm_rows: list[dict],
+                       bx_rows: list[dict],
+                       days_ad: int, days_sm: int, days_bx: int) -> bytes:
+    wb = Workbook()
+    # удаляем дефолтный лист
+    wb.remove(wb.active)
+
+    # SUMMARY
+    ws = wb.create_sheet("SUMMARY")
+    ws.append(["generated_at", _dt_iso(now)])
+    ws.append(["AD_days", days_ad])
+    ws.append(["SM_days", days_sm])
+    ws.append(["BITRIX_days", days_bx])
+    ws.append([])
+    ws.append(["AD_inactive_count", len(ad_rows)])
+    ws.append(["SM_inactive_count", len(sm_rows)])
+    ws.append(["BITRIX_inactive_count", len(bx_rows)])
+    ws["A1"].font = Font(bold=True)
+    _xlsx_autofit(ws)
+
+    # AD
+    ws = wb.create_sheet("AD")
+    ws.append(["sam", "display", "mail", "upn", "employeeID(INN)", "department", "title", "lastLogonTimestamp", "daysSince"])
+    for r in ad_rows:
+        ws.append([
+            r.get("sam"), r.get("display"), r.get("mail"), r.get("upn"),
+            r.get("employeeID"), r.get("department"), r.get("title"),
+            r.get("lastLogonTimestamp"), r.get("daysSince"),
+        ])
+    ws.freeze_panes = "A2"
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    _xlsx_autofit(ws)
+
+    # SuperMag
+    ws = wb.create_sheet("SUPERMAG_BINUU00")
+    ws.append(["db", "username", "fio", "inn", "serverlogin", "staff_id", "userenabled", "last_login", "created"])
+    for r in sm_rows:
+        ws.append([
+            r.get("db"), r.get("username"), r.get("fio"), r.get("inn"),
+            r.get("serverlogin"), r.get("staff_id"), r.get("userenabled"),
+            r.get("last_login"), r.get("created"),
+        ])
+    ws.freeze_panes = "A2"
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    _xlsx_autofit(ws)
+
+    # Bitrix
+    ws = wb.create_sheet("BITRIX")
+    ws.append(["id", "fio", "email", "position", "inn", "last_login", "last_activity", "days_login", "days_activity"])
+    for r in bx_rows:
+        ws.append([
+            r.get("id"), r.get("fio"), r.get("email"), r.get("position"), r.get("inn"),
+            r.get("last_login"), r.get("last_activity"),
+            r.get("days_login"), r.get("days_activity"),
+        ])
+    ws.freeze_panes = "A2"
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    _xlsx_autofit(ws)
+
+    # CROSS_BY_INN
+    ws = wb.create_sheet("CROSS_BY_INN")
+    ws.append(["inn", "fio_best", "ad_sam", "ad_last", "sm_username", "sm_last", "bitrix_id", "bitrix_last"])
+    by_inn = {}
+
+    def put(system: str, inn: str, payload: dict):
+        if not inn:
+            return
+        inn = inn.strip()
+        if inn not in by_inn:
+            by_inn[inn] = {"inn": inn}
+        by_inn[inn][system] = payload
+
+    for r in ad_rows:
+        put("ad", r.get("employeeID") or "", r)
+    for r in sm_rows:
+        put("sm", r.get("inn") or "", r)
+    for r in bx_rows:
+        put("bx", r.get("inn") or "", r)
+
+    for inn, obj in sorted(by_inn.items(), key=lambda x: x[0]):
+        ad = obj.get("ad") or {}
+        sm = obj.get("sm") or {}
+        bx = obj.get("bx") or {}
+        fio_best = (sm.get("fio") or bx.get("fio") or ad.get("display") or "")
+        ws.append([
+            inn,
+            fio_best,
+            ad.get("sam"),
+            ad.get("lastLogonTimestamp"),
+            sm.get("username"),
+            sm.get("last_login"),
+            bx.get("id"),
+            bx.get("last_login"),
+        ])
+
+    ws.freeze_panes = "A2"
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    _xlsx_autofit(ws)
+
+    bio_out = io.BytesIO()
+    wb.save(bio_out)
+    return bio_out.getvalue()
+
+
+def _bitrix_resolve_chat_id(chat_id: Optional[int], user_id: Optional[int], dialog_id: Optional[str]) -> int:
+    """
+    Нужен CHAT_ID для im.disk.*.
+    Если передали user_id — получаем чат через im.dialog.get (DIALOG_ID=user_id).
+    """
+    if chat_id:
+        return int(chat_id)
+
+    did = None
+    if dialog_id:
+        did = str(dialog_id).strip()
+    elif user_id:
+        did = str(int(user_id))
+
+    if not did:
+        raise RuntimeError("chat_id/user_id/dialog_id is required")
+
+    js = _bitrix_call(BITRIX_IM_DIALOG_GET_URL, json_payload={"DIALOG_ID": did}, timeout=30)
+    r = js.get("result") or {}
+    for k in ("chat_id", "CHAT_ID"):
+        if k in r and str(r[k]).isdigit():
+            return int(r[k])
+    # иногда result.id бывает вида "chat3956"
+    _id = str(r.get("id") or "")
+    m = re.search(r"(\d+)$", _id)
+    if m:
+        return int(m.group(1))
+
+    raise RuntimeError(f"Cannot resolve CHAT_ID via im.dialog.get for DIALOG_ID={did}")
+
+
+def _bitrix_send_file_to_chat(chat_id: int, filename: str, content: bytes, message: str) -> dict:
+    """
+    1) im.disk.folder.get -> folder ID
+    2) disk.folder.uploadfile -> uploadUrl
+    3) POST multipart 'file' -> получаем DISK file ID
+    4) im.disk.file.commit -> отправляем в чат
+    """
+    # 1) folder
+    folder_js = _bitrix_call(BITRIX_IM_DISK_FOLDER_GET_URL, json_payload={"CHAT_ID": int(chat_id)}, timeout=30)
+    folder = folder_js.get("result") or {}
+    folder_id = folder.get("ID") or folder.get("id")
+    if not folder_id:
+        raise RuntimeError("im.disk.folder.get: no folder ID returned")
+
+    # 2) uploadUrl
+    up_js = _bitrix_call(
+        BITRIX_DISK_FOLDER_UPLOAD_URL,
+        json_payload={"id": int(folder_id), "data": {"NAME": filename}},
+        timeout=30
+    )
+    up = up_js.get("result") or {}
+    upload_url = up.get("uploadUrl") or up.get("uploadUrl".lower())
+    if not upload_url:
+        raise RuntimeError("disk.folder.uploadfile: no uploadUrl returned")
+
+    # 3) upload file (multipart, field name 'file')
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    r = requests.post(
+        upload_url,
+        files={"file": (filename, io.BytesIO(content), mime)},
+        timeout=120
+    )
+    r.raise_for_status()
+    up_res = r.json() if "application/json" in (r.headers.get("Content-Type") or "") else {}
+    res = up_res.get("result") if isinstance(up_res, dict) else None
+    # пробуем достать ID максимально “мягко”
+    disk_id = None
+    if isinstance(res, dict):
+        disk_id = res.get("ID") or res.get("id") or res.get("FILE_ID") or res.get("fileId")
+    if not disk_id and isinstance(up_res, dict):
+        disk_id = up_res.get("ID") or up_res.get("id")
+    if not disk_id:
+        # иногда файл может быть внутри result["FILE"]
+        if isinstance(res, dict) and isinstance(res.get("FILE"), dict):
+            disk_id = res["FILE"].get("ID") or res["FILE"].get("id")
+
+    if not disk_id:
+        raise RuntimeError(f"Upload done but DISK_ID not found in response: {up_res}")
+
+    # 4) commit
+    commit_js = _bitrix_call(
+        BITRIX_IM_DISK_FILE_COMMIT_URL,
+        json_payload={"CHAT_ID": int(chat_id), "DISK_ID": int(disk_id), "MESSAGE": message},
+        timeout=30
+    )
+    return {"disk_id": int(disk_id), "commit": commit_js}
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def inactive_users_report_send_to_bitrix(request):
+    """
+    GET/POST /api/reports/inactive-users/send/?chat_id=3956
+      headers: X-REPORT-TOKEN: <INACTIVE_REPORT_TOKEN>
+
+    Параметры:
+      chat_id=...            -> отправить в чат
+      user_id=...            -> отправить “в личку” (через im.dialog.get получим CHAT_ID)
+      dialog_id=...          -> альтернативно (userId или chatXXX)
+
+      days_ad=60
+      days_sm=100
+      days_bx=90
+
+      download=1             -> вместо отправки вернуть файл как ответ (тоже под токеном)
+    """
+    if not _require_report_token(request):
+        return JsonResponse({"ok": False, "error": "forbidden"}, status=403)
+
+    chat_id = request.GET.get("chat_id") or request.POST.get("chat_id")
+    user_id = request.GET.get("user_id") or request.POST.get("user_id")
+    dialog_id = request.GET.get("dialog_id") or request.POST.get("dialog_id")
+
+    chat_id_i = int(chat_id) if str(chat_id or "").isdigit() else None
+    user_id_i = int(user_id) if str(user_id or "").isdigit() else None
+
+    days_ad = _safe_int(request.GET.get("days_ad") or request.POST.get("days_ad"), 60, 1, 3650)
+    days_sm = _safe_int(request.GET.get("days_sm") or request.POST.get("days_sm"), 100, 1, 3650)
+    days_bx = _safe_int(request.GET.get("days_bx") or request.POST.get("days_bx"), 90, 1, 3650)
+
+    include_never = (request.GET.get("include_never") or "1").strip().lower() in ("1", "true", "yes", "on")
+    download = (request.GET.get("download") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    now = timezone.now()
+
+    # 1) collect
+    ad_rows = _ad_fetch_inactive_users(days=days_ad, include_never=include_never)
+    sm_rows = _sm_fetch_inactive_users_binu00(days=days_sm, only_enabled=True)
+    bx_rows = _bitrix_fetch_inactive_users(days=days_bx)
+
+    # 2) build xlsx
+    content = _build_report_xlsx(
+        now=now,
+        ad_rows=ad_rows,
+        sm_rows=sm_rows,
+        bx_rows=bx_rows,
+        days_ad=days_ad,
+        days_sm=days_sm,
+        days_bx=days_bx,
+    )
+    fname = f"inactive_users_report_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    if download:
+        resp = HttpResponse(
+            content,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        resp["Content-Disposition"] = f'attachment; filename="{fname}"'
+        return resp
+
+    # 3) send to bitrix
+    try:
+        resolved_chat_id = _bitrix_resolve_chat_id(chat_id_i, user_id_i, dialog_id)
+        msg = (
+            f"Отчёт по неактивным пользователям.\n"
+            f"AD: >= {days_ad} дн, SM(BINUU00): >= {days_sm} дн, Bitrix: >= {days_bx} дн\n"
+            f"Сформировано: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        send_res = _bitrix_send_file_to_chat(resolved_chat_id, fname, content, msg)
+
+        return JsonResponse({
+            "ok": True,
+            "chat_id": resolved_chat_id,
+            "counts": {
+                "ad": len(ad_rows),
+                "supermag": len(sm_rows),
+                "bitrix": len(bx_rows),
+            },
+            "disk_id": send_res.get("disk_id"),
+            "bitrix_commit": send_res.get("commit"),
+        })
+    except Exception as e:
+        logger.exception(f"[REPORT] send failed: {e}")
+        return JsonResponse({
+            "ok": False,
+            "error": str(e),
+            "counts": {"ad": len(ad_rows), "supermag": len(sm_rows), "bitrix": len(bx_rows)},
+        }, status=500)
