@@ -16,7 +16,25 @@ import hmac
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from django.conf import settings
-import cx_Oracle
+# import cx_Oracle
+try:
+    import cx_Oracle  # если вдруг где-то ещё стоит
+except Exception:
+    import oracledb as cx_Oracle
+
+    # включаем thick-mode через Instant Client (у тебя он уже ставится)
+    _ic_dir = os.getenv("ORACLE_IC_DIR", "/opt/oracle/instantclient_21_1")
+    if os.path.isdir(_ic_dir):
+        try:
+            cx_Oracle.init_oracle_client(lib_dir=_ic_dir)
+        except Exception:
+            pass
+
+
+
+
+
+
 import re   
 from django.http import JsonResponse, HttpResponseForbidden
 from django.http import StreamingHttpResponse, FileResponse, HttpResponse
