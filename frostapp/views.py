@@ -83,6 +83,22 @@ def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
             pass
     return out
 
+
+def _oracle_connect(*, user: str, password: str, dsn: str, **kwargs):
+    """
+    Универсальный коннект: cx_Oracle + python-oracledb.
+    Убирает encoding/nencoding если драйвер их не поддерживает.
+    """
+    try:
+        return cx_Oracle.connect(user=user, password=password, dsn=dsn, **kwargs)
+    except TypeError as e:
+        s = str(e)
+        if "unexpected keyword argument 'encoding'" in s or "unexpected keyword argument 'nencoding'" in s:
+            kwargs.pop("encoding", None)
+            kwargs.pop("nencoding", None)
+            return cx_Oracle.connect(user=user, password=password, dsn=dsn, **kwargs)
+        raise
+
 INACTIVE_REPORT_TOKEN="wc3wow"
 UKM5_FULL_XML_STORE_IDS: set[int] = _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", "2013,9016,1003")
 TRM_ID_MAX = 2147483647
@@ -2558,7 +2574,7 @@ def get_store_info(storeid: int | str) -> dict:
     try:
         dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SERVICE)
         logger.info("[Oracle] Подключение...")
-        conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
+        conn = _oracle_connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
         logger.info(f"[Oracle] Подключено. Версия: {getattr(conn, 'version', 'unknown')}")
 
         # Шаг 1. Пытаемся трактовать как SMSTORE (T1.ID)
@@ -3651,7 +3667,7 @@ def generate_qr_string(inn: str, salt: str = "INDIVIDUAL_SALT") -> str:
     
 def connect_oracle():
     dsn = cx_Oracle.makedsn("192.168.17.239", 1521, service_name="xe")
-    return cx_Oracle.connect(user="supermag_user", password="supermag_pass", dsn=dsn, encoding="UTF-8")
+    return _oracle_connect(user="supermag_user", password="supermag_pass", dsn=dsn)
 
 def is_ukm5_store(storeid: int) -> bool:
     """Сохранена стар. сигнатура: True если магазин UKM5, иначе False."""
@@ -4136,7 +4152,7 @@ def connect_oracle_supermag():
     ORA_USER     = os.getenv("ORACLE_USER", "supermag")
     ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
     dsn = cx_Oracle.makedsn(ORA_HOST, ORA_PORT, service_name=ORA_SERVICE)
-    return cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+    return _oracle_connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
 
 def _oracle_rows_to_jsonable(cur):
     """
@@ -8358,14 +8374,8 @@ def _is_valid_inn_digits(inn: str) -> bool:
     inn = (inn or "").strip()
     return inn.isdigit() and len(inn) in (10, 12)
 
-def _connect_oracle_service(service_key: str):
-    """
-    Подключение к Oracle по service_key (например BINUU01, BINCH12 и т.п.)
-    Использует ORACLE_TNS_MAP: у каждого сервиса свой host/port/service_name.
 
-    Важно:
-      - выставляем conn.callTimeout, чтобы не было "тишины часами" при зависшем execute/commit/fetch.
-    """
+def _connect_oracle_service(service_key: str):
     ORA_USER     = os.getenv("ORACLE_USER", "supermag")
     ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
 
@@ -8393,14 +8403,14 @@ def _connect_oracle_service(service_key: str):
             logger.info(
                 f"[INN_SYNC][ORACLE] connect service_key={service_key} host={host} port={port} service_name={service_name}"
             )
-            conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+            conn = _oracle_connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
             try:
                 conn.callTimeout = call_timeout_ms
                 logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host}")
             except Exception as e:
                 logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key}: {e}")
             return conn
-        except cx_Oracle.DatabaseError as e:
+        except Exception as e:
             last_err = e
             logger.warning(
                 f"[INN_SYNC][ORACLE] connect failed (service_name) {service_key}@{host}:{port}/{service_name}: {e}"
@@ -8412,20 +8422,88 @@ def _connect_oracle_service(service_key: str):
             logger.info(
                 f"[INN_SYNC][ORACLE] retry as SID service_key={service_key} host={host} port={port} sid={service_name}"
             )
-            conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn2, encoding="UTF-8")
+            conn = _oracle_connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn2)
             try:
                 conn.callTimeout = call_timeout_ms
                 logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host} (SID)")
             except Exception as e:
                 logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key} (SID): {e}")
             return conn
-        except cx_Oracle.DatabaseError as e2:
+        except Exception as e2:
             last_err = e2
             logger.warning(
                 f"[INN_SYNC][ORACLE] connect failed (sid) {service_key}@{host}:{port} sid={service_name}: {e2}"
             )
 
     raise last_err or RuntimeError(f"Cannot connect to Oracle service {service_key}")
+# def _connect_oracle_service(service_key: str):
+#     """
+#     Подключение к Oracle по service_key (например BINUU01, BINCH12 и т.п.)
+#     Использует ORACLE_TNS_MAP: у каждого сервиса свой host/port/service_name.
+
+#     Важно:
+#       - выставляем conn.callTimeout, чтобы не было "тишины часами" при зависшем execute/commit/fetch.
+#     """
+#     ORA_USER     = os.getenv("ORACLE_USER", "supermag")
+#     ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
+
+#     call_timeout_ms = int(os.getenv("INN_SYNC_ORACLE_CALL_TIMEOUT_MS", "120000"))  # 120s
+
+#     info = ORACLE_TNS_MAP.get(service_key)
+
+#     if not info:
+#         host = os.getenv("ORACLE_HOST", "192.168.17.239")
+#         port = int(os.getenv("ORACLE_PORT", "1521"))
+#         service_name = service_key
+#         hosts = [host]
+#     else:
+#         service_name = (info.get("service_name") or service_key).strip()
+#         port = int(info.get("port", 1521))
+#         hosts = info.get("hosts") or [info.get("host")]
+#         hosts = [h for h in hosts if h]
+
+#     last_err = None
+
+#     for host in hosts:
+#         # 1) SERVICE_NAME
+#         try:
+#             dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+#             logger.info(
+#                 f"[INN_SYNC][ORACLE] connect service_key={service_key} host={host} port={port} service_name={service_name}"
+#             )
+#             conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
+#             try:
+#                 conn.callTimeout = call_timeout_ms
+#                 logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host}")
+#             except Exception as e:
+#                 logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key}: {e}")
+#             return conn
+#         except cx_Oracle.DatabaseError as e:
+#             last_err = e
+#             logger.warning(
+#                 f"[INN_SYNC][ORACLE] connect failed (service_name) {service_key}@{host}:{port}/{service_name}: {e}"
+#             )
+
+#         # 2) SID fallback
+#         try:
+#             dsn2 = cx_Oracle.makedsn(host, port, sid=service_name)
+#             logger.info(
+#                 f"[INN_SYNC][ORACLE] retry as SID service_key={service_key} host={host} port={port} sid={service_name}"
+#             )
+#             conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn2, encoding="UTF-8")
+#             try:
+#                 conn.callTimeout = call_timeout_ms
+#                 logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host} (SID)")
+#             except Exception as e:
+#                 logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key} (SID): {e}")
+#             return conn
+#         except cx_Oracle.DatabaseError as e2:
+#             last_err = e2
+#             logger.warning(
+#                 f"[INN_SYNC][ORACLE] connect failed (sid) {service_key}@{host}:{port} sid={service_name}: {e2}"
+#             )
+
+#     raise last_err or RuntimeError(f"Cannot connect to Oracle service {service_key}")
 
 def _fetch_onec_working_employees() -> list[dict]:
     auth = None
