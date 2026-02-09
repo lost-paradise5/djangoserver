@@ -12319,8 +12319,10 @@ def inactive_users_report_send_to_bitrix(request):
     try:
         resolved_chat_id = _bitrix_resolve_chat_id(chat_id_i, user_id_i, dialog_id)
         msg = (
-            f"Отчёт по неактивным пользователям.\n"
-            f"AD: >= {days_ad} дн, SM(BINUU00): >= {days_sm} дн, Bitrix: >= {days_bx} дн\n"
+            "Отчёт по неактивным пользователям:\n"
+            f"-Active Directory: не входили ≥ {days_ad} дн (найдено: {len(ad_rows)})\n"
+            f"-SuperMag (BINUU00): не входили ≥ {days_sm} дн (найдено: {len(sm_rows)})\n"
+            f"-Bitrix24: не входили ≥ {days_bx} дн (найдено: {len(bx_rows)})\n"
             f"Сформировано: {now.strftime('%Y-%m-%d %H:%M:%S')}"
         )
         send_res = _bitrix_send_file_to_chat(resolved_chat_id, fname, content, msg)
