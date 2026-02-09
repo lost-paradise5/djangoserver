@@ -59,6 +59,7 @@ from django.middleware.csrf import get_token
 from ldap.controls.libldap import SimplePagedResultsControl
 import base64
 from urllib.parse import urlencode
+from functools import wraps
 import io
 import mimetypes
 from openpyxl import Workbook
@@ -68,6 +69,8 @@ from openpyxl.utils import get_column_letter
 from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease
 
 _HEX = set("0123456789abcdefABCDEF")
+logger = logging.getLogger(__name__)
+AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "zDFbCQWRzL7pKYxzpfSSLVdqCrAYsHiN7FORRUDt1hE")
 UKM5_FULL_XML_STORE_ID = 2013
 def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
     raw = os.getenv(name, default_csv) or ""
@@ -528,6 +531,38 @@ def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
 
     return out
 
+
+
+
+def _get_agent_token_from_request(request) -> str:
+    """
+    Поддерживаем 2 варианта:
+    1) Header: X-AGENT-TOKEN: <token>
+    2) Header: Authorization: Bearer <token>
+    """
+    auth = (request.META.get("HTTP_AUTHORIZATION") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+
+    return (request.META.get("HTTP_X_AGENT_TOKEN") or "").strip()
+
+def _agent_token_ok(request) -> bool:
+    token = _get_agent_token_from_request(request)
+    if not token:
+        return False
+    # hmac.compare_digest — защита от тайминговых атак
+    return hmac.compare_digest(token, AGENT_API_TOKEN)
+
+def agent_token_required(view_func):
+    @wraps(view_func)
+    def _wrapped(request, *args, **kwargs):
+        if not _agent_token_ok(request):
+            return JsonResponse(
+                {"status": "error", "message": "Нет доступа: неверный или отсутствующий токен"},
+                status=403
+            )
+        return view_func(request, *args, **kwargs)
+    return _wrapped
 # def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
 #     """
 #     Для списка ИНН возвращает:
@@ -5555,6 +5590,7 @@ def _set_password_pg(user, new_password: str) -> None:
 
 
 @csrf_exempt
+@agent_token_required
 def agent_auth_start(request):
     """
     POST /agent/auth/start/
@@ -5716,6 +5752,7 @@ def agent_auth_start(request):
     
     
 @csrf_exempt
+@agent_token_required
 def agent_auth_select_store(request):
     """
     POST /agent/auth/select_store/
@@ -5822,6 +5859,7 @@ def agent_auth_select_store(request):
     
     
 @csrf_exempt
+@agent_token_required
 def agent_auth_verify_pin(request):
     """
     POST /agent/auth/verify_pin/
