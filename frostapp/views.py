@@ -11616,6 +11616,53 @@ def _dt_iso(dt) -> str:
     except Exception:
         return str(dt)
 
+def _dt_pretty(dt: Optional[datetime.datetime], fmt: str = "%d.%m.%Y %H:%M:%S") -> str:
+    """
+    Делает человеко-читаемую дату:
+    - приводит к aware (если naive)
+    - переводит в локальный TZ Django (timezone.localtime)
+    - убирает микросекунды/ISO-T/offset (за счёт strftime)
+    """
+    if not dt:
+        return ""
+    try:
+        if isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
+            dt = datetime.datetime(dt.year, dt.month, dt.day)
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        dt = timezone.localtime(dt)  # важно: будет в TIME_ZONE проекта
+        return dt.strftime(fmt)
+    except Exception:
+        return str(dt)
+
+
+def _dt_pretty_any(v: Any, fmt: str = "%d.%m.%Y %H:%M:%S") -> str:
+    """
+    Принимает datetime/строку ISO и возвращает красиво.
+    Если строка не парсится — вернёт как есть.
+    """
+    if not v:
+        return ""
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return _dt_pretty(v if isinstance(v, datetime.datetime) else None, fmt=fmt) if isinstance(v, datetime.datetime) else _dt_pretty(datetime.datetime(v.year, v.month, v.day), fmt=fmt)
+
+    try:
+        s = str(v).strip()
+        if not s:
+            return ""
+        # поддержка "Z"
+        s = s.replace("Z", "+00:00")
+        # иногда бывает пробел вместо T
+        if "T" not in s and " " in s and "-" in s:
+            s = s.replace(" ", "T")
+        dt = datetime.datetime.fromisoformat(s)
+        return _dt_pretty(dt, fmt=fmt)
+    except Exception:
+        return str(v)
+
+
+
+
 
 def _parse_ad_filetime(v) -> Optional[datetime.datetime]:
     """
@@ -12004,7 +12051,7 @@ def _build_report_xlsx(now: datetime.datetime,
 
     # SUMMARY
     ws = wb.create_sheet("Общая статистика")
-    ws.append(["Дата формирования", _dt_iso(now)])
+    ws.append(["Дата формирования", _dt_pretty(now)])
     ws.append(["Active directory дней без входа", days_ad])
     ws.append(["Супермаг центральная база дней без входа", days_sm])
     ws.append(["Битрикс дней без входа", days_bx])
@@ -12022,7 +12069,7 @@ def _build_report_xlsx(now: datetime.datetime,
         ws.append([
             r.get("sam"), r.get("display"), r.get("mail"), r.get("upn"),
             r.get("employeeID"), r.get("department"), r.get("title"),
-            r.get("lastLogonTimestamp"), r.get("daysSince"),
+            _dt_pretty_any(r.get("lastLogonTimestamp")), r.get("daysSince"),
         ])
     ws.freeze_panes = "A2"
     for c in ws[1]:
@@ -12049,7 +12096,7 @@ def _build_report_xlsx(now: datetime.datetime,
     for r in bx_rows:
         ws.append([
             r.get("id"), r.get("fio"), r.get("email"), r.get("position"), r.get("inn"),
-            r.get("last_login"), r.get("last_activity"),
+            _dt_pretty_any(r.get("last_login")), _dt_pretty_any(r.get("last_activity")),
             r.get("days_login"), r.get("days_activity"),
         ])
     ws.freeze_panes = "A2"
@@ -12086,11 +12133,11 @@ def _build_report_xlsx(now: datetime.datetime,
             inn,
             fio_best,
             ad.get("sam"),
-            ad.get("lastLogonTimestamp"),
+            _dt_pretty_any(ad.get("lastLogonTimestamp")),
             sm.get("username"),
             sm.get("last_login"),
             bx.get("id"),
-            bx.get("last_login"),
+            _dt_pretty_any(bx.get("last_login")),
         ])
 
     ws.freeze_panes = "A2"
