@@ -12305,7 +12305,7 @@ def inactive_users_report_send_to_bitrix(request):
         days_sm=days_sm,
         days_bx=days_bx,
     )
-    fname = f"inactive_users_report_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
+    fname = f"Неактивные пользователи от {now.strftime('%Y%m%d_%H%M%S')}.xlsx"
 
     if download:
         resp = HttpResponse(
