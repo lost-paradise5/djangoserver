@@ -380,7 +380,6 @@
   const fpCommon = {
     enableTime: true,
     time_24hr: true,
-    minuteIncrement: 5,
     // value (для отправки на бэк): ISO local
     dateFormat: "Y-m-d\\TH:i",
     // UI: красиво
@@ -390,8 +389,18 @@
     clickOpens: true
   };
 
-  const fpStart = flatpickr(startAtEl, { ...fpCommon });
-  const fpEnd   = flatpickr(endAtEl,   { ...fpCommon });
+  const fpStart = flatpickr(startAtEl, {
+    ...fpCommon,
+    minuteIncrement: 5,     // можно оставить 5
+    defaultHour: 0,
+    defaultMinute: 0,
+  });
+   const fpEnd = flatpickr(endAtEl, {
+    ...fpCommon,
+    minuteIncrement: 1,     // важно для 23:59
+    defaultHour: 23,
+    defaultMinute: 59,
+  });
 
   function clearPickers(){
     fpStart.clear();
