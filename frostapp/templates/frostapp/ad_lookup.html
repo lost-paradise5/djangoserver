@@ -4,8 +4,17 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AD / LDAP — поиск пользователя</title>
+
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" rel="stylesheet">
+
+  <style>
+    .card { border-radius: 14px; }
+    code { background: rgba(0,0,0,.04); padding: .1rem .3rem; border-radius: 8px; }
+    .badge { border-radius: 999px; }
+  </style>
 </head>
+
 <body class="bg-light">
 
 <div class="container py-4" style="max-width: 980px;">
@@ -73,6 +82,70 @@
       </div>
     </div>
 
+    <!-- VPN / mikrotik_vpn -->
+    <div class="card shadow-sm mb-3">
+      <div class="card-header">
+        Удалённый доступ (группа <code>{{ vpn.group_cn }}</code>)
+      </div>
+      <div class="card-body">
+
+        {% if not vpn.group_found %}
+          <div class="alert alert-warning mb-0">
+            Группа <b>{{ vpn.group_cn }}</b> не найдена в AD.
+          </div>
+        {% elif not vpn.inn %}
+          <div class="alert alert-info mb-0">
+            Чтобы управлять доступом, сначала заполните <b>employeeID (ИНН)</b> выше.
+          </div>
+        {% else %}
+          <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <div>
+              <div class="text-muted small">employeeID (ИНН)</div>
+              <code id="vpnInn">{{ vpn.inn }}</code>
+            </div>
+
+            <div class="d-flex align-items-center gap-2">
+              <span class="spinner-border spinner-border-sm d-none" id="vpnSpinner" role="status" aria-hidden="true"></span>
+
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" id="vpnToggle"
+                       {% if vpn.in_group %}checked{% endif %}
+                       {% if not vpn.can_manage %}disabled{% endif %}>
+                <label class="form-check-label ms-1" for="vpnToggle">
+                  <span class="small" id="vpnState">{% if vpn.in_group %}Открыт{% else %}Закрыт{% endif %}</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {% if not vpn.can_manage %}
+            <div class="text-muted small mt-2">
+              Управление доступом доступно только для пользователей Django с правами <b>staff</b>.
+            </div>
+          {% endif %}
+
+          <div class="text-muted small mt-2"
+               id="vpnPeriodText"
+               data-kind="{{ vpn.vpn_period_kind|default:'' }}"
+               data-start="{{ vpn.vpn_period_start_iso|default:'' }}"
+               data-end="{{ vpn.vpn_period_end_iso|default:'' }}">
+          </div>
+
+          <div class="text-muted small"
+               id="vpnPlanText"
+               data-kind="{{ vpn.vpn_plan_kind|default:'' }}"
+               data-start="{{ vpn.vpn_plan_start_iso|default:'' }}"
+               data-end="{{ vpn.vpn_plan_end_iso|default:'' }}">
+          </div>
+
+          <div class="alert alert-light small mt-3 mb-0">
+            Переключатель создаёт <b>lease OPEN/BLOCK</b>. Применение по времени делает <code>vpn_access_scheduler</code>.
+          </div>
+        {% endif %}
+
+      </div>
+    </div>
+
     <!-- Просмотр атрибутов -->
     <div class="card shadow-sm">
       <div class="card-header">
@@ -132,6 +205,253 @@
   {% endif %}
 
 </div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ru.js"></script>
+
+<!-- Modal: period -->
+<div class="modal fade" id="periodModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content" style="border-radius:16px;">
+      <div class="modal-header">
+        <h5 class="modal-title" id="periodTitle">Период доступа</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
+      </div>
+
+      <div class="modal-body">
+        <div class="text-muted small mb-3" id="periodHint"></div>
+
+        <div class="row g-2">
+          <div class="col-12">
+            <label class="form-label">Начало (необязательно)</label>
+            <input class="form-control" type="text" id="startAt" placeholder="Выберите дату и время" readonly>
+            <div class="text-muted small mt-1">Если не заполнено — начнётся сразу.</div>
+          </div>
+
+          <div class="col-12">
+            <label class="form-label">Окончание (необязательно)</label>
+            <input class="form-control" type="text" id="endAt" placeholder="Выберите дату и время" readonly>
+            <div class="text-muted small mt-1">Если заполнить только окончание — начало будет “сейчас”.</div>
+          </div>
+
+          <div class="col-12 mt-2">
+            <div class="d-flex flex-wrap gap-2 preset-row">
+              <span class="text-muted small me-2 align-self-center">Быстро:</span>
+              <button type="button" class="btn btn-outline-secondary btn-sm" data-preset="now-start">Начало: сейчас</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-30">Конец: +30 мин</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-60">Конец: +1 час</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-120">Конец: +2 часа</button>
+              <button type="button" class="btn btn-outline-primary btn-sm" data-preset="end-eod">Конец: до конца дня</button>
+            </div>
+          </div>
+
+          <div class="col-12 d-flex justify-content-between align-items-center mt-2">
+            <button type="button" class="btn btn-outline-danger btn-sm" id="clearPeriod">Сброс</button>
+            <div class="text-muted small">Нажмите на поле — откроется выбор времени и даты.</div>
+          </div>
+        </div>
+
+        <div class="alert alert-warning small mt-3 mb-0">
+          При окончании доступ будет открыт/закрыт автоматически.
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Отмена</button>
+        <button class="btn btn-primary" type="button" id="savePeriod">Применить</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const CSRF = "{{ csrf }}";
+  const TOGGLE_URL = "{% url 'ad_ui_lookup_vpn_toggle' %}";
+  const INN = "{{ vpn.inn|default:'' }}";
+
+  const toggleEl = document.getElementById("vpnToggle");
+  const spinnerEl = document.getElementById("vpnSpinner");
+  const stateEl = document.getElementById("vpnState");
+
+  const periodEl = document.getElementById("vpnPeriodText");
+  const planEl = document.getElementById("vpnPlanText");
+
+  const modalEl = document.getElementById("periodModal");
+  const modal = new bootstrap.Modal(modalEl);
+
+  const startAtEl = document.getElementById("startAt");
+  const endAtEl = document.getElementById("endAt");
+  const titleEl = document.getElementById("periodTitle");
+  const hintEl = document.getElementById("periodHint");
+
+  if (toggleEl) {
+    flatpickr.localize(flatpickr.l10ns.ru);
+
+    const fpCommon = {
+      enableTime: true,
+      time_24hr: true,
+      dateFormat: "Y-m-d\\TH:i",
+      altInput: true,
+      altFormat: "d.m.Y H:i",
+      allowInput: false,
+      clickOpens: true
+    };
+
+    const fpStart = flatpickr(startAtEl, { ...fpCommon, minuteIncrement: 5 });
+    const fpEnd = flatpickr(endAtEl, { ...fpCommon, minuteIncrement: 1, defaultHour: 23, defaultMinute: 59 });
+
+    const pad2 = (n) => String(n).padStart(2, "0");
+    function fmtRu(dt){
+      if (!dt || isNaN(dt.getTime())) return "";
+      return `${pad2(dt.getDate())}.${pad2(dt.getMonth()+1)}.${dt.getFullYear()} ${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
+    }
+    function parseIsoToLocal(iso){
+      if (!iso) return null;
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return null;
+      return d;
+    }
+    function buildPeriodText(kind, startIso, endIso){
+      const k = (kind || "").toUpperCase();
+      if (k === "BASELINE" || k === "NONE" || !k) return "бессрочно";
+      const start = parseIsoToLocal(startIso);
+      const end = parseIsoToLocal(endIso);
+      const prefix = (k === "BLOCK") ? "Закрыт: " : "";
+      if (start && end) return `${prefix}с ${fmtRu(start)} по ${fmtRu(end)}`;
+      if (start && !end) return `${prefix}с ${fmtRu(start)} — бессрочно`;
+      if (!start && end) return `${prefix}до ${fmtRu(end)}`;
+      return `${prefix}бессрочно`;
+    }
+    function buildPlanText(kind, startIso, endIso){
+      const k = (kind || "").toUpperCase();
+      if (!k) return "";
+      const start = parseIsoToLocal(startIso);
+      if (!start) return "";
+      const end = parseIsoToLocal(endIso);
+      const action = (k === "OPEN") ? "открыть" : "закрыть";
+      if (end) return `Запланировано: ${action} с ${fmtRu(start)} по ${fmtRu(end)}`;
+      return `Запланировано: ${action} с ${fmtRu(start)} — бессрочно`;
+    }
+    function renderTexts(){
+      if (periodEl){
+        periodEl.textContent = buildPeriodText(periodEl.dataset.kind, periodEl.dataset.start, periodEl.dataset.end) || "";
+      }
+      if (planEl){
+        planEl.textContent = buildPlanText(planEl.dataset.kind, planEl.dataset.start, planEl.dataset.end) || "";
+      }
+    }
+    renderTexts();
+
+    function clearPickers(){ fpStart.clear(); fpEnd.clear(); }
+    document.getElementById("clearPeriod").addEventListener("click", clearPickers);
+
+    function setStartNow(){ fpStart.setDate(new Date(), true); }
+    function setEndAfterMinutes(min){
+      const d = new Date(); d.setMinutes(d.getMinutes() + min); fpEnd.setDate(d, true);
+    }
+    function setEndEndOfDay(){
+      const d = new Date(); d.setHours(23,59,0,0); fpEnd.setDate(d, true);
+    }
+    document.querySelectorAll("[data-preset]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const p = btn.getAttribute("data-preset");
+        if (p === "now-start") setStartNow();
+        if (p === "end-30") setEndAfterMinutes(30);
+        if (p === "end-60") setEndAfterMinutes(60);
+        if (p === "end-120") setEndAfterMinutes(120);
+        if (p === "end-eod") setEndEndOfDay();
+      });
+    });
+
+    let pending = null; // { desired, prevChecked, applied }
+
+    function openPeriodModal(desired, prevChecked){
+      pending = { desired, prevChecked, applied: false };
+      clearPickers();
+      if (desired === "1") {
+        titleEl.textContent = "Открыть удалённый доступ";
+        hintEl.textContent = "Выберите период, на который открыть доступ. Если оставить пустым — откроется сразу без авто-закрытия.";
+      } else {
+        titleEl.textContent = "Закрыть удалённый доступ";
+        hintEl.textContent = "Выберите период, на который закрыть доступ. Если оставить пустым — закроется сразу без авто-открытия.";
+      }
+      modal.show();
+    }
+
+    modalEl.addEventListener("hidden.bs.modal", () => {
+      if (!pending) return;
+      if (!pending.applied) toggleEl.checked = pending.prevChecked;
+      pending = null;
+    });
+
+    toggleEl.addEventListener("change", () => {
+      const desired = toggleEl.checked ? "1" : "0";
+      const prevChecked = !toggleEl.checked;
+      openPeriodModal(desired, prevChecked);
+    });
+
+    document.getElementById("savePeriod").addEventListener("click", async () => {
+      if (!pending) return;
+      pending.applied = true;
+      modal.hide();
+
+      spinnerEl.classList.remove("d-none");
+      toggleEl.disabled = true;
+
+      try{
+        const body = new URLSearchParams();
+        body.set("inn", INN);
+        body.set("desired", pending.desired);
+        body.set("tz_offset_min", String(new Date().getTimezoneOffset()));
+        if (startAtEl.value) body.set("start_at", startAtEl.value);
+        if (endAtEl.value) body.set("end_at", endAtEl.value);
+
+        const resp = await fetch(TOGGLE_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRFToken": CSRF
+          },
+          body: body.toString()
+        });
+
+        const js = await resp.json();
+        if (!js.ok){
+          alert("Ошибка: " + (js.error || "unknown"));
+          toggleEl.checked = pending.prevChecked;
+          return;
+        }
+
+        if (js.vpn_open === null || js.vpn_open === undefined){
+          stateEl.textContent = toggleEl.checked ? "Открывается…" : "Закрывается…";
+        } else {
+          stateEl.textContent = js.vpn_open ? "Открыт" : "Закрыт";
+          toggleEl.checked = !!js.vpn_open;
+        }
+
+        if (periodEl){
+          if (js.vpn_period_kind !== undefined) periodEl.dataset.kind = js.vpn_period_kind || "";
+          if (js.vpn_period_start_iso !== undefined) periodEl.dataset.start = js.vpn_period_start_iso || "";
+          if (js.vpn_period_end_iso !== undefined) periodEl.dataset.end = js.vpn_period_end_iso || "";
+        }
+        if (planEl){
+          if (js.vpn_plan_kind !== undefined) planEl.dataset.kind = js.vpn_plan_kind || "";
+          if (js.vpn_plan_start_iso !== undefined) planEl.dataset.start = js.vpn_plan_start_iso || "";
+          if (js.vpn_plan_end_iso !== undefined) planEl.dataset.end = js.vpn_plan_end_iso || "";
+        }
+        renderTexts();
+
+      } catch(e){
+        alert("Ошибка запроса: " + e);
+        toggleEl.checked = pending.prevChecked;
+      } finally {
+        spinnerEl.classList.add("d-none");
+        toggleEl.disabled = false;
+      }
+    });
+  }
+</script>
 
 </body>
 </html>
