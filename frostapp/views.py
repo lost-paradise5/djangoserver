@@ -1905,6 +1905,130 @@ def vpn_ui_toggle(request):
         "scheduled": True,
         **p,
     })
+
+
+
+
+@staff_member_required
+@require_http_methods(["POST"])
+@csrf_protect
+def ad_ui_lookup_vpn_toggle(request):
+    """
+    UI (AD lookup): открыть/закрыть membership в mikrotik_vpn через leases.
+    POST form-urlencoded:
+      inn, desired ("1"/"0"), tz_offset_min, start_at?, end_at?
+    """
+    inn = re.sub(r"\D+", "", (request.POST.get("inn") or "").strip())
+    desired = (request.POST.get("desired") or "").strip()  # "1"/"0"
+
+    try:
+        tz_offset_min = int(request.POST.get("tz_offset_min") or "0")
+    except Exception:
+        tz_offset_min = 0
+
+    start_at = _parse_dt_local(request.POST.get("start_at"), tz_offset_min)
+    end_at = _parse_dt_local(request.POST.get("end_at"), tz_offset_min)
+
+    if not inn:
+        return JsonResponse({"ok": False, "error": "NO_INN"}, status=400)
+    if not _INN_RE.match(inn):
+        return JsonResponse({"ok": False, "error": "BAD_INN"}, status=400)
+    if desired not in ("0", "1"):
+        return JsonResponse({"ok": False, "error": "BAD_DESIRED"}, status=400)
+
+    now = timezone.now()
+
+    # если указан только end_at -> start = now
+    if end_at and not start_at:
+        start_at = now
+
+    # если ничего не указано -> делаем "сейчас бессрочно"
+    if not start_at and not end_at:
+        start_at = now
+        end_at = None
+
+    if end_at and start_at and end_at <= start_at:
+        return JsonResponse({"ok": False, "error": "BAD_PERIOD:end_at must be > start_at"}, status=400)
+
+    # group dn
+    conn = None
+    try:
+        conn = _ad_connect()
+        group_dn = ad_find_group_dn(conn, VPN_GROUP_CN)
+        if not group_dn:
+            return JsonResponse({"ok": False, "error": f"GROUP_NOT_FOUND:{VPN_GROUP_CN}"}, status=500)
+    finally:
+        try:
+            if conn:
+                conn.unbind_s()
+        except Exception:
+            pass
+
+    # baseline
+    try:
+        vpn_ensure_baseline(inn, group_dn)
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=404)
+
+    lease_type = "OPEN" if desired == "1" else "BLOCK"
+
+    with transaction.atomic():
+        # анти-конфликт: отменяем все активные
+        cancelled_cnt = (
+            VpnAccessLease.objects
+            .select_for_update()
+            .filter(inn=inn, status="ACTIVE")
+            .update(status="CANCELLED")
+        )
+
+        VpnAccessLease.objects.create(
+            id=uuid.uuid4(),
+            lease_type=lease_type,
+            inn=inn,
+            target_bitrix_user_id=None,
+            created_by_ad_login=getattr(request.user, "username", "ui_admin"),
+            created_by_bitrix_user_id=None,
+            starts_at=start_at,
+            ends_at=end_at,
+            status="ACTIVE",
+            created_at=now,
+            notify_sent_at=None,
+            meta={
+                "source": "ad_lookup",
+                "ip": (request.META.get("REMOTE_ADDR") or ""),
+                "tz_offset_min": tz_offset_min,
+                "cancelled_old_active_leases": cancelled_cnt,
+            },
+        )
+
+    # применяем сразу, если окно уже началось
+    if start_at and start_at <= now:
+        try:
+            changed, now_open, effective_until = vpn_apply_state_for_inn(inn, group_dn)
+            p = _build_vpn_period_maps_for_ui([inn]).get(inn, {})
+            return JsonResponse({
+                "ok": True,
+                "changed": bool(changed),
+                "vpn_open": bool(now_open) if now_open is not None else False,
+                "scheduled": False,
+                **p,
+            })
+        except Exception as e:
+            return JsonResponse({"ok": False, "error": str(e)}, status=500)
+
+    # окно в будущем — применит scheduler
+    p = _build_vpn_period_maps_for_ui([inn]).get(inn, {})
+    return JsonResponse({
+        "ok": True,
+        "changed": False,
+        "vpn_open": None,
+        "scheduled": True,
+        **p,
+    })
+
+
+
+
 # @require_http_methods(["POST"])
 # @csrf_protect
 # def vpn_ui_toggle(request):
@@ -2140,6 +2264,23 @@ def ad_ui_lookup(request):
     ok = ""
     result = None
 
+    # данные про VPN-группу для UI
+    vpn = {
+        "group_cn": VPN_GROUP_CN,
+        "group_found": False,
+        "in_group": None,   # True/False/None
+        "inn": "",
+        "can_manage": False,
+
+        # для текста периодов/планов (leases)
+        "vpn_period_kind": "NONE",
+        "vpn_period_start_iso": "",
+        "vpn_period_end_iso": "",
+        "vpn_plan_kind": "",
+        "vpn_plan_start_iso": "",
+        "vpn_plan_end_iso": "",
+    }
+
     login = ""
     if request.method == "POST":
         login = (request.POST.get("login") or "").strip()
@@ -2147,6 +2288,49 @@ def ad_ui_lookup(request):
         login = (request.GET.get("login") or "").strip()
 
     action = (request.POST.get("action") or "lookup").strip() if request.method == "POST" else "lookup"
+
+    def _fill_vpn_context(conn, ad_attrs: dict):
+        """
+        Заполняем vpn-словарь по текущим атрибутам пользователя:
+        - ищем DN группы mikrotik_vpn
+        - проверяем memberOf
+        - берём INN из employeeID
+        - подтягиваем период/план из leases
+        """
+        # group dn
+        group_dn = ad_find_group_dn(conn, VPN_GROUP_CN)
+        if group_dn:
+            vpn["group_found"] = True
+            try:
+                vpn["in_group"] = ad_is_in_group(ad_attrs, group_dn)
+            except Exception:
+                vpn["in_group"] = None
+
+        # employeeID -> INN
+        try:
+            emp_vals = (ad_attrs.get("employeeID") or [])
+            emp0 = emp_vals[0].decode("utf-8", "ignore") if emp_vals else ""
+            inn = re.sub(r"\D+", "", (emp0 or "").strip())
+        except Exception:
+            inn = ""
+
+        vpn["inn"] = inn
+
+        # можно ли управлять
+        vpn["can_manage"] = (
+            bool(getattr(request.user, "is_staff", False))
+            and vpn["group_found"]
+            and bool(inn and _INN_RE.match(inn))
+        )
+
+        # leases -> период/план (если INN валиден)
+        if inn and _INN_RE.match(inn):
+            try:
+                pmap = _build_vpn_period_maps_for_ui([inn]).get(inn, {})
+                if pmap:
+                    vpn.update(pmap)
+            except Exception:
+                pass
 
     if request.method == "POST":
         if not login:
@@ -2186,6 +2370,12 @@ def ad_ui_lookup(request):
                         # перечитаем после изменения
                         dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
 
+                    # vpn контекст (после возможного update)
+                    try:
+                        _fill_vpn_context(conn, ad_attrs)
+                    except Exception:
+                        pass
+
                     result = {
                         "dn": dn,
                         "login_input": login,
@@ -2221,6 +2411,11 @@ def ad_ui_lookup(request):
                 if not dn:
                     error = "Пользователь не найден в AD."
                 else:
+                    try:
+                        _fill_vpn_context(conn, ad_attrs)
+                    except Exception:
+                        pass
+
                     result = {
                         "dn": dn,
                         "login_input": login,
@@ -2241,7 +2436,123 @@ def ad_ui_lookup(request):
         "ok": ok,
         "result": result,
         "login_prefill": login,
+        "vpn": vpn,
+        "csrf": get_token(request),
     })
+# @require_http_methods(["GET", "POST"])
+# @csrf_protect
+# def ad_ui_lookup(request):
+#     """
+#     POST action может быть:
+#       - action=lookup  : поиск
+#       - action=save_employeeid : обновление employeeID
+#     """
+#     error = ""
+#     ok = ""
+#     result = None
+
+#     login = ""
+#     if request.method == "POST":
+#         login = (request.POST.get("login") or "").strip()
+#     else:
+#         login = (request.GET.get("login") or "").strip()
+
+#     action = (request.POST.get("action") or "lookup").strip() if request.method == "POST" else "lookup"
+
+#     if request.method == "POST":
+#         if not login:
+#             error = "Введите логин."
+#         else:
+#             conn = None
+#             try:
+#                 conn = _ad_connect()
+
+#                 dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
+#                 if not dn:
+#                     error = "Пользователь не найден в AD."
+#                 else:
+#                     # если нужно сохранить employeeID — делаем modify
+#                     if action == "save_employeeid":
+#                         new_employee_id = (request.POST.get("employeeID") or "").strip()
+
+#                         # пусто = удалить employeeID
+#                         if new_employee_id:
+#                             if not _INN_RE.match(new_employee_id):
+#                                 error = "employeeID должен быть ИНН из 10 или 12 цифр (или пусто для очистки)."
+#                             else:
+#                                 conn.modify_s(dn, [
+#                                     (ldap.MOD_REPLACE, "employeeID", [new_employee_id.encode("utf-8")]),
+#                                 ])
+#                                 ok = "employeeID обновлён."
+#                         else:
+#                             # удалить атрибут (если был)
+#                             try:
+#                                 conn.modify_s(dn, [
+#                                     (ldap.MOD_DELETE, "employeeID", None),
+#                                 ])
+#                                 ok = "employeeID очищен."
+#                             except ldap.NO_SUCH_ATTRIBUTE:
+#                                 ok = "employeeID уже был пуст."
+
+#                         # перечитаем после изменения
+#                         dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
+
+#                     result = {
+#                         "dn": dn,
+#                         "login_input": login,
+#                         "filter": ldap_filter,
+#                         "attrs": _attrs_to_dict(ad_attrs),
+#                     }
+
+#             except ldap.INSUFFICIENT_ACCESS:
+#                 error = "Недостаточно прав в AD для изменения employeeID (INSUFFICIENT_ACCESS)."
+#             except ldap.INVALID_CREDENTIALS:
+#                 error = "Неверные учетные данные для подключения к AD."
+#             except ldap.SERVER_DOWN:
+#                 error = "AD недоступен (SERVER_DOWN)."
+#             except ldap.LDAPError as e:
+#                 error = f"LDAP ошибка: {str(e)}"
+#             except Exception as e:
+#                 error = str(e)
+#             finally:
+#                 try:
+#                     if conn:
+#                         conn.unbind_s()
+#                 except Exception:
+#                     pass
+
+#     else:
+#         # GET — ничего не ищем, пока не нажмут кнопку,
+#         # но если login передали в querystring — можно показать сразу.
+#         if login:
+#             conn = None
+#             try:
+#                 conn = _ad_connect()
+#                 dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
+#                 if not dn:
+#                     error = "Пользователь не найден в AD."
+#                 else:
+#                     result = {
+#                         "dn": dn,
+#                         "login_input": login,
+#                         "filter": ldap_filter,
+#                         "attrs": _attrs_to_dict(ad_attrs),
+#                     }
+#             except Exception as e:
+#                 error = str(e)
+#             finally:
+#                 try:
+#                     if conn:
+#                         conn.unbind_s()
+#                 except Exception:
+#                     pass
+
+#     return render(request, "frostapp/ad_lookup.html", {
+#         "error": error,
+#         "ok": ok,
+#         "result": result,
+#         "login_prefill": login,
+#     })
 
 
 
