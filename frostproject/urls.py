@@ -48,6 +48,7 @@ from frostapp.views import (
     vpn_ui_users,
     vpn_ui_toggle,
     ad_ui_lookup,
+    ad_ui_lookup_vpn_toggle,
     ldap_tools_home,
     ldap_tools_employees,
     ldap_tools_sync_page,
@@ -103,6 +104,7 @@ urlpatterns = [
     path("ui/vpn/users/", vpn_ui_users, name="vpn_ui_users"),
     path("ui/vpn/toggle/", vpn_ui_toggle, name="vpn_ui_toggle"),
     path("ui/ad/lookup/", ad_ui_lookup, name="ad_ui_lookup"),
+    path("ui/ad/lookup/vpn-toggle/", ad_ui_lookup_vpn_toggle, name="ad_ui_lookup_vpn_toggle"),
 
     path("ui/ldap-tools/", ldap_tools_home, name="ldap_tools_home"),
     path("ui/ldap-tools/employees/", ldap_tools_employees, name="ldap_tools_employees"),
