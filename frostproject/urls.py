@@ -65,6 +65,9 @@ from frostapp.views import (
     ad_ui_users,
     ad_ui_users_toggle,
     inactive_users_report_send_to_bitrix,
+    sm_sync_staff_ui,
+    sm_sync_staff_stream,
+    sm_sync_staff_run,
 )
 
 urlpatterns = [
@@ -132,4 +135,11 @@ urlpatterns = [
 
 
     path("api/reports/inactive-users/send/", inactive_users_report_send_to_bitrix, name="inactive_users_report_send_to_bitrix"),
+
+
+    path("sm/sync-staff/", sm_sync_staff_ui, name="sm_sync_staff_ui"),
+    path("sm/sync-staff/stream/", sm_sync_staff_stream, name="sm_sync_staff_stream"),
+
+    # скриптовый запуск (API)
+    path("api/sm/sync-staff/run/", sm_sync_staff_run, name="sm_sync_staff_run"),
 ]
