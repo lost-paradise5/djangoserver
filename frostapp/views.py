@@ -2015,13 +2015,14 @@ def vpn_ui_toggle(request):
 @require_http_methods(["POST"])
 @csrf_protect
 def ad_ui_lookup_vpn_toggle(request):
-    sess: VpnAccessSession = request.vpn_sess
-    actor_fio = _auth_fio_from_session(sess)
     """
     UI (AD lookup): открыть/закрыть membership в mikrotik_vpn через leases.
     POST form-urlencoded:
       inn, desired ("1"/"0"), tz_offset_min, start_at?, end_at?
     """
+    sess: VpnAccessSession = request.vpn_sess
+    actor_fio = _auth_fio_from_session(sess)
+
     inn = re.sub(r"\D+", "", (request.POST.get("inn") or "").strip())
     desired = (request.POST.get("desired") or "").strip()  # "1"/"0"
 
@@ -2042,11 +2043,9 @@ def ad_ui_lookup_vpn_toggle(request):
 
     now = timezone.now()
 
-    # если указан только end_at -> start = now
     if end_at and not start_at:
         start_at = now
 
-    # если ничего не указано -> делаем "сейчас бессрочно"
     if not start_at and not end_at:
         start_at = now
         end_at = None
@@ -2054,7 +2053,6 @@ def ad_ui_lookup_vpn_toggle(request):
     if end_at and start_at and end_at <= start_at:
         return JsonResponse({"ok": False, "error": "BAD_PERIOD:end_at must be > start_at"}, status=400)
 
-    # group dn
     conn = None
     try:
         conn = _ad_connect()
@@ -2068,7 +2066,6 @@ def ad_ui_lookup_vpn_toggle(request):
         except Exception:
             pass
 
-    # baseline
     try:
         vpn_ensure_baseline(inn, group_dn)
     except Exception as e:
@@ -2077,7 +2074,6 @@ def ad_ui_lookup_vpn_toggle(request):
     lease_type = "OPEN" if desired == "1" else "BLOCK"
 
     with transaction.atomic():
-        # анти-конфликт: отменяем все активные
         cancelled_cnt = (
             VpnAccessLease.objects
             .select_for_update()
@@ -2105,7 +2101,8 @@ def ad_ui_lookup_vpn_toggle(request):
             },
         )
 
-     _telegram_log_vpn_toggle(
+    # ВАЖНО: ровно 4 пробела отступа, не табы
+    _telegram_log_vpn_toggle(
         source="ad_lookup",
         actor_login=sess.ad_login,
         actor_fio=actor_fio,
@@ -2119,7 +2116,6 @@ def ad_ui_lookup_vpn_toggle(request):
         cancelled_cnt=cancelled_cnt,
     )
 
-    # применяем сразу, если окно уже началось
     if start_at and start_at <= now:
         try:
             changed, now_open, effective_until = vpn_apply_state_for_inn(inn, group_dn)
@@ -2134,7 +2130,6 @@ def ad_ui_lookup_vpn_toggle(request):
         except Exception as e:
             return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
-    # окно в будущем — применит scheduler
     p = _build_vpn_period_maps_for_ui([inn]).get(inn, {})
     return JsonResponse({
         "ok": True,
