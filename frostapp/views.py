@@ -324,7 +324,107 @@ def _get_session_or_403(request, must_verified: bool) -> VpnAccessSession:
 
     return sess
 
+def _bx_fio(u: dict) -> str:
+    return " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x]).strip()
 
+def _auth_fio_from_session(sess: VpnAccessSession) -> str:
+    # по умолчанию — AD login
+    fio = sess.ad_login
+    try:
+        me = bitrix_user_get_all(
+            filter_dict={"ID": int(sess.bitrix_user_id)},
+            select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME"],
+        )
+        if me:
+            fio = _bx_fio(me[0]) or fio
+    except Exception:
+        pass
+    return fio
+
+def _target_fio_for_log(inn: str, bitrix_id: int | None) -> tuple[str, int | None]:
+    """
+    Вернёт (fio, bitrix_id). Если bitrix_id не передан — попробуем найти по INN.
+    """
+    try:
+        if bitrix_id:
+            u = bitrix_user_get_by_id(bitrix_id, select_list=["ID", "NAME", "LAST_NAME", "SECOND_NAME"])
+            if u:
+                return (_bx_fio(u) or f"Bitrix ID {bitrix_id}", int(u.get("ID") or bitrix_id))
+        bx = bitrix_find_user_by_inn(inn)
+        if bx:
+            bid = int(bx.get("ID"))
+            fio = _bx_fio(bx) or f"Bitrix ID {bid}"
+            return (fio, bid)
+    except Exception:
+        pass
+    return ("(не удалось определить ФИО)", bitrix_id)
+
+def _ad_login_for_inn(inn: str) -> str:
+    try:
+        ad = ad_find_by_employee_id(inn)
+        if not ad:
+            return ""
+        _, attrs = ad
+        sam = attrs.get("sAMAccountName", [b""])
+        return (sam[0].decode("utf-8", "ignore") if sam else "").strip()
+    except Exception:
+        return ""
+
+def _telegram_log_vpn_toggle(
+    *,
+    source: str,
+    actor_login: str,
+    actor_fio: str,
+    actor_sid: str,
+    actor_ip: str,
+    target_inn: str,
+    target_bitrix_id: int | None,
+    lease_type: str,  # OPEN/BLOCK
+    start_at: datetime.datetime | None,
+    end_at: datetime.datetime | None,
+    cancelled_cnt: int | None = None,
+):
+    target_fio, resolved_bid = _target_fio_for_log(target_inn, target_bitrix_id)
+    target_ad_login = _ad_login_for_inn(target_inn)
+
+    action_emoji = "🔓" if lease_type == "OPEN" else "🔒"
+    action_text = "ОТКРЫЛ" if lease_type == "OPEN" else "ЗАКРЫЛ"
+
+    when = timezone.localtime(timezone.now()).isoformat(sep=" ", timespec="seconds")
+    s_start = start_at.isoformat(sep=" ", timespec="minutes") if start_at else "None"
+    s_end = end_at.isoformat(sep=" ", timespec="minutes") if end_at else "None"
+
+    lines = [
+        f"{action_emoji} {action_text} удалённый доступ (mikrotik_vpn)",
+        f"source: {source}",
+        f"by: {actor_fio} / {actor_login}",
+        f"sid: {actor_sid}",
+        f"ip: {actor_ip}",
+        "---",
+        f"to: {target_fio}",
+        f"target_bitrix_id: {resolved_bid if resolved_bid else (target_bitrix_id or 'None')}",
+        f"target_inn: {target_inn}",
+        f"target_ad_login: {target_ad_login or 'N/A'}",
+        "---",
+        f"starts_at: {s_start}",
+        f"ends_at: {s_end}",
+    ]
+    if cancelled_cnt is not None:
+        lines.append(f"cancelled_old_active_leases: {cancelled_cnt}")
+    lines.append(f"time: {when}")
+
+    send_telegram_log("\n".join(lines))
+
+def vpn_verified_required(view_func):
+    @wraps(view_func)
+    def _wrapped(request, *args, **kwargs):
+        try:
+            sess = _get_session_or_403(request, must_verified=True)
+        except Exception:
+            return redirect(reverse("vpn_ui_login"))
+        request.vpn_sess = sess
+        return view_func(request, *args, **kwargs)
+    return _wrapped
 
 # =========================
 # Helpers: Bitrix
@@ -1848,18 +1948,20 @@ def vpn_ui_toggle(request):
             meta={"ip": sess.ip, "sid": str(sess.id), "tz_offset_min": tz_offset_min},
         )
 
-    send_telegram_log(
-        "\n".join([
-            "🧩 VPN TOGGLE (ANTI-CONFLICT)",
-            f"by: {sess.ad_login} (sid={sess.id})",
-            f"inn: {inn}",
-            f"lease_type: {lease_type}",
-            f"starts_at: {start_at.isoformat(sep=' ', timespec='minutes') if start_at else 'None'}",
-            f"ends_at: {end_at.isoformat(sep=' ', timespec='minutes') if end_at else 'None'}",
-            f"cancelled_old_active_leases: {cancelled_cnt}",
-            f"time: {timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
-            f"ip: {sess.ip}",
-        ])
+    actor_fio = _auth_fio_from_session(sess)
+
+    _telegram_log_vpn_toggle(
+        source="vpn_users",
+        actor_login=sess.ad_login,
+        actor_fio=actor_fio,
+        actor_sid=str(sess.id),
+        actor_ip=sess.ip,
+        target_inn=inn,
+        target_bitrix_id=target_bitrix_id,
+        lease_type=lease_type,
+        start_at=start_at,
+        end_at=end_at,
+        cancelled_cnt=cancelled_cnt,
     )
 
     # применяем сразу, если окно уже началось
@@ -1909,10 +2011,12 @@ def vpn_ui_toggle(request):
 
 
 
-@staff_member_required
+@vpn_verified_required
 @require_http_methods(["POST"])
 @csrf_protect
 def ad_ui_lookup_vpn_toggle(request):
+    sess: VpnAccessSession = request.vpn_sess
+    actor_fio = _auth_fio_from_session(sess)
     """
     UI (AD lookup): открыть/закрыть membership в mikrotik_vpn через leases.
     POST form-urlencoded:
@@ -1986,8 +2090,8 @@ def ad_ui_lookup_vpn_toggle(request):
             lease_type=lease_type,
             inn=inn,
             target_bitrix_user_id=None,
-            created_by_ad_login=getattr(request.user, "username", "ui_admin"),
-            created_by_bitrix_user_id=None,
+            created_by_ad_login=sess.ad_login,
+            created_by_bitrix_user_id=sess.bitrix_user_id,
             starts_at=start_at,
             ends_at=end_at,
             status="ACTIVE",
@@ -2000,6 +2104,20 @@ def ad_ui_lookup_vpn_toggle(request):
                 "cancelled_old_active_leases": cancelled_cnt,
             },
         )
+
+     _telegram_log_vpn_toggle(
+        source="ad_lookup",
+        actor_login=sess.ad_login,
+        actor_fio=actor_fio,
+        actor_sid=str(sess.id),
+        actor_ip=sess.ip,
+        target_inn=inn,
+        target_bitrix_id=None,
+        lease_type=lease_type,
+        start_at=start_at,
+        end_at=end_at,
+        cancelled_cnt=cancelled_cnt,
+    )
 
     # применяем сразу, если окно уже началось
     if start_at and start_at <= now:
@@ -2252,9 +2370,12 @@ def _fetch_user_by_login(conn, login: str):
     dn, ad_attrs = found[0]
     return dn, ad_attrs, ldap_filter
 
+@vpn_verified_required
 @require_http_methods(["GET", "POST"])
 @csrf_protect
 def ad_ui_lookup(request):
+    sess: VpnAccessSession = request.vpn_sess
+    auth_fio = _auth_fio_from_session(sess)
     """
     POST action может быть:
       - action=lookup  : поиск
@@ -2317,11 +2438,7 @@ def ad_ui_lookup(request):
         vpn["inn"] = inn
 
         # можно ли управлять
-        vpn["can_manage"] = (
-            bool(getattr(request.user, "is_staff", False))
-            and vpn["group_found"]
-            and bool(inn and _INN_RE.match(inn))
-        )
+        vpn["can_manage"] = vpn["group_found"] and bool(inn and _INN_RE.match(inn))
 
         # leases -> период/план (если INN валиден)
         if inn and _INN_RE.match(inn):
@@ -2438,6 +2555,8 @@ def ad_ui_lookup(request):
         "login_prefill": login,
         "vpn": vpn,
         "csrf": get_token(request),
+        "sid": str(sess.id),
+        "auth_fio": auth_fio,
     })
 # @require_http_methods(["GET", "POST"])
 # @csrf_protect
@@ -12813,7 +12932,7 @@ def _load_smstaff_column_map(service_key: str) -> dict[str, str]:
                 break
 
     # LOGIN
-    login_candidates = ["login", "userlogin", "username", "userid", "user_name", "name_login", "usrlogin"]
+    login_candidates = ["serverlogin", "server_login", "login", "userlogin", "username", "userid", "user_name", "name_login", "usrlogin"]
     login_col = None
     for c in login_candidates:
         if c in cols_l:
