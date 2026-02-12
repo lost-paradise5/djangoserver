@@ -13061,30 +13061,6 @@ def _find_staff_in_service_by_inn(service_key: str, inn: str) -> Optional[dict]:
         except Exception: pass
 
 
-def _storeid_from_found(found: dict) -> tuple[Optional[int], str]:
-    """
-    Возвращает (ukm_storeid, source_string)
-    """
-    # 1) через storeloc -> таблица stores в PostgreSQL
-    storeloc = found.get("storeloc")
-    if storeloc is not None:
-        s = Store.objects.filter(smstore=storeloc).first()
-        if s:
-            ukm_id = s.ukm4store or s.ukm5store
-            if ukm_id:
-                return int(ukm_id), f"stores(smstore={storeloc})"
-            return None, f"stores(smstore={storeloc}) без ukm4store/ukm5store"
-
-        return None, f"stores(smstore={storeloc}) не найден"
-
-    # 2) fallback от Oracle REP.UKMStoreId
-    fb = found.get("ukm_storeid_fallback")
-    if fb:
-        return int(fb), "oracle REP.UKMStoreId"
-
-    return None, "не удалось определить магазин"
-
-
 def _ensure_open_in_system(*, user: User, username: str, system_id: int, dry_run: bool) -> dict:
     exists = OpenInSystem.objects.filter(user_id=user.id, username=username, system_id=system_id).exists()
     if exists:
@@ -13375,10 +13351,10 @@ def sm_sync_staff_run(request):
         "mode": mode,
         "dry_run": dry_run,
         "users_total": 0,
-        "found_total": 0,
-        "not_found_total": 0,
-        "open_created": 0,
-        "ukm_created": 0,
+        "found_total": 0,         # users found in ANY base
+        "not_found_total": 0,     # users found in NO bases
+        "open_created": 0,        # total created rows in open_in_system (across all bases)
+        "ukm_created": 0,         # total created rows in ukm_users (across all bases)
         "errors": 0,
         "started_at": start.isoformat(),
         "sample_results": [],
@@ -13388,8 +13364,8 @@ def sm_sync_staff_run(request):
         qs = User.objects.all().order_by("id")
         summary["users_total"] = qs.count()
 
-        # чтобы ответ не был гигантским — сохраняем только первые 200 результатов как sample
         sample_limit = 200
+
         for u in qs.iterator(chunk_size=200):
             try:
                 if dry_run:
@@ -13398,30 +13374,36 @@ def sm_sync_staff_run(request):
                     with transaction.atomic():
                         res = _sync_one_user(u, dry_run=False)
 
-                if res.get("found"):
+                # ВАЖНО: теперь используется found_any + found_services
+                if res.get("found_any"):
                     summary["found_total"] += 1
                 else:
                     summary["not_found_total"] += 1
 
-                oi = (res.get("open_in_system") or {})
-                if oi.get("created"):
-                    summary["open_created"] += 1
+                for item in (res.get("found_services") or []):
+                    oi = (item.get("open_in_system") or {})
+                    if oi.get("created"):
+                        summary["open_created"] += 1
 
-                uu = (res.get("ukm_users") or {})
-                if uu.get("created"):
-                    summary["ukm_created"] += 1
+                    uu = (item.get("ukm_users") or {})
+                    if uu.get("created"):
+                        summary["ukm_created"] += 1
 
                 if len(summary["sample_results"]) < sample_limit:
                     summary["sample_results"].append(res)
 
-            except Exception:
+            except Exception as e:
                 summary["errors"] += 1
+                logger.exception(f"[SM_SYNC_STAFF_RUN] user_id={u.id} error: {e}")
 
         finish = tz_now()
         summary["finished_at"] = finish.isoformat()
         summary["duration_sec"] = int((finish - start).total_seconds())
 
-        return JsonResponse({"status": "ok", "summary": summary}, json_dumps_params={"ensure_ascii": False, "indent": 2})
+        return JsonResponse(
+            {"status": "ok", "summary": summary},
+            json_dumps_params={"ensure_ascii": False, "indent": 2}
+        )
 
     finally:
         _oracle_close_cached_conns()
