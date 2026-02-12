@@ -14,12 +14,15 @@
     .log { margin-top: 12px; height: 260px; overflow:auto; border: 1px solid #eee; border-radius: 10px; padding: 10px; background:#0b0f14; color:#cfe1ff; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; }
     th, td { border: 1px solid #eee; padding: 8px; vertical-align: top; font-size: 13px; }
-    th { background:#fafafa; position: sticky; top: 0; }
+    th { background:#fafafa; position: sticky; top: 0; z-index: 1; }
     .badge { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid #ddd; font-size: 12px; }
     .ok { background:#e8fff1; border-color:#b9f5d0; }
     .warn { background:#fff7e6; border-color:#ffe1a6; }
     .err { background:#ffe8ea; border-color:#ffb3bb; }
     .muted { color:#666; }
+    details { margin-top: 6px; }
+    summary { cursor: pointer; }
+    .small { font-size: 12px; }
   </style>
 </head>
 <body>
@@ -37,8 +40,8 @@
   <div><b>Статус:</b> <span id="status">ожидание</span></div>
   <div class="row" style="margin-top:8px">
     <span class="badge" id="b_total">users: 0</span>
-    <span class="badge ok" id="b_found">found: 0</span>
-    <span class="badge warn" id="b_nf">not found: 0</span>
+    <span class="badge ok" id="b_found">found users: 0</span>
+    <span class="badge warn" id="b_nf">not found users: 0</span>
     <span class="badge ok" id="b_open">open_created: 0</span>
     <span class="badge ok" id="b_ukm">ukm_created: 0</span>
     <span class="badge err" id="b_err">errors: 0</span>
@@ -55,10 +58,10 @@
       <th style="width:240px">ФИО</th>
       <th style="width:160px">employee_id (ИНН)</th>
       <th style="width:120px">Найдено?</th>
-      <th style="width:140px">База</th>
-      <th style="width:200px">Логин SMSTAFF</th>
+      <th style="width:170px">Базы</th>
+      <th style="width:220px">Логины SMSTAFF</th>
       <th>Действия</th>
-      <th style="width:260px">Примечания</th>
+      <th style="width:320px">Примечания</th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
@@ -80,18 +83,12 @@
 
   function setMeta(m) {
     $("b_total").textContent = `users: ${m.users_total ?? 0}`;
-    $("b_found").textContent = `found: ${m.found_total ?? 0}`;
-    $("b_nf").textContent = `not found: ${m.not_found_total ?? 0}`;
+    $("b_found").textContent = `found users: ${m.found_total ?? 0}`;
+    $("b_nf").textContent = `not found users: ${m.not_found_total ?? 0}`;
     $("b_open").textContent = `open_created: ${m.open_created ?? 0}`;
     $("b_ukm").textContent = `ukm_created: ${m.ukm_created ?? 0}`;
     $("b_err").textContent = `errors: ${m.errors ?? 0}`;
     $("b_mode").textContent = `mode: ${m.mode ?? "-"}`;
-  }
-
-  function badge(ok) {
-    if (ok === true) return `<span class="badge ok">OK</span>`;
-    if (ok === false) return `<span class="badge err">NO</span>`;
-    return `<span class="badge warn">—</span>`;
   }
 
   function upsertRow(res) {
@@ -108,23 +105,56 @@
     tr.children[1].textContent = res.fio || "";
     tr.children[2].textContent = res.inn_used || res.employee_id || "";
 
-    tr.children[3].innerHTML = res.found ? `<span class="badge ok">ДА</span>` : `<span class="badge warn">НЕТ</span>`;
-    tr.children[4].textContent = res.found_service || "";
-    tr.children[5].textContent = res.found_login || "";
+    const foundAny = !!res.found_any;
+    tr.children[3].innerHTML = foundAny ? `<span class="badge ok">ДА</span>` : `<span class="badge warn">НЕТ</span>`;
 
-    // actions
+    const foundServices = Array.isArray(res.found_services) ? res.found_services : [];
+    const bases = [...new Set(foundServices.map(x => x.service).filter(Boolean))];
+    const logins = [...new Set(foundServices.map(x => x.login).filter(Boolean))];
+
+    tr.children[4].innerHTML = bases.length
+      ? `<div><span class="badge ok">${bases.length}</span> баз</div><div class="muted small">${bases.slice(0,4).join(", ")}${bases.length>4 ? ", ..." : ""}</div>`
+      : "";
+
+    tr.children[5].innerHTML = logins.length
+      ? `<div><span class="badge ok">${logins.length}</span> логин(ов)</div><div class="muted small">${logins.slice(0,3).join(", ")}${logins.length>3 ? ", ..." : ""}</div>`
+      : "";
+
+    // actions: подробности по каждой базе
     const actions = [];
-    if (res.open_in_system) {
-      actions.push(`open_in_system: ${res.open_in_system.message} (system_id=${res.open_in_system.system_id})`);
-    }
-    if (res.ukm_users) {
-      const extra = res.ukm_users.storeid ? ` storeid=${res.ukm_users.storeid} (${res.ukm_users.source || ""})` : "";
-      actions.push(`ukm_users: ${res.ukm_users.message}${extra}`);
-    }
-    tr.children[6].innerHTML = actions.map(a => `<div>${a}</div>`).join("");
+    if (foundServices.length) {
+      const lines = foundServices.map(it => {
+        const oi = it.open_in_system || {};
+        const uu = it.ukm_users || {};
+        const store = it.ukm_storeid ? ` storeid=${it.ukm_storeid}` : "";
+        const src = it.store_source ? ` (${it.store_source})` : "";
+        return `[${it.service}] login=${it.login} sys=${it.system_id} | open: ${oi.message || ""} | ukm: ${uu.message || ""}${store}${src}`;
+      });
 
-    // notes
-    tr.children[7].innerHTML = (res.notes || []).map(n => `<div class="muted">${n}</div>`).join("");
+      actions.push(`
+        <details>
+          <summary>Найдено в ${foundServices.length} базе(ах) — раскрыть</summary>
+          <div class="small" style="margin-top:6px">
+            ${lines.map(l => `<div>${l}</div>`).join("")}
+          </div>
+        </details>
+      `);
+    } else {
+      actions.push(`<div class="muted">нет совпадений</div>`);
+    }
+    tr.children[6].innerHTML = actions.join("");
+
+    // notes + search trace errors
+    const notes = [];
+    (res.notes || []).forEach(n => notes.push(`<div class="muted">${n}</div>`));
+
+    const trace = Array.isArray(res.search_trace) ? res.search_trace : [];
+    const errs = trace.filter(t => t.status === "error");
+    if (errs.length) {
+      notes.push(`<details><summary class="small">Ошибки по базам (${errs.length})</summary><div class="small" style="margin-top:6px">${errs.map(e => `<div>[${e.service}] ${e.error}</div>`).join("")}</div></details>`);
+    }
+
+    tr.children[7].innerHTML = notes.join("");
   }
 
   function start(mode) {
