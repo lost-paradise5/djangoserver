@@ -32,8 +32,8 @@ except Exception:
 
 
 
-
-
+from django.views.decorators.http import require_GET, require_POST
+from django.utils.timezone import now as tz_now
 
 import re   
 from django.http import JsonResponse, HttpResponseForbidden
@@ -12694,3 +12694,569 @@ def inactive_users_report_send_to_bitrix(request):
             "error": str(e),
             "counts": {"ad": len(ad_rows), "supermag": len(sm_rows), "bitrix": len(bx_rows)},
         }, status=500)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ЭТО ДЛЯ ЗАПИСИ ИЗ БАЗ СУПЕРМАГА В НАШУ БД POSTGRESQL
+
+
+# ---------------------------
+# SM SYNC: helpers
+# ---------------------------
+
+_SMSTAFF_COL_CACHE: dict[str, dict[str, str]] = {}  # service_key -> {"inn": "INN", "login": "LOGIN", "store": "STORELOC"}
+_ORA_CONN_CACHE: dict[str, Any] = {}               # service_key -> connection
+_ORA_CONN_HOST_CACHE: dict[str, str] = {}          # service_key -> used_host
+
+
+def _oracle_connect_by_service_key(service_key: str):
+    """
+    Подключение к Oracle по service_key из ORACLE_TNS_MAP.
+    Кэшируем коннект на время запроса (в памяти процесса).
+    """
+    if service_key in _ORA_CONN_CACHE:
+        return _ORA_CONN_CACHE[service_key]
+
+    cfg = ORACLE_TNS_MAP.get(service_key)
+    if not cfg:
+        raise RuntimeError(f"ORACLE_TNS_MAP: неизвестный ключ {service_key!r}")
+
+    ORA_USER = os.getenv("ORACLE_USER", "supermag")
+    ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
+    port = int(cfg.get("port") or 1521)
+    service_name = cfg.get("service_name") or service_key
+
+    hosts = []
+    if "hosts" in cfg and isinstance(cfg["hosts"], list):
+        hosts = cfg["hosts"]
+    else:
+        hosts = [cfg.get("host")]
+
+    last_err = None
+    for host in hosts:
+        if not host:
+            continue
+        try:
+            dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+            conn = _oracle_connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn)
+            _ORA_CONN_CACHE[service_key] = conn
+            _ORA_CONN_HOST_CACHE[service_key] = host
+            return conn
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Не удалось подключиться к Oracle {service_key}: {last_err}")
+
+
+def _oracle_close_cached_conns():
+    for k, conn in list(_ORA_CONN_CACHE.items()):
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _ORA_CONN_CACHE.clear()
+    _ORA_CONN_HOST_CACHE.clear()
+
+
+def _load_smstaff_column_map(service_key: str) -> dict[str, str]:
+    """
+    Определяем имена колонок (inn/login/storeloc) для SMSTAFF динамически.
+    Возвращаем map вида {"inn": "INN", "login": "LOGIN", "store": "STORELOC"} (значения в Oracle-регистре).
+    """
+    if service_key in _SMSTAFF_COL_CACHE:
+        return _SMSTAFF_COL_CACHE[service_key]
+
+    conn = _oracle_connect_by_service_key(service_key)
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT column_name
+            FROM all_tab_columns
+            WHERE owner = 'SUPERMAG'
+              AND table_name = 'SMSTAFF'
+        """)
+        cols = [str(r[0]).strip() for r in cur.fetchall()]
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+    cols_l = {c.lower(): c for c in cols}
+
+    # INN
+    inn_candidates = ["inn", "inn_staff", "taxid", "tax_id"]
+    inn_col = None
+    for c in inn_candidates:
+        if c in cols_l:
+            inn_col = cols_l[c]
+            break
+    if not inn_col:
+        # любой столбец содержащий "inn"
+        for lc, orig in cols_l.items():
+            if "inn" in lc:
+                inn_col = orig
+                break
+
+    # LOGIN
+    login_candidates = ["login", "userlogin", "username", "userid", "user_name", "name_login", "usrlogin"]
+    login_col = None
+    for c in login_candidates:
+        if c in cols_l:
+            login_col = cols_l[c]
+            break
+
+    # STORELOC / STOREID (привязка к магазину)
+    store_candidates = ["storeloc", "store_loc", "storelocid", "storeid", "store", "store_id"]
+    store_col = None
+    for c in store_candidates:
+        if c in cols_l:
+            store_col = cols_l[c]
+            break
+
+    if not inn_col:
+        raise RuntimeError(f"[{service_key}] В SMSTAFF не найден столбец INN (ищу inn/..). Проверь структуру таблицы.")
+    if not login_col:
+        raise RuntimeError(f"[{service_key}] В SMSTAFF не найден столбец LOGIN (ищу login/username/userlogin/..).")
+
+    out = {"inn": inn_col, "login": login_col, "store": store_col or ""}
+    _SMSTAFF_COL_CACHE[service_key] = out
+    return out
+
+
+def _find_staff_in_service_by_inn(service_key: str, inn: str) -> Optional[dict]:
+    """
+    Ищем SMSTAFF по inn в конкретной базе (service_key).
+    Возвращаем:
+      {
+        "service": "...",
+        "login": "...",
+        "storeloc": int|None,
+        "ukm_storeid_fallback": int|None
+      }
+    """
+    colmap = _load_smstaff_column_map(service_key)
+    inn_col = colmap["inn"]
+    login_col = colmap["login"]
+    store_col = colmap["store"]  # может быть ""
+
+    conn = _oracle_connect_by_service_key(service_key)
+    cur = conn.cursor()
+    try:
+        if store_col:
+            sql = f"""
+                SELECT {login_col} AS login, {store_col} AS storeloc
+                FROM smstaff
+                WHERE {inn_col} = :inn
+                  AND ROWNUM = 1
+            """
+        else:
+            sql = f"""
+                SELECT {login_col} AS login
+                FROM smstaff
+                WHERE {inn_col} = :inn
+                  AND ROWNUM = 1
+            """
+        cur.execute(sql, {"inn": inn})
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        login_val = row[0]
+        storeloc_val = None
+        if store_col:
+            storeloc_val = row[1]
+
+        login_str = ("" if login_val is None else str(login_val)).strip()
+        if not login_str:
+            return None
+
+        storeloc_int = None
+        if storeloc_val is not None:
+            try:
+                storeloc_int = int(str(storeloc_val).strip())
+            except Exception:
+                storeloc_int = None
+
+        # fallback: если не смогли вытащить storeloc из SMSTAFF — пробуем REP.UKMStoreId из SMSTOREPROPERTIES
+        ukm_storeid_fallback = None
+        if storeloc_int is None:
+            try:
+                cur2 = conn.cursor()
+                try:
+                    cur2.execute("""
+                        SELECT propval
+                        FROM smstoreproperties
+                        WHERE propid = 'REP.UKMStoreId'
+                          AND ROWNUM = 1
+                    """)
+                    r2 = cur2.fetchone()
+                    if r2 and r2[0] is not None:
+                        ukm_storeid_fallback = int(str(r2[0]).strip())
+                finally:
+                    try:
+                        cur2.close()
+                    except Exception:
+                        pass
+            except Exception:
+                ukm_storeid_fallback = None
+
+        return {
+            "service": service_key,
+            "login": login_str,
+            "storeloc": storeloc_int,
+            "ukm_storeid_fallback": ukm_storeid_fallback,
+        }
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+def _storeid_from_found(found: dict) -> tuple[Optional[int], str]:
+    """
+    Возвращает (ukm_storeid, source_string)
+    """
+    # 1) через storeloc -> таблица stores в PostgreSQL
+    storeloc = found.get("storeloc")
+    if storeloc is not None:
+        s = Store.objects.filter(smstore=storeloc).first()
+        if s:
+            ukm_id = s.ukm4store or s.ukm5store
+            if ukm_id:
+                return int(ukm_id), f"stores(smstore={storeloc})"
+            return None, f"stores(smstore={storeloc}) без ukm4store/ukm5store"
+
+        return None, f"stores(smstore={storeloc}) не найден"
+
+    # 2) fallback от Oracle REP.UKMStoreId
+    fb = found.get("ukm_storeid_fallback")
+    if fb:
+        return int(fb), "oracle REP.UKMStoreId"
+
+    return None, "не удалось определить магазин"
+
+
+def _ensure_open_in_system(*, user: User, username: str, system_id: int, dry_run: bool) -> dict:
+    """
+    Создаёт open_in_system при отсутствии.
+    """
+    exists = OpenInSystem.objects.filter(user_id=user.id, username=username, system_id=system_id).exists()
+    if exists:
+        return {"ok": True, "created": False, "message": "open_in_system уже есть"}
+
+    if dry_run:
+        return {"ok": True, "created": False, "message": "DRY-RUN: создали бы open_in_system"}
+
+    # password тут неизвестен: кладём пустую строку (или можно 'N/A')
+    OpenInSystem.objects.create(
+        user_id=user.id,
+        username=username,
+        password="",
+        system_id=system_id,
+        status=True
+    )
+    return {"ok": True, "created": True, "message": "open_in_system создан"}
+
+
+def _ensure_ukm_user(*, user: User, storeid: int, roleid: int, dry_run: bool) -> dict:
+    """
+    Создаёт ukm_users при отсутствии.
+    """
+    exists = UKMUser.objects.filter(user=user, storeid=storeid).exists()
+    if exists:
+        return {"ok": True, "created": False, "message": "ukm_users уже есть"}
+
+    if dry_run:
+        return {"ok": True, "created": False, "message": "DRY-RUN: создали бы ukm_users"}
+
+    UKMUser.objects.create(
+        user=user,
+        storeid=int(storeid),
+        roleid=int(roleid),
+        version=1
+    )
+    return {"ok": True, "created": True, "message": "ukm_users создан"}
+
+
+def _iterate_services_prefer_binuu00() -> list[str]:
+    """
+    Порядок поиска: сначала BINUU00, потом остальные ключи ORACLE_TNS_MAP (по алфавиту).
+    """
+    keys = list(ORACLE_TNS_MAP.keys())
+    rest = sorted([k for k in keys if k != "BINUU00"])
+    return (["BINUU00"] if "BINUU00" in keys else []) + rest
+
+
+def _sync_one_user(user: User, dry_run: bool) -> dict:
+    """
+    Обработка одного пользователя. Возвращает итоговый dict для UI/логов.
+    """
+    inn = (user.employee_id or "").strip()  # по твоему ТЗ: employee_id = ИНН для SMSTAFF
+    result = {
+        "user_id": user.id,
+        "fio": user.full_name,
+        "employee_id": user.employee_id,
+        "inn_used": inn,
+        "found": False,
+        "found_service": None,
+        "found_login": None,
+        "open_in_system": None,
+        "ukm_users": None,
+        "notes": [],
+    }
+
+    if not inn:
+        result["notes"].append("Пустой employee_id — нечего искать в SMSTAFF")
+        return result
+
+    found = None
+    for service_key in _iterate_services_prefer_binuu00():
+        try:
+            f = _find_staff_in_service_by_inn(service_key, inn)
+            if f:
+                found = f
+                break
+        except Exception as e:
+            # не валим весь процесс из-за одной базы
+            result["notes"].append(f"[{service_key}] ошибка поиска: {e}")
+
+    if not found:
+        result["notes"].append("ИНН не найден в SMSTAFF ни в одной базе")
+        return result
+
+    result["found"] = True
+    result["found_service"] = found["service"]
+    result["found_login"] = found["login"]
+
+    # system_id
+    system_id = 4 if found["service"] == "BINUU00" else 5
+
+    # open_in_system
+    oi = _ensure_open_in_system(user=user, username=found["login"], system_id=system_id, dry_run=dry_run)
+    result["open_in_system"] = {
+        "system_id": system_id,
+        **oi
+    }
+
+    # ukm_users (только если не BINUU00)
+    if found["service"] != "BINUU00":
+        ukm_storeid, src = _storeid_from_found(found)
+        if not ukm_storeid:
+            result["ukm_users"] = {
+                "ok": False,
+                "created": False,
+                "message": f"Не смог определить storeid ({src})"
+            }
+        else:
+            uu = _ensure_ukm_user(user=user, storeid=ukm_storeid, roleid=1, dry_run=dry_run)
+            result["ukm_users"] = {
+                "storeid": ukm_storeid,
+                "source": src,
+                **uu
+            }
+
+    return result
+
+
+def _sse_pack(event: str, payload: dict) -> str:
+    return "event: %s\ndata: %s\n\n" % (event, json.dumps(payload, ensure_ascii=False))
+
+
+# ---------------------------
+# SM SYNC: UI + Stream + API
+# ---------------------------
+
+@staff_member_required
+@never_cache
+@require_GET
+def sm_sync_staff_ui(request):
+    """
+    UI-страница с кнопками ТЕСТ / НАСТОЯЩИЙ.
+    """
+    return render(request, "frostapp/sm_sync_staff.html", {
+        "stream_url": reverse("sm_sync_staff_stream"),
+    })
+
+
+@staff_member_required
+@never_cache
+@require_GET
+def sm_sync_staff_stream(request):
+    """
+    SSE stream:
+      GET /sm/sync-staff/stream/?mode=test|real
+
+    ВАЖНО: mode=real реально пишет в Postgres.
+    Доступ ограничен staff (админская сессия).
+    """
+    mode = (request.GET.get("mode") or "test").strip().lower()
+    dry_run = (mode != "real")
+
+    def gen():
+        start = tz_now()
+        summary = {
+            "mode": mode,
+            "dry_run": dry_run,
+            "users_total": 0,
+            "found_total": 0,
+            "not_found_total": 0,
+            "open_created": 0,
+            "ukm_created": 0,
+            "errors": 0,
+            "started_at": start.isoformat(),
+        }
+
+        yield _sse_pack("hello", {
+            "message": "Старт синхронизации",
+            "mode": mode,
+            "dry_run": dry_run,
+            "ts": start.isoformat(),
+        })
+
+        try:
+            qs = User.objects.all().order_by("id")
+            summary["users_total"] = qs.count()
+
+            yield _sse_pack("meta", summary)
+
+            for u in qs.iterator(chunk_size=200):
+                try:
+                    # важно: не держим большую atomic на весь процесс
+                    if dry_run:
+                        res = _sync_one_user(u, dry_run=True)
+                    else:
+                        with transaction.atomic():
+                            res = _sync_one_user(u, dry_run=False)
+
+                    if res.get("found"):
+                        summary["found_total"] += 1
+                    else:
+                        summary["not_found_total"] += 1
+
+                    oi = (res.get("open_in_system") or {})
+                    if oi.get("created"):
+                        summary["open_created"] += 1
+
+                    uu = (res.get("ukm_users") or {})
+                    if uu.get("created"):
+                        summary["ukm_created"] += 1
+
+                    yield _sse_pack("user", res)
+                    yield _sse_pack("meta", summary)
+
+                except Exception as e:
+                    summary["errors"] += 1
+                    yield _sse_pack("log", {
+                        "level": "error",
+                        "user_id": u.id,
+                        "message": str(e),
+                    })
+                    yield _sse_pack("meta", summary)
+
+            finish = tz_now()
+            summary["finished_at"] = finish.isoformat()
+            summary["duration_sec"] = int((finish - start).total_seconds())
+
+            yield _sse_pack("done", summary)
+
+        finally:
+            _oracle_close_cached_conns()
+
+    resp = StreamingHttpResponse(gen(), content_type="text/event-stream; charset=utf-8")
+    resp["Cache-Control"] = "no-cache"
+    resp["X-Accel-Buffering"] = "no"  # чтобы nginx не буферизовал
+    return resp
+
+
+@csrf_exempt
+@agent_token_required
+@require_POST
+def sm_sync_staff_run(request):
+    """
+    Скриптовый запуск:
+      POST /api/sm/sync-staff/run/
+      Headers: X-AGENT-TOKEN: ...
+      Body: {"mode":"test"|"real"}
+
+    Возвращает JSON с итоговой сводкой + примеры первых N результатов.
+    (Полный список можно сделать, но он может быть огромный.)
+    """
+    try:
+        data = json.loads(request.body.decode("utf-8") if request.body else "{}")
+    except Exception:
+        data = {}
+
+    mode = (data.get("mode") or "test").strip().lower()
+    dry_run = (mode != "real")
+
+    start = tz_now()
+    summary = {
+        "mode": mode,
+        "dry_run": dry_run,
+        "users_total": 0,
+        "found_total": 0,
+        "not_found_total": 0,
+        "open_created": 0,
+        "ukm_created": 0,
+        "errors": 0,
+        "started_at": start.isoformat(),
+        "sample_results": [],
+    }
+
+    try:
+        qs = User.objects.all().order_by("id")
+        summary["users_total"] = qs.count()
+
+        # чтобы ответ не был гигантским — сохраняем только первые 200 результатов как sample
+        sample_limit = 200
+        for u in qs.iterator(chunk_size=200):
+            try:
+                if dry_run:
+                    res = _sync_one_user(u, dry_run=True)
+                else:
+                    with transaction.atomic():
+                        res = _sync_one_user(u, dry_run=False)
+
+                if res.get("found"):
+                    summary["found_total"] += 1
+                else:
+                    summary["not_found_total"] += 1
+
+                oi = (res.get("open_in_system") or {})
+                if oi.get("created"):
+                    summary["open_created"] += 1
+
+                uu = (res.get("ukm_users") or {})
+                if uu.get("created"):
+                    summary["ukm_created"] += 1
+
+                if len(summary["sample_results"]) < sample_limit:
+                    summary["sample_results"].append(res)
+
+            except Exception:
+                summary["errors"] += 1
+
+        finish = tz_now()
+        summary["finished_at"] = finish.isoformat()
+        summary["duration_sec"] = int((finish - start).total_seconds())
+
+        return JsonResponse({"status": "ok", "summary": summary}, json_dumps_params={"ensure_ascii": False, "indent": 2})
+
+    finally:
+        _oracle_close_cached_conns()
