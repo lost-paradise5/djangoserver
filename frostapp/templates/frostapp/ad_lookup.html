@@ -20,8 +20,15 @@
 <div class="container py-4" style="max-width: 980px;">
 
   <div class="d-flex justify-content-between align-items-center mb-3">
-    <h4 class="m-0">AD / LDAP — поиск пользователя</h4>
+    <div>
+      <h4 class="m-0">Поиск сотрудника по логину</h4>
+      <div class="text-muted small">
+        Вы авторизованы как <b>{{ auth_fio }}</b>
+      </div>
+    </div>
+
     <div class="d-flex gap-2">
+      <a class="btn btn-outline-primary btn-sm" href="{% url 'vpn_ui_users' %}?sid={{ sid }}">Назад</a>
       <a class="btn btn-outline-secondary btn-sm" href="/ui/smstaff/">SMSTAFF</a>
     </div>
   </div>
