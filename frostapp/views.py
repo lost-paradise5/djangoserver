@@ -12837,6 +12837,59 @@ _ORA_CONN_CACHE: dict[str, Any] = {}               # service_key -> connection
 _ORA_CONN_HOST_CACHE: dict[str, str] = {}          # service_key -> used_host
 
 
+
+
+def _oracle_get_storeloc_by_dbname(service_key: str, dbname: str) -> Optional[int]:
+    """
+    Ищем storeloc по REP.DBNAME = <dbname> в рамках ЭТОЙ базы.
+    """
+    conn = _oracle_connect_by_service_key(service_key)
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT storeloc
+            FROM smstoreproperties
+            WHERE propid = 'REP.DBNAME'
+              AND UPPER(TRIM(propval)) = UPPER(TRIM(:db))
+              AND ROWNUM = 1
+        """, {"db": dbname})
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return int(str(row[0]).strip())
+    finally:
+        try: cur.close()
+        except Exception: pass
+
+
+
+def _oracle_get_ukm_storeid_by_storeloc(service_key: str, storeloc: int) -> Optional[int]:
+    """
+    Берём REP.UKMStoreId для конкретного storeloc (в рамках ЭТОЙ базы).
+    """
+    conn = _oracle_connect_by_service_key(service_key)
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT propval
+            FROM smstoreproperties
+            WHERE storeloc = :sid
+              AND propid = 'REP.UKMStoreId'
+              AND ROWNUM = 1
+        """, {"sid": int(storeloc)})
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return int(str(row[0]).strip())
+    finally:
+        try: cur.close()
+        except Exception: pass
+
+
+
+
+
+
 def _oracle_connect_by_service_key(service_key: str):
     """
     Подключение к Oracle по service_key из ORACLE_TNS_MAP.
@@ -12889,7 +12942,7 @@ def _oracle_close_cached_conns():
 def _load_smstaff_column_map(service_key: str) -> dict[str, str]:
     """
     Определяем имена колонок (inn/login/storeloc) для SMSTAFF динамически.
-    Возвращаем map вида {"inn": "INN", "login": "LOGIN", "store": "STORELOC"} (значения в Oracle-регистре).
+    login = serverlogin (и fallback на прочие варианты).
     """
     if service_key in _SMSTAFF_COL_CACHE:
         return _SMSTAFF_COL_CACHE[service_key]
@@ -12905,10 +12958,8 @@ def _load_smstaff_column_map(service_key: str) -> dict[str, str]:
         """)
         cols = [str(r[0]).strip() for r in cur.fetchall()]
     finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
+        try: cur.close()
+        except Exception: pass
 
     cols_l = {c.lower(): c for c in cols}
 
@@ -12920,21 +12971,29 @@ def _load_smstaff_column_map(service_key: str) -> dict[str, str]:
             inn_col = cols_l[c]
             break
     if not inn_col:
-        # любой столбец содержащий "inn"
         for lc, orig in cols_l.items():
             if "inn" in lc:
                 inn_col = orig
                 break
 
-    # LOGIN
-    login_candidates = ["serverlogin", "server_login", "login", "userlogin", "username", "userid", "user_name", "name_login", "usrlogin"]
+    # LOGIN (ВАЖНО: serverlogin)
+    login_candidates = [
+        "serverlogin", "server_login",
+        "login", "userlogin", "username", "userid",
+        "user_name", "name_login", "usrlogin"
+    ]
     login_col = None
     for c in login_candidates:
         if c in cols_l:
             login_col = cols_l[c]
             break
+    if not login_col:
+        for lc, orig in cols_l.items():
+            if "login" in lc:
+                login_col = orig
+                break
 
-    # STORELOC / STOREID (привязка к магазину)
+    # STORELOC / STOREID (если вдруг есть в SMSTAFF)
     store_candidates = ["storeloc", "store_loc", "storelocid", "storeid", "store", "store_id"]
     store_col = None
     for c in store_candidates:
@@ -12943,9 +13002,9 @@ def _load_smstaff_column_map(service_key: str) -> dict[str, str]:
             break
 
     if not inn_col:
-        raise RuntimeError(f"[{service_key}] В SMSTAFF не найден столбец INN (ищу inn/..). Проверь структуру таблицы.")
+        raise RuntimeError(f"[{service_key}] В SMSTAFF не найден столбец INN (ищу inn/..).")
     if not login_col:
-        raise RuntimeError(f"[{service_key}] В SMSTAFF не найден столбец LOGIN (ищу login/username/userlogin/..).")
+        raise RuntimeError(f"[{service_key}] В SMSTAFF не найден столбец LOGIN (нужен serverlogin).")
 
     out = {"inn": inn_col, "login": login_col, "store": store_col or ""}
     _SMSTAFF_COL_CACHE[service_key] = out
@@ -12955,13 +13014,8 @@ def _load_smstaff_column_map(service_key: str) -> dict[str, str]:
 def _find_staff_in_service_by_inn(service_key: str, inn: str) -> Optional[dict]:
     """
     Ищем SMSTAFF по inn в конкретной базе (service_key).
-    Возвращаем:
-      {
-        "service": "...",
-        "login": "...",
-        "storeloc": int|None,
-        "ukm_storeid_fallback": int|None
-      }
+    Возвращаем { service, login, storeloc }.
+    ROWNUM=1 оставляем (можно).
     """
     colmap = _load_smstaff_column_map(service_key)
     inn_col = colmap["inn"]
@@ -12990,56 +13044,21 @@ def _find_staff_in_service_by_inn(service_key: str, inn: str) -> Optional[dict]:
         if not row:
             return None
 
-        login_val = row[0]
-        storeloc_val = None
-        if store_col:
-            storeloc_val = row[1]
-
-        login_str = ("" if login_val is None else str(login_val)).strip()
+        login_str = ("" if row[0] is None else str(row[0])).strip()
         if not login_str:
             return None
 
         storeloc_int = None
-        if storeloc_val is not None:
+        if store_col and len(row) > 1 and row[1] is not None:
             try:
-                storeloc_int = int(str(storeloc_val).strip())
+                storeloc_int = int(str(row[1]).strip())
             except Exception:
                 storeloc_int = None
 
-        # fallback: если не смогли вытащить storeloc из SMSTAFF — пробуем REP.UKMStoreId из SMSTOREPROPERTIES
-        ukm_storeid_fallback = None
-        if storeloc_int is None:
-            try:
-                cur2 = conn.cursor()
-                try:
-                    cur2.execute("""
-                        SELECT propval
-                        FROM smstoreproperties
-                        WHERE propid = 'REP.UKMStoreId'
-                          AND ROWNUM = 1
-                    """)
-                    r2 = cur2.fetchone()
-                    if r2 and r2[0] is not None:
-                        ukm_storeid_fallback = int(str(r2[0]).strip())
-                finally:
-                    try:
-                        cur2.close()
-                    except Exception:
-                        pass
-            except Exception:
-                ukm_storeid_fallback = None
-
-        return {
-            "service": service_key,
-            "login": login_str,
-            "storeloc": storeloc_int,
-            "ukm_storeid_fallback": ukm_storeid_fallback,
-        }
+        return {"service": service_key, "login": login_str, "storeloc": storeloc_int}
     finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
+        try: cur.close()
+        except Exception: pass
 
 
 def _storeid_from_found(found: dict) -> tuple[Optional[int], str]:
@@ -13067,9 +13086,6 @@ def _storeid_from_found(found: dict) -> tuple[Optional[int], str]:
 
 
 def _ensure_open_in_system(*, user: User, username: str, system_id: int, dry_run: bool) -> dict:
-    """
-    Создаёт open_in_system при отсутствии.
-    """
     exists = OpenInSystem.objects.filter(user_id=user.id, username=username, system_id=system_id).exists()
     if exists:
         return {"ok": True, "created": False, "message": "open_in_system уже есть"}
@@ -13077,7 +13093,6 @@ def _ensure_open_in_system(*, user: User, username: str, system_id: int, dry_run
     if dry_run:
         return {"ok": True, "created": False, "message": "DRY-RUN: создали бы open_in_system"}
 
-    # password тут неизвестен: кладём пустую строку (или можно 'N/A')
     OpenInSystem.objects.create(
         user_id=user.id,
         username=username,
@@ -13089,10 +13104,7 @@ def _ensure_open_in_system(*, user: User, username: str, system_id: int, dry_run
 
 
 def _ensure_ukm_user(*, user: User, storeid: int, roleid: int, dry_run: bool) -> dict:
-    """
-    Создаёт ukm_users при отсутствии.
-    """
-    exists = UKMUser.objects.filter(user=user, storeid=storeid).exists()
+    exists = UKMUser.objects.filter(user=user, storeid=int(storeid)).exists()
     if exists:
         return {"ok": True, "created": False, "message": "ukm_users уже есть"}
 
@@ -13108,82 +13120,124 @@ def _ensure_ukm_user(*, user: User, storeid: int, roleid: int, dry_run: bool) ->
     return {"ok": True, "created": True, "message": "ukm_users создан"}
 
 
-def _iterate_services_prefer_binuu00() -> list[str]:
+def _iterate_services_all() -> list[str]:
     """
-    Порядок поиска: сначала BINUU00, потом остальные ключи ORACLE_TNS_MAP (по алфавиту).
+    Все базы из ORACLE_TNS_MAP. Можно оставить приоритет BINUU00 первым,
+    но поиск идёт по ВСЕМ без break.
     """
     keys = list(ORACLE_TNS_MAP.keys())
-    rest = sorted([k for k in keys if k != "BINUU00"])
-    return (["BINUU00"] if "BINUU00" in keys else []) + rest
+    if "BINUU00" in keys:
+        rest = sorted([k for k in keys if k != "BINUU00"])
+        return ["BINUU00"] + rest
+    return sorted(keys)
+
+
+def _resolve_ukm_storeid_for_service(service_key: str, found_storeloc: Optional[int]) -> tuple[Optional[int], str]:
+    """
+    Определяем ukm storeid ДЛЯ ЭТОЙ базы:
+      1) если SMSTAFF дал storeloc → пробуем PG stores(smstore=storeloc) → ukm4store/ukm5store
+         если нет — берём REP.UKMStoreId по storeloc из Oracle
+      2) если storeloc нет → storeloc по REP.DBNAME = service_key → REP.UKMStoreId
+    """
+    # 1) storeloc есть
+    if found_storeloc is not None:
+        sloc = int(found_storeloc)
+        s = Store.objects.filter(smstore=sloc).first()
+        if s and (s.ukm4store or s.ukm5store):
+            return int(s.ukm4store or s.ukm5store), f"PG stores(smstore={sloc})"
+
+        ukm_id = _oracle_get_ukm_storeid_by_storeloc(service_key, sloc)
+        if ukm_id is not None:
+            return int(ukm_id), f"Oracle REP.UKMStoreId(storeloc={sloc})"
+        return None, f"storeloc={sloc}, но REP.UKMStoreId не найден"
+
+    # 2) storeloc нет → через REP.DBNAME
+    sloc = _oracle_get_storeloc_by_dbname(service_key, service_key)
+    if sloc is None:
+        return None, f"Не найден storeloc по REP.DBNAME={service_key}"
+    ukm_id = _oracle_get_ukm_storeid_by_storeloc(service_key, int(sloc))
+    if ukm_id is None:
+        return None, f"storeloc={sloc}, но REP.UKMStoreId не найден"
+    return int(ukm_id), f"Oracle REP.DBNAME->{sloc} then REP.UKMStoreId"
+
 
 
 def _sync_one_user(user: User, dry_run: bool) -> dict:
     """
-    Обработка одного пользователя. Возвращает итоговый dict для UI/логов.
+    ГЛАВНОЕ:
+    - ищем ИНН в КАЖДОЙ базе
+    - если нашли в базе → создаём ukm_users для storeid этой базы (каждый storeid)
+    - BINUU00 не исключение: тоже создаём ukm_users
     """
-    inn = (user.employee_id or "").strip()  # по твоему ТЗ: employee_id = ИНН для SMSTAFF
+    inn = (user.employee_id or "").strip()
+
     result = {
         "user_id": user.id,
         "fio": user.full_name,
         "employee_id": user.employee_id,
         "inn_used": inn,
-        "found": False,
-        "found_service": None,
-        "found_login": None,
-        "open_in_system": None,
-        "ukm_users": None,
+        "found_any": False,
+        "found_services": [],   # список находок по каждой базе
         "notes": [],
+        "search_trace": [],
     }
 
     if not inn:
-        result["notes"].append("Пустой employee_id — нечего искать в SMSTAFF")
+        result["notes"].append("Пустой employee_id — нечего искать")
         return result
 
-    found = None
-    for service_key in _iterate_services_prefer_binuu00():
+    for service_key in _iterate_services_all():
+        trace = {"service": service_key, "status": "try"}
         try:
-            f = _find_staff_in_service_by_inn(service_key, inn)
-            if f:
-                found = f
-                break
+            found = _find_staff_in_service_by_inn(service_key, inn)
+            if not found:
+                trace["status"] = "no"
+                result["search_trace"].append(trace)
+                continue
+
+            trace["status"] = "found"
+            result["search_trace"].append(trace)
+            result["found_any"] = True
+
+            login = found["login"]
+            storeloc = found.get("storeloc")
+
+            # open_in_system: BINUU00=4, остальные=5
+            system_id = 4 if service_key == "BINUU00" else 5
+            oi = _ensure_open_in_system(
+                user=user,
+                username=login,
+                system_id=system_id,
+                dry_run=dry_run
+            )
+
+            # storeid (UKM) именно этой базы
+            ukm_storeid, store_source = _resolve_ukm_storeid_for_service(service_key, storeloc)
+
+            if ukm_storeid is not None:
+                uu = _ensure_ukm_user(user=user, storeid=int(ukm_storeid), roleid=1, dry_run=dry_run)
+            else:
+                uu = {"ok": False, "created": False, "message": "Не удалось определить UKM storeid"}
+
+            result["found_services"].append({
+                "service": service_key,
+                "login": login,
+                "system_id": system_id,
+                "open_in_system": oi,
+                "storeloc": storeloc,
+                "ukm_storeid": ukm_storeid,
+                "store_source": store_source,
+                "ukm_users": uu,
+            })
+
         except Exception as e:
-            # не валим весь процесс из-за одной базы
-            result["notes"].append(f"[{service_key}] ошибка поиска: {e}")
+            trace["status"] = "error"
+            trace["error"] = str(e)
+            result["search_trace"].append(trace)
+            result["notes"].append(f"[{service_key}] ошибка: {e}")
 
-    if not found:
-        result["notes"].append("ИНН не найден в SMSTAFF ни в одной базе")
-        return result
-
-    result["found"] = True
-    result["found_service"] = found["service"]
-    result["found_login"] = found["login"]
-
-    # system_id
-    system_id = 4 if found["service"] == "BINUU00" else 5
-
-    # open_in_system
-    oi = _ensure_open_in_system(user=user, username=found["login"], system_id=system_id, dry_run=dry_run)
-    result["open_in_system"] = {
-        "system_id": system_id,
-        **oi
-    }
-
-    # ukm_users (только если не BINUU00)
-    if found["service"] != "BINUU00":
-        ukm_storeid, src = _storeid_from_found(found)
-        if not ukm_storeid:
-            result["ukm_users"] = {
-                "ok": False,
-                "created": False,
-                "message": f"Не смог определить storeid ({src})"
-            }
-        else:
-            uu = _ensure_ukm_user(user=user, storeid=ukm_storeid, roleid=1, dry_run=dry_run)
-            result["ukm_users"] = {
-                "storeid": ukm_storeid,
-                "source": src,
-                **uu
-            }
+    if not result["found_any"]:
+        result["notes"].append("ИНН не найден ни в одной базе")
 
     return result
 
@@ -13216,8 +13270,7 @@ def sm_sync_staff_stream(request):
     SSE stream:
       GET /sm/sync-staff/stream/?mode=test|real
 
-    ВАЖНО: mode=real реально пишет в Postgres.
-    Доступ ограничен staff (админская сессия).
+    mode=real пишет в Postgres.
     """
     mode = (request.GET.get("mode") or "test").strip().lower()
     dry_run = (mode != "real")
@@ -13228,10 +13281,10 @@ def sm_sync_staff_stream(request):
             "mode": mode,
             "dry_run": dry_run,
             "users_total": 0,
-            "found_total": 0,
-            "not_found_total": 0,
-            "open_created": 0,
-            "ukm_created": 0,
+            "found_total": 0,         # users found in ANY base
+            "not_found_total": 0,     # users found in NO bases
+            "open_created": 0,        # total created rows in open_in_system
+            "ukm_created": 0,         # total created rows in ukm_users
             "errors": 0,
             "started_at": start.isoformat(),
         }
@@ -13246,30 +13299,29 @@ def sm_sync_staff_stream(request):
         try:
             qs = User.objects.all().order_by("id")
             summary["users_total"] = qs.count()
-
             yield _sse_pack("meta", summary)
 
             for u in qs.iterator(chunk_size=200):
                 try:
-                    # важно: не держим большую atomic на весь процесс
                     if dry_run:
                         res = _sync_one_user(u, dry_run=True)
                     else:
                         with transaction.atomic():
                             res = _sync_one_user(u, dry_run=False)
 
-                    if res.get("found"):
+                    if res.get("found_any"):
                         summary["found_total"] += 1
                     else:
                         summary["not_found_total"] += 1
 
-                    oi = (res.get("open_in_system") or {})
-                    if oi.get("created"):
-                        summary["open_created"] += 1
-
-                    uu = (res.get("ukm_users") or {})
-                    if uu.get("created"):
-                        summary["ukm_created"] += 1
+                    # считаем созданные записи по всем найденным базам
+                    for item in (res.get("found_services") or []):
+                        oi = (item.get("open_in_system") or {})
+                        if oi.get("created"):
+                            summary["open_created"] += 1
+                        uu = (item.get("ukm_users") or {})
+                        if uu.get("created"):
+                            summary["ukm_created"] += 1
 
                     yield _sse_pack("user", res)
                     yield _sse_pack("meta", summary)
@@ -13286,7 +13338,6 @@ def sm_sync_staff_stream(request):
             finish = tz_now()
             summary["finished_at"] = finish.isoformat()
             summary["duration_sec"] = int((finish - start).total_seconds())
-
             yield _sse_pack("done", summary)
 
         finally:
@@ -13294,7 +13345,7 @@ def sm_sync_staff_stream(request):
 
     resp = StreamingHttpResponse(gen(), content_type="text/event-stream; charset=utf-8")
     resp["Cache-Control"] = "no-cache"
-    resp["X-Accel-Buffering"] = "no"  # чтобы nginx не буферизовал
+    resp["X-Accel-Buffering"] = "no"
     return resp
 
 
