@@ -1217,6 +1217,90 @@ def _ad_search_one(conn, search_base: str, ldap_filter: str, attrs: list[str]) -
     dn, at = res[0]
     return dn, at
 
+
+
+
+
+
+def _ad_first_str(attrs: dict, key: str) -> str:
+    v = (attrs or {}).get(key, []) or []
+    if not v:
+        return ""
+    try:
+        return v[0].decode("utf-8", "ignore").strip()
+    except Exception:
+        try:
+            return str(v[0]).strip()
+        except Exception:
+            return ""
+
+def ad_find_by_employee_id_conn(conn, inn: str) -> tuple[str, dict] | None:
+    f = f"(employeeID={escape_filter_chars(inn)})"
+    return _ad_search_one(
+        conn,
+        AD_SEARCH_BASE,
+        f,
+        ["displayName", "cn", "employeeID", "sAMAccountName", "mail", "memberOf", "department", "title"],
+    )
+
+def ad_find_users_by_department_conn(
+    conn,
+    dept_name: str,
+    page_size: int = 500,
+    max_total: int = 5000,
+) -> list[tuple[str, dict]]:
+    """
+    Ищем людей в AD по атрибуту department=dept_name.
+    Возвращаем список (dn, attrs). Пагинация через SimplePagedResultsControl.
+    """
+    dept_name = (dept_name or "").strip()
+    if not dept_name:
+        return []
+
+    # Только люди-пользователи, без disabled
+    ldap_filter = (
+        "(&"
+        "(objectCategory=person)"
+        "(objectClass=user)"
+        f"(department={escape_filter_chars(dept_name)})"
+        "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
+        ")"
+    )
+
+    attrs = ["displayName", "cn", "employeeID", "sAMAccountName", "mail", "memberOf", "department", "title"]
+
+    results: list[tuple[str, dict]] = []
+    cookie = b""
+
+    while True:
+        ctrl = SimplePagedResultsControl(True, size=page_size, cookie=cookie)
+        msgid = conn.search_ext(AD_SEARCH_BASE, ldap.SCOPE_SUBTREE, ldap_filter, attrlist=attrs, serverctrls=[ctrl])
+        rtype, rdata, rmsgid, serverctrls = conn.result3(msgid)
+
+        for dn, at in (rdata or []):
+            if not dn:
+                continue
+            results.append((dn, at))
+
+        cookie = b""
+        for c in (serverctrls or []):
+            if getattr(c, "controlType", None) == SimplePagedResultsControl.controlType:
+                cookie = getattr(c, "cookie", b"") or b""
+                break
+
+        if not cookie:
+            break
+
+        if len(results) >= max_total:
+            break
+
+    return results
+
+
+
+
+
+
 def ad_find_by_login(login: str) -> tuple[str, dict] | None:
     conn = None
     try:
@@ -1711,6 +1795,7 @@ def vpn_ui_users(request):
     users_by_dept: dict[int, list[dict]] = {}
     all_users_map: dict[int, dict] = {}
 
+    # Собираем пользователей Bitrix по каждому отделу (только активные)
     for did in all_dept_ids:
         bx_users = bitrix_user_get_all(
             filter_dict={"UF_DEPARTMENT": did},
@@ -1729,6 +1814,7 @@ def vpn_ui_users(request):
             except Exception:
                 pass
 
+    # Подмешиваем руководителей отделов (если в списке не оказалось)
     for did in all_dept_ids:
         d = by_id.get(did)
         if not d:
@@ -1751,111 +1837,219 @@ def vpn_ui_users(request):
                     pass
                 users_by_dept.setdefault(did, []).append(extra[0])
 
-    group_dn = None
+    # AD: открываем одно соединение на всю страницу (быстрее)
     conn = None
     try:
         conn = _ad_connect()
         group_dn = ad_find_group_dn(conn, VPN_GROUP_CN)
+        if not group_dn:
+            return render(request, "frostapp/vpn_users.html", {
+                "error": f"Группа безопасности {VPN_GROUP_CN} не найдена в AD.",
+                "dept_blocks": [],
+                "sid": str(sess.id),
+                "csrf": get_token(request),
+                "group_cn": VPN_GROUP_CN,
+                "auth_fio": auth_fio,
+                "total_subordinates": 0,
+            })
+
+        # Кэши
+        ad_by_inn_cache: dict[str, tuple[str, dict] | None] = {}
+
+        def ad_lookup_inn(inn: str) -> tuple[str, dict] | None:
+            if inn in ad_by_inn_cache:
+                return ad_by_inn_cache[inn]
+            got = ad_find_by_employee_id_conn(conn, inn)
+            ad_by_inn_cache[inn] = got
+            return got
+
+        dept_blocks = []
+        all_inns_set = set()
+
+        # Чтобы отфильтровать “не в Bitrix”
+        bitrix_inns_all = set()
+        bitrix_user_ids_all = set()
+
+        # Сначала пробежимся по Bitrix и соберём глобальные множества
+        for did in all_dept_ids:
+            for u in users_by_dept.get(did, []):
+                try:
+                    uid = int(u.get("ID"))
+                    bitrix_user_ids_all.add(uid)
+                except Exception:
+                    pass
+                inn0 = re.sub(r"\D+", "", (u.get(BITRIX_INN_FIELD) or "").strip())
+                if inn0:
+                    bitrix_inns_all.add(inn0)
+
+        # Глобальный дедуп AD-only (на случай если одинаково попадёт в 2 отдела)
+        ad_only_global_inns = set()
+
+        # Основной цикл по отделам: Bitrix rows + AD-only rows
+        for did in all_dept_ids:
+            d = by_id.get(did)
+            dept_title = _dept_name(d) if d else f"{did}"
+
+            rows = []
+            ad_only_rows = []
+
+            seen_uids = set()
+
+            # --- Bitrix rows ---
+            for u in users_by_dept.get(did, []):
+                try:
+                    uid = int(u.get("ID"))
+                except Exception:
+                    continue
+                if uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
+
+                inn = re.sub(r"\D+", "", (u.get(BITRIX_INN_FIELD) or "").strip())
+                position = (u.get("WORK_POSITION") or "").strip()
+
+                ad_found = False
+                ad_login = ""
+                in_group = None
+                ad_err = ""
+
+                if inn:
+                    all_inns_set.add(inn)
+                    try:
+                        ad = ad_lookup_inn(inn)
+                        if ad:
+                            ad_dn, ad_attrs = ad
+                            ad_found = True
+                            ad_login = _ad_first_str(ad_attrs, "sAMAccountName")
+                            in_group = ad_is_in_group(ad_attrs, group_dn)
+                        else:
+                            ad_err = "Не найден в AD по employeeID."
+                    except Exception as e:
+                        ad_err = str(e)
+                else:
+                    ad_err = f"В Bitrix не заполнено поле {BITRIX_INN_FIELD}."
+
+                fio = " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x]).strip()
+
+                rows.append({
+                    "bitrix_id": uid,
+                    "fio": fio,
+                    "position": position,
+                    "inn": inn,
+                    "ad_found": ad_found,
+                    "ad_login": ad_login,
+                    "vpn_open": bool(in_group) if in_group is not None else False,
+                    "vpn_known": (in_group is not None),
+                    "ad_err": ad_err,
+
+                    "vpn_period_kind": "NONE",
+                    "vpn_period_start_iso": "",
+                    "vpn_period_end_iso": "",
+                    "vpn_plan_kind": "",
+                    "vpn_plan_start_iso": "",
+                    "vpn_plan_end_iso": "",
+                })
+
+            # --- AD-only rows (по department) ---
+            # Пытаемся искать по dept_title, и если нет результатов — пробуем без префикса "Отдел "
+            dept_names_to_try = []
+            t = (dept_title or "").strip()
+            if t:
+                dept_names_to_try.append(t)
+                if t.lower().startswith("отдел "):
+                    dept_names_to_try.append(t[6:].strip())
+
+            ad_hits: list[tuple[str, dict]] = []
+            for nm in dept_names_to_try:
+                try:
+                    ad_hits = ad_find_users_by_department_conn(conn, nm, page_size=500, max_total=5000)
+                except Exception:
+                    ad_hits = []
+                if ad_hits:
+                    break
+
+            for dn, at in (ad_hits or []):
+                inn_ad = re.sub(r"\D+", "", _ad_first_str(at, "employeeID"))
+                if not inn_ad:
+                    continue
+                if not _INN_RE.match(inn_ad):
+                    continue
+
+                # если уже есть в Bitrix (по INN) — не считаем “не найден в Bitrix”
+                if inn_ad in bitrix_inns_all:
+                    continue
+
+                # дедуп глобально + по текущему отделу
+                if inn_ad in ad_only_global_inns:
+                    continue
+                ad_only_global_inns.add(inn_ad)
+
+                all_inns_set.add(inn_ad)
+
+                fio_ad = _ad_first_str(at, "displayName") or _ad_first_str(at, "cn") or "(без имени)"
+                login_ad = _ad_first_str(at, "sAMAccountName")
+                title_ad = _ad_first_str(at, "title")
+
+                in_group_ad = ad_is_in_group(at, group_dn)
+
+                ad_only_rows.append({
+                    "bitrix_id": "",  # важно: пусто
+                    "fio": fio_ad,
+                    "position": title_ad,
+                    "inn": inn_ad,
+                    "ad_found": True,
+                    "ad_login": login_ad,
+                    "vpn_open": bool(in_group_ad),
+                    "vpn_known": True,
+                    "ad_err": "",
+
+                    "vpn_period_kind": "NONE",
+                    "vpn_period_start_iso": "",
+                    "vpn_period_end_iso": "",
+                    "vpn_plan_kind": "",
+                    "vpn_plan_start_iso": "",
+                    "vpn_plan_end_iso": "",
+                })
+
+            dept_blocks.append({
+                "dept_id": did,
+                "dept_title": dept_title,
+                "rows": rows,
+                "ad_only_rows": ad_only_rows,
+                "rows_count": len(rows),
+                "ad_only_count": len(ad_only_rows),
+            })
+
+        # Периоды/планы для всех ИНН (Bitrix + AD-only)
+        period_map = _build_vpn_period_maps_for_ui(sorted(all_inns_set))
+        for b in dept_blocks:
+            for r in (b.get("rows") or []):
+                inn = r.get("inn") or ""
+                if inn and inn in period_map:
+                    r.update(period_map[inn])
+            for r in (b.get("ad_only_rows") or []):
+                inn = r.get("inn") or ""
+                if inn and inn in period_map:
+                    r.update(period_map[inn])
+
+        total_subordinates = len(bitrix_user_ids_all) + len(ad_only_global_inns)
+
+        return render(request, "frostapp/vpn_users.html", {
+            "error": "",
+            "dept_blocks": dept_blocks,
+            "sid": str(sess.id),
+            "csrf": get_token(request),
+            "group_cn": VPN_GROUP_CN,
+            "auth_fio": auth_fio,
+            "total_subordinates": total_subordinates,
+        })
+
     finally:
         try:
             if conn:
                 conn.unbind_s()
         except Exception:
             pass
-
-    if not group_dn:
-        return render(request, "frostapp/vpn_users.html", {
-            "error": f"Группа безопасности {VPN_GROUP_CN} не найдена в AD.",
-            "dept_blocks": [],
-            "sid": str(sess.id),
-            "csrf": get_token(request),
-            "group_cn": VPN_GROUP_CN,
-            "auth_fio": auth_fio,
-        })
-
-    dept_blocks = []
-    all_inns_set = set()
-
-    for did in all_dept_ids:
-        d = by_id.get(did)
-        dept_title = _dept_name(d) if d else f"{did}"
-
-        rows = []
-        seen_uids = set()
-
-        for u in users_by_dept.get(did, []):
-            try:
-                uid = int(u.get("ID"))
-            except Exception:
-                continue
-            if uid in seen_uids:
-                continue
-            seen_uids.add(uid)
-
-            inn = re.sub(r"\D+", "", (u.get(BITRIX_INN_FIELD) or "").strip())
-            position = (u.get("WORK_POSITION") or "").strip()
-
-            ad_found = False
-            ad_login = ""
-            in_group = None
-            ad_err = ""
-
-            if inn:
-                all_inns_set.add(inn)
-                try:
-                    ad = ad_find_by_employee_id(inn)
-                    if ad:
-                        ad_dn, ad_attrs = ad
-                        ad_found = True
-                        sam = ad_attrs.get("sAMAccountName", [b""])
-                        ad_login = (sam[0].decode("utf-8", "ignore") if sam else "")
-                        in_group = ad_is_in_group(ad_attrs, group_dn)
-                    else:
-                        ad_err = "Не найден в AD по employeeID."
-                except Exception as e:
-                    ad_err = str(e)
-            else:
-                ad_err = f"В Bitrix не заполнено поле {BITRIX_INN_FIELD}."
-
-            fio = " ".join([x for x in [u.get("LAST_NAME"), u.get("NAME"), u.get("SECOND_NAME")] if x]).strip()
-
-            rows.append({
-                "bitrix_id": uid,
-                "fio": fio,
-                "position": position,
-                "inn": inn,
-                "ad_found": ad_found,
-                "ad_login": ad_login,
-                "vpn_open": bool(in_group) if in_group is not None else False,
-                "vpn_known": (in_group is not None),
-                "ad_err": ad_err,
-
-                # будет заполнено ниже
-                "vpn_period_kind": "NONE",
-                "vpn_period_start_iso": "",
-                "vpn_period_end_iso": "",
-                "vpn_plan_kind": "",
-                "vpn_plan_start_iso": "",
-                "vpn_plan_end_iso": "",
-            })
-
-        dept_blocks.append({"dept_id": did, "dept_title": dept_title, "rows": rows})
-
-    period_map = _build_vpn_period_maps_for_ui(sorted(all_inns_set))
-    for b in dept_blocks:
-        for r in b["rows"]:
-            inn = r.get("inn") or ""
-            if inn and inn in period_map:
-                r.update(period_map[inn])
-
-    return render(request, "frostapp/vpn_users.html", {
-        "error": "",
-        "dept_blocks": dept_blocks,
-        "sid": str(sess.id),
-        "csrf": get_token(request),
-        "group_cn": VPN_GROUP_CN,
-        "auth_fio": auth_fio,
-    })
 
 
 @require_http_methods(["POST"])
