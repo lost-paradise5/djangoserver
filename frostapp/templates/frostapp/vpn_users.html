@@ -127,10 +127,12 @@
         <div class="muted" style="font-size:.92rem;">
           Вы авторизованы как <b>{{ auth_fio }}</b>
         </div>
+        <div class="muted" style="font-size:.92rem;">
+          Подчинённых: <b>{{ total_subordinates }}</b>
+        </div>
       </div>
 
       <div class="d-flex align-items-center gap-2">
-        <a class="btn btn-outline-primary btn-sm" href="{% url 'ad_ui_lookup' %}?sid={{ sid }}">Поиск сотрудников по логину</a>
         <a class="btn btn-outline-secondary btn-sm" href="{% url 'vpn_ui_login' %}">Выйти</a>
       </div>
     </div>
@@ -149,7 +151,14 @@
   {% for b in dept_blocks %}
     <div class="card mb-3">
       <div class="card-header">
-        <b>Отдел {{ b.dept_title }}</b>
+        <div class="d-flex justify-content-between align-items-center">
+          <b>Отдел {{ b.dept_title }}</b>
+          <div class="small" style="opacity:.88;">
+            {% if b.rows_count is not None or b.ad_only_count is not None %}
+              Bitrix: <b>{{ b.rows_count|default:0 }}</b> &nbsp;|&nbsp; AD-only: <b>{{ b.ad_only_count|default:0 }}</b>
+            {% endif %}
+          </div>
+        </div>
       </div>
 
       <div class="card-body p-0">
@@ -224,6 +233,66 @@
             {% empty %}
               <tr><td colspan="5" class="text-muted p-3">Нет сотрудников</td></tr>
             {% endfor %}
+
+            {% if b.ad_only_rows %}
+              <tr class="table-secondary">
+                <td colspan="5" class="fw-semibold">
+                  Не найдены в Битрикс, но есть в AD
+                </td>
+              </tr>
+
+              {% for r in b.ad_only_rows %}
+                <tr data-inn="{{ r.inn }}" data-bitrix-id="">
+                  <td class="fw-semibold">{{ r.fio }}</td>
+
+                  <td class="text-muted">
+                    {{ r.position|default_if_none:"" }}
+                  </td>
+
+                  <td><code>{{ r.inn }}</code></td>
+
+                  <td>
+                    <span class="badge text-bg-success">OK</span>
+                    <span class="text-muted ms-1">{{ r.ad_login }}</span>
+                  </td>
+
+                  <td class="text-end">
+                    {% if r.vpn_known and r.ad_found %}
+                      <div class="switch-wrap">
+                        <div class="d-flex flex-column align-items-end">
+
+                          <div class="form-check form-switch d-inline-flex align-items-center gap-2 m-0">
+                            <input class="form-check-input vpn-toggle"
+                                   type="checkbox"
+                                   {% if r.vpn_open %}checked{% endif %}>
+                            <span class="small vpn-state">
+                              {% if r.vpn_open %}Открыт{% else %}Закрыт{% endif %}
+                            </span>
+                            <span class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
+                          </div>
+
+                          <div class="text-muted small mt-1 vpn-period-text"
+                               data-kind="{{ r.vpn_period_kind|default:'' }}"
+                               data-start="{{ r.vpn_period_start_iso|default:'' }}"
+                               data-end="{{ r.vpn_period_end_iso|default:'' }}">
+                          </div>
+
+                          <div class="text-muted small vpn-plan-text"
+                               data-kind="{{ r.vpn_plan_kind|default:'' }}"
+                               data-start="{{ r.vpn_plan_start_iso|default:'' }}"
+                               data-end="{{ r.vpn_plan_end_iso|default:'' }}">
+                          </div>
+
+                        </div>
+                      </div>
+                    {% else %}
+                      <span class="text-muted">—</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            {% endif %}
+
             </tbody>
 
           </table>
@@ -396,7 +465,7 @@
     defaultHour: 0,
     defaultMinute: 0,
   });
-   const fpEnd = flatpickr(endAtEl, {
+  const fpEnd = flatpickr(endAtEl, {
     ...fpCommon,
     minuteIncrement: 1,     // важно для 23:59
     defaultHour: 23,
