@@ -6248,7 +6248,7 @@ def agent_auth_start(request):
     count = users_qs.count()
 
     if count == 0:
-        return JsonResponse({'status': 'error', 'message': 'Пользователь с таким телефоном не найден'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Пользователь с таким номером не найден'}, status=404)
 
     if count > 1:
         logger.error(
@@ -6257,7 +6257,7 @@ def agent_auth_start(request):
         )
         return JsonResponse({
             'status': 'error',
-            'message': 'Найдено несколько пользователей с таким телефоном, обратитесь к администратору'
+            'message': 'Найдено несколько пользователей с таким номером, обратитесь к администратору'
         }, status=409)
 
     user = users_qs.first()
