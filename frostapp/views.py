@@ -8620,16 +8620,39 @@ def get_devices_for_ids(*, tg_id: str, max_id: str) -> tuple[Optional[User], lis
 
 
 
-def get_devices_for_ids(*, tg_id: str, max_id: str) -> tuple[Optional[User], list[dict], str]:
+@csrf_exempt
+def pos_list_by_tg(request):
     """
-    Возвращает (user, devices, err_msg).
+    POST {"tg_id":"..."} или {"max_id":"..."} или оба -> список касс/КСО UKM4 + UKM5 с ip.
     """
-    user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
-    if not user:
-        return None, [], err
+    if request.method != "POST":
+        return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
 
-    user, devices = get_devices_for_user(user)
-    return user, devices, ""
+    try:
+        body = json.loads(request.body.decode("utf-8") if request.body else "{}")
+    except Exception:
+        return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
+
+    tg_id = str(body.get("tg_id") or "").strip()
+    max_id = str(body.get("max_id") or "").strip()
+
+    if not tg_id and not max_id:
+        return JsonResponse({"status": "error", "message": "Не указан tg_id или max_id"}, status=400)
+
+    user, devices, err = get_devices_for_ids(tg_id=tg_id, max_id=max_id)
+    if not user:
+        return JsonResponse({"status": "error", "message": err or "Пользователь не найден"}, status=404)
+
+    return JsonResponse(
+        {
+            "status": "ok",
+            "tg_id": str(getattr(user, "tg_id", "") or "").strip(),
+            "max_id": str(getattr(user, "max_id", "") or "").strip(),
+            "user_id": user.id,
+            "devices": devices,
+        },
+        json_dumps_params={"ensure_ascii": False},
+    )
 
 
 def _ssh_reboot(ip: str, *, username: str, password: str, use_sudo: bool) -> dict:
