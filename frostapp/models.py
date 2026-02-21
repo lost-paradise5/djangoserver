@@ -67,6 +67,7 @@ class Logs(models.Model):
 class User(models.Model):
     id = models.AutoField(primary_key=True)
     employee_id = models.CharField(max_length=20)
+    max_id = models.BigIntegerField(null=True, blank=True)
     encrypted_inn = models.CharField(max_length=128)
     full_name = models.CharField(max_length=255)
     mail = models.CharField(max_length=255)
