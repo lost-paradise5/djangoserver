@@ -6681,6 +6681,49 @@ def _get_existing_open_password(
 
 
 
+def _resolve_user_by_ids(*, tg_id: str, max_id: str) -> tuple[Optional[User], str]:
+    """
+    Возвращает (user, err_msg).
+    Принимает tg_id и/или max_id.
+    Если оба заданы — они обязаны указывать на одного и того же user.
+    """
+    tg_id = str(tg_id or "").strip()
+    max_id = str(max_id or "").strip()
+
+    if not tg_id and not max_id:
+        return None, "Не указан tg_id или max_id"
+
+    user_by_tg = None
+    user_by_max = None
+
+    if tg_id:
+        user_by_tg = User.objects.filter(tg_id=tg_id).first()
+        if not user_by_tg:
+            return None, "Пользователь не найден по tg_id"
+
+    if max_id:
+        user_by_max = User.objects.filter(max_id=max_id).first()
+        if not user_by_max:
+            return None, "Пользователь не найден по max_id"
+
+    if user_by_tg and user_by_max and user_by_tg.id != user_by_max.id:
+        return None, "tg_id и max_id принадлежат разным пользователям"
+
+    return (user_by_tg or user_by_max), ""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -6690,10 +6733,11 @@ def get_qr_code_by_tg(request):
     """
     READ-ONLY.
 
-    POST {"tg_id": "..."} -> возвращает существующий open_in_system.password (system_id=9)
+    POST {"tg_id": "..."} или {"max_id":"..."} или оба -> возвращает существующий open_in_system.password (system_id=9)
 
     Делает:
-      - находит пользователя по tg_id
+      - находит пользователя по tg_id/max_id
+      - если пришли оба — проверяет, что это один и тот же пользователь
       - валидирует employee_id как ИНН
       - проверяет ukm_users
       - читает существующий open_in_system.password (system_id=9) и возвращает
@@ -6714,15 +6758,15 @@ def get_qr_code_by_tg(request):
         try:
             data = json.loads(raw_body)
         except Exception as e:
-            logger.error(f"[QR/TG/RO] JSON parse error: {e}; body={raw_body!r}")
+            logger.error(f"[QR/RO] JSON parse error: {e}; body={raw_body!r}")
             send_telegram_log(
-                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Парсинг JSON\nПричина: {e}\n\n"
                 f"Сырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_TG",
+                method="BY_ID",
                 status="error",
                 user=None,
                 tg_id="",
@@ -6736,15 +6780,15 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
 
-        tg_id_val = data.get("tg_id", "")
-        tg_id = str(tg_id_val).strip()
+        tg_id = str(data.get("tg_id") or "").strip()
+        max_id = str(data.get("max_id") or "").strip()
 
-        if not tg_id:
-            msg = "Не указан tg_id"
-            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR по TG\nЭтап: Валидация\nПричина: {msg}")
+        if not tg_id and not max_id:
+            msg = "Не указан tg_id или max_id"
+            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR\nЭтап: Валидация\nПричина: {msg}")
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_TG",
+                method="BY_ID",
                 status="error",
                 user=None,
                 tg_id="",
@@ -6758,13 +6802,16 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": msg}, status=400)
 
-        user = User.objects.filter(tg_id=tg_id).first()
+        user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
         if not user:
-            msg = f"Пользователь с tg_id={tg_id!r} не найден"
-            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR по TG\nЭтап: Поиск пользователя\nПричина: {msg}")
+            msg = f"Пользователь не найден: {err} (tg_id={tg_id!r}, max_id={max_id!r})"
+            send_telegram_log(
+                "❌ Ошибка (READ-ONLY) при выдаче QR\n"
+                f"Этап: Поиск пользователя\nПричина: {msg}"
+            )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_TG",
+                method="BY_ID",
                 status="error",
                 user=None,
                 tg_id=tg_id,
@@ -6774,10 +6821,12 @@ def get_qr_code_by_tg(request):
                 phone_normalized="",
                 qr_data="",
                 error_message=f"Поиск пользователя: {msg}",
-                raw_request={"raw_body": raw_body} if raw_body else None,
+                raw_request={"raw_body": raw_body, "tg_id": tg_id, "max_id": max_id} if raw_body else None,
             )
             return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
+        # tg_id для логов — берём из user, если есть
+        tg_id_user = str(getattr(user, "tg_id", "") or "").strip()
         fio = " ".join((user.full_name or "").split()).strip()
         employee_id_raw = (user.employee_id or "").strip()
 
@@ -6786,23 +6835,24 @@ def get_qr_code_by_tg(request):
         except Exception as e:
             msg = f"Некорректный employee_id (ИНН) у user_id={user.id}: {e}"
             send_telegram_log(
-                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Валидация ИНН\nПричина: {msg}\n\n"
-                f"tg_id={tg_id}\nuser_id={user.id}\nФИО={fio or '—'}\nemployee_id={employee_id_raw!r}"
+                f"tg_id={tg_id_user or '—'}\nmax_id={getattr(user,'max_id','') or '—'}\n"
+                f"user_id={user.id}\nФИО={fio or '—'}\nemployee_id={employee_id_raw!r}"
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_TG",
+                method="BY_ID",
                 status="error",
                 user=user,
-                tg_id=tg_id,
+                tg_id=tg_id_user,
                 employee_inn=employee_id_raw,
                 employee_fio=fio,
                 phone_raw=user.phone or "",
                 phone_normalized=normalize_phone_ru(user.phone or "") or "",
                 qr_data="",
                 error_message=f"Валидация ИНН: {msg}",
-                raw_request={"raw_body": raw_body} if raw_body else None,
+                raw_request={"raw_body": raw_body, "tg_id": tg_id, "max_id": max_id} if raw_body else None,
             )
             return JsonResponse({"status": "error", "message": f"Некорректный employee_id: {e}"}, status=400)
 
@@ -6810,23 +6860,24 @@ def get_qr_code_by_tg(request):
         if not ukm_links:
             msg = f"Нет записей ukm_users для user_id={user.id}"
             send_telegram_log(
-                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n\n"
-                f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\ntg_id={tg_id}"
+                f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\n"
+                f"tg_id={tg_id_user or '—'}\nmax_id={getattr(user,'max_id','') or '—'}"
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_TG",
+                method="BY_ID",
                 status="error",
                 user=user,
-                tg_id=tg_id,
+                tg_id=tg_id_user,
                 employee_inn=plain_inn,
                 employee_fio=fio,
                 phone_raw=user.phone or "",
                 phone_normalized=normalize_phone_ru(user.phone or "") or "",
                 qr_data="",
                 error_message=f"Проверка доступов: {msg}",
-                raw_request={"raw_body": raw_body} if raw_body else None,
+                raw_request={"raw_body": raw_body, "tg_id": tg_id, "max_id": max_id} if raw_body else None,
             )
             return JsonResponse({"status": "error", "message": "Для пользователя нет записей в ukm_users"}, status=404)
 
@@ -6835,27 +6886,28 @@ def get_qr_code_by_tg(request):
         if not password:
             msg = f"Нет password в open_in_system (system_id=9) для user_id={user.id}"
             send_telegram_log(
-                "❌ Ошибка (READ-ONLY) при выдаче QR по TG\n"
+                "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Чтение open_in_system\nПричина: {msg}\n\n"
-                f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\ntg_id={tg_id}"
+                f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\n"
+                f"tg_id={tg_id_user or '—'}\nmax_id={getattr(user,'max_id','') or '—'}"
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_TG",
+                method="BY_ID",
                 status="error",
                 user=user,
-                tg_id=tg_id,
+                tg_id=tg_id_user,
                 employee_inn=plain_inn,
                 employee_fio=fio,
                 phone_raw=user.phone or "",
                 phone_normalized=normalize_phone_ru(user.phone or "") or "",
                 qr_data="",
                 error_message=f"open_in_system: {msg}",
-                raw_request={"raw_body": raw_body} if raw_body else None,
+                raw_request={"raw_body": raw_body, "tg_id": tg_id, "max_id": max_id} if raw_body else None,
             )
             return JsonResponse({"status": "error", "message": "У пользователя нет сохранённого QR (open_in_system)"}, status=404)
 
-        # Для логов/ответа: mapping ukm4store -> Store
+        # mapping ukm4store -> Store
         ukm_store_ids_str = [str(int(x["storeid"])) for x in ukm_links if str(x.get("storeid", "")).isdigit()]
         store_map = {
             str(s.ukm4store).strip(): s
@@ -6865,7 +6917,7 @@ def get_qr_code_by_tg(request):
         per_store_results = []
         for link in ukm_links:
             sid = int(link["storeid"])
-            role_id_db = int(link["roleid"])
+            role_id_db = int(link["roleid"]) if str(link.get("roleid", "")).isdigit() else None
             s_obj = store_map.get(str(sid))
             per_store_results.append({
                 "ukm_storeid": sid,
@@ -6877,12 +6929,13 @@ def get_qr_code_by_tg(request):
                 "found_in_trm": None,
             })
 
-        # Telegram-лог
+        # Telegram лог (сохраняем старый текст, но добавляем max_id)
         lines = [
-            "✅ QR-код запросили из Telegram-бота",
+            "✅ QR-код запросили из бота",
             "",
             "👤 Сотрудник:",
-            f"  • Telegram ID: {tg_id}",
+            f"  • Telegram ID: {tg_id_user or '—'}",
+            f"  • MAX ID: {getattr(user,'max_id','') or '—'}",
             f"  • user_id (PostgreSQL): {user.id}",
             f"  • ФИО: {fio or '—'}",
             f"  • ИНН: {plain_inn}",
@@ -6899,22 +6952,29 @@ def get_qr_code_by_tg(request):
         ]
         send_telegram_log("\n".join(lines))
 
-        # QRIssueLog по каждой связке store/role
+        # QRIssueLog
         phone_norm = normalize_phone_ru(user.phone or "") or ""
         try:
             raw_req = json.loads(raw_body) if raw_body else None
         except Exception:
             raw_req = {"raw_body": raw_body}
 
+        # дополняем raw_request, чтобы было видно, кто вызывал
+        if isinstance(raw_req, dict):
+            raw_req.setdefault("tg_id", tg_id)
+            raw_req.setdefault("max_id", max_id)
+            raw_req.setdefault("tg_id_user", tg_id_user)
+            raw_req.setdefault("max_id_user", getattr(user, "max_id", None))
+
         for r in per_store_results:
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_TG",
+                method="BY_ID",
                 status="ok",
                 user=user,
                 employee_inn=plain_inn,
                 employee_fio=fio,
-                tg_id=tg_id,
+                tg_id=tg_id_user,
                 phone_raw=user.phone or "",
                 phone_normalized=phone_norm,
                 sm_store_id=r["smstore"],
@@ -6930,13 +6990,15 @@ def get_qr_code_by_tg(request):
             "qr_data": password,
             "user_id": user.id,
             "stores": per_store_results,
+            "tg_id": tg_id_user,
+            "max_id": getattr(user, "max_id", None),
         })
 
     except Exception as e:
-        logger.exception("[QR/TG/RO] Unexpected error")
+        logger.exception("[QR/RO] Unexpected error")
         try:
             send_telegram_log(
-                "💥 Критическая ошибка (READ-ONLY) при выдаче QR по TG\n"
+                "💥 Критическая ошибка (READ-ONLY) при выдаче QR\n"
                 f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
             )
         except Exception:
@@ -7711,122 +7773,6 @@ def update_cashier(request):
         except Exception:
             pass
         return JsonResponse({"status": "error", "message": str(exc)}, status=500)
-# @csrf_exempt
-# def update_cashier(request):
-#     if request.method != 'POST':
-#         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
-
-#     try:
-#         data = json.loads(request.body)
-
-#         plain_inn = ensure_plain_inn(data.get('inn'))
-#         fio = data.get('fio')
-#         storeids = data.get('storeid')
-
-#         if not (plain_inn and fio and storeids):
-#             return JsonResponse({'status': 'error', 'message': 'inn, fio и storeid обязательны'}, status=400)
-
-#         store_ids = [int(s.strip()) for s in str(storeids).split(',') if s.strip().isdigit()]
-#         if not store_ids:
-#             return JsonResponse({'status': 'error', 'message': 'Некорректный storeid'}, status=400)
-
-#         user = User.objects.filter(employee_id=plain_inn, full_name=fio).first()
-#         if not user:
-#             return JsonResponse({'status': 'error', 'message': 'Пользователь не найден'}, status=404)
-
-#         open_rec = OpenInSystem.objects.filter(user_id=user.id, system_id=9).first()
-#         if not open_rec:
-#             return JsonResponse({'status': 'error', 'message': 'Пароль для пользователя не найден'}, status=500)
-#         password_plain = open_rec.password
-
-#         ukm_emp_id = get_trm_employee_id(plain_inn, fio)
-
-#         existing_storeids = set(UKMUser.objects.filter(user_id=user.id).values_list('storeid', flat=True))
-
-#         ukm_conn = connect_ukm()
-#         ukm_cursor = ukm_conn.cursor()
-#         ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
-#         cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
-#         ukm_conn.close()
-
-#         cashier_counter = 0
-#         added_storeids = []
-
-#         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-#         xml_dir = os.path.join(base_dir, 'xml')
-#         os.makedirs(xml_dir, exist_ok=True)
-
-#         for sid in store_ids:
-#             if sid in existing_storeids:
-#                 logger.info(f"[Пропуск] Доступ уже есть: storeid={sid}")
-#                 continue
-
-#             UKMUser.objects.create(user=user, roleid=1, storeid=sid, version=1)
-
-#             cashier_id = ukm_emp_id if ukm_emp_id else (cashier_id_base + cashier_counter)
-#             cashier_counter += 1
-
-#             info = get_store_info(sid)
-#             ukm4ip = info.get("ukm4ip")
-#             is_ukm5 = info.get("is_ukm5", False)
-
-#             if ukm4ip:
-#                 try:
-#                     conv = connect_store_mysql(ukm4ip)
-#                     cur = conv.cursor()
-
-#                     base_version = _calc_next_signal_version(cur)
-
-#                     cur.execute("""
-#                         INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-#                         VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-#                     """, (
-#                         sid, cashier_id, fio, plain_inn, mysql_pwd(password_plain), 1, base_version
-#                     ))
-#                     cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
-#                     conv.commit()
-#                     conv.close()
-#                     logger.info(f"[MySQL:{ukm4ip}] Доступ открыт store={sid}, id={cashier_id}, version={base_version}")
-#                 except Exception as exc:
-#                     logger.error(f"[MySQL:{ukm4ip}] Ошибка для {sid}: {exc}")
-#             else:
-#                 logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
-
-#             if is_ukm5:
-#                 try:
-#                     if sid == UKM5_FULL_XML_STORE_ID:
-#                         # Для магазина 2013 всегда пересборка полного XML
-#                         xml_path = build_full_ukm5_xml_for_store(sid)
-#                         logger.info(
-#                             f"[XML] Полный XML пересобран для УКМ5 магазина {sid}: {xml_path}"
-#                         )
-#                     else:
-#                         # Остальные УКМ5 — точечное добавление кассира
-#                         xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
-
-#                         c_el = ET.SubElement(root, "cashier")
-#                         ET.SubElement(c_el, "roleId").text = "1"
-#                         ET.SubElement(c_el, "id").text = str(cashier_id)
-#                         ET.SubElement(c_el, "name").text = fio
-#                         ET.SubElement(c_el, "INN").text = plain_inn
-#                         ET.SubElement(c_el, "password").text = password_plain
-
-#                         _write_xml_with_declaration(xml_path, root, ensure_base=True)
-#                         logger.info(f"[XML] Обновлён файл {xml_path}")
-#                 except Exception as exc:
-#                     logger.error(f"[XML] Ошибка для {sid}: {exc}")
-
-#             added_storeids.append(sid)
-
-#         if not added_storeids:
-#             return JsonResponse({'status': 'ok', 'message': 'У пользователя уже был доступ ко всем указанным магазинам'})
-
-#         return JsonResponse({'status': 'ok', 'message': 'Доступ открыт', 'added': added_storeids})
-
-#     except Exception as exc:
-#         logger.exception("open_access_cashier error")
-#         return JsonResponse({'status': 'error', 'message': str(exc)}, status=500)
-
 
 
 @csrf_exempt
@@ -8350,7 +8296,87 @@ def employee_identification(request):
 
 
 
+def get_devices_for_user(user: User) -> tuple[Optional[User], list[dict]]:
+    if not user:
+        return None, []
 
+    ukm_links = list(
+        UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid")
+    )
+    if not ukm_links:
+        return user, []
+
+    # storeid -> roleid (берём первый ненулевой, если есть)
+    roles_by_store: dict[int, int | None] = {}
+    store_ids: list[int] = []
+    for x in ukm_links:
+        sid_raw = x.get("storeid")
+        rid_raw = x.get("roleid")
+        if str(sid_raw).isdigit():
+            sid = int(sid_raw)
+            store_ids.append(sid)
+            if sid not in roles_by_store:
+                roles_by_store[sid] = int(rid_raw) if str(rid_raw).isdigit() else None
+
+    store_ids = sorted(set(store_ids))
+    if not store_ids:
+        return user, []
+
+    # ukm4store -> Store из Postgres (если есть)
+    store_map = {
+        int(s.ukm4store): s
+        for s in Store.objects.filter(ukm4store__in=store_ids)
+        if s.ukm4store is not None
+    }
+
+    devices: list[dict] = []
+
+    for ukm4_storeid in store_ids:
+        role_id = roles_by_store.get(ukm4_storeid)
+
+        # 1) smstore пытаемся взять из таблицы Store
+        s_obj = store_map.get(int(ukm4_storeid))
+        smstore = getattr(s_obj, "smstore", None)
+
+        # 2) если нет — пробуем достать smstore через Oracle по ukm4_storeid
+        if smstore is None:
+            try:
+                info_by_ukm = get_store_info(ukm4_storeid)
+                smstore = info_by_ukm.get("smstore")
+            except Exception:
+                smstore = None
+
+        if smstore is None:
+            logger.warning(f"[POS] smstore not resolved for ukm4store={ukm4_storeid}")
+            continue
+
+        # 1) UKM4 кассы
+        try:
+            devices.extend(
+                fetch_ukm4_pos_list(
+                    ukm4_storeid=int(ukm4_storeid),
+                    smstore=int(smstore),
+                    role_id=role_id,
+                )
+            )
+        except Exception as e:
+            logger.exception(f"[POS] UKM4 list error ukm4store={ukm4_storeid}, smstore={smstore}: {e}")
+
+        # 2) UKM5 кассы — только если Oracle магазин помечен как UKM5
+        try:
+            info = get_store_info(int(smstore))
+            if info.get("is_ukm5", False):
+                devices.extend(
+                    fetch_ukm5_pos_list(
+                        smstore=int(smstore),
+                        ukm4_storeid=int(ukm4_storeid),
+                        role_id=role_id,
+                    )
+                )
+        except Exception as e:
+            logger.exception(f"[POS] UKM5 list error smstore={smstore}: {e}")
+
+    return user, devices
 
 
 
@@ -8575,118 +8601,35 @@ def get_devices_for_tg_id(tg_id: str) -> tuple[Optional[User], list[dict]]:
     if not user:
         return None, []
 
-    ukm_links = list(
-        UKMUser.objects
-        .filter(user_id=user.id)
-        .values("storeid", "roleid")
-    )
-    if not ukm_links:
-        return user, []
-
-    # storeid -> roleid (берём первый ненулевой, если есть)
-    roles_by_store: dict[int, int | None] = {}
-    store_ids: list[int] = []
-    for x in ukm_links:
-        sid_raw = x.get("storeid")
-        rid_raw = x.get("roleid")
-        if str(sid_raw).isdigit():
-            sid = int(sid_raw)
-            store_ids.append(sid)
-            if sid not in roles_by_store:
-                roles_by_store[sid] = int(rid_raw) if str(rid_raw).isdigit() else None
-
-    store_ids = sorted(set(store_ids))
-    if not store_ids:
-        return user, []
-
-    # ukm4store -> Store из Postgres (если есть)
-    store_map = {
-        int(s.ukm4store): s
-        for s in Store.objects.filter(ukm4store__in=store_ids)
-        if s.ukm4store is not None
-    }
-
-    devices: list[dict] = []
-
-    for ukm4_storeid in store_ids:
-        role_id = roles_by_store.get(ukm4_storeid)
-
-        # 1) smstore пытаемся взять из таблицы Store
-        s_obj = store_map.get(int(ukm4_storeid))
-        smstore = getattr(s_obj, "smstore", None)
-
-        # 2) если нет — пробуем достать smstore через Oracle по ukm4_storeid
-        if smstore is None:
-            try:
-                info_by_ukm = get_store_info(ukm4_storeid)  # умеет маппить REP.UKMStoreId -> STORELOC
-                smstore = info_by_ukm.get("smstore")
-            except Exception:
-                smstore = None
-
-        if smstore is None:
-            logger.warning(f"[POS] smstore not resolved for ukm4store={ukm4_storeid}")
-            continue
-
-        # 1) UKM4 кассы
-        try:
-            devices.extend(
-                fetch_ukm4_pos_list(
-                    ukm4_storeid=int(ukm4_storeid),
-                    smstore=int(smstore),
-                    role_id=role_id,
-                )
-            )
-        except Exception as e:
-            logger.exception(f"[POS] UKM4 list error ukm4store={ukm4_storeid}, smstore={smstore}: {e}")
-
-        # 2) UKM5 кассы — только если Oracle магазин помечен как UKM5
-        try:
-            info = get_store_info(int(smstore))
-            if info.get("is_ukm5", False):
-                devices.extend(
-                    fetch_ukm5_pos_list(
-                        smstore=int(smstore),
-                        ukm4_storeid=int(ukm4_storeid),
-                        role_id=role_id,
-                    )
-                )
-        except Exception as e:
-            logger.exception(f"[POS] UKM5 list error smstore={smstore}: {e}")
-
-    return user, devices
+    return get_devices_for_user(user)
 
 
-@csrf_exempt
-def pos_list_by_tg(request):
+
+def get_devices_for_ids(*, tg_id: str, max_id: str) -> tuple[Optional[User], list[dict], str]:
     """
-    POST {"tg_id":"..."} -> список касс/КСО UKM4 + UKM5 с ip.
+    Возвращает (user, devices, err_msg).
     """
-    if request.method != "POST":
-        return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
-
-    try:
-        body = json.loads(request.body.decode("utf-8") if request.body else "{}")
-    except Exception:
-        return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
-
-    tg_id = str(body.get("tg_id") or "").strip()
-    if not tg_id:
-        return JsonResponse({"status": "error", "message": "Не указан tg_id"}, status=400)
-
-    user, devices = get_devices_for_tg_id(tg_id)
+    user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
     if not user:
-        return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
+        return None, [], err
 
-    # Отдадим ровно то, что тебе нужно
-    return JsonResponse(
-        {
-            "status": "ok",
-            "tg_id": tg_id,
-            "user_id": user.id,
-            "devices": devices
-        },
-        json_dumps_params={"ensure_ascii": False},
-    )
+    user, devices = get_devices_for_user(user)
+    return user, devices, ""
+
+
+
+
+
+def get_devices_for_ids(*, tg_id: str, max_id: str) -> tuple[Optional[User], list[dict], str]:
+    """
+    Возвращает (user, devices, err_msg).
+    """
+    user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
+    if not user:
+        return None, [], err
+
+    user, devices = get_devices_for_user(user)
+    return user, devices, ""
 
 
 def _ssh_reboot(ip: str, *, username: str, password: str, use_sudo: bool) -> dict:
@@ -8750,6 +8693,7 @@ def pos_reboot(request):
         return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
 
     tg_id = str(body.get("tg_id") or "").strip()
+    max_id = str(body.get("max_id") or "").strip()
     ip = str(body.get("ip") or "").strip()
 
     # эти поля могут присылать, но мы НЕ доверяем им (используем только для сверки/логов)
@@ -8757,16 +8701,19 @@ def pos_reboot(request):
     req_ukm5 = body.get("ukm5", None)
     req_is_kso = body.get("is_kso", None)
 
-    if not tg_id or not ip:
-        return JsonResponse({"status": "error", "message": "Нужны tg_id и ip"}, status=400)
+    if (not tg_id and not max_id) or not ip:
+        return JsonResponse({"status": "error", "message": "Нужны tg_id/max_id и ip"}, status=400)
 
     if not _ip_allowed(ip):
         return JsonResponse({"status": "error", "message": f"IP {ip} запрещён (allowlist)"}, status=403)
 
     # 1) ищем пользователя и все его устройства
-    user, devices = get_devices_for_tg_id(tg_id)
+    user, devices, err = get_devices_for_ids(tg_id=tg_id, max_id=max_id)
     if not user:
-        return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
+        return JsonResponse({"status": "error", "message": err or "Пользователь не найден"}, status=404)
+
+    # tg_id для логов
+    tg_id_user = str(getattr(user, "tg_id", "") or "").strip()
 
     # 2) находим устройство по IP (и берём ВСЮ правду из него)
     dev = next((d for d in devices if str(d.get("ip") or "").strip() == ip), None)
@@ -8790,18 +8737,16 @@ def pos_reboot(request):
     if not (ukm4 or ukm5):
         return JsonResponse({"status": "error", "message": "Некорректное устройство: не ukm4 и не ukm5"}, status=500)
 
-    # нормальные поля устройства
     cash_id = dev.get("cash_id")
     name = dev.get("name") or ""
-    ssh_user = dev.get("ssh_user") or ""
     sm_store_id = dev.get("sm_store_id")
     ukm_store_id = dev.get("ukm_store_id")
     role_id = dev.get("role_id")
 
     kind = _pos_kind_label(ukm4=ukm4, ukm5=ukm5, is_kso=is_kso)
-    cmd_hint, use_sudo_hint = _device_cmd_hint(ukm4=ukm4, ukm5=ukm5, is_kso=is_kso)
+    cmd_hint, _use_sudo_hint = _device_cmd_hint(ukm4=ukm4, ukm5=ukm5, is_kso=is_kso)
 
-    # 3) выбираем ssh-логин и пароль (УЖЕ по реальному типу)
+    # 3) выбираем ssh-логин и пароль (по реальному типу)
     if ukm5:
         username = "ukm5"
         password = SSH_UKM5_PASSWORD
@@ -8822,23 +8767,21 @@ def pos_reboot(request):
     initiator_name = _human_user_name(user)
 
     logger.info(
-        f"[POS/REBOOT] start: tg_id={tg_id} user_id={user.id} "
+        f"[POS/REBOOT] start: tg_id={tg_id_user or '—'} max_id={getattr(user,'max_id','') or '—'} user_id={user.id} "
         f"initiator={initiator_name!r} ip={ip} kind={kind} "
         f"sm_store_id={sm_store_id} ukm_store_id={ukm_store_id} role_id={role_id} "
         f"ssh_user={username} cash_id={cash_id} name={name!r}"
     )
 
-    # 4) выполняем reboot + логируем в QRIssueLog + Telegram
     try:
         res = _ssh_reboot(ip, username=username, password=password, use_sudo=use_sudo)
 
-        # DB лог
         log_qr_issue(
             endpoint="pos_reboot",
             method="POS_REBOOT",
             status="ok",
             user=user,
-            tg_id=tg_id,
+            tg_id=tg_id_user,
             sm_store_id=int(sm_store_id) if str(sm_store_id).isdigit() else sm_store_id,
             ukm_store_id=int(ukm_store_id) if str(ukm_store_id).isdigit() else ukm_store_id,
             role_id=int(role_id) if str(role_id).isdigit() else role_id,
@@ -8850,6 +8793,7 @@ def pos_reboot(request):
             error_message="",
             raw_request={
                 "request": body,
+                "resolved": {"tg_id": tg_id_user, "max_id": getattr(user, "max_id", None), "user_id": user.id},
                 "device": dev,
                 "ssh_user": username,
                 "ssh_port": POS_SSH_PORT,
@@ -8858,82 +8802,14 @@ def pos_reboot(request):
             },
         )
 
-        # Telegram лог (читабельно)
         msg_lines = [
             "🔁 Перезагрузка кассы",
             "",
             "👤 Инициатор:",
             f"  • {initiator_name}",
             f"  • user_id: {user.id}",
-            f"  • tg_id: {tg_id}",
-            "",
-            "🏬 Магазин:",
-            f"  • ukm_store_id (ukm_users.storeid): {ukm_store_id if ukm_store_id is not None else '—'}",
-            f"  • sm_store_id (stores.smstore / Oracle STORELOC): {sm_store_id if sm_store_id is not None else '—'}",
-            f"  • role_id: {role_id if role_id is not None else '—'}",
-            "",
-            "💻 Касса:",
-            f"  • Тип: {kind}",
-            f"  • name: {name or '—'}",
-            f"  • cash_id: {cash_id if cash_id is not None else '—'}",
-            f"  • ip: {ip}",
-            "",
-            "🔐 SSH:",
-            f"  • user: {username}",
-            f"  • port: {POS_SSH_PORT}",
-            f"  • cmd: {cmd_hint}",
-            "",
-            "✅ Результат:",
-            f"  • ok: {res.get('ok')}",
-            f"  • stdout: {res.get('stdout') or '—'}",
-            f"  • stderr: {res.get('stderr') or '—'}",
-        ]
-        send_telegram_log("\n".join(msg_lines))
-
-        return JsonResponse(
-            {"status": "ok", "result": res},
-            json_dumps_params={"ensure_ascii": False},
-        )
-
-    except Exception as e:
-        logger.exception(f"[POS/REBOOT] error: {e}")
-
-        # DB лог ошибки
-        try:
-            log_qr_issue(
-                endpoint="pos_reboot",
-                method="POS_REBOOT",
-                status="error",
-                user=user,
-                tg_id=tg_id,
-                sm_store_id=int(sm_store_id) if str(sm_store_id).isdigit() else sm_store_id,
-                ukm_store_id=int(ukm_store_id) if str(ukm_store_id).isdigit() else ukm_store_id,
-                role_id=int(role_id) if str(role_id).isdigit() else role_id,
-                employee_inn="",
-                employee_fio="",
-                phone_raw="",
-                phone_normalized="",
-                qr_data="",
-                error_message=str(e),
-                raw_request={
-                    "request": body,
-                    "device": dev,
-                    "ssh_user": username,
-                    "ssh_port": POS_SSH_PORT,
-                    "cmd": cmd_hint,
-                },
-            )
-        except Exception:
-            logger.exception("[POS/REBOOT] failed to write QRIssueLog")
-
-        # Telegram лог ошибки
-        msg_lines = [
-            "❌ Ошибка перезагрузки кассы",
-            "",
-            "👤 Инициатор:",
-            f"  • {initiator_name}",
-            f"  • user_id: {user.id}",
-            f"  • tg_id: {tg_id}",
+            f"  • tg_id: {tg_id_user or '—'}",
+            f"  • max_id: {getattr(user,'max_id','') or '—'}",
             "",
             "🏬 Магазин:",
             f"  • ukm_store_id: {ukm_store_id if ukm_store_id is not None else '—'}",
@@ -8946,20 +8822,66 @@ def pos_reboot(request):
             f"  • cash_id: {cash_id if cash_id is not None else '—'}",
             f"  • ip: {ip}",
             "",
-            "🔐 SSH:",
-            f"  • user: {username}",
-            f"  • port: {POS_SSH_PORT}",
-            f"  • cmd: {cmd_hint}",
+            "✅ Результат:",
+            f"  • ok: {res.get('ok')}",
+            f"  • stdout: {res.get('stdout') or '—'}",
+            f"  • stderr: {res.get('stderr') or '—'}",
+        ]
+        send_telegram_log("\n".join(msg_lines))
+
+        return JsonResponse({"status": "ok", "result": res}, json_dumps_params={"ensure_ascii": False})
+
+    except Exception as e:
+        logger.exception(f"[POS/REBOOT] error: {e}")
+
+        try:
+            log_qr_issue(
+                endpoint="pos_reboot",
+                method="POS_REBOOT",
+                status="error",
+                user=user,
+                tg_id=tg_id_user,
+                sm_store_id=int(sm_store_id) if str(sm_store_id).isdigit() else sm_store_id,
+                ukm_store_id=int(ukm_store_id) if str(ukm_store_id).isdigit() else ukm_store_id,
+                role_id=int(role_id) if str(role_id).isdigit() else role_id,
+                employee_inn="",
+                employee_fio="",
+                phone_raw="",
+                phone_normalized="",
+                qr_data="",
+                error_message=str(e),
+                raw_request={
+                    "request": body,
+                    "resolved": {"tg_id": tg_id_user, "max_id": getattr(user, "max_id", None), "user_id": user.id},
+                    "device": dev,
+                    "ssh_user": username,
+                    "ssh_port": POS_SSH_PORT,
+                    "cmd": cmd_hint,
+                },
+            )
+        except Exception:
+            logger.exception("[POS/REBOOT] failed to write QRIssueLog")
+
+        msg_lines = [
+            "❌ Ошибка перезагрузки кассы",
+            "",
+            "👤 Инициатор:",
+            f"  • {initiator_name}",
+            f"  • user_id: {user.id}",
+            f"  • tg_id: {tg_id_user or '—'}",
+            f"  • max_id: {getattr(user,'max_id','') or '—'}",
+            "",
+            "💻 Касса:",
+            f"  • Тип: {kind}",
+            f"  • name: {name or '—'}",
+            f"  • cash_id: {cash_id if cash_id is not None else '—'}",
+            f"  • ip: {ip}",
             "",
             f"🧨 Ошибка: {e}",
         ]
         send_telegram_log("\n".join(msg_lines))
 
-        return JsonResponse(
-            {"status": "error", "message": str(e)},
-            status=500,
-            json_dumps_params={"ensure_ascii": False},
-        )
+        return JsonResponse({"status": "error", "message": str(e)}, status=500, json_dumps_params={"ensure_ascii": False})
 
 
 
