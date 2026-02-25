@@ -10859,7 +10859,9 @@ def tg_admin_badge_start(request):
     if not channel:
         return JsonResponse({"status": "error", "message": "tg_id or max_id required"}, status=400)
 
-    user = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id, channel=channel)
+    user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
+    if err:
+        return JsonResponse({"status":"error","message": err}, status=404)
     if not user:
         send_telegram_log(
             "\n".join([
