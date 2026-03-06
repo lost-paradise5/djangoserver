@@ -206,7 +206,7 @@ INN_SYNC_ORACLE_CALL_TIMEOUT_MS = int(os.getenv("INN_SYNC_ORACLE_CALL_TIMEOUT_MS
 INN_SYNC_SLOW_STEP_WARN_SEC = float(os.getenv("INN_SYNC_SLOW_STEP_WARN_SEC", "10"))
 
 # Для MAX
-MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
+MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "f9LHodD0cOLB5T7-pExgJ_hpfhRlo6c71eHipQzkJpONY4RosjHynb9NbY6bDk7ermUnV2IJnEbal0A-oRzl")
 MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api.max.ru")
 MAX_HTTP_TIMEOUT = int(os.getenv("MAX_HTTP_TIMEOUT", "10"))
 
