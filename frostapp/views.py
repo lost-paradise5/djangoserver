@@ -6450,8 +6450,6 @@ def agent_auth_start(request):
             'id': user.id,
             'fio': user.full_name,
         },
-        'stores_count': len(stores_payload),
-        'stores': stores_payload,
     })
     
     
