@@ -9917,6 +9917,135 @@ def _ui_has_col(cols_set: set[str], col: str) -> bool:
     return col.upper() in cols_set
 
 
+
+
+
+#10.03.2026 Для создания пользователя в СМ (первая версия)
+
+_SM_ACHECK_CHOICES = [
+    {"value": "-1", "label": "-1 — нового не создавать, работать только с существующим"},
+    {"value": "0",  "label": "0 — если пользователь уже есть, ничего не делать"},
+    {"value": "1",  "label": "1 — если пользователь уже есть, поменять должность/пароль"},
+    {"value": "2",  "label": "2 — удалить пользователя"},
+]
+
+_SM_USERENABLED_CHOICES = [
+    {"value": "-1", "label": "-1 — не менять статус"},
+    {"value": "1",  "label": "1 — активировать пользователя"},
+    {"value": "0",  "label": "0 — заблокировать пользователя"},
+]
+
+
+def _is_valid_inn_digits(inn: str) -> bool:
+    inn = (inn or "").strip()
+    return inn.isdigit() and len(inn) in (10, 12)
+
+
+def _generate_sm_password(length: int = 4) -> str:
+    return "".join(random.choices(string.digits, k=length))
+
+
+def _is_valid_sm_login(login: str) -> bool:
+    """
+    Разрешаем логины формата:
+    t_test, i.ivanov, user-1, user_1
+    """
+    login = (login or "").strip()
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,64}", login))
+
+
+def _oracle_fetch_smoffcfg_choices(cur) -> list[dict]:
+    cur.execute("""
+        SELECT id, title
+        FROM smoffcfg
+        ORDER BY title
+    """)
+    items = []
+    for row in cur.fetchall():
+        items.append({
+            "id": row[0],
+            "title": row[1],
+        })
+    return items
+
+
+def _oracle_fetch_smstaff_conflicts(cur, login: str, inn: str) -> list[dict]:
+    """
+    Ищем существующих пользователей по логину и/или ИНН.
+    """
+    cur.execute("""
+        SELECT
+            s.id,
+            s.surname,
+            s.name,
+            s.patronymic,
+            s.serverlogin,
+            s.inn,
+            s.userenabled,
+            s.offindex,
+            (
+                SELECT c.title
+                FROM smoffcfg c
+                WHERE c.id = s.offindex
+                  AND ROWNUM = 1
+            ) AS off_title
+        FROM smstaff s
+        WHERE LOWER(TRIM(s.serverlogin)) = :b_login
+           OR TRIM(s.inn) = :b_inn
+        ORDER BY s.id
+    """, b_login=(login or "").strip().lower(), b_inn=(inn or "").strip())
+
+    return _oracle_rows_to_jsonable(cur)
+
+
+def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
+    cur.execute("""
+        SELECT
+            s.id,
+            s.surname,
+            s.name,
+            s.patronymic,
+            s.serverlogin,
+            s.inn,
+            s.userenabled,
+            s.offindex,
+            (
+                SELECT c.title
+                FROM smoffcfg c
+                WHERE c.id = s.offindex
+                  AND ROWNUM = 1
+            ) AS off_title
+        FROM smstaff s
+        WHERE LOWER(TRIM(s.serverlogin)) = :b_login
+        ORDER BY s.id
+    """, b_login=(login or "").strip().lower())
+
+    return _oracle_rows_to_jsonable(cur)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @require_http_methods(["GET"])
 def sm_staff_ui_list(request):
     """
@@ -9926,8 +10055,8 @@ def sm_staff_ui_list(request):
     services = _ui_services_list()
     db = (request.GET.get("db") or "").strip().upper()
     if not db:
-        # по умолчанию первая база
         db = services[0] if services else "BINUU00"
+
     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
         return render(request, "frostapp/smstaff_list.html", {
             "services": services,
@@ -9935,60 +10064,89 @@ def sm_staff_ui_list(request):
             "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
             "items": [],
         })
+
     login = (request.GET.get("login") or "").strip().lower()
     inn = (request.GET.get("inn") or "").strip()
     only_enabled = (request.GET.get("only_enabled") or "").strip().lower() in ("1", "true", "yes", "on")
+
     try:
         page = int(request.GET.get("page", "1"))
     except ValueError:
         page = 1
+
     try:
         page_size = int(request.GET.get("page_size", "50"))
     except ValueError:
         page_size = 50
+
     page = max(1, page)
     page_size = max(10, min(200, page_size))
     offset = (page - 1) * page_size
+
     conn = cur = None
     items = []
     total = 0
     cols_present = []
+
     try:
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
+
         cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
         cols_present = sorted(list(cols_set))
-        def SEL(col: str) -> str:
-            # если колонки нет — отдадим NULL
-            return col if _ui_has_col(cols_set, col) else f"NULL AS {col}"
-        select_sql = ", ".join([
-            SEL("id"),
-            SEL("surname"),
-            SEL("name"),
-            SEL("patronymic"),
-            SEL("serverlogin"),
-            SEL("inn"),
-            SEL("userenabled"),
-        ])
+
+        def SEL(alias: str, col: str) -> str:
+            return f"{alias}.{col} AS {col}" if _ui_has_col(cols_set, col) else f"NULL AS {col}"
+
+        select_parts = [
+            SEL("s", "id"),
+            SEL("s", "surname"),
+            SEL("s", "name"),
+            SEL("s", "patronymic"),
+            SEL("s", "serverlogin"),
+            SEL("s", "inn"),
+            SEL("s", "userenabled"),
+        ]
+
+        if _ui_has_col(cols_set, "offindex"):
+            select_parts.append("s.offindex AS offindex")
+            select_parts.append("""
+                (
+                    SELECT c.title
+                    FROM smoffcfg c
+                    WHERE c.id = s.offindex
+                      AND ROWNUM = 1
+                ) AS off_title
+            """)
+        else:
+            select_parts.append("NULL AS offindex")
+            select_parts.append("NULL AS off_title")
+
+        select_sql = ", ".join(select_parts)
+
         where = []
         binds = {}
+
         if only_enabled and _ui_has_col(cols_set, "userenabled"):
-            where.append("(userenabled = '1' OR userenabled = 1)")
+            where.append("(s.userenabled = '1' OR s.userenabled = 1)")
+
         if login and _ui_has_col(cols_set, "serverlogin"):
-            where.append("LOWER(serverlogin) LIKE :b_login")
+            where.append("LOWER(s.serverlogin) LIKE :b_login")
             binds["b_login"] = f"%{login}%"
+
         if inn and _ui_has_col(cols_set, "inn"):
-            # ищем подстрокой (удобно), но можно заменить на "=" если нужно строго
-            where.append("TRIM(inn) LIKE :b_inn")
+            where.append("TRIM(s.inn) LIKE :b_inn")
             binds["b_inn"] = f"%{inn}%"
-        base_from = f"FROM smstaff"
+
+        base_from = "FROM smstaff s"
         if where:
             base_from += " WHERE " + " AND ".join(where)
-        # total count
+
         cur.execute(f"SELECT COUNT(*) {base_from}", binds)
         total = int(cur.fetchone()[0])
-        # ORDER BY для пагинации
+
         order_expr = "surname" if _ui_has_col(cols_set, "surname") else "id"
+
         sql = f"""
             SELECT *
             FROM (
@@ -10001,11 +10159,14 @@ def sm_staff_ui_list(request):
             WHERE rn > :b_off
               AND rn <= :b_to
         """
+
         binds2 = dict(binds)
         binds2["b_off"] = offset
         binds2["b_to"] = offset + page_size
+
         cur.execute(sql, binds2)
         items = _oracle_rows_to_jsonable(cur)
+
     except Exception as e:
         logger.exception(f"[UI/SMSTAFF] list error db={db}: {e}")
         return render(request, "frostapp/smstaff_list.html", {
@@ -10016,14 +10177,17 @@ def sm_staff_ui_list(request):
         })
     finally:
         try:
-            if cur: cur.close()
-            if conn: conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
+
     pages = max(1, (total + page_size - 1) // page_size)
-    # ссылки пагинации с сохранением фильтров
+
     def page_url(p: int) -> str:
-        if p < 1 or p > pages:  # Защита от некорректных значений
+        if p < 1 or p > pages:
             return ""
         q = {
             "db": db,
@@ -10033,15 +10197,13 @@ def sm_staff_ui_list(request):
             "page_size": str(page_size),
             "page": str(p),
         }
-        # выкидываем пустые
         q = {k: v for k, v in q.items() if v not in ("", None)}
         return f"{reverse('sm_staff_ui_list')}?{urlencode(q)}"
 
-    # Вычисление конкретных URL для пагинации
-    first_page_url = page_url(1) if pages > 0 else ''
-    prev_page_url = page_url(page - 1) if page > 1 else ''
-    next_page_url = page_url(page + 1) if page < pages else ''
-    last_page_url = page_url(pages) if pages > 0 else ''
+    first_page_url = page_url(1) if pages > 0 else ""
+    prev_page_url = page_url(page - 1) if page > 1 else ""
+    next_page_url = page_url(page + 1) if page < pages else ""
+    last_page_url = page_url(pages) if pages > 0 else ""
 
     return render(request, "frostapp/smstaff_list.html", {
         "services": services,
@@ -10055,12 +10217,265 @@ def sm_staff_ui_list(request):
         "total": total,
         "items": items,
         "cols_present": cols_present,
-        "page_url": page_url,  # Оставляем для других нужд, если требуется
+        "page_url": page_url,
         "first_page_url": first_page_url,
         "prev_page_url": prev_page_url,
         "next_page_url": next_page_url,
         "last_page_url": last_page_url,
     })
+
+
+@require_http_methods(["GET", "POST"])
+@csrf_protect
+def sm_staff_ui_create(request):
+    """
+    UI создание пользователя в SMSTAFF через процедуру bin_createuser
+    и последующая установка OFFINDEX по выбранной должности из SMOFFCFG.
+    """
+    services = _ui_services_list()
+
+    if request.method == "POST":
+        db = (request.POST.get("db") or "").strip().upper()
+    else:
+        db = (request.GET.get("db") or "").strip().upper()
+
+    if not db:
+        db = services[0] if services else "BINUU00"
+
+    form = {
+        "auser": "",
+        "ainn": "",
+        "adol": "",
+        "acheck": "1",
+        "auserenabled": "1",
+    }
+
+    positions = []
+    conflicts = []
+    created_rows = []
+    created_password = ""
+    success_message = ""
+    error = ""
+
+    if request.method == "POST":
+        form["auser"] = (request.POST.get("auser") or "").strip().lower()
+        form["ainn"] = (request.POST.get("ainn") or "").strip()
+        form["adol"] = (request.POST.get("adol") or "").strip()
+        form["acheck"] = (request.POST.get("acheck") or "1").strip()
+        form["auserenabled"] = (request.POST.get("auserenabled") or "1").strip()
+
+    if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
+        return render(request, "frostapp/smstaff_create.html", {
+            "services": services,
+            "db": db,
+            "form": form,
+            "positions": [],
+            "acheck_choices": _SM_ACHECK_CHOICES,
+            "auserenabled_choices": _SM_USERENABLED_CHOICES,
+            "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
+            "conflicts": [],
+            "created_rows": [],
+            "created_password": "",
+            "success_message": "",
+            "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
+        })
+
+    conn = cur = None
+    try:
+        conn = _connect_oracle_service(db)
+        cur = conn.cursor()
+
+        positions = _oracle_fetch_smoffcfg_choices(cur)
+        positions_map = {str(x["id"]): x for x in positions}
+
+        if request.method == "POST":
+            auser = form["auser"]
+            ainn = form["ainn"]
+            adol_id = form["adol"]
+            acheck_raw = form["acheck"]
+            auserenabled_raw = form["auserenabled"]
+
+            if not auser:
+                error = "Заполни логин (AUSER)."
+            elif not _is_valid_sm_login(auser):
+                error = "Логин может содержать только латинские буквы, цифры, точку, дефис и нижнее подчёркивание."
+            elif not ainn:
+                error = "Заполни ИНН (AINN)."
+            elif not _is_valid_inn_digits(ainn):
+                error = "ИНН должен состоять из 10 или 12 цифр."
+            elif adol_id not in positions_map:
+                error = "Выбери должность из списка."
+            elif acheck_raw not in {x['value'] for x in _SM_ACHECK_CHOICES}:
+                error = "Некорректное значение ACHECK."
+            elif auserenabled_raw not in {x['value'] for x in _SM_USERENABLED_CHOICES}:
+                error = "Некорректное значение AUSERENABLED."
+            else:
+                conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
+
+                exact_exists = False
+                for row in conflicts:
+                    row_login = (row.get("serverlogin") or "").strip().lower()
+                    row_inn = (row.get("inn") or "").strip()
+                    if row_login == auser and row_inn == ainn:
+                        exact_exists = True
+                        break
+
+                if exact_exists:
+                    error = f"Пользователь с логином {auser} и ИНН {ainn} уже существует в базе {db}."
+                else:
+                    selected_pos = positions_map[adol_id]
+                    adol_title = (selected_pos.get("title") or "").strip()
+                    adol_offindex = int(selected_pos["id"])
+                    acheck = int(acheck_raw)
+                    auserenabled = int(auserenabled_raw)
+
+                    created_password = _generate_sm_password(4)
+
+                    proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
+                    if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+                        raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
+
+                    logger.info(
+                        f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={ainn} "
+                        f"offindex={adol_offindex} acheck={acheck} auserenabled={auserenabled}"
+                    )
+
+                    cur.execute(
+                        f"""
+                        BEGIN
+                            {proc_name}(
+                                AUSER => :p_auser,
+                                APASS => :p_apass,
+                                ADOL => :p_adol,
+                                ACHECK => :p_acheck,
+                                AUSERENABLED => :p_auserenabled,
+                                AINN => :p_ainn
+                            );
+                        END;
+                        """,
+                        p_auser=auser,
+                        p_apass=created_password,
+                        p_adol=adol_title,
+                        p_acheck=acheck,
+                        p_auserenabled=auserenabled,
+                        p_ainn=ainn,
+                    )
+
+                    if acheck != 2:
+                        cur.execute("""
+                            UPDATE smstaff
+                               SET offindex = :b_offindex
+                             WHERE LOWER(TRIM(serverlogin)) = :b_login
+                        """, b_offindex=adol_offindex, b_login=auser)
+
+                    conn.commit()
+
+                    created_rows = _oracle_fetch_smstaff_by_login(cur, auser)
+
+                    if acheck == 2:
+                        success_message = (
+                            f"Процедура выполнена для логина {auser}. "
+                            f"Режим ACHECK=2 означает удаление пользователя."
+                        )
+                    else:
+                        success_message = (
+                            f"Пользователь успешно обработан в базе {db}. "
+                            f"Сгенерированный пароль: {created_password}"
+                        )
+
+                    logger.info(
+                        f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
+                        f"created_rows={len(created_rows)}"
+                    )
+
+    except Exception as e:
+        logger.exception(f"[UI/SMSTAFF_CREATE] error db={db}: {e}")
+        error = str(e)
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+    return render(request, "frostapp/smstaff_create.html", {
+        "services": services,
+        "db": db,
+        "form": form,
+        "positions": positions,
+        "acheck_choices": _SM_ACHECK_CHOICES,
+        "auserenabled_choices": _SM_USERENABLED_CHOICES,
+        "error": error,
+        "conflicts": conflicts,
+        "created_rows": created_rows,
+        "created_password": created_password,
+        "success_message": success_message,
+        "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
+    })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @require_http_methods(["GET", "POST"])
