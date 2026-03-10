@@ -9972,54 +9972,105 @@ def _oracle_fetch_smoffcfg_choices(cur) -> list[dict]:
 def _oracle_fetch_smstaff_conflicts(cur, login: str, inn: str) -> list[dict]:
     """
     Ищем существующих пользователей по логину и/или ИНН.
+    Безопасно для баз, где нет части колонок.
     """
-    cur.execute("""
-        SELECT
-            s.id,
-            s.surname,
-            s.name,
-            s.patronymic,
-            s.serverlogin,
-            s.inn,
-            s.userenabled,
-            s.offindex,
+    cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+
+    def HAS(col: str) -> bool:
+        return col.upper() in cols_set
+
+    select_parts = [
+        "s.id AS id" if HAS("id") else "NULL AS id",
+        "s.surname AS surname" if HAS("surname") else "NULL AS surname",
+        "s.name AS name" if HAS("name") else "NULL AS name",
+        "s.patronymic AS patronymic" if HAS("patronymic") else "NULL AS patronymic",
+        "s.serverlogin AS serverlogin" if HAS("serverlogin") else "NULL AS serverlogin",
+        "s.inn AS inn" if HAS("inn") else "NULL AS inn",
+        "s.userenabled AS userenabled" if HAS("userenabled") else "NULL AS userenabled",
+        "s.offindex AS offindex" if HAS("offindex") else "NULL AS offindex",
+    ]
+
+    if HAS("offindex"):
+        select_parts.append("""
             (
                 SELECT c.title
                 FROM smoffcfg c
                 WHERE c.id = s.offindex
                   AND ROWNUM = 1
             ) AS off_title
-        FROM smstaff s
-        WHERE LOWER(TRIM(s.serverlogin)) = :b_login
-           OR TRIM(s.inn) = :b_inn
-        ORDER BY s.id
-    """, b_login=(login or "").strip().lower(), b_inn=(inn or "").strip())
+        """)
+    else:
+        select_parts.append("NULL AS off_title")
 
+    where_parts = []
+    binds = {}
+
+    if HAS("serverlogin") and login:
+        where_parts.append("LOWER(TRIM(s.serverlogin)) = :b_login")
+        binds["b_login"] = (login or "").strip().lower()
+
+    if HAS("inn") and inn:
+        where_parts.append("TRIM(s.inn) = :b_inn")
+        binds["b_inn"] = (inn or "").strip()
+
+    if not where_parts:
+        return []
+
+    sql = f"""
+        SELECT {", ".join(select_parts)}
+        FROM smstaff s
+        WHERE {" OR ".join(where_parts)}
+        ORDER BY s.id
+    """
+
+    cur.execute(sql, binds)
     return _oracle_rows_to_jsonable(cur)
 
 
 def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
-    cur.execute("""
-        SELECT
-            s.id,
-            s.surname,
-            s.name,
-            s.patronymic,
-            s.serverlogin,
-            s.inn,
-            s.userenabled,
-            s.offindex,
+    """
+    Читаем пользователя по логину.
+    Безопасно для баз, где нет части колонок.
+    """
+    cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+
+    def HAS(col: str) -> bool:
+        return col.upper() in cols_set
+
+    if not HAS("serverlogin"):
+        return []
+
+    select_parts = [
+        "s.id AS id" if HAS("id") else "NULL AS id",
+        "s.surname AS surname" if HAS("surname") else "NULL AS surname",
+        "s.name AS name" if HAS("name") else "NULL AS name",
+        "s.patronymic AS patronymic" if HAS("patronymic") else "NULL AS patronymic",
+        "s.serverlogin AS serverlogin" if HAS("serverlogin") else "NULL AS serverlogin",
+        "s.inn AS inn" if HAS("inn") else "NULL AS inn",
+        "s.userenabled AS userenabled" if HAS("userenabled") else "NULL AS userenabled",
+        "s.offindex AS offindex" if HAS("offindex") else "NULL AS offindex",
+    ]
+
+    if HAS("offindex"):
+        select_parts.append("""
             (
                 SELECT c.title
                 FROM smoffcfg c
                 WHERE c.id = s.offindex
                   AND ROWNUM = 1
             ) AS off_title
+        """)
+    else:
+        select_parts.append("NULL AS off_title")
+
+    sql = f"""
+        SELECT {", ".join(select_parts)}
         FROM smstaff s
         WHERE LOWER(TRIM(s.serverlogin)) = :b_login
         ORDER BY s.id
-    """, b_login=(login or "").strip().lower())
+    """
 
+    cur.execute(sql, b_login=(login or "").strip().lower())
     return _oracle_rows_to_jsonable(cur)
 
 
