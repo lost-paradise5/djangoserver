@@ -9955,16 +9955,35 @@ def _is_valid_sm_login(login: str) -> bool:
 
 
 def _oracle_fetch_smoffcfg_choices(cur) -> list[dict]:
-    cur.execute("""
-        SELECT id, title
+    cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMOFFCFG")
+
+    has_id = "ID" in cols_set
+    has_title = "TITLE" in cols_set
+    has_orarole = "ORAROLE" in cols_set
+
+    if not has_id:
+        raise ValueError("В таблице SMOFFCFG нет колонки ID.")
+
+    select_parts = [
+        "id",
+        "title" if has_title else "NULL AS title",
+        "orarole" if has_orarole else "NULL AS orarole",
+    ]
+
+    order_expr = "title" if has_title else "id"
+
+    cur.execute(f"""
+        SELECT {", ".join(select_parts)}
         FROM smoffcfg
-        ORDER BY title
+        ORDER BY {order_expr}
     """)
+
     items = []
     for row in cur.fetchall():
         items.append({
             "id": row[0],
             "title": row[1],
+            "orarole": row[2],
         })
     return items
 
@@ -10282,6 +10301,11 @@ def sm_staff_ui_create(request):
     """
     UI создание пользователя в SMSTAFF через процедуру bin_createuser
     и последующая установка OFFINDEX по выбранной должности из SMOFFCFG.
+
+    Важно:
+    - в процедуру передаётся SMOFFCFG.ORAROLE
+    - в SMSTAFF.OFFINDEX записывается выбранный SMOFFCFG.ID
+    - пароль генерируется автоматически (4 цифры) и передаётся в шаблон
     """
     services = _ui_services_list()
 
@@ -10348,18 +10372,28 @@ def sm_staff_ui_create(request):
 
             if not auser:
                 error = "Заполни логин (AUSER)."
+
             elif not _is_valid_sm_login(auser):
-                error = "Логин может содержать только латинские буквы, цифры, точку, дефис и нижнее подчёркивание."
+                error = (
+                    "Логин может содержать только латинские буквы, цифры, "
+                    "точку, дефис и нижнее подчёркивание."
+                )
+
             elif not ainn:
                 error = "Заполни ИНН (AINN)."
+
             elif not _is_valid_inn_digits(ainn):
                 error = "ИНН должен состоять из 10 или 12 цифр."
+
             elif adol_id not in positions_map:
                 error = "Выбери должность из списка."
-            elif acheck_raw not in {x['value'] for x in _SM_ACHECK_CHOICES}:
+
+            elif acheck_raw not in {x["value"] for x in _SM_ACHECK_CHOICES}:
                 error = "Некорректное значение ACHECK."
-            elif auserenabled_raw not in {x['value'] for x in _SM_USERENABLED_CHOICES}:
+
+            elif auserenabled_raw not in {x["value"] for x in _SM_USERENABLED_CHOICES}:
                 error = "Некорректное значение AUSERENABLED."
+
             else:
                 conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
 
@@ -10375,78 +10409,101 @@ def sm_staff_ui_create(request):
                     error = f"Пользователь с логином {auser} и ИНН {ainn} уже существует в базе {db}."
                 else:
                     selected_pos = positions_map[adol_id]
+
                     adol_title = (selected_pos.get("title") or "").strip()
+                    adol_orarole = (selected_pos.get("orarole") or "").strip()
                     adol_offindex = int(selected_pos["id"])
+
                     acheck = int(acheck_raw)
                     auserenabled = int(auserenabled_raw)
 
-                    created_password = _generate_sm_password(4)
-
-                    proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
-                    if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
-                        raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
-
-                    logger.info(
-                        f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={ainn} "
-                        f"offindex={adol_offindex} acheck={acheck} auserenabled={auserenabled}"
-                    )
-
-                    cur.execute(
-                        f"""
-                        BEGIN
-                            {proc_name}(
-                                AUSER => :p_auser,
-                                APASS => :p_apass,
-                                ADOL => :p_adol,
-                                ACHECK => :p_acheck,
-                                AUSERENABLED => :p_auserenabled,
-                                AINN => :p_ainn
-                            );
-                        END;
-                        """,
-                        p_auser=auser,
-                        p_apass=created_password,
-                        p_adol=adol_title,
-                        p_acheck=acheck,
-                        p_auserenabled=auserenabled,
-                        p_ainn=ainn,
-                    )
-
-                    if acheck != 2:
-                        cur.execute("""
-                            UPDATE smstaff
-                               SET offindex = :b_offindex
-                             WHERE LOWER(TRIM(serverlogin)) = :b_login
-                        """, b_offindex=adol_offindex, b_login=auser)
-
-                    conn.commit()
-
-                    created_rows = _oracle_fetch_smstaff_by_login(cur, auser)
-
-                    if acheck == 2:
-                        success_message = (
-                            f"Процедура выполнена для логина {auser}. "
-                            f"Режим ACHECK=2 означает удаление пользователя."
+                    if not adol_orarole:
+                        error = (
+                            f"Для выбранной должности "
+                            f"'{adol_title or adol_offindex}' "
+                            f"в SMOFFCFG не заполнено поле ORAROLE."
                         )
                     else:
-                        success_message = (
-                            f"Пользователь успешно обработан в базе {db}. "
-                            f"Сгенерированный пароль: {created_password}"
+                        created_password = _generate_sm_password(4)
+
+                        proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
+                        if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+                            raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
+
+                        logger.info(
+                            f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={ainn} "
+                            f"offindex={adol_offindex} title={adol_title} orarole={adol_orarole} "
+                            f"acheck={acheck} auserenabled={auserenabled}"
                         )
 
-                    logger.info(
-                        f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
-                        f"created_rows={len(created_rows)}"
-                    )
+                        cur.execute(
+                            f"""
+                            BEGIN
+                                {proc_name}(
+                                    AUSER => :p_auser,
+                                    APASS => :p_apass,
+                                    ADOL => :p_adol,
+                                    ACHECK => :p_acheck,
+                                    AUSERENABLED => :p_auserenabled,
+                                    AINN => :p_ainn
+                                );
+                            END;
+                            """,
+                            p_auser=auser,
+                            p_apass=created_password,
+                            p_adol=adol_orarole,
+                            p_acheck=acheck,
+                            p_auserenabled=auserenabled,
+                            p_ainn=ainn,
+                        )
+
+                        if acheck != 2:
+                            cur.execute("""
+                                UPDATE smstaff
+                                   SET offindex = :b_offindex
+                                 WHERE LOWER(TRIM(serverlogin)) = :b_login
+                            """, b_offindex=adol_offindex, b_login=auser)
+
+                        conn.commit()
+
+                        created_rows = _oracle_fetch_smstaff_by_login(cur, auser)
+
+                        if acheck == 2:
+                            success_message = (
+                                f"Процедура выполнена для логина {auser}. "
+                                f"Режим ACHECK=2 означает удаление пользователя."
+                            )
+                        else:
+                            success_message = (
+                                f"Пользователь успешно обработан в базе {db}. "
+                                f"Сгенерированный пароль: {created_password}"
+                            )
+
+                        logger.info(
+                            f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
+                            f"created_rows={len(created_rows)} offindex={adol_offindex} "
+                            f"orarole={adol_orarole}"
+                        )
 
     except Exception as e:
         logger.exception(f"[UI/SMSTAFF_CREATE] error db={db}: {e}")
-        error = str(e)
+
+        err_text = str(e)
+        if "ORA-01403" in err_text and "BIN_CREATEUSER" in err_text:
+            error = (
+                "Oracle-процедура BIN_CREATEUSER не смогла найти обязательные данные "
+                "для создания пользователя. Вероятно, в выбранной базе отсутствует "
+                "связанная запись, которую ожидает процедура."
+            )
+        else:
+            error = err_text
+
         try:
             if conn:
                 conn.rollback()
         except Exception:
             pass
+
     finally:
         try:
             if cur:
