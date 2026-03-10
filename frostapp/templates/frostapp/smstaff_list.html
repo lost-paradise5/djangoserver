@@ -12,15 +12,18 @@
   <div class="container-fluid">
     <a class="navbar-brand" href="/ui/smstaff/">SMSTAFF</a>
     <div class="d-flex gap-2">
+      <a class="btn btn-outline-light btn-sm" href="{% url 'sm_staff_ui_create' %}?db={{ db }}">Создать УЗ</a>
       <a class="btn btn-outline-light btn-sm" href="/admin/">Admin</a>
       <a class="btn btn-outline-light btn-sm" href="/sm/databases/">API: stores/db</a>
     </div>
   </div>
 </nav>
+
 <div class="container py-4">
   {% if error %}
     <div class="alert alert-danger">{{ error }}</div>
   {% endif %}
+
   <form class="card card-body mb-3" method="get" action="{% url 'sm_staff_ui_list' %}">
     <div class="row g-2 align-items-end">
       <div class="col-md-3">
@@ -31,14 +34,17 @@
           {% endfor %}
         </select>
       </div>
+
       <div class="col-md-3">
         <label class="form-label">Логин (serverlogin содержит)</label>
         <input class="form-control" name="login" value="{{ login|default:'' }}" placeholder="например i_ivanov">
       </div>
+
       <div class="col-md-3">
         <label class="form-label">ИНН (inn содержит)</label>
         <input class="form-control" name="inn" value="{{ inn|default:'' }}" placeholder="10/12 цифр или часть">
       </div>
+
       <div class="col-md-2">
         <label class="form-label">Размер страницы</label>
         <select class="form-select" name="page_size">
@@ -47,23 +53,28 @@
           {% endfor %}
         </select>
       </div>
+
       <div class="col-md-1 d-flex align-items-center">
         <div class="form-check mt-4">
           <input class="form-check-input" type="checkbox" name="only_enabled" value="1" {% if only_enabled %}checked{% endif %}>
           <label class="form-check-label">Активные</label>
         </div>
       </div>
-      <div class="col-12">
+
+      <div class="col-12 d-flex gap-2">
         <button class="btn btn-primary">Показать</button>
         <a class="btn btn-outline-secondary" href="{% url 'sm_staff_ui_list' %}?db={{ db }}">Сброс</a>
+        <a class="btn btn-outline-success" href="{% url 'sm_staff_ui_create' %}?db={{ db }}">Создать УЗ</a>
       </div>
     </div>
   </form>
+
   <div class="d-flex justify-content-between align-items-center mb-2">
     <div class="text-muted">
       База: <b>{{ db }}</b> · Найдено: <b>{{ total }}</b> · Стр.: <b>{{ page }}</b> / <b>{{ pages }}</b>
     </div>
   </div>
+
   <div class="table-responsive">
     <table class="table table-sm table-striped table-hover align-middle">
       <thead class="table-dark">
@@ -73,6 +84,7 @@
           <th>Имя</th>
           <th>Отчество</th>
           <th>Логин</th>
+          <th>Должность</th>
           <th>ИНН</th>
           <th>Enabled</th>
           <th></th>
@@ -86,13 +98,19 @@
             <td>{{ r.name }}</td>
             <td>{{ r.patronymic }}</td>
             <td><code>{{ r.serverlogin }}</code></td>
+            <td>
+              {{ r.off_title|default:"—" }}
+              {% if r.offindex %}
+                <div class="text-muted small">OFFINDEX: {{ r.offindex }}</div>
+              {% endif %}
+            </td>
             <td><code>{{ r.inn }}</code></td>
             <td>{{ r.userenabled }}</td>
             <td class="text-end">
               {% if r.id > 0 %}
                 <a class="btn btn-sm btn-outline-primary"
-                     href="{% url 'sm_staff_ui_edit_inn' db=db staff_id=r.id %}">
-                    Изменить ИНН
+                   href="{% url 'sm_staff_ui_edit_inn' db=db staff_id=r.id %}">
+                  Изменить ИНН
                 </a>
               {% else %}
                 <span class="text-muted">ID: {{ r.id }}</span>
@@ -100,11 +118,12 @@
             </td>
           </tr>
         {% empty %}
-          <tr><td colspan="8" class="text-muted">Нет данных</td></tr>
+          <tr><td colspan="9" class="text-muted">Нет данных</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+
   <div class="d-flex justify-content-between">
     <div>
       {% if page > 1 %}
