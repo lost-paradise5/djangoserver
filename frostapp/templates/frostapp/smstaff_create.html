@@ -98,12 +98,12 @@
             <option value="">Выбери должность</option>
             {% for p in positions %}
               <option value="{{ p.id }}" {% if form.adol == p.id|stringformat:"s" %}selected{% endif %}>
-                {{ p.title }} (ID: {{ p.id }})
+                {{ p.title|default:"Без названия" }} (ID: {{ p.id }}){% if p.orarole %} — ORAROLE: {{ p.orarole }}{% endif %}
               </option>
             {% endfor %}
           </select>
           <div class="form-text">
-            В процедуру уйдёт TITLE, а после выполнения в SMSTAFF.OFFINDEX будет записан выбранный ID.
+            В процедуру уйдёт значение <b>SMOFFCFG.ORAROLE</b>, а после выполнения в <b>SMSTAFF.OFFINDEX</b> будет записан выбранный ID.
           </div>
         </div>
 
