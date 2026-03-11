@@ -6219,6 +6219,9 @@ def _mask_phone(phone: str) -> str:
     return f"{phone[:2]}***{phone[-2:]}"
 
 
+def _agent_error(message: str, status: int = 500):
+    return JsonResponse({"error": str(message)}, status=status)
+
 
 def _normalize_oracle_value(value):
     if value is None:
@@ -6348,7 +6351,7 @@ def _get_supermag_store_meta_map(smstore_ids):
                 "fsrar_id": _normalize_oracle_value(item.get("fsrar_id")),
                 "ukm_server_ip": _normalize_oracle_value(item.get("ukm_server_ip")),
                 "dbname": _normalize_oracle_value(item.get("dbname")),
-                "subformat2": _normalize_oracle_value(item.get("subformat2")),
+                "market": _normalize_oracle_value(item.get("subformat2")),
             }
 
         return result
@@ -6532,18 +6535,18 @@ def _get_agent_user_stores(user):
             'inn': meta.get('inn'),
             'kpp': meta.get('kpp'),
             'fsrar_id': meta.get('fsrar_id'),
-            'subformat2': meta.get('subformat2'),
+            'market': meta.get('market'),
         })
 
     return stores_payload
 
 
-def _get_agent_open_credentials(user_id):
+def _get_agent_primary_credentials(user_id):
     """
-    Возвращает ВСЕ активные username/password пользователя из open_in_system,
-    только для system_id = 4.
+    Возвращает первую активную username/password пользователя
+    из open_in_system только для system_id = 4.
     """
-    creds_qs = (
+    cred = (
         OpenInSystem.objects
         .filter(
             user_id=user_id,
@@ -6551,31 +6554,25 @@ def _get_agent_open_credentials(user_id):
             status=True
         )
         .order_by('id')
+        .first()
     )
 
-    return [
-        {
-            'username': c.username,
-            'password': c.password,
-        }
-        for c in creds_qs
-    ]
+    if not cred:
+        return None
+
+    return {
+        'username': cred.username,
+        'password': cred.password,
+    }
 
 
 def _build_agent_stores_response(user):
     """
-    Формирует компактный ответ:
-    stores = [
-        {
-            ...данные магазина...,
-            credentials: [
-                {"username": "...", "password": "..."}
-            ]
-        }
-    ]
+    Формирует список магазинов, где в каждом магазине
+    лежат плоские username/password.
     """
     stores = _get_agent_user_stores(user)
-    creds = _get_agent_open_credentials(user.id)
+    cred = _get_agent_primary_credentials(user.id)
 
     stores_response = []
     for store in stores:
@@ -6590,17 +6587,12 @@ def _build_agent_stores_response(user):
             'inn': store['inn'],
             'kpp': store['kpp'],
             'fsrar_id': store['fsrar_id'],
-            'subformat2': store['subformat2'],
-            'credentials': [
-                {
-                    'username': cred['username'],
-                    'password': cred['password'],
-                }
-                for cred in creds
-            ]
+            'market': store['market'],
+            'username': cred['username'] if cred else None,
+            'password': cred['password'] if cred else None,
         })
 
-    return stores, creds, stores_response
+    return stores, cred, stores_response
 
 
 @csrf_exempt
@@ -6608,141 +6600,127 @@ def _build_agent_stores_response(user):
 def agent_auth_start(request):
     """
     POST /agent/auth/start/
+    body:
     {
       "phone": "+7924..."
     }
 
-    Логика:
-      1) Ищем пользователя по телефону.
-      2) Ищем все его магазины в ukm_users.
-      3) Проверяем, что есть хотя бы одна активная запись в open_in_system с system_id=4.
-      4) Генерируем PIN.
-      5) Отправляем PIN:
-         - в Telegram, если есть tg_id
-         - в MAX, если есть max_id
-      6) Этап выбора магазина пропускается полностью.
+    Успех:
+    200
+    {
+      "session_id": "..."
+    }
 
-    В Telegram админам отправляем только одно сообщение:
-    - кто начал входить
+    Ошибка:
+    404 -> сервис недоступен
+    500 -> { "error": "..." }
     """
     if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+        return _agent_error('Сервис недоступен', status=404)
 
     try:
         data = json.loads(request.body.decode('utf-8') if request.body else "{}")
     except Exception as e:
         logger.error(f"[AGENT_AUTH/START] JSON parse error: {e}")
-        return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
+        return _agent_error('Некорректный JSON', status=500)
 
     phone_raw = str(data.get('phone') or "").strip()
     if not phone_raw:
-        return JsonResponse({'status': 'error', 'message': 'Не указан phone'}, status=400)
-
-    phone_norm = normalize_phone_ru(phone_raw)
-    phone_candidates = {phone_raw}
-    if phone_norm:
-        phone_candidates.add(phone_norm)
-
-    users_qs = User.objects.filter(phone__in=list(phone_candidates))
-    count = users_qs.count()
-
-    if count == 0:
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Пользователь с таким номером не найден'
-        }, status=404)
-
-    if count > 1:
-        logger.error(
-            f"[AGENT_AUTH/START] Несколько пользователей для phone={phone_candidates}: "
-            f"ids={list(users_qs.values_list('id', flat=True))}"
-        )
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Найдено несколько пользователей с таким номером, обратитесь к администратору'
-        }, status=409)
-
-    user = users_qs.first()
-
-    if not user.tg_id and not user.max_id:
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Для пользователя не указан ни tg_id, ни max_id, отправка PIN невозможна'
-        }, status=400)
-
-    stores_payload = _get_agent_user_stores(user)
-    if not stores_payload:
-        return JsonResponse({
-            'status': 'error',
-            'message': 'У пользователя нет магазинов в ukm_users'
-        }, status=404)
-
-    creds_payload = _get_agent_open_credentials(user.id)
-    if not creds_payload:
-        logger.error(
-            f"[AGENT_AUTH/START] Нет активных записей в open_in_system для user_id={user.id}, system_id=4"
-        )
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Для пользователя не найдены активные учётные данные (open_in_system, system_id=4)'
-        }, status=404)
-
-    session_uuid = uuid.uuid4()
-    session_id = str(session_uuid)
-
-    pin = _generate_pin_code()
-    expires_at = timezone.now() + datetime.timedelta(minutes=PIN_TTL_MINUTES)
-    pin_hash = hashlib.sha256(pin.encode('utf-8')).hexdigest()
-
-    AuthSession.objects.create(
-        session_id=session_uuid,
-        user=user,
-        storeid=None,
-        pin_hash=pin_hash,
-        status='pin_sent',
-        attempts=0,
-        expires_at=expires_at,
-    )
-
-    delivery = send_pin_to_user_channels(user, pin)
-
-    if not delivery["ok"]:
-        logger.error(
-            f"[AGENT_AUTH/START] Не удалось отправить PIN user_id={user.id} "
-            f"(telegram_sent={delivery['telegram_sent']}, max_sent={delivery['max_sent']})"
-        )
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Не удалось отправить PIN ни в Telegram, ни в MAX'
-        }, status=500)
+        return _agent_error('Не указан phone', status=500)
 
     try:
-        send_telegram_log(
-            "\n".join([
-                "🔐 Начат вход агента",
-                f"User ID: {user.id}",
-                f"ФИО: {user.full_name}",
-                f"Телефон: {_mask_phone(phone_raw)}",
-                f"Session ID: {session_id}",
-                f"PIN TTL: {PIN_TTL_MINUTES} мин",
-                f"Telegram отправлен: {'да' if delivery['telegram_sent'] else 'нет'}",
-                f"MAX отправлен: {'да' if delivery['max_sent'] else 'нет'}",
-            ])
-        )
-    except Exception:
-        pass
+        phone_norm = normalize_phone_ru(phone_raw)
+        phone_candidates = {phone_raw}
+        if phone_norm:
+            phone_candidates.add(phone_norm)
 
-    return JsonResponse({
-        'status': 'ok',
-        'session_id': session_id,
-        'step': 'WAIT_PIN',
-        'expires_at': expires_at.isoformat(),
-        'pin_ttl_minutes': PIN_TTL_MINUTES,
-        'user': {
-            'id': user.id,
-            'fio': user.full_name,
-        },
-    })
+        users_qs = User.objects.filter(phone__in=list(phone_candidates))
+        count = users_qs.count()
+
+        if count == 0:
+            return _agent_error('Пользователь с таким номером не найден', status=500)
+
+        if count > 1:
+            logger.error(
+                f"[AGENT_AUTH/START] Несколько пользователей для phone={phone_candidates}: "
+                f"ids={list(users_qs.values_list('id', flat=True))}"
+            )
+            return _agent_error(
+                'Найдено несколько пользователей с таким номером, обратитесь к администратору',
+                status=500
+            )
+
+        user = users_qs.first()
+
+        if not user.tg_id and not user.max_id:
+            return _agent_error(
+                'Для пользователя не указан ни tg_id, ни max_id, отправка PIN невозможна',
+                status=500
+            )
+
+        stores_payload = _get_agent_user_stores(user)
+        if not stores_payload:
+            return _agent_error('У пользователя нет магазинов в ukm_users', status=500)
+
+        cred = _get_agent_primary_credentials(user.id)
+        if not cred:
+            logger.error(
+                f"[AGENT_AUTH/START] Нет активных записей в open_in_system для user_id={user.id}, system_id=4"
+            )
+            return _agent_error(
+                'Для пользователя не найдены активные учётные данные (open_in_system, system_id=4)',
+                status=500
+            )
+
+        session_uuid = uuid.uuid4()
+        session_id = str(session_uuid)
+
+        pin = _generate_pin_code()
+        expires_at = timezone.now() + datetime.timedelta(minutes=PIN_TTL_MINUTES)
+        pin_hash = hashlib.sha256(pin.encode('utf-8')).hexdigest()
+
+        AuthSession.objects.create(
+            session_id=session_uuid,
+            user=user,
+            storeid=None,
+            pin_hash=pin_hash,
+            status='pin_sent',
+            attempts=0,
+            expires_at=expires_at,
+        )
+
+        delivery = send_pin_to_user_channels(user, pin)
+
+        if not delivery["ok"]:
+            logger.error(
+                f"[AGENT_AUTH/START] Не удалось отправить PIN user_id={user.id} "
+                f"(telegram_sent={delivery['telegram_sent']}, max_sent={delivery['max_sent']})"
+            )
+            return _agent_error('Не удалось отправить PIN ни в Telegram, ни в MAX', status=500)
+
+        try:
+            send_telegram_log(
+                "\n".join([
+                    "🔐 Начат вход агента",
+                    f"User ID: {user.id}",
+                    f"ФИО: {user.full_name}",
+                    f"Телефон: {_mask_phone(phone_raw)}",
+                    f"Session ID: {session_id}",
+                    f"PIN TTL: {PIN_TTL_MINUTES} мин",
+                    f"Telegram отправлен: {'да' if delivery['telegram_sent'] else 'нет'}",
+                    f"MAX отправлен: {'да' if delivery['max_sent'] else 'нет'}",
+                ])
+            )
+        except Exception:
+            pass
+
+        return JsonResponse({
+            'session_id': session_id,
+        }, status=200)
+
+    except Exception as e:
+        logger.exception(f"[AGENT_AUTH/START] Unexpected error: {e}")
+        return _agent_error(f'Ошибка при запуске авторизации: {e}', status=500)
 
 
 @csrf_exempt
@@ -6750,135 +6728,142 @@ def agent_auth_start(request):
 def agent_auth_verify_pin(request):
     """
     POST /agent/auth/verify_pin/
+    body:
     {
       "session_id": "...",
       "pin": "1234"
     }
 
-    При успехе возвращает компактный список магазинов,
-    а внутри каждого магазина — список credentials.
+    Успех:
+    200
+    {
+      "user": {
+        "id": ...,
+        "fio": "..."
+      },
+      "stores": [
+        {
+          "ukm_storeid": ...,
+          "smstore": ...,
+          "name": "...",
+          "address": "...",
+          "roleid": ...,
+          "dbname": "...",
+          "ukm_server_ip": "...",
+          "inn": "...",
+          "kpp": "...",
+          "fsrar_id": "...",
+          "subformat2": "...",
+          "username": "...",
+          "password": "..."
+        }
+      ]
+    }
+
+    Ошибка:
+    404 -> сервис недоступен
+    500 -> { "error": "..." }
     """
     if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
+        return _agent_error('Сервис недоступен', status=404)
 
     try:
         data = json.loads(request.body.decode('utf-8') if request.body else "{}")
     except Exception as e:
         logger.error(f"[AGENT_AUTH/VERIFY_PIN] JSON parse error: {e}")
-        return JsonResponse({'status': 'error', 'message': 'Некорректный JSON'}, status=400)
+        return _agent_error('Некорректный JSON', status=500)
 
     session_id = str(data.get('session_id') or "").strip()
     pin_input = str(data.get('pin') or "").strip()
 
     if not session_id or not pin_input:
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Нужны session_id и pin'
-        }, status=400)
-
-    sess = (
-        AuthSession.objects
-        .select_related('user')
-        .filter(session_id=session_id)
-        .first()
-    )
-    if not sess:
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Сессия не найдена или уже истекла'
-        }, status=404)
-
-    now = timezone.now()
-
-    if now > sess.expires_at:
-        sess.status = 'expired'
-        sess.save(update_fields=['status', 'updated_at'])
-        return JsonResponse({
-            'status': 'error',
-            'message': 'PIN истёк, начните авторизацию заново'
-        }, status=400)
-
-    if sess.status != 'pin_sent':
-        return JsonResponse({
-            'status': 'error',
-            'message': f'Неверное состояние сессии: {sess.status}, начните заново'
-        }, status=400)
-
-    if sess.attempts >= MAX_PIN_ATTEMPTS:
-        sess.status = 'blocked'
-        sess.save(update_fields=['status', 'updated_at'])
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Превышено количество попыток, начните заново'
-        }, status=400)
-
-    pin_hash_input = hashlib.sha256(pin_input.encode('utf-8')).hexdigest()
-    if pin_hash_input != (sess.pin_hash or ""):
-        sess.attempts = sess.attempts + 1
-        if sess.attempts >= MAX_PIN_ATTEMPTS:
-            sess.status = 'blocked'
-        sess.save(update_fields=['attempts', 'status', 'updated_at'])
-
-        attempts_left = max(0, MAX_PIN_ATTEMPTS - sess.attempts)
-        if attempts_left == 0:
-            return JsonResponse({
-                'status': 'error',
-                'message': 'Неверный PIN, попытки закончились',
-                'attempts_left': 0
-            }, status=400)
-
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Неверный PIN',
-            'attempts_left': attempts_left
-        }, status=400)
-
-    sess.status = 'success'
-    sess.save(update_fields=['status', 'updated_at'])
-
-    stores_payload, creds_payload, stores_response = _build_agent_stores_response(sess.user)
-
-    if not stores_payload:
-        logger.error(f"[AGENT_AUTH/VERIFY_PIN] У пользователя нет магазинов user_id={sess.user.id}")
-        return JsonResponse({
-            'status': 'error',
-            'message': 'У пользователя нет магазинов в ukm_users'
-        }, status=404)
-
-    if not creds_payload:
-        logger.error(
-            f"[AGENT_AUTH/VERIFY_PIN] Нет записей в open_in_system для user_id={sess.user.id}, system_id=4"
-        )
-        return JsonResponse({
-            'status': 'error',
-            'message': 'Для пользователя не найдены учётные данные (open_in_system, system_id=4)'
-        }, status=500)
+        return _agent_error('Нужны session_id и pin', status=500)
 
     try:
-        send_telegram_log(
-            "\n".join([
-                "✅ Агент успешно вошёл",
-                f"User ID: {sess.user.id}",
-                f"ФИО: {sess.user.full_name}",
-                f"Session ID: {session_id}",
-                f"Магазинов: {len(stores_response)}",
-                f"Учёток: {len(creds_payload)}",
-            ])
+        sess = (
+            AuthSession.objects
+            .select_related('user')
+            .filter(session_id=session_id)
+            .first()
         )
-    except Exception:
-        pass
+        if not sess:
+            return _agent_error('Сессия не найдена или уже истекла', status=500)
 
-    response = {
-        'status': 'ok',
-        'session_id': str(sess.session_id),
-        'user': {
-            'id': sess.user.id,
-            'fio': sess.user.full_name,
-        },
-        'stores': stores_response,
-    }
+        now = timezone.now()
 
-    return JsonResponse(response, json_dumps_params={'ensure_ascii': False})
+        if now > sess.expires_at:
+            sess.status = 'expired'
+            sess.save(update_fields=['status', 'updated_at'])
+            return _agent_error('PIN истёк, начните авторизацию заново', status=500)
+
+        if sess.status != 'pin_sent':
+            return _agent_error(
+                f'Неверное состояние сессии: {sess.status}, начните заново',
+                status=500
+            )
+
+        if sess.attempts >= MAX_PIN_ATTEMPTS:
+            sess.status = 'blocked'
+            sess.save(update_fields=['status', 'updated_at'])
+            return _agent_error('Превышено количество попыток, начните заново', status=500)
+
+        pin_hash_input = hashlib.sha256(pin_input.encode('utf-8')).hexdigest()
+        if pin_hash_input != (sess.pin_hash or ""):
+            sess.attempts = sess.attempts + 1
+            if sess.attempts >= MAX_PIN_ATTEMPTS:
+                sess.status = 'blocked'
+            sess.save(update_fields=['attempts', 'status', 'updated_at'])
+
+            attempts_left = max(0, MAX_PIN_ATTEMPTS - sess.attempts)
+            if attempts_left == 0:
+                return _agent_error('Неверный PIN, попытки закончились', status=500)
+
+            return _agent_error(f'Неверный PIN. Осталось попыток: {attempts_left}', status=500)
+
+        sess.status = 'success'
+        sess.save(update_fields=['status', 'updated_at'])
+
+        stores_payload, cred, stores_response = _build_agent_stores_response(sess.user)
+
+        if not stores_payload:
+            logger.error(f"[AGENT_AUTH/VERIFY_PIN] У пользователя нет магазинов user_id={sess.user.id}")
+            return _agent_error('У пользователя нет магазинов в ukm_users', status=500)
+
+        if not cred:
+            logger.error(
+                f"[AGENT_AUTH/VERIFY_PIN] Нет записей в open_in_system для user_id={sess.user.id}, system_id=4"
+            )
+            return _agent_error(
+                'Для пользователя не найдены учётные данные (open_in_system, system_id=4)',
+                status=500
+            )
+
+        try:
+            send_telegram_log(
+                "\n".join([
+                    "✅ Агент успешно вошёл",
+                    f"User ID: {sess.user.id}",
+                    f"ФИО: {sess.user.full_name}",
+                    f"Session ID: {session_id}",
+                    f"Магазинов: {len(stores_response)}",
+                ])
+            )
+        except Exception:
+            pass
+
+        response = {
+            'user': {
+                'id': sess.user.id,
+                'fio': sess.user.full_name,
+            },
+            'stores': stores_response,
+        }
+
+        return JsonResponse(response, json_dumps_params={'ensure_ascii': False}, status=200)
+
+    except Exception as e:
+        logger.exception(f"[AGENT_AUTH/VERIFY_PIN] Unexpected error: {e}")
+        return _agent_error(f'Ошибка при проверке PIN: {e}', status=500)
 
 
 
