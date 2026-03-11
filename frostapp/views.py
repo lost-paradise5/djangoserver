@@ -418,7 +418,7 @@ def _telegram_log_vpn_toggle(
         lines.append(f"cancelled_old_active_leases: {cancelled_cnt}")
     lines.append(f"time: {when}")
 
-    send_telegram_log("\n".join(lines))
+    _send_telegram_log_async("\n".join(lines))
 
 def vpn_verified_required(view_func):
     @wraps(view_func)
@@ -1487,8 +1487,7 @@ def vpn_ui_login(request):
                         head_dept_ids.append(did)
 
                 if not head_dept_ids:
-                    # можно тоже логировать факт отказа
-                    send_telegram_log(
+                    _send_telegram_log_async(
                         "\n".join([
                             "❌ ПОПЫТКА ВХОДА В СИСТЕМУ КОНТРОЛЯ УДАЛЁННОГО ДОСТУПА: Сотрудник не является руководителем отдела в Битрикс24",
                             f"login: {login}",
@@ -1528,8 +1527,7 @@ def vpn_ui_login(request):
                     user_agent=(request.META.get("HTTP_USER_AGENT") or "")[:2000],
                 )
 
-                # ✅ ЛОГ В TELEGRAM: запрос PIN
-                send_telegram_log(
+                _send_telegram_log_async(
                     "\n".join([
                         "🔐 Запрошен ПИН-код для УД",
                         f"login: {login}",
@@ -1543,11 +1541,9 @@ def vpn_ui_login(request):
                     ])
                 )
 
-                # отправляем PIN в битрикс
                 bitrix_send_pin(bx_user_id, pin)
 
-                # ✅ ЛОГ В TELEGRAM: PIN отправлен в Bitrix
-                send_telegram_log(
+                _send_telegram_log_async(
                     "\n".join([
                         "✅ ПИН-код для УД отправлен в Битрикс",
                         f"login: {login}",
@@ -1563,8 +1559,8 @@ def vpn_ui_login(request):
 
             except Exception as e:
                 error = str(e)
-               
-                send_telegram_log(
+
+                _send_telegram_log_async(
                     "\n".join([
                         "❌ Ошибка при отправке ПИН-кода",
                         f"login: {login}",
@@ -1600,7 +1596,7 @@ def vpn_ui_pin(request):
                 sess.save(update_fields=["status"])
                 error = "Слишком много попыток. Сессия истекла."
 
-                send_telegram_log(
+                _send_telegram_log_async(
                     "\n".join([
                         "⛔ ПИН-код истёк (Слишком много попыток)",
                         f"login: {sess.ad_login}",
@@ -1615,7 +1611,7 @@ def vpn_ui_pin(request):
                     sess.save(update_fields=["pin_attempts"])
                     error = "Неверный PIN."
 
-                    send_telegram_log(
+                    _send_telegram_log_async(
                         "\n".join([
                             "❌ Введён неверный ПИН-код",
                             f"login: {sess.ad_login}",
@@ -1633,7 +1629,7 @@ def vpn_ui_pin(request):
                     sess.save(update_fields=["status", "verified_at", "expires_at"])
                     ok = True
 
-                    send_telegram_log(
+                    _send_telegram_log_async(
                         "\n".join([
                             "✅ Успешный вход в УД (Пин-код введён верно)",
                             f"login: {sess.ad_login}",
@@ -2757,7 +2753,7 @@ def ad_ui_users_toggle(request):
             ]
             for x in details[:50]:
                 lines.append(x)
-            send_telegram_log("\n".join(lines))
+            _send_telegram_log_async("\n".join(lines))
         except Exception:
             pass
 
@@ -5511,18 +5507,23 @@ def _agent_error(message: str, status: int = 500):
 
 def _send_admin_log_async(message: str) -> None:
     """
-    Не блокирует HTTP-ответ.
+    Совместимый алиас — чтобы не менять остальной код по всему файлу.
     """
-    def _worker():
-        try:
-            send_telegram_log(message)
-        except Exception as e:
-            logger.exception(f"[ADMIN_LOG] async send error: {e}")
+    _send_telegram_log_async(message)
+# def _send_admin_log_async(message: str) -> None:
+#     """
+#     Не блокирует HTTP-ответ.
+#     """
+#     def _worker():
+#         try:
+#             send_telegram_log(message)
+#         except Exception as e:
+#             logger.exception(f"[ADMIN_LOG] async send error: {e}")
 
-    try:
-        threading.Thread(target=_worker, daemon=True).start()
-    except Exception as e:
-        logger.exception(f"[ADMIN_LOG] thread start error: {e}")
+#     try:
+#         threading.Thread(target=_worker, daemon=True).start()
+#     except Exception as e:
+#         logger.exception(f"[ADMIN_LOG] thread start error: {e}")
 
 
 def _normalize_oracle_value(value):
@@ -11442,8 +11443,8 @@ def bitrix_inactive_users_ui(request):
 def bitrix_users_toggle_active(request):
     """
     POST:
-      user_id=123              (один)
-      user_id=1&user_id=2...   (массив)
+      user_id=123
+      user_id=1&user_id=2...
       action=block|unblock
 
     Делает user.update ACTIVE и ОБЯЗАТЕЛЬНО проверяет, что Bitrix реально поменял значение.
@@ -11469,10 +11470,9 @@ def bitrix_users_toggle_active(request):
         except Exception as e:
             bad.append({"id": uid, "error": str(e)})
 
-    # лог в телеграм (коротко)
     try:
         err_preview = "; ".join([f"{x['id']}:{x['error']}" for x in bad[:5]])
-        send_telegram_log(
+        _send_telegram_log_async(
             "\n".join([
                 "👥 BITRIX USERS TOGGLE ACTIVE",
                 f"by_django_user={getattr(request.user, 'username', 'unknown')}",
@@ -11486,11 +11486,9 @@ def bitrix_users_toggle_active(request):
     except Exception:
         pass
 
-    # AJAX
     if request.headers.get("x-requested-with") == "XMLHttpRequest":
         return JsonResponse({"ok": True, "updated": ok_ids, "errors": bad})
 
-    # обычная форма -> обратно
     back = request.META.get("HTTP_REFERER") or reverse("bitrix_inactive_users_ui")
     sep = "&" if "?" in back else "?"
     return redirect(f"{back}{sep}updated_ok={len(ok_ids)}&updated_bad={len(bad)}")
