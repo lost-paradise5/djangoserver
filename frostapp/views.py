@@ -6219,6 +6219,155 @@ def _mask_phone(phone: str) -> str:
     return f"{phone[:2]}***{phone[-2:]}"
 
 
+
+def _normalize_oracle_value(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value if value else None
+
+
+def _get_supermag_store_meta_map(smstore_ids):
+    """
+    Возвращает словарь:
+    {
+        smstore_id: {
+            "name": ...,
+            "address": ...,
+            "inn": ...,
+            "kpp": ...,
+            "fsrar_id": ...,
+            "ukm_server_ip": ...,
+            "dbname": ...,
+            "subformat2": ...
+        }
+    }
+    """
+    prepared_ids = []
+    for sid in smstore_ids or []:
+        if sid is None:
+            continue
+        try:
+            prepared_ids.append(int(sid))
+        except Exception:
+            continue
+
+    prepared_ids = list(dict.fromkeys(prepared_ids))
+    if not prepared_ids:
+        return {}
+
+    bind_names = []
+    binds = {}
+    for i, sid in enumerate(prepared_ids):
+        key = f"sid{i}"
+        bind_names.append(f":{key}")
+        binds[key] = sid
+
+    sql = f"""
+        SELECT
+            t1.id AS smstore,
+            t1.name AS name,
+            t1.address AS address,
+            ci.inn AS inn,
+            t1.kpp AS kpp,
+            (SELECT propval
+               FROM smstoreproperties
+              WHERE propid = 'EGAIS.FSRARID'
+                AND storeloc = t1.id) AS fsrar_id,
+            (SELECT propval
+               FROM smstoreproperties
+              WHERE propid = 'REP.UKMSERVER'
+                AND storeloc = t1.id) AS ukm_server_ip,
+            (SELECT propval
+               FROM smstoreproperties
+              WHERE propid = 'REP.DBNAME'
+                AND storeloc = t1.id) AS dbname,
+            (SELECT UPPER(a.name)
+               FROM Supermag.SAStoresAssort a,
+                    Supermag.SMStoresAssort m
+              WHERE a.Tree LIKE '2.2.%'
+                AND a.ID = m.IDAssort
+                AND m.IDLoc = t1.ID) AS subformat2
+        FROM SMSTORELOCATIONS t1
+        JOIN SMREGIONS r
+          ON r.rgnid = t1.rgnid
+        JOIN smownclientlocs ol
+          ON ol.locid = t1.id
+        JOIN smclientinfo ci
+          ON ci.id = ol.clientid
+        JOIN sastoreformats f
+          ON f.id = t1.formatid
+        JOIN sastoreclass sc
+          ON sc.id = t1.idclass
+        LEFT JOIN (
+            SELECT STORELOC, PROPVAL
+            FROM SMSTOREPROPERTIES
+            WHERE PROPID = 'REP.CLOSEDATE'
+        ) t2
+          ON t1.ID = t2.STORELOC
+        WHERE
+            UPPER(t1.name) NOT LIKE 'Я %'
+            AND t1.name NOT LIKE '%ТЕСТ%'
+            AND sc.tree IS NOT NULL
+            AND t1.idclass IN (
+                SELECT id
+                FROM supermag.sastoreclass
+                WHERE tree LIKE '1.1.%'
+                   OR tree LIKE '1.2.%'
+                   OR tree LIKE '1.3.%'
+                   OR tree LIKE '1.4.%'
+                   OR tree LIKE '2.1.%'
+                   OR tree LIKE '2.2.%'
+            )
+            AND t1.accepted = 1
+            AND t1.loctype = 4
+            AND (t2.PROPVAL IS NULL OR TO_DATE(t2.PROPVAL, 'DD.MM.YYYY') >= TO_DATE(SYSDATE))
+            AND t1.id IN ({", ".join(bind_names)})
+        ORDER BY t1.id
+    """
+
+    conn = cur = None
+    result = {}
+    try:
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+        cur.execute(sql, binds)
+
+        cols = [d[0].lower() for d in cur.description]
+        for row in cur.fetchall():
+            item = dict(zip(cols, row))
+            smstore = item.get("smstore")
+            if smstore is None:
+                continue
+
+            result[int(smstore)] = {
+                "name": _normalize_oracle_value(item.get("name")),
+                "address": _normalize_oracle_value(item.get("address")),
+                "inn": _normalize_oracle_value(item.get("inn")),
+                "kpp": _normalize_oracle_value(item.get("kpp")),
+                "fsrar_id": _normalize_oracle_value(item.get("fsrar_id")),
+                "ukm_server_ip": _normalize_oracle_value(item.get("ukm_server_ip")),
+                "dbname": _normalize_oracle_value(item.get("dbname")),
+                "subformat2": _normalize_oracle_value(item.get("subformat2")),
+            }
+
+        return result
+
+    except Exception as e:
+        logger.exception(f"[AGENT_AUTH] Ошибка получения расширенных данных магазинов из Supermag: {e}")
+        return {}
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
+
 def send_max_to_user(max_user_id, message: str) -> bool:
     """
     Отправка сообщения пользователю в MAX по user_id.
@@ -6321,8 +6470,8 @@ def send_pin_to_user_channels(user, pin: str) -> dict:
 
 def _get_agent_user_stores(user):
     """
-    Возвращает уникальные магазины пользователя из ukm_users + данные из stores + dbname.
-    Уникальность по storeid.
+    Возвращает уникальные магазины пользователя из ukm_users
+    + обогащает их данными из Postgres stores и Oracle Supermag.
     """
     ukm_links = list(
         UKMUser.objects
@@ -6341,18 +6490,28 @@ def _get_agent_user_stores(user):
             unique_links[sid] = row
 
     store_ids = list(unique_links.keys())
+
     store_map = {
         s.ukm4store: s
         for s in Store.objects.filter(ukm4store__in=store_ids)
     }
 
+    smstore_ids = []
+    for sid in store_ids:
+        store_obj = store_map.get(sid)
+        if store_obj and store_obj.smstore is not None:
+            smstore_ids.append(store_obj.smstore)
+
+    supermag_meta_map = _get_supermag_store_meta_map(smstore_ids)
+
     stores_payload = []
     for sid, row in unique_links.items():
         store_obj = store_map.get(sid)
         smstore = store_obj.smstore if store_obj else None
+        meta = supermag_meta_map.get(int(smstore), {}) if smstore is not None else {}
 
-        dbname = None
-        if smstore is not None:
+        dbname = meta.get('dbname')
+        if not dbname and smstore is not None:
             try:
                 dbname = get_dbname_for_smstore(smstore)
             except Exception as e:
@@ -6365,10 +6524,15 @@ def _get_agent_user_stores(user):
         stores_payload.append({
             'ukm_storeid': sid,
             'smstore': smstore,
-            'name': store_obj.name if store_obj else '',
-            'address': store_obj.address if store_obj else '',
+            'name': meta.get('name') or (store_obj.name if store_obj else '') or '',
+            'address': meta.get('address') or (store_obj.address if store_obj else '') or '',
             'roleid': row.get('roleid'),
             'dbname': dbname,
+            'ukm_server_ip': meta.get('ukm_server_ip') or (str(store_obj.ukm4ip) if store_obj and store_obj.ukm4ip else None),
+            'inn': meta.get('inn'),
+            'kpp': meta.get('kpp'),
+            'fsrar_id': meta.get('fsrar_id'),
+            'subformat2': meta.get('subformat2'),
         })
 
     return stores_payload
@@ -6377,7 +6541,7 @@ def _get_agent_user_stores(user):
 def _get_agent_open_credentials(user_id):
     """
     Возвращает ВСЕ активные username/password пользователя из open_in_system,
-    но только для system_id = 4.
+    только для system_id = 4.
     """
     creds_qs = (
         OpenInSystem.objects
@@ -6391,44 +6555,52 @@ def _get_agent_open_credentials(user_id):
 
     return [
         {
-            'open_in_system_id': c.id,
             'username': c.username,
             'password': c.password,
-            'system_id': c.system_id,
         }
         for c in creds_qs
     ]
 
 
-def _build_agent_accounts_payload(user):
+def _build_agent_stores_response(user):
     """
-    Формирует итоговый список:
-    для каждого магазина пользователя -> все username/password из open_in_system(system_id=4).
+    Формирует компактный ответ:
+    stores = [
+        {
+            ...данные магазина...,
+            credentials: [
+                {"username": "...", "password": "..."}
+            ]
+        }
+    ]
     """
     stores = _get_agent_user_stores(user)
     creds = _get_agent_open_credentials(user.id)
 
-    accounts = []
+    stores_response = []
     for store in stores:
-        store_payload = {
+        stores_response.append({
             'ukm_storeid': store['ukm_storeid'],
             'smstore': store['smstore'],
             'name': store['name'],
             'address': store['address'],
             'roleid': store['roleid'],
-        }
+            'dbname': store['dbname'],
+            'ukm_server_ip': store['ukm_server_ip'],
+            'inn': store['inn'],
+            'kpp': store['kpp'],
+            'fsrar_id': store['fsrar_id'],
+            'subformat2': store['subformat2'],
+            'credentials': [
+                {
+                    'username': cred['username'],
+                    'password': cred['password'],
+                }
+                for cred in creds
+            ]
+        })
 
-        for cred in creds:
-            accounts.append({
-                'store': store_payload,
-                'dbname': store['dbname'],
-                'username': cred['username'],
-                'password': cred['password'],
-                'system_id': cred['system_id'],
-                'open_in_system_id': cred['open_in_system_id'],
-            })
-
-    return stores, creds, accounts
+    return stores, creds, stores_response
 
 
 @csrf_exempt
@@ -6583,21 +6755,8 @@ def agent_auth_verify_pin(request):
       "pin": "1234"
     }
 
-    При успехе возвращает список accounts:
-    [
-      {
-        "store": {...},
-        "dbname": "...",
-        "username": "...",
-        "password": "..."
-      }
-    ]
-
-    Если магазин один и учётка одна - дополнительно вернёт старые поля
-    username/password/dbname/store для обратной совместимости.
-
-    В Telegram админам отправляем только одно сообщение:
-    - кто успешно вошёл по верному PIN
+    При успехе возвращает компактный список магазинов,
+    а внутри каждого магазина — список credentials.
     """
     if request.method != 'POST':
         return JsonResponse({'status': 'error', 'message': 'Только POST'}, status=405)
@@ -6677,7 +6836,7 @@ def agent_auth_verify_pin(request):
     sess.status = 'success'
     sess.save(update_fields=['status', 'updated_at'])
 
-    stores_payload, creds_payload, accounts = _build_agent_accounts_payload(sess.user)
+    stores_payload, creds_payload, stores_response = _build_agent_stores_response(sess.user)
 
     if not stores_payload:
         logger.error(f"[AGENT_AUTH/VERIFY_PIN] У пользователя нет магазинов user_id={sess.user.id}")
@@ -6702,9 +6861,8 @@ def agent_auth_verify_pin(request):
                 f"User ID: {sess.user.id}",
                 f"ФИО: {sess.user.full_name}",
                 f"Session ID: {session_id}",
-                f"Магазинов: {len(stores_payload)}",
+                f"Магазинов: {len(stores_response)}",
                 f"Учёток: {len(creds_payload)}",
-                f"Accounts: {len(accounts)}",
             ])
         )
     except Exception:
@@ -6717,19 +6875,8 @@ def agent_auth_verify_pin(request):
             'id': sess.user.id,
             'fio': sess.user.full_name,
         },
-        'stores_count': len(stores_payload),
-        'credentials_count': len(creds_payload),
-        'accounts_count': len(accounts),
-        'accounts': accounts,
+        'stores': stores_response,
     }
-
-    if len(accounts) == 1:
-        response.update({
-            'username': accounts[0]['username'],
-            'password': accounts[0]['password'],
-            'dbname': accounts[0]['dbname'],
-            'store': accounts[0]['store'],
-        })
 
     return JsonResponse(response, json_dumps_params={'ensure_ascii': False})
 
