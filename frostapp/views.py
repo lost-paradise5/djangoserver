@@ -213,9 +213,8 @@ MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api.max.ru")
 MAX_HTTP_TIMEOUT = int(os.getenv("MAX_HTTP_TIMEOUT", "10"))
 
 
-# =========================
+
 # Report endpoint config
-# =========================
 
 INACTIVE_REPORT_TOKEN = os.getenv("INACTIVE_REPORT_TOKEN", "wc3wow").strip()
 
@@ -233,9 +232,9 @@ BITRIX_IM_DISK_FILE_COMMIT_URL = "https://gkbin.bitrix24.ru/rest/61518/s0rg1x8c0
 
 
 
-# =========================
+
 # Config
-# =========================
+
 
 BITRIX_DEPARTMENT_GET_URL = os.getenv(
     "BITRIX_DEPARTMENT_GET_URL",
@@ -273,16 +272,16 @@ VPN_MAX_PIN_ATTEMPTS = int(os.getenv("VPN_MAX_PIN_ATTEMPTS", "5"))
 _INN_RE = re.compile(r"^\d{10}(\d{2})?$")
 VPN_INSTRUCTION_URL = os.getenv("VPN_INSTRUCTION_URL", "https://gkbin.bitrix24.ru/bitrix/tools/disk/focus.php?folderId=10054660&action=openFolderList&ncc=1")
 VPN_SCHEDULER_LOCK_KEY = int(os.getenv("VPN_SCHEDULER_LOCK_KEY", "778899"))
-# =========================
+
 # UI: LDAP Tools (employees + sync employeeID from 1C)
-# =========================
+
 
 LDAP_TOOLS_PAGE_SIZE = int(os.getenv("LDAP_TOOLS_PAGE_SIZE", "200"))
 LDAP_EXPORT_PAGE_SIZE = int(os.getenv("LDAP_EXPORT_PAGE_SIZE", "500"))
 LDAP_EXPORT_MAX_TOTAL = int(os.getenv("LDAP_EXPORT_MAX_TOTAL", "20000"))
-# =========================
+
 # Helpers: hashing/pin/session
-# =========================
+
 
 def _rand_pin_4() -> str:
     return f"{random.randint(0, 9999):04d}"
@@ -432,9 +431,8 @@ def vpn_verified_required(view_func):
         return view_func(request, *args, **kwargs)
     return _wrapped
 
-# =========================
 # Helpers: Bitrix
-# =========================
+
 
 def _fmt_dt_ru_with_tz_offset(dt: datetime.datetime | None, tz_offset_min: int | None = None) -> str:
     """
@@ -466,12 +464,7 @@ def bitrix_notify_remote_access_open(user_id: int, until_dt=None, tz_offset_min:
     if until_dt:
         msg += f"\nСрок: до {_fmt_dt_ru_with_tz_offset(until_dt, tz_offset_min)}"
     _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": int(user_id), "MESSAGE": msg})
-# def bitrix_notify_remote_access_open(user_id: int, until_dt=None):
-#     msg = f"Вам открыт удаленный доступ.\nИнструкция: {VPN_INSTRUCTION_URL}"
-#     if until_dt:
-#         lt = timezone.localtime(until_dt)
-#         msg += f"\nСрок: до {lt.strftime('%d.%m.%Y %H:%M')}"
-#     _bitrix_call(BITRIX_NOTIFY_URL, data={"USER_ID": int(user_id), "MESSAGE": msg})
+
 
 def _parse_dt_local(val: str | None, tz_offset_min: int | None = None):
     """
@@ -669,116 +662,6 @@ def agent_token_required(view_func):
             )
         return view_func(request, *args, **kwargs)
     return _wrapped
-# def _build_vpn_period_maps_for_ui(inns: list[str]) -> dict[str, dict]:
-#     """
-#     Для списка ИНН возвращает:
-#       - vpn_period_text: текущий период (активные лизы, иначе baseline/неизвестно) -> 'с ... по ...' или 'бессрочно'
-#       - vpn_plan_text: ближайшее запланированное изменение (starts_at > now)
-#       - vpn_period_kind: 'OPEN'/'BLOCK'/'BASELINE'/'NONE'
-#     """
-#     inns = [x for x in set([re.sub(r"\D+", "", (x or "").strip()) for x in inns]) if x]
-#     if not inns:
-#         return {}
-
-#     now = timezone.now()
-
-#     active_cond = Q(status="ACTIVE") & Q(starts_at__lte=now) & (Q(ends_at__isnull=True) | Q(ends_at__gt=now))
-#     future_cond = Q(status="ACTIVE") & Q(starts_at__gt=now)
-
-#     # baseline (как было до управлений)
-#     baseline_map = {b.inn: b for b in VpnAccessBaseline.objects.filter(inn__in=inns)}
-
-#     # активные лизы
-#     leases = list(
-#         VpnAccessLease.objects
-#         .filter(active_cond, inn__in=inns)
-#         .values("inn", "lease_type", "starts_at", "ends_at")
-#     )
-
-#     by_inn = {inn: {"OPEN": [], "BLOCK": []} for inn in inns}
-#     for it in leases:
-#         t = it.get("lease_type")
-#         inn = it.get("inn")
-#         if inn in by_inn and t in ("OPEN", "BLOCK"):
-#             by_inn[inn][t].append(it)
-
-#     # ближайшее будущее изменение
-#     future_rows = list(
-#         VpnAccessLease.objects
-#         .filter(future_cond, inn__in=inns)
-#         .values("inn", "lease_type", "starts_at", "ends_at")
-#         .order_by("inn", "starts_at")
-#     )
-#     next_by_inn: dict[str, dict] = {}
-#     for it in future_rows:
-#         inn = it["inn"]
-#         if inn not in next_by_inn:
-#             next_by_inn[inn] = it
-
-#     def _period_text(prefix: str, start_dt, end_dt) -> str:
-#         # просили: с какой даты/время по какую дату/время; если нет — "бессрочно"
-#         if start_dt and end_dt:
-#             return f"{prefix}с {_fmt_dt_ru(start_dt)} по {_fmt_dt_ru(end_dt)}"
-#         if start_dt and not end_dt:
-#             return f"{prefix}с {_fmt_dt_ru(start_dt)} — бессрочно"
-#         # если нет данных (нет активных лиз/нет baseline) — бессрочно
-#         return f"{prefix}бессрочно"
-
-#     out: dict[str, dict] = {}
-
-#     for inn in inns:
-#         blocks = by_inn[inn]["BLOCK"]
-#         opens = by_inn[inn]["OPEN"]
-
-#         if blocks:
-#             # закрыт пока есть хотя бы один BLOCK
-#             starts = min(x["starts_at"] for x in blocks if x["starts_at"])
-#             any_inf = any(x["ends_at"] is None for x in blocks)
-#             ends = None if any_inf else max(x["ends_at"] for x in blocks if x["ends_at"])
-#             out[inn] = {
-#                 "vpn_period_kind": "BLOCK",
-#                 "vpn_period_text": _period_text("Закрыт: ", starts, ends),
-#             }
-#         elif opens:
-#             starts = min(x["starts_at"] for x in opens if x["starts_at"])
-#             any_inf = any(x["ends_at"] is None for x in opens)
-#             ends = None if any_inf else max(x["ends_at"] for x in opens if x["ends_at"])
-#             out[inn] = {
-#                 "vpn_period_kind": "OPEN",
-#                 "vpn_period_text": _period_text("", starts, ends),
-#             }
-#         else:
-#             base = baseline_map.get(inn)
-#             if base:
-#                 # baseline тоже считаем "информацией": если нет активных лиз — бессрочно
-#                 out[inn] = {
-#                     "vpn_period_kind": "BASELINE",
-#                     "vpn_period_text": "бессрочно",
-#                 }
-#             else:
-#                 out[inn] = {
-#                     "vpn_period_kind": "NONE",
-#                     "vpn_period_text": "бессрочно",
-#                 }
-
-#         # добавим ближайший план (если есть)
-#         nxt = next_by_inn.get(inn)
-#         plan_text = ""
-#         if nxt:
-#             action = "открыть" if nxt["lease_type"] == "OPEN" else "закрыть"
-#             s = nxt.get("starts_at")
-#             e = nxt.get("ends_at")
-#             if s and e:
-#                 plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} по {_fmt_dt_ru(e)}"
-#             elif s and not e:
-#                 plan_text = f"Запланировано: {action} с {_fmt_dt_ru(s)} — бессрочно"
-#             else:
-#                 plan_text = ""
-
-#         out[inn]["vpn_plan_text"] = plan_text
-
-#     return out
-
 
 
 
@@ -1153,9 +1036,9 @@ def bitrix_set_user_active_strict(user_id: int, desired_active: bool) -> None:
     )
 
 
-# =========================
+
 # Helpers: departments tree
-# =========================
+
 
 def _dept_index(depts: list[dict]) -> tuple[dict[int, dict], dict[int, list[int]]]:
     by_id = {}
@@ -1202,9 +1085,9 @@ def _dept_head_id(d: dict) -> int | None:
     return None
 
 
-# =========================
+
 # Helpers: AD (LDAP)
-# =========================
+
 
 def _ad_connect():
     ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
@@ -1375,9 +1258,9 @@ def ad_group_remove_member(group_dn: str, user_dn: str):
 
 
 
-# =========================
+
 # Это для интерфейса по блокировке в AD 
-# =========================
+
 AD_DISABLE_FLAG = 2  # userAccountControl bit: ACCOUNTDISABLE
 
 
@@ -1561,9 +1444,9 @@ def _append_qs(url: str, **params) -> str:
 
 
 
-# =========================
+
 # UI: login -> pin -> users
-# =========================
+
 
 @require_http_methods(["GET", "POST"])
 @csrf_protect
@@ -1901,7 +1784,7 @@ def vpn_ui_users(request):
 
             seen_uids = set()
 
-            # --- Bitrix rows ---
+            # Bitrix rows
             for u in users_by_dept.get(did, []):
                 try:
                     uid = int(u.get("ID"))
@@ -1956,7 +1839,7 @@ def vpn_ui_users(request):
                     "vpn_plan_end_iso": "",
                 })
 
-            # --- AD-only rows (по department) ---
+            # AD-only rows (по department)
             # Пытаемся искать по dept_title, и если нет результатов — пробуем без префикса "Отдел "
             dept_names_to_try = []
             t = (dept_title or "").strip()
@@ -2342,168 +2225,6 @@ def ad_ui_lookup_vpn_toggle(request):
 
 
 
-# @require_http_methods(["POST"])
-# @csrf_protect
-# def vpn_ui_toggle(request):
-#     try:
-#         sess = _get_session_or_403(request, must_verified=True)
-#     except Exception:
-#         return JsonResponse({"ok": False, "error": "NO_SESSION"}, status=403)
-
-#     inn = re.sub(r"\D+", "", (request.POST.get("inn") or "").strip())
-#     desired = (request.POST.get("desired") or "").strip()  # "1" или "0"
-
-#     if not inn:
-#         return JsonResponse({"ok": False, "error": "NO_INN"}, status=400)
-#     if desired not in ("0", "1"):
-#         return JsonResponse({"ok": False, "error": "BAD_DESIRED"}, status=400)
-
-#     # group dn
-#     conn = None
-#     try:
-#         conn = _ad_connect()
-#         group_dn = ad_find_group_dn(conn, VPN_GROUP_CN)
-#         if not group_dn:
-#             return JsonResponse({"ok": False, "error": f"GROUP_NOT_FOUND:{VPN_GROUP_CN}"}, status=500)
-#     finally:
-#         try:
-#             if conn:
-#                 conn.unbind_s()
-#         except Exception:
-#             pass
-
-#     # user dn
-#     ad = ad_find_by_employee_id(inn)
-#     if not ad:
-#         return JsonResponse({"ok": False, "error": "AD_USER_NOT_FOUND"}, status=404)
-
-#     user_dn, user_attrs = ad
-#     currently = ad_is_in_group(user_attrs, group_dn)
-
-#     # для лога вытащим логин из AD
-#     sam = user_attrs.get("sAMAccountName", [b""])
-#     target_ad_login = (sam[0].decode("utf-8", "ignore") if sam else "").strip()
-
-#     try:
-#         if desired == "1":
-#             if currently:
-#                 send_telegram_log(
-#                     "\n".join([
-#                         "ℹ️ Удалённый доступ открыт (Без изменений, уже был открыт)",
-#                         f"by: {sess.ad_login} (sid={sess.id})",
-#                         f"target_inn: {inn}",
-#                         f"target_ad_login: {target_ad_login}",
-#                         f"target_dn: {user_dn}",
-#                         f"group: {VPN_GROUP_CN}",
-#                         f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#                         f"ip: {sess.ip}",
-#                     ])
-#                 )
-#                 return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
-
-#             ad_group_add_member(group_dn, user_dn)
-
-#             send_telegram_log(
-#                 "\n".join([
-#                     "✅ Удалённый доступ открыт",
-#                     f"by: {sess.ad_login} (sid={sess.id})",
-#                     f"target_inn: {inn}",
-#                     f"target_ad_login: {target_ad_login}",
-#                     f"target_dn: {user_dn}",
-#                     f"group: {VPN_GROUP_CN}",
-#                     f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#                     f"ip: {sess.ip}",
-#                 ])
-#             )
-#             return JsonResponse({"ok": True, "changed": True, "vpn_open": True})
-
-#         else:
-#             if not currently:
-#                 send_telegram_log(
-#                     "\n".join([
-#                         "ℹ️ Удалённый доступ закрыт (Без изменений, уже был закрыт)",
-#                         f"by: {sess.ad_login} (sid={sess.id})",
-#                         f"target_inn: {inn}",
-#                         f"target_ad_login: {target_ad_login}",
-#                         f"target_dn: {user_dn}",
-#                         f"group: {VPN_GROUP_CN}",
-#                         f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#                         f"ip: {sess.ip}",
-#                     ])
-#                 )
-#                 return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
-
-#             ad_group_remove_member(group_dn, user_dn)
-
-#             send_telegram_log(
-#                 "\n".join([
-#                     "✅ Удалённый доступ закрыт",
-#                     f"by: {sess.ad_login} (sid={sess.id})",
-#                     f"target_inn: {inn}",
-#                     f"target_ad_login: {target_ad_login}",
-#                     f"target_dn: {user_dn}",
-#                     f"group: {VPN_GROUP_CN}",
-#                     f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#                     f"ip: {sess.ip}",
-#                 ])
-#             )
-#             return JsonResponse({"ok": True, "changed": True, "vpn_open": False})
-
-#     except ldap.ALREADY_EXISTS:
-#         send_telegram_log(
-#             "\n".join([
-#                 "ℹ️ VPN ACCESS OPEN (LDAP ALREADY_EXISTS)",
-#                 f"by: {sess.ad_login} (sid={sess.id})",
-#                 f"target_inn: {inn}",
-#                 f"target_ad_login: {target_ad_login}",
-#                 f"target_dn: {user_dn}",
-#                 f"group: {VPN_GROUP_CN}",
-#                 f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#                 f"ip: {sess.ip}",
-#             ])
-#         )
-#         return JsonResponse({"ok": True, "changed": False, "vpn_open": True})
-
-#     except ldap.NO_SUCH_ATTRIBUTE:
-#         send_telegram_log(
-#             "\n".join([
-#                 "ℹ️ VPN ACCESS CLOSE (LDAP NO_SUCH_ATTRIBUTE)",
-#                 f"by: {sess.ad_login} (sid={sess.id})",
-#                 f"target_inn: {inn}",
-#                 f"target_ad_login: {target_ad_login}",
-#                 f"target_dn: {user_dn}",
-#                 f"group: {VPN_GROUP_CN}",
-#                 f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#                 f"ip: {sess.ip}",
-#             ])
-#         )
-#         return JsonResponse({"ok": True, "changed": False, "vpn_open": False})
-
-#     except Exception as e:
-#         send_telegram_log(
-#             "\n".join([
-#                 "❌ VPN TOGGLE ERROR",
-#                 f"by: {sess.ad_login} (sid={sess.id})",
-#                 f"target_inn: {inn}",
-#                 f"target_ad_login: {target_ad_login}",
-#                 f"target_dn: {user_dn}",
-#                 f"group: {VPN_GROUP_CN}",
-#                 f"error: {str(e)}",
-#                 f"time: {timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#                 f"ip: {sess.ip}",
-#             ])
-#         )
-#         return JsonResponse({"ok": False, "error": str(e)}, status=500)
-
-
-
-
-
-
-
-
-
-
 
 def _decode_ldap_val(v):
     if isinstance(v, bytes):
@@ -2753,138 +2474,6 @@ def ad_ui_lookup(request):
         "sid": str(sess.id),
         "auth_fio": auth_fio,
     })
-# @require_http_methods(["GET", "POST"])
-# @csrf_protect
-# def ad_ui_lookup(request):
-#     """
-#     POST action может быть:
-#       - action=lookup  : поиск
-#       - action=save_employeeid : обновление employeeID
-#     """
-#     error = ""
-#     ok = ""
-#     result = None
-
-#     login = ""
-#     if request.method == "POST":
-#         login = (request.POST.get("login") or "").strip()
-#     else:
-#         login = (request.GET.get("login") or "").strip()
-
-#     action = (request.POST.get("action") or "lookup").strip() if request.method == "POST" else "lookup"
-
-#     if request.method == "POST":
-#         if not login:
-#             error = "Введите логин."
-#         else:
-#             conn = None
-#             try:
-#                 conn = _ad_connect()
-
-#                 dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
-#                 if not dn:
-#                     error = "Пользователь не найден в AD."
-#                 else:
-#                     # если нужно сохранить employeeID — делаем modify
-#                     if action == "save_employeeid":
-#                         new_employee_id = (request.POST.get("employeeID") or "").strip()
-
-#                         # пусто = удалить employeeID
-#                         if new_employee_id:
-#                             if not _INN_RE.match(new_employee_id):
-#                                 error = "employeeID должен быть ИНН из 10 или 12 цифр (или пусто для очистки)."
-#                             else:
-#                                 conn.modify_s(dn, [
-#                                     (ldap.MOD_REPLACE, "employeeID", [new_employee_id.encode("utf-8")]),
-#                                 ])
-#                                 ok = "employeeID обновлён."
-#                         else:
-#                             # удалить атрибут (если был)
-#                             try:
-#                                 conn.modify_s(dn, [
-#                                     (ldap.MOD_DELETE, "employeeID", None),
-#                                 ])
-#                                 ok = "employeeID очищен."
-#                             except ldap.NO_SUCH_ATTRIBUTE:
-#                                 ok = "employeeID уже был пуст."
-
-#                         # перечитаем после изменения
-#                         dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
-
-#                     result = {
-#                         "dn": dn,
-#                         "login_input": login,
-#                         "filter": ldap_filter,
-#                         "attrs": _attrs_to_dict(ad_attrs),
-#                     }
-
-#             except ldap.INSUFFICIENT_ACCESS:
-#                 error = "Недостаточно прав в AD для изменения employeeID (INSUFFICIENT_ACCESS)."
-#             except ldap.INVALID_CREDENTIALS:
-#                 error = "Неверные учетные данные для подключения к AD."
-#             except ldap.SERVER_DOWN:
-#                 error = "AD недоступен (SERVER_DOWN)."
-#             except ldap.LDAPError as e:
-#                 error = f"LDAP ошибка: {str(e)}"
-#             except Exception as e:
-#                 error = str(e)
-#             finally:
-#                 try:
-#                     if conn:
-#                         conn.unbind_s()
-#                 except Exception:
-#                     pass
-
-#     else:
-#         # GET — ничего не ищем, пока не нажмут кнопку,
-#         # но если login передали в querystring — можно показать сразу.
-#         if login:
-#             conn = None
-#             try:
-#                 conn = _ad_connect()
-#                 dn, ad_attrs, ldap_filter = _fetch_user_by_login(conn, login)
-#                 if not dn:
-#                     error = "Пользователь не найден в AD."
-#                 else:
-#                     result = {
-#                         "dn": dn,
-#                         "login_input": login,
-#                         "filter": ldap_filter,
-#                         "attrs": _attrs_to_dict(ad_attrs),
-#                     }
-#             except Exception as e:
-#                 error = str(e)
-#             finally:
-#                 try:
-#                     if conn:
-#                         conn.unbind_s()
-#                 except Exception:
-#                     pass
-
-#     return render(request, "frostapp/ad_lookup.html", {
-#         "error": error,
-#         "ok": ok,
-#         "result": result,
-#         "login_prefill": login,
-#     })
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -3442,7 +3031,28 @@ def send_telegram_log(message: str) -> None:
                     )
     except Exception as e:
         logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)     
-        
+
+
+
+_TELEGRAM_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+
+
+def _send_telegram_log_async(message: str) -> None:
+    """
+    Отправляет админ-лог в Telegram в фоне и не блокирует HTTP-ответ.
+    """
+    text = (message or "").strip()
+    if not text or not TELEGRAM_BOT_TOKEN:
+        return
+
+    try:
+        _TELEGRAM_LOG_EXECUTOR.submit(send_telegram_log, text)
+    except Exception as e:
+        logger.exception(f"[TELEGRAM/ASYNC] Не удалось поставить лог в очередь: {e}")
+
+
+
+
 def log_qr_issue(
     *,
     endpoint: str,
@@ -4381,9 +3991,9 @@ def _update_store_mysql_and_xml_for_single_store(
     is_ukm5 = info.get("is_ukm5", False)
     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
 
-    # -------------------------
+    
     # UKM4 / MySQL import4
-    # -------------------------
+    
     if ukm4ip:
         conv = cur = None
         try:
@@ -4484,9 +4094,9 @@ def _update_store_mysql_and_xml_for_single_store(
     else:
         logger.error(f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal")
 
-    # -------------------------
+    
     # UKM5 / XML
-    # -------------------------
+    
     if not is_ukm5:
         return
 
@@ -4527,133 +4137,9 @@ def _update_store_mysql_and_xml_for_single_store(
     except Exception as e:
         logger.error(f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}", exc_info=True)
         
-# def _update_store_mysql_and_xml_for_single_store(
-#     store_id: int,
-#     cashier_id: int,
-#     role_id: int,
-#     plain_inn: str,
-#     fio: str,
-#     password_plain: str
-# ) -> None:
-#     """
-#     Обновляет кассира по ОДНОМУ магазину:
-#       • UKM4 (MySQL import4.users + import4.signal)
-#       • UKM5 (XML storeCashiers_... если магазин UKM5)
 
-#     ВАЖНО:
-#       • Для магазинов из UKM5_FULL_XML_STORE_IDS делаем ПОЛНУЮ пересборку XML,
-#         а не точечный upsert одного кассира.
-#     """
-#     logger.info(
-#         f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
-#         f"cashier_id={cashier_id}, role_id={role_id}"
-#     )
-
-#     info = get_store_info(store_id)
-#     ukm4ip = info.get("ukm4ip")
-#     is_ukm5 = info.get("is_ukm5", False)
-#     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
-
-#     # -------------------------
-#     # UKM4 / MySQL import4
-#     # -------------------------
-#     if ukm4ip:
-#         conv = cur = None
-#         try:
-#             conv = connect_store_mysql(ukm4ip)
-#             cur = conv.cursor()
-
-#             base_version = _calc_next_signal_version(cur)
-#             logger.info(
-#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): next version={base_version} "
-#                 f"(по MAX(signal.version))"
-#             )
-
-#             cur.execute("""
-#                 INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-#                 VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-#             """, (
-#                 store_id,
-#                 cashier_id,
-#                 fio,
-#                 plain_inn,
-#                 mysql_pwd(password_plain),
-#                 role_id,
-#                 base_version
-#             ))
-
-#             cur.execute(
-#                 "INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)",
-#                 (base_version,)
-#             )
-
-#             conv.commit()
-#             logger.info(
-#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): OK users+signal "
-#                 f"(id={cashier_id}, role_id={role_id}, version={base_version})"
-#             )
-#         except Exception as e:
-#             logger.error(f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}", exc_info=True)
-#             if conv:
-#                 try:
-#                     conv.rollback()
-#                 except Exception:
-#                     pass
-#         finally:
-#             try:
-#                 if cur: cur.close()
-#                 if conv: conv.close()
-#             except Exception:
-#                 pass
-#     else:
-#         logger.error(f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal")
-
-#     # -------------------------
-#     # UKM5 / XML
-#     # -------------------------
-#     if not is_ukm5:
-#         return
-
-#     # Полная пересборка XML для “спец” магазинов
-#     if int(store_id) in UKM5_FULL_XML_STORE_IDS:
-#         try:
-#             xml_path = build_full_ukm5_xml_for_store(store_id)
-#             logger.info(f"[QR/EMP] Store {store_id}: полный XML пересобран: {xml_path}")
-#         except Exception as e:
-#             logger.error(
-#                 f"[QR/EMP] Store {store_id}: ошибка полной пересборки XML/UKM5: {e}",
-#                 exc_info=True
-#             )
-#         return
-
-#     # Остальные UKM5 — точечное обновление одного кассира
-#     try:
-#         xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
-
-#         # удаляем старые записи этого INN
-#         changed = False
-#         for cash_el in list(root.findall("cashier")):
-#             if (cash_el.findtext("INN") or "").strip() == plain_inn:
-#                 root.remove(cash_el)
-#                 changed = True
-#         if changed:
-#             logger.info(f"[QR/EMP] Store {store_id}: удалены старые cashier с INN={plain_inn} из {xml_path}")
-
-#         cash_el = ET.SubElement(root, "cashier")
-#         ET.SubElement(cash_el, "roleId").text = str(role_id)
-#         ET.SubElement(cash_el, "id").text = str(cashier_id)
-#         ET.SubElement(cash_el, "name").text = fio
-#         ET.SubElement(cash_el, "INN").text = plain_inn
-#         ET.SubElement(cash_el, "password").text = password_plain
-
-#         _write_xml_with_declaration(xml_path, root, ensure_base=True)
-#         logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
-#     except Exception as e:
-#         logger.error(f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}", exc_info=True)
             
-            
-            
-            
+              
 
 def ensure_plain_inn(value: str) -> str:
     v = (value or "").strip()
@@ -5621,54 +5107,6 @@ def encrypt_inn(inn):
     hash_object = hashlib.sha256(inn.encode('utf-8'))
     return hash_object.hexdigest()
 
-# def validate_and_create_record(payload, required_fields, action_name="CREATE"):
-#     """
-#     1) Смотрим payload['data'] (других полей в запросе нет).
-#     2) Проверяем наличие всех required_fields.
-#     3) Если чего-то не хватает → пишем в queue (status='failed') + только в MODUL_logs.
-#     4) Если всё ок → queue (status='pending'), без логирования.
-
-#     Возвращает (final_status, missing_fields).
-#     """
-#     data = payload.get('data', {})
-#     if not isinstance(data, dict):
-#         data = {}
-
-#     final_status = 'pending'
-#     attempts = 0
-#     last_attempt = None
-
-#     # Проверяем обязательные поля
-#     missing = [f for f in required_fields if not data.get(f)]
-
-#     # Хэшируем ИНН (если он есть и валиден)
-#     if data.get('inn'):
-#         try:
-#             data['inn'] = encrypt_inn(data['inn'])
-#         except ValueError:
-#             missing.append('inn')
-
-#     if missing:
-#         final_status = 'failed'
-
-#     # Создаём запись в queue
-#     Queue.objects.create(
-#         data=data,
-#         attempts=attempts,
-#         status=final_status,
-#         last_attempt=last_attempt
-#     )
-
-#     # Если failed → фиксируем только в MODUL_logs
-#     if final_status == 'failed':
-#         MODUL_logs.objects.create(
-#             data={                       # JSONB-поле в таблице
-#                 "error": f"Незаполненные поля: {missing}",
-#                 "payload": data
-#             }
-#         )
-
-#     return final_status, missing
 
 def validate_and_create_record(payload, required_fields, action_name="CREATE"):
     data = payload.get('data', {})
@@ -5682,14 +5120,14 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
     attempts = 0
     last_attempt = None
 
-    # --- guid_dep: нормализуем как строку ---
+    # guid_dep: нормализуем как строку
     if 'guid_dep' in data:
         gd = data.get('guid_dep')
         gd = "" if gd is None else str(gd)
         gd = gd.strip()
         data['guid_dep'] = gd or None  # пустое -> None (чтобы попало в missing)
 
-    # --- ИНН: сохраняем чистый в id_compare + хэшируем в inn ---
+    # ИНН: сохраняем чистый в id_compare + хэшируем в inn
     raw_inn = data.get('inn')
     if raw_inn:
         try:
@@ -5721,64 +5159,6 @@ def validate_and_create_record(payload, required_fields, action_name="CREATE"):
         )
 
     return final_status, missing
-# def validate_and_create_record(payload, required_fields, action_name="CREATE"):
-#     """
-#     1) Смотрим payload['data'] (других полей в запросе нет).
-#     2) Проверяем наличие всех required_fields.
-#     3) Если чего-то не хватает → пишем в queue (status='failed') + только в MODUL_logs.
-#     4) Если всё ок → queue (status='pending'), без логирования.
-
-#     Дополнительно:
-#     - сохраняем исходный ИНН в data['id_compare']
-#     - в data['inn'] сохраняем SHA-256 (как раньше)
-#     """
-#     data = payload.get('data', {})
-#     if not isinstance(data, dict):
-#         data = {}
-#     else:
-#         # чтобы не мутировать исходный payload
-#         data = dict(data)
-
-#     final_status = 'pending'
-#     attempts = 0
-#     last_attempt = None
-
-#     # Проверяем обязательные поля (до любых преобразований)
-#     missing = [f for f in required_fields if not data.get(f)]
-
-#     # ИНН: сохраняем чистый в id_compare + хэшируем в inn
-#     raw_inn = data.get('inn')
-#     if raw_inn:
-#         try:
-#             plain_inn = ensure_plain_inn(str(raw_inn))  
-#             data['id_compare'] = plain_inn        
-#             data['inn'] = encrypt_inn(plain_inn)      
-#         except ValueError:
-#             missing.append('inn')
-#             data.pop('id_compare', None)  # на всякий случай
-#     # если raw_inn пустой — missing уже содержит 'inn', если он в required_fields
-
-#     if missing:
-#         final_status = 'failed'
-
-#     # Создаём запись в queue
-#     Queue.objects.create(
-#         data=data,
-#         attempts=attempts,
-#         status=final_status,
-#         last_attempt=last_attempt
-#     )
-
-#     # Если failed → фиксируем только в MODUL_logs
-#     if final_status == 'failed':
-#         MODUL_logs.objects.create(
-#             data={
-#                 "error": f"Незаполненные поля: {missing}",
-#                 "payload": data
-#             }
-#         )
-
-#     return final_status, missing
 
 
 @csrf_exempt
@@ -6077,102 +5457,6 @@ def regenerate_qr(user):
                 next_free_id += 1
         except Exception as exc:
             logger.error(f"[XML] Ошибка для {sid}: {exc}", exc_info=True)
-# def regenerate_qr(user):
-#     new_password = build_user_password(user.employee_id)
-#     now = timezone.now()
-#     expiration = now + datetime.timedelta(days=1)
-
-#     # PostgreSQL: QR + open_in_system
-#     QRCode.objects.filter(user=user).delete()
-#     QRCode.objects.create(user=user, qr_data=new_password, created_at=now, expires_at=expiration)
-#     OpenInSystem.objects.filter(user_id=user.id, system_id=9).update(password=new_password)
-
-#     # для id кассира
-#     ukm_conn = connect_ukm()
-#     ukm_cursor = ukm_conn.cursor()
-#     ukm_cursor.execute("SELECT MAX(id)+1 AS next_id FROM trm_in_users")
-#     cashier_id_base = ukm_cursor.fetchone()['next_id'] or 1
-#     ukm_conn.close()
-
-#     ukm_emp_id = get_trm_employee_id(user.employee_id, user.full_name)
-#     ukm_users = list(UKMUser.objects.filter(user_id=user.id))
-#     cashier_counter = 0
-
-#     for ukm_user in ukm_users:
-#         sid = ukm_user.storeid
-#         cashier_id = ukm_emp_id if ukm_emp_id else (cashier_id_base + cashier_counter)
-
-#         info = get_store_info(sid)
-#         ukm4ip = info.get("ukm4ip")
-
-#         if ukm4ip:
-#             try:
-#                 conv = connect_store_mysql(ukm4ip)
-#                 cur = conv.cursor()
-
-#                 base_version = _calc_next_signal_version(cur)
-
-#                 cur.execute("""
-#                     INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-#                     VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
-#                 """, (
-#                     sid,
-#                     cashier_id,
-#                     user.full_name,
-#                     user.employee_id,
-#                     mysql_pwd(new_password),
-#                     ukm_user.roleid,
-#                     base_version
-#                 ))
-#                 cur.execute("INSERT INTO `signal`(`signal`, `version`) VALUES ('incr', %s)", (base_version,))
-#                 conv.commit()
-#                 conv.close()
-#                 logger.info(
-#                     f"[MySQL:{ukm4ip}] Пароль обновлён store={sid}, "
-#                     f"id={cashier_id}, version={base_version}"
-#                 )
-#             except Exception as e:
-#                 logger.error(f"[MySQL:{ukm4ip}] Ошибка обновления пароля для store={sid}: {e}")
-#         else:
-#             logger.error(f"[Oracle] Не найден UKM4IP для storeid={sid}. Пропуск записи в MySQL.")
-
-#         cashier_counter += 1
-
-#     # XML для UKM5 (обновляем записи)
-#     next_free_id = cashier_id_base + cashier_counter
-
-#     for ukm_user in ukm_users:
-#         sid = ukm_user.storeid
-#         if not is_ukm5_store(sid):
-#             continue
-
-#         try:
-#             if sid == UKM5_FULL_XML_STORE_ID:
-#                 # Для магазина 2013 при смене пароля пересобираем полный XML
-#                 xml_path = build_full_ukm5_xml_for_store(sid)
-#                 logger.info(
-#                     f"[XML] Полный XML пересобран при регенерации QR для storeid={sid}: {xml_path}"
-#                 )
-#             else:
-#                 # Остальные магазины — точечное обновление одного кассира
-#                 xml_path, tree, root = _get_or_create_storecashiers_tree(sid)
-
-#                 for el in list(root.findall("cashier")):
-#                     if el.findtext("INN") == user.employee_id:
-#                         root.remove(el)
-
-#                 c_el = ET.SubElement(root, "cashier")
-#                 ET.SubElement(c_el, "roleId").text = str(ukm_user.roleid)
-#                 ET.SubElement(c_el, "id").text = str(next_free_id)
-#                 ET.SubElement(c_el, "name").text = user.full_name
-#                 ET.SubElement(c_el, "INN").text = user.employee_id
-#                 ET.SubElement(c_el, "password").text = new_password
-
-#                 _write_xml_with_declaration(xml_path, root, ensure_base=True)
-#                 logger.info(f"[XML] Обновлён при регенерации QR: {xml_path}")
-#                 next_free_id += 1
-#         except Exception as exc:
-#             logger.error(f"[XML] Ошибка для {sid}: {exc}")
 
 
 
@@ -6990,7 +6274,7 @@ def get_qr_code_by_tg(request):
       - проверяет ukm_users
       - читает существующий open_in_system.password (system_id=9) и возвращает
       - пишет QRIssueLog по каждой связке store/role
-      - шлёт админ-лог в Telegram (TELEGRAM_ADMIN_CHAT_IDS)
+      - шлёт админ-лог в Telegram (в фоне)
 
     НЕ делает:
       - НЕ обновляет QRCode / OpenInSystem / UKMUser
@@ -7007,7 +6291,7 @@ def get_qr_code_by_tg(request):
             data = json.loads(raw_body)
         except Exception as e:
             logger.error(f"[QR/RO] JSON parse error: {e}; body={raw_body!r}")
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Парсинг JSON\nПричина: {e}\n\n"
                 f"Сырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
@@ -7033,7 +6317,9 @@ def get_qr_code_by_tg(request):
 
         if not tg_id and not max_id:
             msg = "Не указан tg_id или max_id"
-            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR\nЭтап: Валидация\nПричина: {msg}")
+            _send_telegram_log_async(
+                f"❌ Ошибка (READ-ONLY) при выдаче QR\nЭтап: Валидация\nПричина: {msg}"
+            )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
                 method="BY_ID",
@@ -7053,7 +6339,7 @@ def get_qr_code_by_tg(request):
         user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
         if not user:
             msg = f"Пользователь не найден: {err} (tg_id={tg_id!r}, max_id={max_id!r})"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Поиск пользователя\nПричина: {msg}"
             )
@@ -7073,7 +6359,6 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
-        # tg_id для логов — берём из user, если есть
         tg_id_user = str(getattr(user, "tg_id", "") or "").strip()
         fio = " ".join((user.full_name or "").split()).strip()
         employee_id_raw = (user.employee_id or "").strip()
@@ -7082,7 +6367,7 @@ def get_qr_code_by_tg(request):
             plain_inn = ensure_plain_inn(employee_id_raw)
         except Exception as e:
             msg = f"Некорректный employee_id (ИНН) у user_id={user.id}: {e}"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Валидация ИНН\nПричина: {msg}\n\n"
                 f"tg_id={tg_id_user or '—'}\nmax_id={getattr(user,'max_id','') or '—'}\n"
@@ -7107,7 +6392,7 @@ def get_qr_code_by_tg(request):
         ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
         if not ukm_links:
             msg = f"Нет записей ukm_users для user_id={user.id}"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n\n"
                 f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\n"
@@ -7129,11 +6414,10 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": "Для пользователя нет записей в ukm_users"}, status=404)
 
-        # open_in_system.password (READ-ONLY)
         password, open_username, open_row_id = _get_existing_open_password(user_id=user.id, system_id=9)
         if not password:
             msg = f"Нет password в open_in_system (system_id=9) для user_id={user.id}"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Чтение open_in_system\nПричина: {msg}\n\n"
                 f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\n"
@@ -7155,7 +6439,6 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": "У пользователя нет сохранённого QR (open_in_system)"}, status=404)
 
-        # mapping ukm4store -> Store
         ukm_store_ids_str = [str(int(x["storeid"])) for x in ukm_links if str(x.get("storeid", "")).isdigit()]
         store_map = {
             str(s.ukm4store).strip(): s
@@ -7177,7 +6460,6 @@ def get_qr_code_by_tg(request):
                 "found_in_trm": None,
             })
 
-        # Telegram лог (сохраняем старый текст, но добавляем max_id)
         lines = [
             "✅ QR-код запросили из бота",
             "",
@@ -7198,16 +6480,14 @@ def get_qr_code_by_tg(request):
             password,
             f"open_in_system.id={open_row_id}, username={open_username or '—'}",
         ]
-        send_telegram_log("\n".join(lines))
+        _send_telegram_log_async("\n".join(lines))
 
-        # QRIssueLog
         phone_norm = normalize_phone_ru(user.phone or "") or ""
         try:
             raw_req = json.loads(raw_body) if raw_body else None
         except Exception:
             raw_req = {"raw_body": raw_body}
 
-        # дополняем raw_request, чтобы было видно, кто вызывал
         if isinstance(raw_req, dict):
             raw_req.setdefault("tg_id", tg_id)
             raw_req.setdefault("max_id", max_id)
@@ -7244,13 +6524,10 @@ def get_qr_code_by_tg(request):
 
     except Exception as e:
         logger.exception("[QR/RO] Unexpected error")
-        try:
-            send_telegram_log(
-                "💥 Критическая ошибка (READ-ONLY) при выдаче QR\n"
-                f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
-            )
-        except Exception:
-            pass
+        _send_telegram_log_async(
+            "💥 Критическая ошибка (READ-ONLY) при выдаче QR\n"
+            f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
+        )
         return JsonResponse({"status": "error", "message": str(e)}, status=500)
 
 @csrf_exempt
@@ -7262,25 +6539,12 @@ def get_qr_code_by_employee_id(request):
     {
       "inn": "7536207278",
       "fio": "Иванов Иван Иванович",
-      "storeId": 514,     # SMSTORE (Supermag)
+      "storeId": 514,
       "roleId": 1,
       "phone": "8 (924) 000-00-00"
     }
 
-    Делает:
-      - валидирует INN/FIO/storeId/roleId
-      - маппит smstore -> ukm4store через таблицу Store
-      - ищет пользователя в users по ИНН (как раньше: plain + sha + sha20)
-      - проверяет, что у пользователя есть записи ukm_users
-      - (опционально) проверяет, что запрошенный ukm4store есть среди ukm_users
-      - читает существующий open_in_system.password (system_id=9) и возвращает
-      - пишет QRIssueLog (по каждому магазину пользователя)
-      - шлёт админ-лог в Telegram (TELEGRAM_ADMIN_CHAT_IDS)
-
-    НЕ делает:
-      - НЕ обновляет QRCode / OpenInSystem / UKMUser
-      - НЕ пишет в MySQL import4.users/signal
-      - НЕ обновляет XML UKM5
+    Админ-логи в Telegram отправляются в фоне.
     """
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
@@ -7292,7 +6556,7 @@ def get_qr_code_by_employee_id(request):
             data = json.loads(raw_body)
         except Exception as e:
             logger.error(f"[QR/EMP/RO] JSON parse error: {e}; body={raw_body!r}")
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Парсинг JSON\nПричина: {e}\n\n"
                 f"Сырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
@@ -7322,10 +6586,11 @@ def get_qr_code_by_employee_id(request):
         role_raw = str(data.get("roleId") or data.get("roleid") or "").strip()
         phone_raw = str(data.get("phone") or "").strip()
 
-        # INN
         if not inn_raw:
             msg = "Не указан inn"
-            send_telegram_log(f"❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}")
+            _send_telegram_log_async(
+                f"❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}"
+            )
             log_qr_issue(
                 endpoint="get_qr_code_by_employee_id",
                 method="BY_INN",
@@ -7349,7 +6614,7 @@ def get_qr_code_by_employee_id(request):
             plain_inn = ensure_plain_inn(inn_raw)
         except Exception as e:
             msg = f"Некорректный ИНН: {e}"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация ИНН\nПричина: {msg}\ninn={inn_raw!r}"
             )
@@ -7372,10 +6637,9 @@ def get_qr_code_by_employee_id(request):
             )
             return JsonResponse({"status": "error", "message": msg}, status=400)
 
-        # FIO
         if not fio_raw:
             msg = "Не указано fio"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация\nПричина: {msg}\ninn={plain_inn}"
             )
@@ -7399,10 +6663,9 @@ def get_qr_code_by_employee_id(request):
             return JsonResponse({"status": "error", "message": msg}, status=400)
         fio = " ".join(fio_raw.split()).strip()
 
-        # storeId(smstore)
         if not store_raw or not store_raw.isdigit():
             msg = "Некорректный storeId (smstore)"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация\nПричина: {msg}\nstoreId={store_raw!r}"
             )
@@ -7426,10 +6689,9 @@ def get_qr_code_by_employee_id(request):
             return JsonResponse({"status": "error", "message": msg}, status=400)
         sm_store_id = int(store_raw)
 
-        # roleId
         if not role_raw or not role_raw.isdigit():
             msg = "Некорректный roleId"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация\nПричина: {msg}\nroleId={role_raw!r}"
             )
@@ -7455,11 +6717,10 @@ def get_qr_code_by_employee_id(request):
 
         phone_norm = normalize_phone_ru(phone_raw) or ""
 
-        # smstore -> ukm4store
         store_obj = Store.objects.filter(smstore=sm_store_id).first()
         if not store_obj or store_obj.ukm4store is None:
             msg = "Магазин не найден в stores или не указан ukm4store"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Маппинг smstore→ukm4store\nПричина: {msg}\nsmstore={sm_store_id}"
             )
@@ -7486,13 +6747,12 @@ def get_qr_code_by_employee_id(request):
             ukm_store_id_req = int(str(store_obj.ukm4store).strip())
         except Exception:
             msg = "Некорректное значение ukm4store"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Маппинг smstore→ukm4store\nПричина: {msg}\nsmstore={sm_store_id}"
             )
             return JsonResponse({"status": "error", "message": msg}, status=400)
 
-        # Поиск пользователя (как было — несколько стратегий)
         inn_sha = hashlib.sha256(plain_inn.encode("utf-8")).hexdigest()
         inn_sha20 = inn_sha[:20]
         user = (
@@ -7505,7 +6765,7 @@ def get_qr_code_by_employee_id(request):
         )
         if not user:
             msg = f"Пользователь с INN={plain_inn} не найден в PostgreSQL"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Поиск пользователя\nПричина: {msg}\n"
                 f"inn={plain_inn}\nfio={fio}\nsmstore={sm_store_id} (ukm4store={ukm_store_id_req})"
@@ -7529,11 +6789,10 @@ def get_qr_code_by_employee_id(request):
             )
             return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
-        # ukm_users (READ-ONLY): просто читаем
         ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
         if not ukm_links:
             msg = f"Нет записей ukm_users для user_id={user.id}"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n"
                 f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}\nsmstore={sm_store_id} (ukm4store={ukm_store_id_req})"
@@ -7557,11 +6816,10 @@ def get_qr_code_by_employee_id(request):
             )
             return JsonResponse({"status": "error", "message": "Для пользователя нет записей в ukm_users"}, status=404)
 
-        # Проверим, что запрошенный магазин есть в ukm_users (ничего не меняем)
         has_requested_store = any(int(x["storeid"]) == int(ukm_store_id_req) for x in ukm_links if str(x.get("storeid", "")).isdigit())
         if not has_requested_store:
             msg = f"У пользователя нет доступа к ukm4store={ukm_store_id_req} (запрошен smstore={sm_store_id})"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n"
                 f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}"
@@ -7585,11 +6843,10 @@ def get_qr_code_by_employee_id(request):
             )
             return JsonResponse({"status": "error", "message": msg}, status=403)
 
-        # open_in_system.password (READ-ONLY)
         password, open_username, open_row_id = _get_existing_open_password(user_id=user.id, system_id=9)
         if not password:
             msg = f"Нет password в open_in_system (system_id=9) для user_id={user.id}"
-            send_telegram_log(
+            _send_telegram_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Чтение open_in_system\nПричина: {msg}\n\n"
                 f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}"
@@ -7613,7 +6870,6 @@ def get_qr_code_by_employee_id(request):
             )
             return JsonResponse({"status": "error", "message": "У пользователя нет сохранённого QR (open_in_system)"}, status=404)
 
-        # Store map для вывода/логов
         ukm_store_ids_str = [str(int(x["storeid"])) for x in ukm_links if str(x.get("storeid", "")).isdigit()]
         store_map = {
             str(s.ukm4store).strip(): s
@@ -7640,7 +6896,6 @@ def get_qr_code_by_employee_id(request):
                 "found_in_trm": None,
             })
 
-        # Telegram-лог
         fio_db = " ".join(((user.full_name or "").split())) if (user.full_name or "").strip() else ""
         fio_match = (fio_db == fio) if fio_db else None
 
@@ -7674,9 +6929,8 @@ def get_qr_code_by_employee_id(request):
             password,
             f"open_in_system.id={open_row_id}, username={open_username or '—'}",
         ]
-        send_telegram_log("\n".join(lines))
+        _send_telegram_log_async("\n".join(lines))
 
-        # Логи в таблицу (по каждому магазину)
         try:
             raw_req = json.loads(raw_body) if raw_body else None
         except Exception:
@@ -7715,13 +6969,10 @@ def get_qr_code_by_employee_id(request):
 
     except Exception as e:
         logger.exception("[QR/EMP/RO] Unexpected error")
-        try:
-            send_telegram_log(
-                "💥 Критическая ошибка (READ-ONLY) при выдаче QR по ИНН\n"
-                f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
-            )
-        except Exception:
-            pass
+        _send_telegram_log_async(
+            "💥 Критическая ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+            f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
+        )
         return JsonResponse({"status": "error", "message": str(e)}, status=500)
 
 
@@ -7738,7 +6989,7 @@ def update_cashier(request):
         raw_body = request.body.decode("utf-8") if request.body else "{}"
         data = json.loads(raw_body)
 
-        # ---- входные поля (поддержим несколько вариантов названий)
+        # входные поля
         inn_raw = str(data.get("inn") or data.get("employee_id") or "").strip()
         fio_raw = str(data.get("fio") or data.get("full_name") or "").strip()
         storeids_raw = data.get("storeid") or data.get("storeids") or data.get("stores")
@@ -7770,7 +7021,7 @@ def update_cashier(request):
         if not store_ids:
             return JsonResponse({"status": "error", "message": "Некорректный storeid"}, status=400)
 
-        # ---- поиск пользователя (plain/sha/sha20) + нормализованное ФИО
+        #поиск пользователя (plain/sha/sha20) + нормализованное ФИО
         inn_sha = hashlib.sha256(plain_inn.encode("utf-8")).hexdigest()
         inn_sha20 = inn_sha[:20]
 
@@ -7800,7 +7051,7 @@ def update_cashier(request):
         if not user:
             return JsonResponse({"status": "error", "message": "Пользователь не найден"}, status=404)
 
-        # ---- добавим недостающие магазины в ukm_users (в Postgres) + сразу ротируем пароль
+        # добавим недостающие магазины в ukm_users (в Postgres) + сразу ротируем пароль
         added_storeids: list[int] = []
 
         with transaction.atomic():
@@ -7853,7 +7104,7 @@ def update_cashier(request):
         if not ukm_links:
             return JsonResponse({"status": "error", "message": "Нет записей ukm_users у пользователя"}, status=400)
 
-        # ---- allocator новых trm-id: ключим по resolved_host, чтобы не словить дубль,
+        # allocator новых trm-id: ключим по resolved_host, чтобы не словить дубль,
         # если разные storeid попадают на один и тот же ukmserver
         trm_alloc: dict[str, dict] = {}  # {resolved_host: {"next": int, "reserved": set[int]}}
 
@@ -7898,7 +7149,7 @@ def update_cashier(request):
                 st["next"] = candidate + 1
                 return int(candidate), key
 
-        # ---- обновление UKM4/UKM5 по всем магазинам пользователя
+        # обновление UKM4/UKM5 по всем магазинам пользователя
         per_store = []
         errors = 0
 
@@ -8458,7 +7709,7 @@ def employee_identification(request):
             phone_raw=phone_raw,
         )
 
-    # --- 6. Анализ ответа 1С и логирование ---
+    # 6. Анализ ответа 1С и логирование
     ok_1c = (200 <= status_1c < 300)
 
     # Лог в Telegram (в любом случае)
@@ -8520,7 +7771,7 @@ def employee_identification(request):
     except Exception:
         logger.exception("[EMP_IDENT] Ошибка при записи успеха/ошибки в qr_issue_logs")
 
-    # --- 7. Ответ клиенту ---
+    # 7. Ответ клиенту
     if not ok_1c:
         return JsonResponse(
             {
@@ -8967,7 +8218,6 @@ def pos_reboot(request):
     max_id = str(body.get("max_id") or "").strip()
     ip = str(body.get("ip") or "").strip()
 
-    # эти поля могут присылать, но мы НЕ доверяем им (используем только для сверки/логов)
     req_ukm4 = body.get("ukm4", None)
     req_ukm5 = body.get("ukm5", None)
     req_is_kso = body.get("is_kso", None)
@@ -8978,15 +8228,12 @@ def pos_reboot(request):
     if not _ip_allowed(ip):
         return JsonResponse({"status": "error", "message": f"IP {ip} запрещён (allowlist)"}, status=403)
 
-    # 1) ищем пользователя и все его устройства
     user, devices, err = get_devices_for_ids(tg_id=tg_id, max_id=max_id)
     if not user:
         return JsonResponse({"status": "error", "message": err or "Пользователь не найден"}, status=404)
 
-    # tg_id для логов
     tg_id_user = str(getattr(user, "tg_id", "") or "").strip()
 
-    # 2) находим устройство по IP (и берём ВСЮ правду из него)
     dev = next((d for d in devices if str(d.get("ip") or "").strip() == ip), None)
     if not dev:
         return JsonResponse({"status": "error", "message": "Этот IP не найден среди касс пользователя (запрещено)"}, status=403)
@@ -8995,7 +8242,6 @@ def pos_reboot(request):
     ukm5 = bool(dev.get("ukm5"))
     is_kso = bool(dev.get("is_kso"))
 
-    # сверка если клиент прислал флаги (чтобы не было путаницы)
     if req_ukm4 is not None and bool(req_ukm4) != ukm4:
         return JsonResponse({"status": "error", "message": "ukm4 не совпадает с типом кассы пользователя"}, status=400)
     if req_ukm5 is not None and bool(req_ukm5) != ukm5:
@@ -9017,7 +8263,6 @@ def pos_reboot(request):
     kind = _pos_kind_label(ukm4=ukm4, ukm5=ukm5, is_kso=is_kso)
     cmd_hint, _use_sudo_hint = _device_cmd_hint(ukm4=ukm4, ukm5=ukm5, is_kso=is_kso)
 
-    # 3) выбираем ssh-логин и пароль (по реальному типу)
     if ukm5:
         username = "ukm5"
         password = SSH_UKM5_PASSWORD
@@ -9098,7 +8343,7 @@ def pos_reboot(request):
             f"  • stdout: {res.get('stdout') or '—'}",
             f"  • stderr: {res.get('stderr') or '—'}",
         ]
-        send_telegram_log("\n".join(msg_lines))
+        _send_telegram_log_async("\n".join(msg_lines))
 
         return JsonResponse({"status": "ok", "result": res}, json_dumps_params={"ensure_ascii": False})
 
@@ -9150,7 +8395,7 @@ def pos_reboot(request):
             "",
             f"🧨 Ошибка: {e}",
         ]
-        send_telegram_log("\n".join(msg_lines))
+        _send_telegram_log_async("\n".join(msg_lines))
 
         return JsonResponse({"status": "error", "message": str(e)}, status=500, json_dumps_params={"ensure_ascii": False})
 
@@ -9286,74 +8531,7 @@ def _connect_oracle_service(service_key: str):
             )
 
     raise last_err or RuntimeError(f"Cannot connect to Oracle service {service_key}")
-# def _connect_oracle_service(service_key: str):
-#     """
-#     Подключение к Oracle по service_key (например BINUU01, BINCH12 и т.п.)
-#     Использует ORACLE_TNS_MAP: у каждого сервиса свой host/port/service_name.
 
-#     Важно:
-#       - выставляем conn.callTimeout, чтобы не было "тишины часами" при зависшем execute/commit/fetch.
-#     """
-#     ORA_USER     = os.getenv("ORACLE_USER", "supermag")
-#     ORA_PASSWORD = os.getenv("ORACLE_PASSWORD", "qqq")
-
-#     call_timeout_ms = int(os.getenv("INN_SYNC_ORACLE_CALL_TIMEOUT_MS", "120000"))  # 120s
-
-#     info = ORACLE_TNS_MAP.get(service_key)
-
-#     if not info:
-#         host = os.getenv("ORACLE_HOST", "192.168.17.239")
-#         port = int(os.getenv("ORACLE_PORT", "1521"))
-#         service_name = service_key
-#         hosts = [host]
-#     else:
-#         service_name = (info.get("service_name") or service_key).strip()
-#         port = int(info.get("port", 1521))
-#         hosts = info.get("hosts") or [info.get("host")]
-#         hosts = [h for h in hosts if h]
-
-#     last_err = None
-
-#     for host in hosts:
-#         # 1) SERVICE_NAME
-#         try:
-#             dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
-#             logger.info(
-#                 f"[INN_SYNC][ORACLE] connect service_key={service_key} host={host} port={port} service_name={service_name}"
-#             )
-#             conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn, encoding="UTF-8")
-#             try:
-#                 conn.callTimeout = call_timeout_ms
-#                 logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host}")
-#             except Exception as e:
-#                 logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key}: {e}")
-#             return conn
-#         except cx_Oracle.DatabaseError as e:
-#             last_err = e
-#             logger.warning(
-#                 f"[INN_SYNC][ORACLE] connect failed (service_name) {service_key}@{host}:{port}/{service_name}: {e}"
-#             )
-
-#         # 2) SID fallback
-#         try:
-#             dsn2 = cx_Oracle.makedsn(host, port, sid=service_name)
-#             logger.info(
-#                 f"[INN_SYNC][ORACLE] retry as SID service_key={service_key} host={host} port={port} sid={service_name}"
-#             )
-#             conn = cx_Oracle.connect(user=ORA_USER, password=ORA_PASSWORD, dsn=dsn2, encoding="UTF-8")
-#             try:
-#                 conn.callTimeout = call_timeout_ms
-#                 logger.info(f"[INN_SYNC][ORACLE] callTimeout={call_timeout_ms}ms service={service_key} host={host} (SID)")
-#             except Exception as e:
-#                 logger.warning(f"[INN_SYNC][ORACLE] cannot set callTimeout service={service_key} (SID): {e}")
-#             return conn
-#         except cx_Oracle.DatabaseError as e2:
-#             last_err = e2
-#             logger.warning(
-#                 f"[INN_SYNC][ORACLE] connect failed (sid) {service_key}@{host}:{port} sid={service_name}: {e2}"
-#             )
-
-#     raise last_err or RuntimeError(f"Cannot connect to Oracle service {service_key}")
 
 def _fetch_onec_working_employees() -> list[dict]:
     auth = None
@@ -9476,7 +8654,7 @@ def sm_sync_inn_from_onec(
     """
     services = services or ORACLE_SERVICES_ALL
 
-    # --- настройки логов/прогресса/таймингов из env ---
+    # настройки логов/прогресса/таймингов из env
     progress_every_rows = int(os.getenv("INN_SYNC_PROGRESS_EVERY_ROWS", "2000"))
     heartbeat_sec = int(os.getenv("INN_SYNC_HEARTBEAT_SEC", "30"))
     slow_warn_sec = float(os.getenv("INN_SYNC_SLOW_STEP_WARN_SEC", "10"))
@@ -10740,10 +9918,8 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
     staff_id в urls.py допускает отрицательные (re_path), но мы их отвергаем валидацией.
     """
 
-    # --- normalize db ---
     db = (db or "").strip().upper()
 
-    # --- parse staff_id ---
     try:
         staff_id_int = int(staff_id)
     except (ValueError, TypeError):
@@ -10764,7 +9940,7 @@ def sm_staff_ui_edit_inn(request, db: str, staff_id: str):
             "error": f"Некорректный ID пользователя: {staff_id_int}. ID должен быть положительным числом.",
         })
 
-    # --- validate db against map/allowlist ---
+    # validate db against map/allowlist
     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
         return render(request, "frostapp/smstaff_edit.html", {
             "db": db,
@@ -11605,6 +10781,8 @@ def tg_admin_badge_start(request):
     """
     START: { tg_id } или { max_id }
     Ответ: guid + stores + cashier + expires_at
+
+    Админ-лог в Telegram отправляется в фоне.
     """
     if not _require_bot_token(request):
         return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
@@ -11621,9 +10799,9 @@ def tg_admin_badge_start(request):
 
     user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
     if err:
-        return JsonResponse({"status":"error","message": err}, status=404)
+        return JsonResponse({"status": "error", "message": err}, status=404)
     if not user:
-        send_telegram_log(
+        _send_telegram_log_async(
             "\n".join([
                 "❌ Запрос админского бейджа: пользователь не найден",
                 f"channel={channel}",
@@ -11643,7 +10821,7 @@ def tg_admin_badge_start(request):
     store_ids = [int(x) for x in store_ids if str(x).isdigit()]
 
     if not store_ids:
-        send_telegram_log(
+        _send_telegram_log_async(
             "\n".join([
                 "❌ Запрос админского бейджа: Нет в таблице ukm_users",
                 f"channel={channel}",
@@ -11681,7 +10859,7 @@ def tg_admin_badge_start(request):
         },
     )
 
-    send_telegram_log(
+    _send_telegram_log_async(
         "\n".join([
             "🪪 Запрос админского бейджа: Запрошен",
             f"guid={req.id}",
@@ -11709,104 +10887,6 @@ def tg_admin_badge_start(request):
         "expires_at": timezone.localtime(req.expires_at).isoformat(sep=' ', timespec='seconds'),
         "channel": channel,
     })
-# @csrf_exempt
-# @require_http_methods(["POST"])
-# def tg_admin_badge_start(request):
-#     """
-#     1) Кассир нажимает "Запросить бейдж админа"
-#     POST JSON: { "tg_id": "..." }
-#     Ответ: { status, guid, stores:[...], cashier:{id, full_name, tg_id} }
-#     """
-#     if not _require_bot_token(request):
-#         return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
-
-#     _expire_old_badge_requests()
-
-#     data, err = _json_body_or_400(request)
-#     if err:
-#         return err
-
-#     tg_id = str(data.get("tg_id") or "").strip()
-#     if not tg_id:
-#         return JsonResponse({"status": "error", "message": "tg_id required"}, status=400)
-
-#     user = User.objects.filter(tg_id=tg_id).first()
-#     if not user:
-#         send_telegram_log(
-#             "\n".join([
-#                 "❌ Запрос админского бейджа: пользователь не найден",
-#                 f"tg_id={tg_id}",
-#                 f"ip={_client_ip_simple(request)}",
-#                 f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#             ])
-#         )
-#         return JsonResponse({"status": "error", "message": "USER_NOT_FOUND"}, status=404)
-
-#     store_ids = list(
-#         UKMUser.objects.filter(user_id=user.id)
-#         .values_list("storeid", flat=True)
-#         .distinct()
-#     )
-#     store_ids = [int(x) for x in store_ids if str(x).isdigit()]
-
-#     if not store_ids:
-#         send_telegram_log(
-#             "\n".join([
-#                 "❌ Запрос админского бейджа: Нет в таблице ukm_users",
-#                 f"cashier_user_id={user.id}",
-#                 f"cashier_fio={user.full_name}",
-#                 f"cashier_tg_id={tg_id}",
-#                 f"ip={_client_ip_simple(request)}",
-#                 f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#             ])
-#         )
-#         return JsonResponse({"status": "error", "message": "NO_STORES"}, status=404)
-
-#     now = timezone.now()
-#     req = AdminBadgeRequest.objects.create(
-#         status="NEW",
-#         cashier_user_id=user.id,
-#         cashier_tg_id=tg_id,
-#         cashier_full_name=(user.full_name or "").strip(),
-#         store_ids=store_ids,
-#         storeid=None,
-#         admin_user_id=None,
-#         admin_tg_id=None,
-#         admin_full_name=None,
-#         decision=None,
-#         decided_at=None,
-#         expires_at=now + timezone.timedelta(minutes=BADGE_REQ_TTL_MINUTES),
-#         ip=_client_ip_simple(request),
-#         user_agent=(request.META.get("HTTP_USER_AGENT") or "")[:2000],
-#         meta={"start_payload": data},
-#     )
-
-#     send_telegram_log(
-#         "\n".join([
-#             "🪪 Запрос админского бейджа: Запрошен",
-#             f"guid={req.id}",
-#             f"cashier_user_id={user.id}",
-#             f"cashier_fio={user.full_name}",
-#             f"cashier_tg_id={tg_id}",
-#             f"stores={store_ids}",
-#             f"expires_at={timezone.localtime(req.expires_at).isoformat(sep=' ', timespec='seconds')}",
-#             f"ip={req.ip}",
-#         ])
-#     )
-
-#     return JsonResponse({
-#         "status": "ok",
-#         "guid": str(req.id),
-#         "stores": store_ids,
-#         "cashier": {
-#             "id": user.id,
-#             "full_name": (user.full_name or "").strip(),
-#             "tg_id": tg_id,
-#         },
-#         "expires_at": timezone.localtime(req.expires_at).isoformat(sep=' ', timespec='seconds'),
-#     })
-
-
 
 
 
@@ -11891,99 +10971,6 @@ def tg_admin_badge_admins(request):
         "admins": admins,
         "channel": channel,
     })
-# @csrf_exempt
-# @require_http_methods(["POST"])
-# def tg_admin_badge_admins(request):
-#     """
-#     2) Кассир выбрал магазин
-#     POST JSON: { "tg_id":"...", "guid":"...", "storeid": 514 }
-#     Ответ: { status, guid, storeid, admins:[{id, tg_id, full_name, can_notify}] }
-#     """
-#     if not _require_bot_token(request):
-#         return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
-
-#     _expire_old_badge_requests()
-
-#     data, err = _json_body_or_400(request)
-#     if err:
-#         return err
-
-#     tg_id = str(data.get("tg_id") or "").strip()
-#     guid = str(data.get("guid") or "").strip()
-#     storeid_raw = data.get("storeid")
-
-#     if not tg_id or not guid or storeid_raw is None:
-#         return JsonResponse({"status": "error", "message": "tg_id, guid, storeid required"}, status=400)
-
-#     try:
-#         storeid = int(str(storeid_raw).strip())
-#     except Exception:
-#         return JsonResponse({"status": "error", "message": "BAD_STOREID"}, status=400)
-
-#     try:
-#         req = AdminBadgeRequest.objects.get(id=guid)
-#     except Exception:
-#         return JsonResponse({"status": "error", "message": "GUID_NOT_FOUND"}, status=404)
-
-#     if req.status == "EXPIRED" or req.expires_at < timezone.now():
-#         return JsonResponse({"status": "error", "message": "EXPIRED"}, status=410)
-
-#     if str(req.cashier_tg_id) != tg_id:
-#         return JsonResponse({"status": "error", "message": "NOT_YOUR_SESSION"}, status=403)
-
-#     allowed_stores = req.store_ids or []
-#     if storeid not in allowed_stores:
-#         return JsonResponse({"status": "error", "message": "STORE_NOT_ALLOWED"}, status=403)
-
-#     # Ищем админов: roleid 11 или 13 по этому storeid
-#     admin_user_ids = list(
-#         UKMUser.objects.filter(storeid=storeid, roleid__in=[11, 13])
-#         .values_list("user_id", flat=True)
-#         .distinct()
-#     )
-#     admin_user_ids = [int(x) for x in admin_user_ids if str(x).isdigit()]
-
-#     admins = []
-#     if admin_user_ids:
-#         qs = User.objects.filter(id__in=admin_user_ids).order_by("full_name")
-#         for u in qs:
-#             tg_admin = str(getattr(u, "tg_id", "") or "").strip()
-#             admins.append({
-#                 "id": u.id,
-#                 "tg_id": tg_admin,
-#                 "full_name": (u.full_name or "").strip(),
-#                 "can_notify": bool(tg_admin),
-#             })
-
-#     # сохраняем выбранный магазин
-#     req.storeid = storeid
-#     req.status = "STORE_SELECTED"
-#     req.meta = {**(req.meta or {}), "admins_payload": data, "admins_count": len(admins)}
-#     req.save(update_fields=["storeid", "status", "meta"])
-
-#     send_telegram_log(
-#         "\n".join([
-#             "🪪 Запрос админского бейджа: Выбор магазинов / Список администраторов",
-#             f"guid={req.id}",
-#             f"cashier_user_id={req.cashier_user_id}",
-#             f"cashier_fio={req.cashier_full_name}",
-#             f"cashier_tg_id={req.cashier_tg_id}",
-#             f"storeid={storeid}",
-#             f"admins_found={len(admins)} (roleid in 11,13)",
-#             f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#         ])
-#     )
-
-#     return JsonResponse({
-#         "status": "ok",
-#         "guid": str(req.id),
-#         "storeid": storeid,
-#         "admins": admins,
-#     })
-
-
-
-
 
 
 
@@ -12111,140 +11098,6 @@ def tg_admin_badge_request(request):
         "admin": {"id": admin_user.id, "max_id": admin_max, "full_name": req.admin_full_name, "can_notify_max": True},
         "channel": "max",
     })
-# @csrf_exempt
-# @require_http_methods(["POST"])
-# def tg_admin_badge_request(request):
-#     """
-#     3) Кассир выбрал администратора
-#     POST JSON: { "tg_id":"cashier_tg", "guid":"...", "storeid":514, "admin_id":123 }
-#     Ответ: { status, guid, message:"WAIT_ADMIN" }
-#     """
-#     if not _require_bot_token(request):
-#         return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
-
-#     _expire_old_badge_requests()
-
-#     data, err = _json_body_or_400(request)
-#     if err:
-#         return err
-
-#     tg_id = str(data.get("tg_id") or "").strip()
-#     guid = str(data.get("guid") or "").strip()
-#     storeid_raw = data.get("storeid")
-#     admin_id_raw = data.get("admin_id")
-
-#     if not tg_id or not guid or storeid_raw is None or admin_id_raw is None:
-#         return JsonResponse({"status": "error", "message": "tg_id,guid,storeid,admin_id required"}, status=400)
-
-#     try:
-#         storeid = int(str(storeid_raw).strip())
-#         admin_id = int(str(admin_id_raw).strip())
-#     except Exception:
-#         return JsonResponse({"status": "error", "message": "BAD_STOREID_OR_ADMIN_ID"}, status=400)
-
-#     try:
-#         req = AdminBadgeRequest.objects.get(id=guid)
-#     except Exception:
-#         return JsonResponse({"status": "error", "message": "GUID_NOT_FOUND"}, status=404)
-
-#     if req.status == "EXPIRED" or req.expires_at < timezone.now():
-#         return JsonResponse({"status": "error", "message": "EXPIRED"}, status=410)
-
-#     if str(req.cashier_tg_id) != tg_id:
-#         return JsonResponse({"status": "error", "message": "NOT_YOUR_SESSION"}, status=403)
-
-#     if not req.storeid or int(req.storeid) != storeid:
-#         return JsonResponse({"status": "error", "message": "STORE_NOT_SELECTED_OR_MISMATCH"}, status=400)
-
-#     # проверим, что выбранный admin реально админ в этом storeid (role 11/13)
-#     is_admin_here = UKMUser.objects.filter(
-#         storeid=storeid, roleid__in=[11, 13], user_id=admin_id
-#     ).exists()
-#     if not is_admin_here:
-#         return JsonResponse({"status": "error", "message": "ADMIN_NOT_IN_STORE_OR_BAD_ROLE"}, status=403)
-
-#     admin_user = User.objects.filter(id=admin_id).first()
-#     if not admin_user:
-#         return JsonResponse({"status": "error", "message": "ADMIN_USER_NOT_FOUND"}, status=404)
-
-#     admin_tg = str(getattr(admin_user, "tg_id", "") or "").strip()
-#     if not admin_tg:
-#         # нельзя уведомить — нет tg_id
-#         send_telegram_log(
-#             "\n".join([
-#                 "❌ Запрос админского бейджа: У администратора нет телеграм-бота",
-#                 f"guid={req.id}",
-#                 f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
-#                 f"storeid={storeid}",
-#                 f"admin_id={admin_user.id}",
-#                 f"admin_fio={admin_user.full_name}",
-#             ])
-#         )
-#         return JsonResponse({"status": "error", "message": "ADMIN_HAS_NO_TG_ID"}, status=409)
-
-#     # красивое имя магазина (если есть)
-#     store_name = ""
-#     try:
-#         st = Store.objects.filter(ukm4store=storeid).first()
-#         store_name = (st.name or "").strip() if st else ""
-#     except Exception:
-#         pass
-
-#     # сохраняем админа в сессию
-#     req.admin_user_id = admin_user.id
-#     req.admin_tg_id = admin_tg
-#     req.admin_full_name = (admin_user.full_name or "").strip()
-#     req.status = "PENDING_ADMIN"
-#     req.meta = {**(req.meta or {}), "request_payload": data}
-#     req.save(update_fields=["admin_user_id", "admin_tg_id", "admin_full_name", "status", "meta"])
-
-#     # сообщение админу + inline кнопки
-#     msg = "\n".join([
-#         "🪪 Запрос бейджа администратора",
-#         "",
-#         f"Кассир: {req.cashier_full_name or '—'} (user_id={req.cashier_user_id})",
-#         f"Магазин: {storeid}" + (f" — {store_name}" if store_name else ""),
-#         "",
-#         f"GUID: {req.id}",
-#         "",
-#         "Разрешить выдачу бейджа?",
-#     ])
-
-#     reply_markup = {
-#         "inline_keyboard": [
-#             [
-#                 {"text": "✅ Разрешить", "callback_data": f"admin_badge:accept:{req.id}"},
-#                 {"text": "⛔ Запретить", "callback_data": f"admin_badge:reject:{req.id}"},
-#             ]
-#         ]
-#     }
-
-#     ok_send = _tg_send_message(admin_tg, msg, reply_markup=reply_markup)
-
-#     send_telegram_log(
-#         "\n".join([
-#             "🪪 Запрос админского бейджа: Запрос отправлен выбранному администратору",
-#             f"guid={req.id}",
-#             f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
-#             f"storeid={storeid}" + (f" ({store_name})" if store_name else ""),
-#             f"admin={req.admin_full_name} (user_id={req.admin_user_id}, tg_id={req.admin_tg_id})",
-#             f"telegram_send_ok={ok_send}",
-#             f"time={timezone.localtime(timezone.now()).isoformat(sep=' ', timespec='seconds')}",
-#         ])
-#     )
-
-#     return JsonResponse({
-#         "status": "ok",
-#         "guid": str(req.id),
-#         "message": "WAIT_ADMIN",
-#         "admin": {"id": admin_user.id, "tg_id": admin_tg, "full_name": (admin_user.full_name or "").strip()},
-#     })
-
-
-
-
-
-
 
 
 
@@ -12333,127 +11186,7 @@ def tg_admin_badge_decision(request):
         "password": password,
         "admin_open_in_system": {"id": open_row_id, "username": open_username, "system_id": 9},
     })
-# @csrf_exempt
-# @require_http_methods(["POST"])
-# def tg_admin_badge_decision(request):
-#     """
-#     4) Админ нажал "Разрешить/Запретить"
-#     POST JSON:
-#       {
-#         "guid":"...",
-#         "decision":"accept|reject",
-#         "admin_id": 123,
-#         "admin_tg_id": "...."
-#       }
 
-#     Если accept:
-#       -> находим пароль админа в open_in_system по user_id=admin_id (system_id=9)
-#       -> возвращаем: {status, decision, password, send_to_tg_id: cashier_tg_id, guid}
-#     Если reject:
-#       -> возвращаем: {status, decision, send_to_tg_id: cashier_tg_id, guid}
-#     """
-#     if not _require_bot_token(request):
-#         return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
-
-#     _expire_old_badge_requests()
-
-#     data, err = _json_body_or_400(request)
-#     if err:
-#         return err
-
-#     guid = str(data.get("guid") or "").strip()
-#     decision = str(data.get("decision") or "").strip().lower()
-#     admin_id_raw = data.get("admin_id")
-#     admin_tg_id = str(data.get("admin_tg_id") or "").strip()
-
-#     if not guid or decision not in ("accept", "reject") or admin_id_raw is None:
-#         return JsonResponse({"status": "error", "message": "guid, decision(accept/reject), admin_id required"}, status=400)
-
-#     try:
-#         admin_id = int(str(admin_id_raw).strip())
-#     except Exception:
-#         return JsonResponse({"status": "error", "message": "BAD_ADMIN_ID"}, status=400)
-
-#     try:
-#         req = AdminBadgeRequest.objects.get(id=guid)
-#     except Exception:
-#         return JsonResponse({"status": "error", "message": "GUID_NOT_FOUND"}, status=404)
-
-#     if req.status == "EXPIRED" or req.expires_at < timezone.now():
-#         return JsonResponse({"status": "error", "message": "EXPIRED"}, status=410)
-
-#     # защита: решение должен принимать только выбранный админ
-#     if not req.admin_user_id or int(req.admin_user_id) != int(admin_id):
-#         return JsonResponse({"status": "error", "message": "ADMIN_MISMATCH"}, status=403)
-
-#     # если передали tg_id админа — сверим (не обязательно, но полезно)
-#     if admin_tg_id and req.admin_tg_id and str(req.admin_tg_id) != admin_tg_id:
-#         return JsonResponse({"status": "error", "message": "ADMIN_TG_MISMATCH"}, status=403)
-
-#     now = timezone.now()
-#     req.decision = decision
-#     req.decided_at = now
-#     req.status = "ACCEPTED" if decision == "accept" else "REJECTED"
-#     req.meta = {**(req.meta or {}), "decision_payload": data}
-#     req.save(update_fields=["decision", "decided_at", "status", "meta"])
-
-#     if decision == "reject":
-#         send_telegram_log(
-#             "\n".join([
-#                 "⛔ Запрос админского бейджа: ОТКЛОНЁН",
-#                 f"guid={req.id}",
-#                 f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
-#                 f"storeid={req.storeid}",
-#                 f"admin={req.admin_full_name} (user_id={req.admin_user_id}, tg_id={req.admin_tg_id})",
-#                 f"time={timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
-#             ])
-#         )
-#         return JsonResponse({
-#             "status": "ok",
-#             "guid": str(req.id),
-#             "decision": "reject",
-#             "send_to_tg_id": str(req.cashier_tg_id),
-#             "message_to_cashier": "Администратор отклонил запрос бейджа.",
-#         })
-
-#     # accept -> вытаскиваем пароль админа
-#     password, open_username, open_row_id = _get_existing_open_password(user_id=admin_id, system_id=9)
-#     if not password:
-#         send_telegram_log(
-#             "\n".join([
-#                 "❌ Запрос админского бейджа: Одобрен, но в таблице нет пароля",
-#                 f"guid={req.id}",
-#                 f"admin_user_id={admin_id}",
-#                 f"admin_fio={req.admin_full_name}",
-#                 "Причина: нет пароля в open_in_system (system_id=9)",
-#             ])
-#         )
-#         return JsonResponse({"status": "error", "message": "ADMIN_PASSWORD_NOT_FOUND"}, status=404)
-
-#     send_telegram_log(
-#         "\n".join([
-#             "✅ Запрос админского бейджа: ОДОБРЕНО",
-#             f"guid={req.id}",
-#             f"cashier={req.cashier_full_name} (user_id={req.cashier_user_id}, tg_id={req.cashier_tg_id})",
-#             f"storeid={req.storeid}",
-#             f"admin={req.admin_full_name} (user_id={req.admin_user_id}, tg_id={req.admin_tg_id})",
-#             f"open_in_system.id={open_row_id}, username={open_username or '—'}",
-#             f"time={timezone.localtime(now).isoformat(sep=' ', timespec='seconds')}",
-#         ])
-#     )
-
-#     return JsonResponse({
-#         "status": "ok",
-#         "guid": str(req.id),
-#         "decision": "accept",
-#         "send_to_tg_id": str(req.cashier_tg_id),
-#         "password": password,
-#         "admin_open_in_system": {
-#             "id": open_row_id,
-#             "username": open_username,
-#             "system_id": 9,
-#         }
-#     })
 
 
 
@@ -12518,7 +11251,7 @@ def bitrix_inactive_users_ui(request):
     показ ACTIVE / IS_ONLINE / LAST_LOGIN / LAST_ACTIVITY_DATE,
     + массовая/точечная блокировка через отдельный POST endpoint.
     """
-    # --- фильтры ---
+    # фильтры
     try:
         days = int((request.GET.get("days") or "30").strip())
     except Exception:
@@ -12549,7 +11282,7 @@ def bitrix_inactive_users_ui(request):
     now = timezone.now()
     cutoff = now - timezone.timedelta(days=days)
 
-    # --- departments ---
+    # departments 
     try:
         depts = bitrix_get_departments()
         by_id, children = _dept_index(depts)
@@ -12564,7 +11297,7 @@ def bitrix_inactive_users_ui(request):
         else:
             allowed_dept_ids_set = {dept_id}
 
-    # --- users ---
+    # users 
     select_fields = [
         "ID", "NAME", "LAST_NAME", "SECOND_NAME",
         "EMAIL", "WORK_POSITION",
@@ -12808,7 +11541,6 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
         conn = _connect_oracle_service(db)
         cur = conn.cursor()
 
-        # --- колонки реального объекта (таблица/вьюха) ---
         staff_cols = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
         user_cols  = _oracle_get_table_columns_set(cur, owner="SYS", table="DBA_USERS")
 
@@ -12827,7 +11559,7 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
         if not has_user("CREATED"):
             return [], "В SYS.DBA_USERS не найдено поле CREATED — нельзя посчитать 'старше N дней'"
 
-        # --- определяем источник LAST_LOGIN ---
+        # определяем источник LAST_LOGIN
         last_login_expr = None
         audit_join_sql = ""
         binds = {"b_days": int(days)}
@@ -12879,7 +11611,7 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
                 # last_login нигде не достать — деградируем до NULL
                 last_login_expr = "NULL"
 
-        # --- роль SUPERMAG_USER (если доступно) ---
+        # роль SUPERMAG_USER 
         role_cols = _oracle_get_table_columns_set(cur, owner="SYS", table="DBA_ROLE_PRIVS")
         has_role_view = ("GRANTEE" in role_cols and "GRANTED_ROLE" in role_cols)
 
@@ -12896,7 +11628,7 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
             """
             role_expr = "NVL2(drp.grantee, 1, 0)"
 
-        # --- поля SMSTAFF (все через проверки) ---
+        # поля SMSTAFF 
         sel_staff_id   = "ss.id AS staff_id" if has_staff("ID") else "NULL AS staff_id"
         sel_surname    = "ss.surname AS surname" if has_staff("SURNAME") else "NULL AS surname"
         sel_name       = "ss.name AS name" if has_staff("NAME") else "NULL AS name"
@@ -12904,7 +11636,7 @@ def _sm_fetch_stale_users_in_db(db: str, days: int, only_enabled: bool, q: str, 
         sel_userenabled= "ss.userenabled AS userenabled" if has_staff("USERENABLED") else "NULL AS userenabled"
         sel_inn        = "ss.inn AS inn" if has_staff("INN") else "NULL AS inn"
 
-        # --- фильтры ---
+        # фильтры 
         q = (q or "").strip().lower()
         where = ["ss.id > 0"]
         # stale predicate
@@ -14127,9 +12859,9 @@ def inactive_users_report_send_to_bitrix(request):
 # ЭТО ДЛЯ ЗАПИСИ ИЗ БАЗ СУПЕРМАГА В НАШУ БД POSTGRESQL
 
 
-# ---------------------------
+
 # SM SYNC: helpers
-# ---------------------------
+
 
 _SMSTAFF_COL_CACHE: dict[str, dict[str, str]] = {}  # service_key -> {"inn": "INN", "login": "LOGIN", "store": "STORELOC"}
 _ORA_CONN_CACHE: dict[str, Any] = {}               # service_key -> connection
@@ -14521,9 +13253,9 @@ def _sse_pack(event: str, payload: dict) -> str:
     return "event: %s\ndata: %s\n\n" % (event, json.dumps(payload, ensure_ascii=False))
 
 
-# ---------------------------
+
 # SM SYNC: UI + Stream + API
-# ---------------------------
+
 
 @staff_member_required
 @never_cache
