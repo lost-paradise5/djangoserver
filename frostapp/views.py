@@ -13,6 +13,8 @@ import datetime
 import uuid
 import pymysql
 import hmac
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from django.conf import settings
@@ -6223,6 +6225,22 @@ def _agent_error(message: str, status: int = 500):
     return JsonResponse({"error": str(message)}, status=status)
 
 
+def _send_admin_log_async(message: str) -> None:
+    """
+    Не блокирует HTTP-ответ.
+    """
+    def _worker():
+        try:
+            send_telegram_log(message)
+        except Exception as e:
+            logger.exception(f"[ADMIN_LOG] async send error: {e}")
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as e:
+        logger.exception(f"[ADMIN_LOG] thread start error: {e}")
+
+
 def _normalize_oracle_value(value):
     if value is None:
         return None
@@ -6433,36 +6451,43 @@ def send_pin_to_user_channels(user, pin: str) -> dict:
     - в Telegram, если есть tg_id
     - в MAX, если есть max_id
 
-    Возвращает:
-    {
-        "ok": bool,
-        "telegram_sent": bool,
-        "max_sent": bool
-    }
+    Отправка идёт параллельно, чтобы не ждать каналы по очереди.
     """
     message = f"Ваш код авторизации: {pin}\nОн действителен {PIN_TTL_MINUTES} минут."
 
+    futures = {}
     telegram_sent = False
     max_sent = False
 
-    if getattr(user, "tg_id", None):
-        try:
-            telegram_sent = bool(send_telegram_to_user(user, message))
-        except Exception as e:
-            logger.exception(
-                f"[PIN_DELIVERY] Ошибка отправки в Telegram user_id={getattr(user, 'id', None)}: {e}"
-            )
-            telegram_sent = False
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            if getattr(user, "tg_id", None):
+                futures["telegram"] = executor.submit(send_telegram_to_user, user, message)
 
-    if getattr(user, "max_id", None):
-        try:
-            max_sent = bool(send_max_to_user(user.max_id, message))
-        except Exception as e:
-            logger.exception(
-                f"[PIN_DELIVERY] Ошибка отправки в MAX user_id={getattr(user, 'id', None)} "
-                f"max_id={getattr(user, 'max_id', None)}: {e}"
-            )
-            max_sent = False
+            if getattr(user, "max_id", None):
+                futures["max"] = executor.submit(send_max_to_user, user.max_id, message)
+
+            if "telegram" in futures:
+                try:
+                    telegram_sent = bool(futures["telegram"].result())
+                except Exception as e:
+                    logger.exception(
+                        f"[PIN_DELIVERY] Ошибка отправки в Telegram user_id={getattr(user, 'id', None)}: {e}"
+                    )
+                    telegram_sent = False
+
+            if "max" in futures:
+                try:
+                    max_sent = bool(futures["max"].result())
+                except Exception as e:
+                    logger.exception(
+                        f"[PIN_DELIVERY] Ошибка отправки в MAX user_id={getattr(user, 'id', None)} "
+                        f"max_id={getattr(user, 'max_id', None)}: {e}"
+                    )
+                    max_sent = False
+
+    except Exception as e:
+        logger.exception(f"[PIN_DELIVERY] Общая ошибка отправки PIN: {e}")
 
     return {
         "ok": telegram_sent or max_sent,
@@ -6553,6 +6578,7 @@ def _get_agent_primary_credentials(user_id):
             system_id=4,
             status=True
         )
+        .only('username', 'password')
         .order_by('id')
         .first()
     )
@@ -6614,6 +6640,10 @@ def agent_auth_start(request):
     Ошибка:
     404 -> сервис недоступен
     500 -> { "error": "..." }
+
+    Оптимизация:
+    - здесь НЕ тянем Oracle и НЕ собираем полные данные магазинов
+    - только проверяем, что у пользователя есть хотя бы один магазин
     """
     if request.method != 'POST':
         return _agent_error('Сервис недоступен', status=404)
@@ -6634,23 +6664,27 @@ def agent_auth_start(request):
         if phone_norm:
             phone_candidates.add(phone_norm)
 
-        users_qs = User.objects.filter(phone__in=list(phone_candidates))
-        count = users_qs.count()
+        users = list(
+            User.objects
+            .filter(phone__in=list(phone_candidates))
+            .only('id', 'full_name', 'tg_id', 'max_id')
+            .order_by('id')[:2]
+        )
 
-        if count == 0:
+        if not users:
             return _agent_error('Пользователь с таким номером не найден', status=500)
 
-        if count > 1:
+        if len(users) > 1:
             logger.error(
                 f"[AGENT_AUTH/START] Несколько пользователей для phone={phone_candidates}: "
-                f"ids={list(users_qs.values_list('id', flat=True))}"
+                f"ids={[u.id for u in users]}"
             )
             return _agent_error(
                 'Найдено несколько пользователей с таким номером, обратитесь к администратору',
                 status=500
             )
 
-        user = users_qs.first()
+        user = users[0]
 
         if not user.tg_id and not user.max_id:
             return _agent_error(
@@ -6658,8 +6692,9 @@ def agent_auth_start(request):
                 status=500
             )
 
-        stores_payload = _get_agent_user_stores(user)
-        if not stores_payload:
+        # ВАЖНО: вместо _get_agent_user_stores(user) — только быстрая проверка наличия магазина
+        has_store = UKMUser.objects.filter(user=user).exists()
+        if not has_store:
             return _agent_error('У пользователя нет магазинов в ukm_users', status=500)
 
         cred = _get_agent_primary_credentials(user.id)
@@ -6698,21 +6733,18 @@ def agent_auth_start(request):
             )
             return _agent_error('Не удалось отправить PIN ни в Telegram, ни в MAX', status=500)
 
-        try:
-            send_telegram_log(
-                "\n".join([
-                    "🔐 Начат вход агента",
-                    f"User ID: {user.id}",
-                    f"ФИО: {user.full_name}",
-                    f"Телефон: {_mask_phone(phone_raw)}",
-                    f"Session ID: {session_id}",
-                    f"PIN TTL: {PIN_TTL_MINUTES} мин",
-                    f"Telegram отправлен: {'да' if delivery['telegram_sent'] else 'нет'}",
-                    f"MAX отправлен: {'да' if delivery['max_sent'] else 'нет'}",
-                ])
-            )
-        except Exception:
-            pass
+        _send_admin_log_async(
+            "\n".join([
+                "🔐 Начат вход агента",
+                f"User ID: {user.id}",
+                f"ФИО: {user.full_name}",
+                f"Телефон: {_mask_phone(phone_raw)}",
+                f"Session ID: {session_id}",
+                f"PIN TTL: {PIN_TTL_MINUTES} мин",
+                f"Telegram отправлен: {'да' if delivery['telegram_sent'] else 'нет'}",
+                f"MAX отправлен: {'да' if delivery['max_sent'] else 'нет'}",
+            ])
+        )
 
         return JsonResponse({
             'session_id': session_id,
@@ -6741,23 +6773,7 @@ def agent_auth_verify_pin(request):
         "id": ...,
         "fio": "..."
       },
-      "stores": [
-        {
-          "ukm_storeid": ...,
-          "smstore": ...,
-          "name": "...",
-          "address": "...",
-          "roleid": ...,
-          "dbname": "...",
-          "ukm_server_ip": "...",
-          "inn": "...",
-          "kpp": "...",
-          "fsrar_id": "...",
-          "subformat2": "...",
-          "username": "...",
-          "password": "..."
-        }
-      ]
+      "stores": [...]
     }
 
     Ошибка:
@@ -6838,18 +6854,15 @@ def agent_auth_verify_pin(request):
                 status=500
             )
 
-        try:
-            send_telegram_log(
-                "\n".join([
-                    "✅ Агент успешно вошёл",
-                    f"User ID: {sess.user.id}",
-                    f"ФИО: {sess.user.full_name}",
-                    f"Session ID: {session_id}",
-                    f"Магазинов: {len(stores_response)}",
-                ])
-            )
-        except Exception:
-            pass
+        _send_admin_log_async(
+            "\n".join([
+                "✅ Агент успешно вошёл",
+                f"User ID: {sess.user.id}",
+                f"ФИО: {sess.user.full_name}",
+                f"Session ID: {session_id}",
+                f"Магазинов: {len(stores_response)}",
+            ])
+        )
 
         response = {
             'user': {
