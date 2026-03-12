@@ -1,0 +1,56 @@
+{% extends "maxbot/base.html" %}
+{% block title %}Должности{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Должности</h1>
+        <div class="muted">Здесь задаются типы пользователей, которые увидит бот: водитель, кладовщик и т.д.</div>
+    </div>
+    <a class="btn btn-primary" href="{% url 'maxbot_role_create' %}">+ Добавить</a>
+</div>
+
+<div class="card">
+    <form method="get" class="filters">
+        <input type="text" name="q" value="{{ q }}" placeholder="Поиск по названию или коду" class="form-control" style="max-width:320px;">
+        <button type="submit" class="btn btn-primary">Найти</button>
+        <a class="btn btn-secondary" href="{% url 'maxbot_role_list' %}">Сбросить</a>
+    </form>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Порядок</th>
+                <th>Код</th>
+                <th>Название</th>
+                <th>Выбор ФИО</th>
+                <th>Выбор машины</th>
+                <th>Активна</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for obj in page_obj %}
+            <tr>
+                <td>{{ obj.sort_order }}</td>
+                <td>{{ obj.code }}</td>
+                <td>{{ obj.name }}</td>
+                <td>{{ obj.requires_employee|yesno:"Да,Нет" }}</td>
+                <td>{{ obj.requires_vehicle|yesno:"Да,Нет" }}</td>
+                <td>{{ obj.is_active|yesno:"Да,Нет" }}</td>
+                <td>
+                    <div class="actions">
+                        <a class="btn btn-secondary" href="{% url 'maxbot_role_edit' obj.id %}">Редактировать</a>
+                        <a class="btn btn-danger" href="{% url 'maxbot_role_delete' obj.id %}">Удалить</a>
+                    </div>
+                </td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="7">Записей нет.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    {% include "maxbot/pagination.html" with page_obj=page_obj %}
+</div>
+{% endblock %}
