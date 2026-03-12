@@ -15,6 +15,7 @@ from .models import (
 
 class MaxBotQuestionOptionInline(admin.TabularInline):
     model = MaxBotQuestionOption
+    fk_name = "question"
     extra = 0
     fields = (
         "code",
