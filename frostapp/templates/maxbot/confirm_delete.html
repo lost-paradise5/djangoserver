@@ -14,12 +14,7 @@
         {% csrf_token %}
         <div class="actions">
             <button type="submit" class="btn btn-danger">{{ submit_text|default:"Удалить" }}</button>
-
-            {% if back_url_kwargs %}
-                <a class="btn btn-secondary" href="{% url back_url_name **back_url_kwargs %}">Отмена</a>
-            {% else %}
-                <a class="btn btn-secondary" href="{% url back_url_name %}">Отмена</a>
-            {% endif %}
+            <a class="btn btn-secondary" href="{{ back_url }}">Отмена</a>
         </div>
     </form>
 </div>
