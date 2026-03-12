@@ -5538,6 +5538,144 @@ def _normalize_oracle_value(value):
     return value if value else None
 
 
+# def _get_supermag_store_meta_map(smstore_ids):
+#     """
+#     Возвращает словарь:
+#     {
+#         smstore_id: {
+#             "name": ...,
+#             "address": ...,
+#             "inn": ...,
+#             "kpp": ...,
+#             "fsrar_id": ...,
+#             "ukm_server_ip": ...,
+#             "dbname": ...,
+#             "subformat2": ...
+#         }
+#     }
+#     """
+#     prepared_ids = []
+#     for sid in smstore_ids or []:
+#         if sid is None:
+#             continue
+#         try:
+#             prepared_ids.append(int(sid))
+#         except Exception:
+#             continue
+
+#     prepared_ids = list(dict.fromkeys(prepared_ids))
+#     if not prepared_ids:
+#         return {}
+
+#     bind_names = []
+#     binds = {}
+#     for i, sid in enumerate(prepared_ids):
+#         key = f"sid{i}"
+#         bind_names.append(f":{key}")
+#         binds[key] = sid
+
+#     sql = f"""
+#         SELECT
+#             t1.id AS smstore,
+#             t1.name AS name,
+#             t1.address AS address,
+#             ci.inn AS inn,
+#             t1.kpp AS kpp,
+#             (SELECT propval
+#                FROM smstoreproperties
+#               WHERE propid = 'EGAIS.FSRARID'
+#                 AND storeloc = t1.id) AS fsrar_id,
+#             (SELECT propval
+#                FROM smstoreproperties
+#               WHERE propid = 'REP.UKMSERVER'
+#                 AND storeloc = t1.id) AS ukm_server_ip,
+#             (SELECT propval
+#                FROM smstoreproperties
+#               WHERE propid = 'REP.DBNAME'
+#                 AND storeloc = t1.id) AS dbname,
+#             (SELECT UPPER(a.name)
+#                FROM Supermag.SAStoresAssort a,
+#                     Supermag.SMStoresAssort m
+#               WHERE a.Tree LIKE '2.2.%'
+#                 AND a.ID = m.IDAssort
+#                 AND m.IDLoc = t1.ID) AS subformat2
+#         FROM SMSTORELOCATIONS t1
+#         JOIN SMREGIONS r
+#           ON r.rgnid = t1.rgnid
+#         JOIN smownclientlocs ol
+#           ON ol.locid = t1.id
+#         JOIN smclientinfo ci
+#           ON ci.id = ol.clientid
+#         JOIN sastoreformats f
+#           ON f.id = t1.formatid
+#         JOIN sastoreclass sc
+#           ON sc.id = t1.idclass
+#         LEFT JOIN (
+#             SELECT STORELOC, PROPVAL
+#             FROM SMSTOREPROPERTIES
+#             WHERE PROPID = 'REP.CLOSEDATE'
+#         ) t2
+#           ON t1.ID = t2.STORELOC
+#         WHERE
+#             UPPER(t1.name) NOT LIKE 'Я %'
+#             AND t1.name NOT LIKE '%ТЕСТ%'
+#             AND sc.tree IS NOT NULL
+#             AND t1.idclass IN (
+#                 SELECT id
+#                 FROM supermag.sastoreclass
+#                 WHERE tree LIKE '1.1.%'
+#                    OR tree LIKE '1.2.%'
+#                    OR tree LIKE '1.3.%'
+#                    OR tree LIKE '1.4.%'
+#                    OR tree LIKE '2.1.%'
+#                    OR tree LIKE '2.2.%'
+#             )
+#             AND t1.accepted = 1
+#             AND t1.loctype = 4
+#             AND (t2.PROPVAL IS NULL OR TO_DATE(t2.PROPVAL, 'DD.MM.YYYY') >= TO_DATE(SYSDATE))
+#             AND t1.id IN ({", ".join(bind_names)})
+#         ORDER BY t1.id
+#     """
+
+#     conn = cur = None
+#     result = {}
+#     try:
+#         conn = connect_oracle_supermag()
+#         cur = conn.cursor()
+#         cur.execute(sql, binds)
+
+#         cols = [d[0].lower() for d in cur.description]
+#         for row in cur.fetchall():
+#             item = dict(zip(cols, row))
+#             smstore = item.get("smstore")
+#             if smstore is None:
+#                 continue
+
+#             result[int(smstore)] = {
+#                 "name": _normalize_oracle_value(item.get("name")),
+#                 "address": _normalize_oracle_value(item.get("address")),
+#                 "inn": _normalize_oracle_value(item.get("inn")),
+#                 "kpp": _normalize_oracle_value(item.get("kpp")),
+#                 "fsrar_id": _normalize_oracle_value(item.get("fsrar_id")),
+#                 "ukm_server_ip": _normalize_oracle_value(item.get("ukm_server_ip")),
+#                 "dbname": _normalize_oracle_value(item.get("dbname")),
+#                 "market": _normalize_oracle_value(item.get("subformat2")),
+#             }
+
+#         return result
+
+#     except Exception as e:
+#         logger.exception(f"[AGENT_AUTH] Ошибка получения расширенных данных магазинов из Supermag: {e}")
+#         return {}
+#     finally:
+#         try:
+#             if cur:
+#                 cur.close()
+#             if conn:
+#                 conn.close()
+#         except Exception:
+#             pass
+
 def _get_supermag_store_meta_map(smstore_ids):
     """
     Возвращает словарь:
@@ -5546,11 +5684,11 @@ def _get_supermag_store_meta_map(smstore_ids):
             "name": ...,
             "address": ...,
             "inn": ...,
-            "kpp": ...,
+            "kpp": ...,          # ВАЖНО: теперь из supermag.smclientinfo
             "fsrar_id": ...,
             "ukm_server_ip": ...,
             "dbname": ...,
-            "subformat2": ...
+            "market": ...
         }
     }
     """
@@ -5580,7 +5718,7 @@ def _get_supermag_store_meta_map(smstore_ids):
             t1.name AS name,
             t1.address AS address,
             ci.inn AS inn,
-            t1.kpp AS kpp,
+            ci.kpp AS kpp,
             (SELECT propval
                FROM smstoreproperties
               WHERE propid = 'EGAIS.FSRARID'
