@@ -1,0 +1,93 @@
+{% extends "maxbot/base.html" %}
+{% block title %}Заявка {{ req.request_no }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Заявка {{ req.request_no }}</h1>
+        <div class="muted">Детальная карточка прохождения сценария.</div>
+    </div>
+    <a class="btn btn-secondary" href="{% url 'maxbot_request_list' %}">К реестру</a>
+</div>
+
+<div class="two-col">
+    <div class="card">
+        <h2>Основная информация</h2>
+        <table>
+            <tbody>
+                <tr><th>Кто заполнил</th><td>{{ req.applicant_full_name }}</td></tr>
+                <tr><th>MAX user ID</th><td>{{ req.max_user_id }}</td></tr>
+                <tr><th>Чат</th><td>{{ req.max_chat_id|default:"-" }}</td></tr>
+                <tr><th>Должность</th><td>{{ req.role|default:"-" }}</td></tr>
+                <tr><th>Сотрудник</th><td>{{ req.employee|default:"-" }}</td></tr>
+                <tr><th>Машина</th><td>{{ req.vehicle|default:"-" }}</td></tr>
+                <tr><th>Сценарий</th><td>{{ req.scenario|default:"-" }}</td></tr>
+                <tr><th>Статус</th><td>{{ req.status_label }}</td></tr>
+                <tr><th>Аварийность</th><td>{{ req.emergency_flag|yesno:"Да,Нет" }}</td></tr>
+                <tr><th>Создано</th><td>{{ req.created_at|date:"d.m.Y H:i:s" }}</td></tr>
+                <tr><th>Завершено</th><td>{{ req.finished_at|date:"d.m.Y H:i:s"|default:"-" }}</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Итог/summary</h2>
+        {% if req.summary %}
+            <div style="white-space: pre-wrap;">{{ req.summary }}</div>
+        {% else %}
+            <div class="muted">Итог пока не сформирован.</div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    <h2>Ответы</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Дата</th>
+                <th>Вопрос</th>
+                <th>Ответ</th>
+                <th>Действие для реестра</th>
+                <th>Фото</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for ans in answers %}
+            <tr>
+                <td>{{ ans.created_at|date:"d.m.Y H:i:s" }}</td>
+                <td>{{ ans.question_text }}</td>
+                <td>
+                    {% if ans.option_text %}
+                        {{ ans.option_text }}
+                    {% elif ans.answer_text %}
+                        {{ ans.answer_text }}
+                    {% elif ans.answer_number %}
+                        {{ ans.answer_number }}
+                    {% else %}
+                        -
+                    {% endif %}
+
+                    {% if ans.is_emergency %}
+                        <div><span class="badge badge-danger">Аварийный ответ</span></div>
+                    {% endif %}
+                </td>
+                <td>{{ ans.registry_action_text|default:"-" }}</td>
+                <td>
+                    {% if ans.photo_file %}
+                        <div><a href="{{ ans.photo_file.url }}" target="_blank">Открыть файл</a></div>
+                        <img class="preview" src="{{ ans.photo_file.url }}" alt="photo">
+                    {% elif ans.photo_url %}
+                        <div><a href="{{ ans.photo_url }}" target="_blank">Открыть URL</a></div>
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="5">Ответов пока нет.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
