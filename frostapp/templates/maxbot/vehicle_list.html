@@ -1,0 +1,62 @@
+{% extends "maxbot/base.html" %}
+{% block title %}Машины{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Машины</h1>
+        <div class="muted">Здесь хранится список машин, который бот показывает после выбора сотрудника.</div>
+    </div>
+    <a class="btn btn-primary" href="{% url 'maxbot_vehicle_create' %}">+ Добавить</a>
+</div>
+
+<div class="card">
+    <form method="get" class="filters">
+        <input type="text" name="q" value="{{ q }}" placeholder="Номер или название" class="form-control" style="max-width:280px;">
+        <select name="role_id" class="form-select" style="max-width:240px;">
+            <option value="">Все должности</option>
+            {% for role in roles %}
+                <option value="{{ role.id }}" {% if role_id == role.id|stringformat:"s" %}selected{% endif %}>{{ role.name }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="btn btn-primary">Найти</button>
+        <a class="btn btn-secondary" href="{% url 'maxbot_vehicle_list' %}">Сбросить</a>
+    </form>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Должность</th>
+                <th>Номер</th>
+                <th>Название</th>
+                <th>Привязанный сотрудник</th>
+                <th>Активна</th>
+                <th>Порядок</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for obj in page_obj %}
+            <tr>
+                <td>{{ obj.role }}</td>
+                <td>{{ obj.reg_number }}</td>
+                <td>{{ obj.title|default:"-" }}</td>
+                <td>{{ obj.employee|default:"-" }}</td>
+                <td>{{ obj.is_active|yesno:"Да,Нет" }}</td>
+                <td>{{ obj.sort_order }}</td>
+                <td>
+                    <div class="actions">
+                        <a class="btn btn-secondary" href="{% url 'maxbot_vehicle_edit' obj.id %}">Редактировать</a>
+                        <a class="btn btn-danger" href="{% url 'maxbot_vehicle_delete' obj.id %}">Удалить</a>
+                    </div>
+                </td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="7">Записей нет.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    {% include "maxbot/pagination.html" with page_obj=page_obj %}
+</div>
+{% endblock %}
