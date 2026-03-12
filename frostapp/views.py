@@ -46,6 +46,9 @@ from django.utils import timezone
 import ipaddress
 import paramiko
 import csv
+from django.core.paginator import Paginator
+from django.shortcuts import get_object_or_404
+
 from django.db.models import Q
 import math
 from collections import defaultdict, Counter
@@ -73,7 +76,41 @@ from django.db import connection
 from django.core.files.base import ContentFile
 from django.utils.html import escape
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease,  MaxBotRole, MaxBotEmployee, MaxBotVehicle, MaxBotScenario, MaxBotQuestion, MaxBotQuestionOption, MaxBotRequest, MaxBotRequestAnswer
+from .models import (
+    Queue, 
+    MODUL_logs, 
+    User, 
+    UKMUser, 
+    OpenInSystem, 
+    QRCode, 
+    Department, 
+    Position, 
+    Store, 
+    AuthSession,
+    QRIssueLog, 
+    VpnAccessSession, 
+    AdminBadgeRequest, 
+    VpnAccessBaseline, 
+    VpnAccessLease,  
+    MaxBotRole, 
+    MaxBotEmployee, 
+    MaxBotVehicle, 
+    MaxBotScenario, 
+    MaxBotQuestion, 
+    MaxBotQuestionOption, 
+    MaxBotRequest, 
+    MaxBotRequestAnswer,
+)
+
+from .forms import (
+    MaxBotRoleForm,
+    MaxBotEmployeeForm,
+    MaxBotVehicleForm,
+    MaxBotScenarioForm,
+    MaxBotQuestionForm,
+    MaxBotQuestionOptionForm,
+)
+
 
 _HEX = set("0123456789abcdefABCDEF")
 logger = logging.getLogger(__name__)
@@ -14324,3 +14361,651 @@ def maxbot_process_update(request):
         ))
 
     return JsonResponse(build_main_menu(user))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+MAXBOT_REQUEST_STATUS_LABELS = {
+    "draft": "Черновик",
+    "awaiting_role": "Ожидание выбора должности",
+    "awaiting_employee": "Ожидание выбора сотрудника",
+    "awaiting_vehicle": "Ожидание выбора машины",
+    "awaiting_answer": "Ожидание ответа",
+    "completed": "Завершено",
+    "emergency_stop": "Аварийный стоп",
+    "cancelled": "Отменено",
+}
+
+
+def _maxbot_stamp_and_save(obj):
+    now = timezone.now()
+    if hasattr(obj, "created_at") and not getattr(obj, "created_at", None):
+        obj.created_at = now
+    if hasattr(obj, "updated_at"):
+        obj.updated_at = now
+    obj.save()
+    return obj
+
+
+def _maxbot_paginate(request, queryset, per_page=25):
+    paginator = Paginator(queryset, per_page)
+    page_number = request.GET.get("page")
+    return paginator.get_page(page_number)
+
+
+@staff_member_required
+def maxbot_dashboard(request):
+    total_roles = MaxBotRole.objects.count()
+    total_employees = MaxBotEmployee.objects.count()
+    total_vehicles = MaxBotVehicle.objects.count()
+    total_scenarios = MaxBotScenario.objects.count()
+
+    total_requests = MaxBotRequest.objects.count()
+    emergency_requests = MaxBotRequest.objects.filter(emergency_flag=True).count()
+    active_requests = MaxBotRequest.objects.filter(
+        status__in=["draft", "awaiting_role", "awaiting_employee", "awaiting_vehicle", "awaiting_answer"]
+    ).count()
+    completed_requests = MaxBotRequest.objects.filter(status="completed").count()
+
+    latest_requests = (
+        MaxBotRequest.objects
+        .select_related("role", "employee", "vehicle")
+        .order_by("-created_at")[:10]
+    )
+
+    for req in latest_requests:
+        req.status_label = MAXBOT_REQUEST_STATUS_LABELS.get(req.status, req.status)
+
+    return render(request, "maxbot/dashboard.html", {
+        "total_roles": total_roles,
+        "total_employees": total_employees,
+        "total_vehicles": total_vehicles,
+        "total_scenarios": total_scenarios,
+        "total_requests": total_requests,
+        "emergency_requests": emergency_requests,
+        "active_requests": active_requests,
+        "completed_requests": completed_requests,
+        "latest_requests": latest_requests,
+    })
+
+
+# ---------- Roles ----------
+
+@staff_member_required
+def maxbot_role_list(request):
+    q = (request.GET.get("q") or "").strip()
+
+    qs = MaxBotRole.objects.all().order_by("sort_order", "name")
+    if q:
+        qs = qs.filter(Q(name__icontains=q) | Q(code__icontains=q))
+
+    page_obj = _maxbot_paginate(request, qs, per_page=30)
+
+    return render(request, "maxbot/role_list.html", {
+        "page_obj": page_obj,
+        "q": q,
+    })
+
+
+@staff_member_required
+def maxbot_role_create(request):
+    if request.method == "POST":
+        form = MaxBotRoleForm(request.POST)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_role_list")
+    else:
+        form = MaxBotRoleForm()
+
+    return render(request, "maxbot/object_form.html", {
+        "title": "Новая должность",
+        "form": form,
+        "back_url_name": "maxbot_role_list",
+    })
+
+
+@staff_member_required
+def maxbot_role_edit(request, pk):
+    obj = get_object_or_404(MaxBotRole, pk=pk)
+
+    if request.method == "POST":
+        form = MaxBotRoleForm(request.POST, instance=obj)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_role_list")
+    else:
+        form = MaxBotRoleForm(instance=obj)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Редактирование должности: {obj.name}",
+        "form": form,
+        "back_url_name": "maxbot_role_list",
+    })
+
+
+@staff_member_required
+def maxbot_role_delete(request, pk):
+    obj = get_object_or_404(MaxBotRole, pk=pk)
+
+    if request.method == "POST":
+        obj.delete()
+        return redirect("maxbot_role_list")
+
+    return render(request, "maxbot/confirm_delete.html", {
+        "title": "Удаление должности",
+        "object_name": obj.name,
+        "back_url_name": "maxbot_role_list",
+    })
+
+
+# ---------- Employees ----------
+
+@staff_member_required
+def maxbot_employee_list(request):
+    q = (request.GET.get("q") or "").strip()
+    role_id = (request.GET.get("role_id") or "").strip()
+
+    qs = (
+        MaxBotEmployee.objects
+        .select_related("role", "user")
+        .order_by("role__sort_order", "sort_order", "full_name")
+    )
+
+    if q:
+        qs = qs.filter(Q(full_name__icontains=q) | Q(phone__icontains=q))
+    if role_id:
+        qs = qs.filter(role_id=role_id)
+
+    page_obj = _maxbot_paginate(request, qs, per_page=30)
+
+    return render(request, "maxbot/employee_list.html", {
+        "page_obj": page_obj,
+        "q": q,
+        "role_id": role_id,
+        "roles": MaxBotRole.objects.all().order_by("sort_order", "name"),
+    })
+
+
+@staff_member_required
+def maxbot_employee_create(request):
+    if request.method == "POST":
+        form = MaxBotEmployeeForm(request.POST)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_employee_list")
+    else:
+        form = MaxBotEmployeeForm()
+
+    return render(request, "maxbot/object_form.html", {
+        "title": "Новый сотрудник",
+        "form": form,
+        "back_url_name": "maxbot_employee_list",
+    })
+
+
+@staff_member_required
+def maxbot_employee_edit(request, pk):
+    obj = get_object_or_404(MaxBotEmployee, pk=pk)
+
+    if request.method == "POST":
+        form = MaxBotEmployeeForm(request.POST, instance=obj)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_employee_list")
+    else:
+        form = MaxBotEmployeeForm(instance=obj)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Редактирование сотрудника: {obj.full_name}",
+        "form": form,
+        "back_url_name": "maxbot_employee_list",
+    })
+
+
+@staff_member_required
+def maxbot_employee_delete(request, pk):
+    obj = get_object_or_404(MaxBotEmployee, pk=pk)
+
+    if request.method == "POST":
+        obj.delete()
+        return redirect("maxbot_employee_list")
+
+    return render(request, "maxbot/confirm_delete.html", {
+        "title": "Удаление сотрудника",
+        "object_name": obj.full_name,
+        "back_url_name": "maxbot_employee_list",
+    })
+
+
+# ---------- Vehicles ----------
+
+@staff_member_required
+def maxbot_vehicle_list(request):
+    q = (request.GET.get("q") or "").strip()
+    role_id = (request.GET.get("role_id") or "").strip()
+
+    qs = (
+        MaxBotVehicle.objects
+        .select_related("role", "employee")
+        .order_by("role__sort_order", "sort_order", "reg_number")
+    )
+
+    if q:
+        qs = qs.filter(Q(reg_number__icontains=q) | Q(title__icontains=q))
+    if role_id:
+        qs = qs.filter(role_id=role_id)
+
+    page_obj = _maxbot_paginate(request, qs, per_page=30)
+
+    return render(request, "maxbot/vehicle_list.html", {
+        "page_obj": page_obj,
+        "q": q,
+        "role_id": role_id,
+        "roles": MaxBotRole.objects.all().order_by("sort_order", "name"),
+    })
+
+
+@staff_member_required
+def maxbot_vehicle_create(request):
+    if request.method == "POST":
+        form = MaxBotVehicleForm(request.POST)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_vehicle_list")
+    else:
+        form = MaxBotVehicleForm()
+
+    return render(request, "maxbot/object_form.html", {
+        "title": "Новая машина",
+        "form": form,
+        "back_url_name": "maxbot_vehicle_list",
+    })
+
+
+@staff_member_required
+def maxbot_vehicle_edit(request, pk):
+    obj = get_object_or_404(MaxBotVehicle, pk=pk)
+
+    if request.method == "POST":
+        form = MaxBotVehicleForm(request.POST, instance=obj)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_vehicle_list")
+    else:
+        form = MaxBotVehicleForm(instance=obj)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Редактирование машины: {obj}",
+        "form": form,
+        "back_url_name": "maxbot_vehicle_list",
+    })
+
+
+@staff_member_required
+def maxbot_vehicle_delete(request, pk):
+    obj = get_object_or_404(MaxBotVehicle, pk=pk)
+
+    if request.method == "POST":
+        obj.delete()
+        return redirect("maxbot_vehicle_list")
+
+    return render(request, "maxbot/confirm_delete.html", {
+        "title": "Удаление машины",
+        "object_name": str(obj),
+        "back_url_name": "maxbot_vehicle_list",
+    })
+
+
+# ---------- Scenarios ----------
+
+@staff_member_required
+def maxbot_scenario_list(request):
+    q = (request.GET.get("q") or "").strip()
+
+    qs = (
+        MaxBotScenario.objects
+        .select_related("role", "first_question")
+        .order_by("role__sort_order", "name")
+    )
+
+    if q:
+        qs = qs.filter(Q(name__icontains=q) | Q(code__icontains=q) | Q(role__name__icontains=q))
+
+    page_obj = _maxbot_paginate(request, qs, per_page=30)
+
+    return render(request, "maxbot/scenario_list.html", {
+        "page_obj": page_obj,
+        "q": q,
+    })
+
+
+@staff_member_required
+def maxbot_scenario_create(request):
+    if request.method == "POST":
+        form = MaxBotScenarioForm(request.POST)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_scenario_list")
+    else:
+        form = MaxBotScenarioForm()
+
+    return render(request, "maxbot/object_form.html", {
+        "title": "Новый сценарий",
+        "form": form,
+        "back_url_name": "maxbot_scenario_list",
+    })
+
+
+@staff_member_required
+def maxbot_scenario_edit(request, pk):
+    obj = get_object_or_404(MaxBotScenario, pk=pk)
+
+    if request.method == "POST":
+        form = MaxBotScenarioForm(request.POST, instance=obj)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_scenario_list")
+    else:
+        form = MaxBotScenarioForm(instance=obj)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Редактирование сценария: {obj.name}",
+        "form": form,
+        "back_url_name": "maxbot_scenario_list",
+    })
+
+
+@staff_member_required
+def maxbot_scenario_delete(request, pk):
+    obj = get_object_or_404(MaxBotScenario, pk=pk)
+
+    if request.method == "POST":
+        obj.delete()
+        return redirect("maxbot_scenario_list")
+
+    return render(request, "maxbot/confirm_delete.html", {
+        "title": "Удаление сценария",
+        "object_name": obj.name,
+        "back_url_name": "maxbot_scenario_list",
+    })
+
+
+# ---------- Questions ----------
+
+@staff_member_required
+def maxbot_scenario_questions(request, scenario_id):
+    scenario = get_object_or_404(
+        MaxBotScenario.objects.select_related("role", "first_question"),
+        pk=scenario_id,
+    )
+
+    questions = scenario.questions.order_by("sort_order", "id").prefetch_related("options")
+    page_obj = _maxbot_paginate(request, questions, per_page=50)
+
+    return render(request, "maxbot/question_list.html", {
+        "scenario": scenario,
+        "page_obj": page_obj,
+    })
+
+
+@staff_member_required
+def maxbot_question_create(request, scenario_id):
+    scenario = get_object_or_404(MaxBotScenario, pk=scenario_id)
+
+    if request.method == "POST":
+        form = MaxBotQuestionForm(request.POST, scenario=scenario)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            obj.scenario = scenario
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_scenario_questions", scenario_id=scenario.id)
+    else:
+        form = MaxBotQuestionForm(scenario=scenario)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Новый вопрос для сценария: {scenario.name}",
+        "form": form,
+        "back_url_name": "maxbot_scenario_questions",
+        "back_url_kwargs": {"scenario_id": scenario.id},
+    })
+
+
+@staff_member_required
+def maxbot_question_edit(request, pk):
+    obj = get_object_or_404(MaxBotQuestion.objects.select_related("scenario"), pk=pk)
+
+    if request.method == "POST":
+        form = MaxBotQuestionForm(request.POST, instance=obj, scenario=obj.scenario)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_scenario_questions", scenario_id=obj.scenario_id)
+    else:
+        form = MaxBotQuestionForm(instance=obj, scenario=obj.scenario)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Редактирование вопроса: {obj.code}",
+        "form": form,
+        "back_url_name": "maxbot_scenario_questions",
+        "back_url_kwargs": {"scenario_id": obj.scenario_id},
+    })
+
+
+@staff_member_required
+def maxbot_question_delete(request, pk):
+    obj = get_object_or_404(MaxBotQuestion.objects.select_related("scenario"), pk=pk)
+
+    if request.method == "POST":
+        scenario_id = obj.scenario_id
+        obj.delete()
+        return redirect("maxbot_scenario_questions", scenario_id=scenario_id)
+
+    return render(request, "maxbot/confirm_delete.html", {
+        "title": "Удаление вопроса",
+        "object_name": obj.text,
+        "back_url_name": "maxbot_scenario_questions",
+        "back_url_kwargs": {"scenario_id": obj.scenario_id},
+    })
+
+
+@staff_member_required
+def maxbot_question_set_first(request, scenario_id, question_id):
+    scenario = get_object_or_404(MaxBotScenario, pk=scenario_id)
+    question = get_object_or_404(MaxBotQuestion, pk=question_id, scenario=scenario)
+
+    if request.method == "POST":
+        scenario.first_question = question
+        scenario.updated_at = timezone.now()
+        scenario.save(update_fields=["first_question", "updated_at"])
+        return redirect("maxbot_scenario_questions", scenario_id=scenario.id)
+
+    return render(request, "maxbot/confirm_delete.html", {
+        "title": "Сделать вопрос первым",
+        "object_name": question.text,
+        "submit_text": "Сделать первым",
+        "back_url_name": "maxbot_scenario_questions",
+        "back_url_kwargs": {"scenario_id": scenario.id},
+    })
+
+
+# ---------- Options ----------
+
+@staff_member_required
+def maxbot_question_options(request, question_id):
+    question = get_object_or_404(
+        MaxBotQuestion.objects.select_related("scenario", "scenario__role"),
+        pk=question_id,
+    )
+
+    options = question.options.order_by("sort_order", "id")
+    page_obj = _maxbot_paginate(request, options, per_page=50)
+
+    return render(request, "maxbot/option_list.html", {
+        "question": question,
+        "page_obj": page_obj,
+    })
+
+
+@staff_member_required
+def maxbot_option_create(request, question_id):
+    question = get_object_or_404(MaxBotQuestion.objects.select_related("scenario"), pk=question_id)
+
+    if request.method == "POST":
+        form = MaxBotQuestionOptionForm(request.POST, question=question)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            obj.question = question
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_question_options", question_id=question.id)
+    else:
+        form = MaxBotQuestionOptionForm(question=question)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Новый вариант ответа для вопроса: {question.code}",
+        "form": form,
+        "back_url_name": "maxbot_question_options",
+        "back_url_kwargs": {"question_id": question.id},
+    })
+
+
+@staff_member_required
+def maxbot_option_edit(request, pk):
+    obj = get_object_or_404(MaxBotQuestionOption.objects.select_related("question", "question__scenario"), pk=pk)
+
+    if request.method == "POST":
+        form = MaxBotQuestionOptionForm(request.POST, instance=obj, question=obj.question)
+        if form.is_valid():
+            obj = form.save(commit=False)
+            _maxbot_stamp_and_save(obj)
+            return redirect("maxbot_question_options", question_id=obj.question_id)
+    else:
+        form = MaxBotQuestionOptionForm(instance=obj, question=obj.question)
+
+    return render(request, "maxbot/object_form.html", {
+        "title": f"Редактирование варианта ответа: {obj.code}",
+        "form": form,
+        "back_url_name": "maxbot_question_options",
+        "back_url_kwargs": {"question_id": obj.question_id},
+    })
+
+
+@staff_member_required
+def maxbot_option_delete(request, pk):
+    obj = get_object_or_404(MaxBotQuestionOption.objects.select_related("question"), pk=pk)
+
+    if request.method == "POST":
+        question_id = obj.question_id
+        obj.delete()
+        return redirect("maxbot_question_options", question_id=question_id)
+
+    return render(request, "maxbot/confirm_delete.html", {
+        "title": "Удаление варианта ответа",
+        "object_name": obj.text,
+        "back_url_name": "maxbot_question_options",
+        "back_url_kwargs": {"question_id": obj.question_id},
+    })
+
+
+# ---------- Requests / Registry ----------
+
+@staff_member_required
+def maxbot_request_list(request):
+    q = (request.GET.get("q") or "").strip()
+    status = (request.GET.get("status") or "").strip()
+    emergency = (request.GET.get("emergency") or "").strip()
+
+    qs = (
+        MaxBotRequest.objects
+        .select_related("role", "employee", "vehicle", "scenario", "applicant_user")
+        .order_by("-created_at")
+    )
+
+    if q:
+        qs = qs.filter(
+            Q(request_no__icontains=q) |
+            Q(applicant_full_name__icontains=q) |
+            Q(employee__full_name__icontains=q) |
+            Q(vehicle__reg_number__icontains=q) |
+            Q(summary__icontains=q)
+        )
+
+    if status:
+        qs = qs.filter(status=status)
+
+    if emergency == "1":
+        qs = qs.filter(emergency_flag=True)
+    elif emergency == "0":
+        qs = qs.filter(emergency_flag=False)
+
+    page_obj = _maxbot_paginate(request, qs, per_page=40)
+
+    for req in page_obj.object_list:
+        req.status_label = MAXBOT_REQUEST_STATUS_LABELS.get(req.status, req.status)
+
+    return render(request, "maxbot/request_list.html", {
+        "page_obj": page_obj,
+        "q": q,
+        "status": status,
+        "emergency": emergency,
+        "status_choices": MAXBOT_REQUEST_STATUS_LABELS,
+    })
+
+
+@staff_member_required
+def maxbot_request_detail(request, pk):
+    req = get_object_or_404(
+        MaxBotRequest.objects.select_related("role", "employee", "vehicle", "scenario", "applicant_user"),
+        pk=pk,
+    )
+
+    answers = (
+        req.answers
+        .select_related("question", "option")
+        .order_by("created_at", "id")
+    )
+
+    req.status_label = MAXBOT_REQUEST_STATUS_LABELS.get(req.status, req.status)
+
+    return render(request, "maxbot/request_detail.html", {
+        "req": req,
+        "answers": answers,
+    })
