@@ -73,7 +73,7 @@ from django.db import connection
 from django.core.files.base import ContentFile
 from django.utils.html import escape
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease,  MaxBotRole, MaxBotEmployee, MaxBotVehicle, MaxBotScenario, MaxBotQuestion, MaxBotQuestionOption, MaxBotRequest, MaxBotRequestAnswer,
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease,  MaxBotRole, MaxBotEmployee, MaxBotVehicle, MaxBotScenario, MaxBotQuestion, MaxBotQuestionOption, MaxBotRequest, MaxBotRequestAnswer
 
 _HEX = set("0123456789abcdefABCDEF")
 logger = logging.getLogger(__name__)
