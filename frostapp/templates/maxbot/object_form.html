@@ -27,12 +27,7 @@
 
         <div class="actions">
             <button type="submit" class="btn btn-success">Сохранить</button>
-
-            {% if back_url_kwargs %}
-                <a class="btn btn-secondary" href="{% url back_url_name **back_url_kwargs %}">Назад</a>
-            {% else %}
-                <a class="btn btn-secondary" href="{% url back_url_name %}">Назад</a>
-            {% endif %}
+            <a class="btn btn-secondary" href="{{ back_url }}">Назад</a>
         </div>
     </form>
 </div>
