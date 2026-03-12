@@ -1,0 +1,63 @@
+{% extends "maxbot/base.html" %}
+{% block title %}Вопросы сценария{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Вопросы сценария: {{ scenario.name }}</h1>
+        <div class="muted">
+            Должность: <strong>{{ scenario.role }}</strong><br>
+            Первый вопрос запуска: <strong>{{ scenario.first_question|default:"не выбран" }}</strong>
+        </div>
+    </div>
+    <div class="actions">
+        <a class="btn btn-primary" href="{% url 'maxbot_question_create' scenario.id %}">+ Добавить вопрос</a>
+        <a class="btn btn-secondary" href="{% url 'maxbot_scenario_list' %}">К сценариям</a>
+    </div>
+</div>
+
+<div class="card">
+    <table>
+        <thead>
+            <tr>
+                <th>Порядок</th>
+                <th>Код</th>
+                <th>Текст</th>
+                <th>Тип</th>
+                <th>Следующий по умолчанию</th>
+                <th>Варианты</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for obj in page_obj %}
+            <tr>
+                <td>{{ obj.sort_order }}</td>
+                <td>
+                    {{ obj.code }}
+                    {% if scenario.first_question_id == obj.id %}
+                        <div><span class="badge badge-success">Первый</span></div>
+                    {% endif %}
+                </td>
+                <td>{{ obj.text }}</td>
+                <td>{{ obj.question_type }}</td>
+                <td>{{ obj.default_next_question|default:"-" }}</td>
+                <td>{{ obj.options.count }}</td>
+                <td>
+                    <div class="actions">
+                        <a class="btn btn-primary" href="{% url 'maxbot_question_options' obj.id %}">Варианты</a>
+                        <a class="btn btn-secondary" href="{% url 'maxbot_question_edit' obj.id %}">Редактировать</a>
+                        <a class="btn btn-success" href="{% url 'maxbot_question_set_first' scenario.id obj.id %}">Сделать первым</a>
+                        <a class="btn btn-danger" href="{% url 'maxbot_question_delete' obj.id %}">Удалить</a>
+                    </div>
+                </td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="7">Вопросов пока нет.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    {% include "maxbot/pagination.html" with page_obj=page_obj %}
+</div>
+{% endblock %}
