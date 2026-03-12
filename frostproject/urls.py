@@ -68,6 +68,7 @@ from frostapp.views import (
     sm_sync_staff_stream,
     sm_sync_staff_run,
     sm_staff_ui_create,
+    maxbot_process_update
 )
 
 urlpatterns = [
@@ -142,4 +143,6 @@ urlpatterns = [
     # скриптовый запуск (API)
     path("api/sm/sync-staff/run/", sm_sync_staff_run, name="sm_sync_staff_run"),
     path('ui/smstaff/create/', sm_staff_ui_create, name='sm_staff_ui_create'),
+
+    path("api/maxbot/process/", maxbot_process_update, name="maxbot_process_update"),
 ]
