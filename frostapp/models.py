@@ -391,3 +391,321 @@ class VpnAccessLease(models.Model):
 
 
 
+
+
+
+
+
+
+
+
+
+class MaxBotRole(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    code = models.CharField(max_length=64, unique=True)
+    name = models.CharField(max_length=255)
+    requires_employee = models.BooleanField(default=True)
+    requires_vehicle = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_role"
+        managed = False
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class MaxBotEmployee(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    role = models.ForeignKey(
+        MaxBotRole,
+        db_column="role_id",
+        on_delete=models.CASCADE,
+        related_name="employees",
+    )
+    user = models.ForeignKey(
+        User,
+        db_column="user_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maxbot_directory_rows",
+    )
+    full_name = models.CharField(max_length=255)
+    phone = models.CharField(max_length=50, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_employee"
+        managed = False
+        ordering = ["sort_order", "full_name"]
+
+    def __str__(self):
+        return self.full_name
+
+
+class MaxBotVehicle(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    role = models.ForeignKey(
+        MaxBotRole,
+        db_column="role_id",
+        on_delete=models.CASCADE,
+        related_name="vehicles",
+    )
+    employee = models.ForeignKey(
+        MaxBotEmployee,
+        db_column="employee_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="vehicles",
+    )
+    reg_number = models.CharField(max_length=64)
+    title = models.CharField(max_length=255, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_vehicle"
+        managed = False
+        ordering = ["sort_order", "reg_number"]
+
+    def __str__(self):
+        return self.title or self.reg_number
+
+
+class MaxBotScenario(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    role = models.ForeignKey(
+        MaxBotRole,
+        db_column="role_id",
+        on_delete=models.CASCADE,
+        related_name="scenarios",
+    )
+    code = models.CharField(max_length=64)
+    name = models.CharField(max_length=255)
+    is_active = models.BooleanField(default=True)
+    first_question = models.ForeignKey(
+        "MaxBotQuestion",
+        db_column="first_question_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_scenario"
+        managed = False
+        ordering = ["name"]
+        unique_together = ("role", "code")
+
+    def __str__(self):
+        return f"{self.role.name} / {self.name}"
+
+
+class MaxBotQuestion(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    scenario = models.ForeignKey(
+        MaxBotScenario,
+        db_column="scenario_id",
+        on_delete=models.CASCADE,
+        related_name="questions",
+    )
+    code = models.CharField(max_length=64)
+    text = models.TextField()
+    question_type = models.CharField(max_length=32)
+    is_required = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    placeholder = models.TextField(null=True, blank=True)
+    help_text = models.TextField(null=True, blank=True)
+    default_next_question = models.ForeignKey(
+        "self",
+        db_column="default_next_question_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="default_prev_questions",
+    )
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_question"
+        managed = False
+        ordering = ["sort_order", "id"]
+        unique_together = ("scenario", "code")
+
+    def __str__(self):
+        return f"{self.scenario.name}: {self.text[:60]}"
+
+
+class MaxBotQuestionOption(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    question = models.ForeignKey(
+        MaxBotQuestion,
+        db_column="question_id",
+        on_delete=models.CASCADE,
+        related_name="options",
+    )
+    code = models.CharField(max_length=64)
+    text = models.CharField(max_length=255)
+    numeric_value = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    registry_action_text = models.TextField(null=True, blank=True)
+    notification_text = models.TextField(null=True, blank=True)
+    request_status_on_select = models.CharField(max_length=32, null=True, blank=True)
+    is_emergency = models.BooleanField(default=False)
+    is_finish = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    next_question = models.ForeignKey(
+        MaxBotQuestion,
+        db_column="next_question_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="incoming_options",
+    )
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_question_option"
+        managed = False
+        ordering = ["sort_order", "id"]
+        unique_together = ("question", "code")
+
+    def __str__(self):
+        return self.text
+
+
+class MaxBotRequest(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    request_no = models.CharField(max_length=64, unique=True)
+    applicant_user = models.ForeignKey(
+        User,
+        db_column="applicant_user_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maxbot_requests",
+    )
+    applicant_full_name = models.CharField(max_length=255)
+    max_user_id = models.BigIntegerField()
+    max_chat_id = models.BigIntegerField(null=True, blank=True)
+    role = models.ForeignKey(
+        MaxBotRole,
+        db_column="role_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="requests",
+    )
+    employee = models.ForeignKey(
+        MaxBotEmployee,
+        db_column="employee_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="requests",
+    )
+    vehicle = models.ForeignKey(
+        MaxBotVehicle,
+        db_column="vehicle_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="requests",
+    )
+    scenario = models.ForeignKey(
+        MaxBotScenario,
+        db_column="scenario_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="requests",
+    )
+    current_question = models.ForeignKey(
+        MaxBotQuestion,
+        db_column="current_question_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="current_requests",
+    )
+    status = models.CharField(max_length=32, default="draft")
+    emergency_flag = models.BooleanField(default=False)
+    summary = models.TextField(null=True, blank=True)
+    raw_last_event = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "maxbot_request"
+        managed = False
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.request_no
+
+
+class MaxBotRequestAnswer(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    request = models.ForeignKey(
+        MaxBotRequest,
+        db_column="request_id",
+        on_delete=models.CASCADE,
+        related_name="answers",
+    )
+    question = models.ForeignKey(
+        MaxBotQuestion,
+        db_column="question_id",
+        on_delete=models.CASCADE,
+        related_name="request_answers",
+    )
+    option = models.ForeignKey(
+        MaxBotQuestionOption,
+        db_column="option_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="request_answers",
+    )
+    question_text = models.TextField()
+    option_text = models.CharField(max_length=255, null=True, blank=True)
+    answer_text = models.TextField(null=True, blank=True)
+    answer_number = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    photo_url = models.TextField(null=True, blank=True)
+    photo_file = models.FileField(upload_to="maxbot_photos/%Y/%m/%d/", null=True, blank=True)
+    registry_action_text = models.TextField(null=True, blank=True)
+    is_emergency = models.BooleanField(default=False)
+    raw_payload = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_request_answer"
+        managed = False
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.request.request_no} / {self.question_text[:50]}"
+
+
+
+
+
+
