@@ -68,12 +68,17 @@ import mimetypes
 from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
+from decimal import Decimal, InvalidOperation
+from django.db import connection
+from django.core.files.base import ContentFile
+from django.utils.html import escape
 
-from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease
+from .models import Queue, MODUL_logs, User, UKMUser, OpenInSystem, QRCode, Department, Position, Store, AuthSession, QRIssueLog, VpnAccessSession, AdminBadgeRequest, VpnAccessBaseline, VpnAccessLease,  MaxBotRole, MaxBotEmployee, MaxBotVehicle, MaxBotScenario, MaxBotQuestion, MaxBotQuestionOption, MaxBotRequest, MaxBotRequestAnswer,
 
 _HEX = set("0123456789abcdefABCDEF")
 logger = logging.getLogger(__name__)
 AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "zDFbCQWRzL7pKYxzpfSSLVdqCrAYsHiN7FORRUDt1hE")
+MAX_BOT_INTERNAL_TOKEN = os.getenv("MAX_BOT_INTERNAL_TOKEN", "wc3wow")
 UKM5_FULL_XML_STORE_ID = 2013
 def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
     raw = os.getenv(name, default_csv) or ""
@@ -13436,3 +13441,748 @@ def sm_sync_staff_run(request):
 
     finally:
         _oracle_close_cached_conns()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def maxbot_api_required(view_func):
+    @wraps(view_func)
+    def _wrapped(request, *args, **kwargs):
+        token = request.headers.get("X-MAXBOT-TOKEN") or request.META.get("HTTP_X_MAXBOT_TOKEN")
+        if not token or token != MAX_BOT_INTERNAL_TOKEN:
+            return JsonResponse({"ok": False, "error": "forbidden"}, status=403)
+        return view_func(request, *args, **kwargs)
+    return _wrapped
+
+
+def parse_json_body(request):
+    try:
+        return json.loads(request.body.decode("utf-8") if request.body else "{}")
+    except Exception:
+        return {}
+
+
+def normalize_phone(raw_phone: str) -> str:
+    digits = re.sub(r"\D", "", raw_phone or "")
+    if len(digits) == 10:
+        digits = "7" + digits
+    elif len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return digits
+
+
+def find_user_by_phone(raw_phone: str) -> Optional[User]:
+    phone = normalize_phone(raw_phone)
+    if not phone:
+        return None
+
+    last10 = phone[-10:]
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id
+            FROM users
+            WHERE active = TRUE
+              AND (
+                    regexp_replace(coalesce(phone, ''), '\D', '', 'g') = %s
+                 OR right(regexp_replace(coalesce(phone, ''), '\D', '', 'g'), 10) = %s
+              )
+            ORDER BY id
+            LIMIT 1
+            """,
+            [phone, last10],
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    return User.objects.filter(pk=row[0]).first()
+
+
+def find_user_by_max_id(max_user_id: int) -> Optional[User]:
+    return User.objects.filter(max_id=max_user_id, active=True).first()
+
+
+def bind_max_user_to_phone(max_user_id: int, raw_phone: str) -> Tuple[Optional[User], Optional[str]]:
+    user = find_user_by_phone(raw_phone)
+    if not user:
+        return None, "Пользователь с таким номером телефона не найден в базе."
+
+    if user.max_id and int(user.max_id) != int(max_user_id):
+        return None, "Этот номер телефона уже привязан к другому MAX-аккаунту."
+
+    if not user.max_id:
+        User.objects.filter(pk=user.id).update(
+            max_id=max_user_id,
+            updated_at=timezone.now(),
+        )
+        user.refresh_from_db()
+
+    return user, None
+
+
+def kb_callback(text: str, payload: str):
+    return {"type": "callback", "text": text, "payload": payload}
+
+
+def kb_contact(text: str):
+    return {"type": "request_contact", "text": text}
+
+
+def build_response(text=None, buttons=None, notification=None, fmt="html"):
+    return {
+        "ok": True,
+        "text": text,
+        "buttons": buttons or [],
+        "notification": notification,
+        "format": fmt,
+    }
+
+
+def build_auth_response():
+    return build_response(
+        text=(
+            "Для входа в бот нажми кнопку <b>«Отправить контакт»</b>.\n\n"
+            "Я сверю номер телефона с таблицей <code>users</code> и привяжу твой MAX ID."
+        ),
+        buttons=[[kb_contact("Отправить контакт")]],
+    )
+
+
+def build_main_menu(user: User):
+    return build_response(
+        text=(
+            f"Привет, <b>{escape(user.full_name)}</b>!\n\n"
+            "Нажми <b>«Начать»</b>, чтобы пройти сценарий и сохранить запись в реестр."
+        ),
+        buttons=[
+            [kb_callback("Начать", "start")],
+        ],
+    )
+
+
+def generate_request_no() -> str:
+    return f"MAX-{timezone.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+
+
+def get_open_request(max_user_id: int) -> Optional[MaxBotRequest]:
+    return (
+        MaxBotRequest.objects
+        .filter(
+            max_user_id=max_user_id,
+            status__in=[
+                "draft",
+                "awaiting_role",
+                "awaiting_employee",
+                "awaiting_vehicle",
+                "awaiting_answer",
+            ],
+        )
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def cancel_previous_open_requests(max_user_id: int):
+    MaxBotRequest.objects.filter(
+        max_user_id=max_user_id,
+        status__in=[
+            "draft",
+            "awaiting_role",
+            "awaiting_employee",
+            "awaiting_vehicle",
+            "awaiting_answer",
+        ],
+    ).update(
+        status="cancelled",
+        updated_at=timezone.now(),
+        finished_at=timezone.now(),
+    )
+
+
+def create_new_request_for_user(user: User, max_user_id: int, max_chat_id: Optional[int], raw_event=None) -> MaxBotRequest:
+    cancel_previous_open_requests(max_user_id)
+
+    req = MaxBotRequest.objects.create(
+        request_no=generate_request_no(),
+        applicant_user=user,
+        applicant_full_name=user.full_name,
+        max_user_id=max_user_id,
+        max_chat_id=max_chat_id,
+        status="awaiting_role",
+        raw_last_event=raw_event or {},
+        created_at=timezone.now(),
+        updated_at=timezone.now(),
+    )
+    return req
+
+
+def get_active_roles():
+    return MaxBotRole.objects.filter(is_active=True).order_by("sort_order", "name")
+
+
+def get_active_scenario_for_role(role: MaxBotRole) -> Optional[MaxBotScenario]:
+    return (
+        MaxBotScenario.objects
+        .filter(role=role, is_active=True)
+        .order_by("id")
+        .first()
+    )
+
+
+def ask_role(req: MaxBotRequest):
+    roles = list(get_active_roles())
+    buttons = [[kb_callback(role.name, f"role:{role.id}")] for role in roles]
+    buttons.append([kb_callback("Отмена", "cancel")])
+
+    return build_response(
+        text="Выберите должность:",
+        buttons=buttons,
+    )
+
+
+def ask_employee(req: MaxBotRequest, role: MaxBotRole):
+    employees = list(
+        MaxBotEmployee.objects.filter(role=role, is_active=True).order_by("sort_order", "full_name")
+    )
+    if not employees:
+        return build_response(
+            text="Для этой должности пока нет сотрудников в справочнике.",
+            buttons=[[kb_callback("В главное меню", "main_menu")]],
+        )
+
+    buttons = [[kb_callback(emp.full_name, f"employee:{emp.id}")] for emp in employees]
+    buttons.append([kb_callback("Отмена", "cancel")])
+
+    return build_response(
+        text="Выберите ФИО:",
+        buttons=buttons,
+    )
+
+
+def ask_vehicle(req: MaxBotRequest, role: MaxBotRole, employee: Optional[MaxBotEmployee] = None):
+    qs = MaxBotVehicle.objects.filter(role=role, is_active=True).order_by("sort_order", "reg_number")
+    if employee:
+        filtered = qs.filter(models.Q(employee__isnull=True) | models.Q(employee=employee))
+    else:
+        filtered = qs
+
+    vehicles = list(filtered)
+    if not vehicles:
+        return build_response(
+            text="Для этой должности пока нет автомобилей в справочнике.",
+            buttons=[[kb_callback("В главное меню", "main_menu")]],
+        )
+
+    buttons = [[kb_callback(v.title or v.reg_number, f"vehicle:{v.id}")] for v in vehicles]
+    buttons.append([kb_callback("Отмена", "cancel")])
+
+    return build_response(
+        text="Выберите автомобиль:",
+        buttons=buttons,
+    )
+
+
+def ask_question(req: MaxBotRequest, question: MaxBotQuestion, notification: Optional[str] = None):
+    req.current_question = question
+    req.status = "awaiting_answer"
+    req.updated_at = timezone.now()
+    req.save(update_fields=["current_question", "status", "updated_at"])
+
+    if question.question_type == "single_choice":
+        options = list(question.options.filter(is_active=True).order_by("sort_order", "id"))
+        buttons = [[kb_callback(opt.text, f"answer:{opt.id}")] for opt in options]
+        buttons.append([kb_callback("Отмена", "cancel")])
+        return build_response(text=question.text, buttons=buttons, notification=notification)
+
+    if question.question_type == "photo":
+        return build_response(
+            text=question.text,
+            buttons=[[kb_callback("Отмена", "cancel")]],
+            notification=notification,
+        )
+
+    if question.question_type in ("text", "number"):
+        return build_response(
+            text=question.text,
+            buttons=[[kb_callback("Отмена", "cancel")]],
+            notification=notification,
+        )
+
+    return build_response(
+        text="Тип вопроса не поддерживается.",
+        buttons=[[kb_callback("В главное меню", "main_menu")]],
+    )
+
+
+def rebuild_request_summary(req: MaxBotRequest) -> str:
+    lines = []
+    answers = req.answers.order_by("created_at", "id")
+
+    for ans in answers:
+        if ans.registry_action_text:
+            lines.append(ans.registry_action_text)
+            continue
+
+        if ans.option_text:
+            lines.append(f"{ans.question_text}: {ans.option_text}")
+            continue
+
+        if ans.answer_text:
+            lines.append(f"{ans.question_text}: {ans.answer_text}")
+            continue
+
+        if ans.answer_number is not None:
+            lines.append(f"{ans.question_text}: {ans.answer_number}")
+            continue
+
+        if ans.photo_file or ans.photo_url:
+            lines.append(f"{ans.question_text}: приложено фото")
+            continue
+
+    return "\n".join(lines)
+
+
+def finish_request(req: MaxBotRequest, status: str = "completed", notification: Optional[str] = None):
+    req.status = status
+    req.current_question = None
+    req.summary = rebuild_request_summary(req)
+    req.finished_at = timezone.now()
+    req.updated_at = timezone.now()
+    req.save(update_fields=["status", "current_question", "summary", "finished_at", "updated_at"])
+
+    if status == "emergency_stop":
+        text = (
+            f"Заявка <b>{req.request_no}</b> сохранена.\n\n"
+            f"<b>СТОП!</b> Машину не выгонять из гаража, ставим на ремонт.\n\n"
+            f"<b>Итог:</b>\n{escape(req.summary or '-')}"
+        )
+    else:
+        text = (
+            f"Готово. Заявка <b>{req.request_no}</b> сохранена в реестр.\n\n"
+            f"<b>Итог:</b>\n{escape(req.summary or '-')}"
+        )
+
+    return build_response(
+        text=text,
+        buttons=[[kb_callback("Начать заново", "start")]],
+        notification=notification,
+    )
+
+
+def save_photo_to_answer(answer: MaxBotRequestAnswer, photo_url: str):
+    answer.photo_url = photo_url
+    if not photo_url:
+        answer.save(update_fields=["photo_url"])
+        return
+
+    try:
+        resp = requests.get(photo_url, timeout=20)
+        resp.raise_for_status()
+
+        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+        ext = mimetypes.guess_extension(content_type) or ".jpg"
+        filename = f"{uuid.uuid4().hex}{ext}"
+
+        answer.photo_file.save(filename, ContentFile(resp.content), save=False)
+    except Exception:
+        logger.exception("Не удалось скачать фото из MAX URL: %s", photo_url)
+
+    answer.save()
+
+
+def start_scenario_after_directory(req: MaxBotRequest):
+    if not req.scenario or not req.scenario.first_question:
+        return build_response(
+            text="Для выбранной должности сценарий ещё не настроен.",
+            buttons=[[kb_callback("В главное меню", "main_menu")]],
+        )
+
+    return ask_question(req, req.scenario.first_question)
+
+
+def handle_role_selection(req: MaxBotRequest, role_id: int):
+    role = MaxBotRole.objects.filter(id=role_id, is_active=True).first()
+    if not role:
+        return build_response(text="Должность не найдена.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    scenario = get_active_scenario_for_role(role)
+    req.role = role
+    req.scenario = scenario
+    req.updated_at = timezone.now()
+
+    if role.requires_employee:
+        req.status = "awaiting_employee"
+        req.save(update_fields=["role", "scenario", "status", "updated_at"])
+        return ask_employee(req, role)
+
+    if role.requires_vehicle:
+        req.status = "awaiting_vehicle"
+        req.save(update_fields=["role", "scenario", "status", "updated_at"])
+        return ask_vehicle(req, role, None)
+
+    req.save(update_fields=["role", "scenario", "updated_at"])
+    return start_scenario_after_directory(req)
+
+
+def handle_employee_selection(req: MaxBotRequest, employee_id: int):
+    if not req.role:
+        return build_response(text="Сначала выберите должность.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    employee = MaxBotEmployee.objects.filter(id=employee_id, role=req.role, is_active=True).first()
+    if not employee:
+        return build_response(text="Сотрудник не найден.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    req.employee = employee
+    req.updated_at = timezone.now()
+
+    if req.role.requires_vehicle:
+        req.status = "awaiting_vehicle"
+        req.save(update_fields=["employee", "status", "updated_at"])
+        return ask_vehicle(req, req.role, employee)
+
+    req.save(update_fields=["employee", "updated_at"])
+    return start_scenario_after_directory(req)
+
+
+def handle_vehicle_selection(req: MaxBotRequest, vehicle_id: int):
+    if not req.role:
+        return build_response(text="Сначала выберите должность.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    vehicle_qs = MaxBotVehicle.objects.filter(id=vehicle_id, role=req.role, is_active=True)
+    if req.employee:
+        vehicle_qs = vehicle_qs.filter(models.Q(employee__isnull=True) | models.Q(employee=req.employee))
+
+    vehicle = vehicle_qs.first()
+    if not vehicle:
+        return build_response(text="Автомобиль не найден.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    req.vehicle = vehicle
+    req.updated_at = timezone.now()
+    req.save(update_fields=["vehicle", "updated_at"])
+
+    return start_scenario_after_directory(req)
+
+
+def save_option_answer(req: MaxBotRequest, option: MaxBotQuestionOption, raw_payload=None):
+    question = req.current_question
+    if not question:
+        return build_response(text="Нет активного вопроса.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    if option.question_id != question.id:
+        return ask_question(req, question, notification="Этот ответ уже не актуален. Повтори выбор.")
+
+    MaxBotRequestAnswer.objects.create(
+        request=req,
+        question=question,
+        option=option,
+        question_text=question.text,
+        option_text=option.text,
+        answer_number=option.numeric_value,
+        registry_action_text=option.registry_action_text,
+        is_emergency=option.is_emergency,
+        raw_payload=raw_payload or {},
+        created_at=timezone.now(),
+    )
+
+    if option.is_emergency:
+        req.emergency_flag = True
+
+    next_question = option.next_question or question.default_next_question
+    req.updated_at = timezone.now()
+    req.raw_last_event = raw_payload or {}
+
+    if option.request_status_on_select == "emergency_stop":
+        req.save(update_fields=["emergency_flag", "updated_at", "raw_last_event"])
+        return finish_request(req, status="emergency_stop", notification=option.notification_text)
+
+    if option.is_finish and not next_question:
+        req.save(update_fields=["emergency_flag", "updated_at", "raw_last_event"])
+        return finish_request(req, status="completed", notification=option.notification_text)
+
+    req.save(update_fields=["emergency_flag", "updated_at", "raw_last_event"])
+
+    if next_question:
+        return ask_question(req, next_question, notification=option.notification_text)
+
+    return finish_request(req, status="completed", notification=option.notification_text)
+
+
+def save_text_or_number_answer(req: MaxBotRequest, text_value: str, raw_payload=None):
+    question = req.current_question
+    if not question:
+        return build_response(text="Нет активного вопроса.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    answer_number = None
+    answer_text = text_value
+
+    if question.question_type == "number":
+        try:
+            normalized = (text_value or "").replace(",", ".").strip()
+            answer_number = Decimal(normalized)
+            answer_text = None
+        except (InvalidOperation, AttributeError):
+            return build_response(
+                text="Нужно отправить число. Например: 1 или 1.5",
+                buttons=[[kb_callback("Отмена", "cancel")]],
+            )
+
+    MaxBotRequestAnswer.objects.create(
+        request=req,
+        question=question,
+        question_text=question.text,
+        answer_text=answer_text,
+        answer_number=answer_number,
+        raw_payload=raw_payload or {},
+        created_at=timezone.now(),
+    )
+
+    req.updated_at = timezone.now()
+    req.raw_last_event = raw_payload or {}
+    req.save(update_fields=["updated_at", "raw_last_event"])
+
+    next_question = question.default_next_question
+    if next_question:
+        return ask_question(req, next_question)
+
+    return finish_request(req, status="completed")
+
+
+def save_photo_answer(req: MaxBotRequest, photo_url: str, raw_payload=None):
+    question = req.current_question
+    if not question:
+        return build_response(text="Нет активного вопроса.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    if question.question_type != "photo":
+        return build_response(text="Сейчас бот не ждёт фото.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+
+    ans = MaxBotRequestAnswer.objects.create(
+        request=req,
+        question=question,
+        question_text=question.text,
+        registry_action_text="Приложено фото",
+        raw_payload=raw_payload or {},
+        created_at=timezone.now(),
+    )
+    save_photo_to_answer(ans, photo_url)
+
+    req.updated_at = timezone.now()
+    req.raw_last_event = raw_payload or {}
+    req.save(update_fields=["updated_at", "raw_last_event"])
+
+    next_question = question.default_next_question
+    if next_question:
+        return ask_question(req, next_question)
+
+    return finish_request(req, status="completed")
+
+
+def handle_callback_event(user: User, payload: str, max_user_id: int, max_chat_id: Optional[int], raw_data: dict):
+    payload = (payload or "").strip()
+
+    if payload == "main_menu":
+        return build_main_menu(user)
+
+    if payload == "start":
+        req = create_new_request_for_user(user, max_user_id, max_chat_id, raw_event=raw_data)
+        return ask_role(req)
+
+    if payload == "cancel":
+        req = get_open_request(max_user_id)
+        if req:
+            req.status = "cancelled"
+            req.updated_at = timezone.now()
+            req.finished_at = timezone.now()
+            req.save(update_fields=["status", "updated_at", "finished_at"])
+        return build_response(
+            text="Текущий сценарий отменён.",
+            buttons=[[kb_callback("Начать заново", "start")]],
+            notification="Отменено",
+        )
+
+    req = get_open_request(max_user_id)
+    if not req:
+        return build_response(
+            text="Нет активного сценария. Нажми «Начать».",
+            buttons=[[kb_callback("Начать", "start")]],
+        )
+
+    if payload.startswith("role:"):
+        role_id = int(payload.split(":", 1)[1])
+        return handle_role_selection(req, role_id)
+
+    if payload.startswith("employee:"):
+        employee_id = int(payload.split(":", 1)[1])
+        return handle_employee_selection(req, employee_id)
+
+    if payload.startswith("vehicle:"):
+        vehicle_id = int(payload.split(":", 1)[1])
+        return handle_vehicle_selection(req, vehicle_id)
+
+    if payload.startswith("answer:"):
+        option_id = int(payload.split(":", 1)[1])
+        option = MaxBotQuestionOption.objects.filter(id=option_id, is_active=True).first()
+        if not option:
+            return build_response(
+                text="Вариант ответа не найден.",
+                buttons=[[kb_callback("В главное меню", "main_menu")]],
+            )
+        return save_option_answer(req, option, raw_payload=raw_data)
+
+    return build_response(
+        text="Неизвестная команда.",
+        buttons=[[kb_callback("В главное меню", "main_menu")]],
+    )
+
+
+@csrf_exempt
+@require_POST
+@maxbot_api_required
+def maxbot_process_update(request):
+    data = parse_json_body(request)
+
+    event_type = (data.get("event_type") or "").strip()
+    max_user_id = data.get("max_user_id")
+    max_chat_id = data.get("chat_id")
+    text = (data.get("text") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    payload = (data.get("payload") or "").strip()
+    photo_url = (data.get("photo_url") or "").strip()
+    raw_update = data.get("raw_update") or data
+
+    if not max_user_id:
+        return JsonResponse({"ok": False, "error": "max_user_id is required"}, status=400)
+
+    max_user_id = int(max_user_id)
+    if max_chat_id is not None:
+        try:
+            max_chat_id = int(max_chat_id)
+        except Exception:
+            max_chat_id = None
+
+    user = find_user_by_max_id(max_user_id)
+
+    # 1. Пользователь ещё не привязан
+    if not user:
+        if event_type == "contact_shared":
+            user, error = bind_max_user_to_phone(max_user_id, phone)
+            if error:
+                return JsonResponse(build_response(
+                    text=(
+                        f"{escape(error)}\n\n"
+                        "Нажми кнопку «Отправить контакт» ещё раз или обратись к администратору."
+                    ),
+                    buttons=[[kb_contact("Отправить контакт")]],
+                ))
+
+            return JsonResponse(build_main_menu(user))
+
+        return JsonResponse(build_auth_response())
+
+    # 2. Уже привязан
+    if event_type == "bot_started":
+        return JsonResponse(build_main_menu(user))
+
+    if event_type == "contact_shared":
+        return JsonResponse(build_main_menu(user))
+
+    if event_type == "callback":
+        result = handle_callback_event(user, payload, max_user_id, max_chat_id, raw_update)
+        return JsonResponse(result)
+
+    req = get_open_request(max_user_id)
+
+    if event_type == "photo_message":
+        if not req:
+            return JsonResponse(build_response(
+                text="Нет активного сценария. Нажми «Начать».",
+                buttons=[[kb_callback("Начать", "start")]],
+            ))
+
+        return JsonResponse(save_photo_answer(req, photo_url, raw_payload=raw_update))
+
+    if event_type == "message":
+        if text.lower() in {"/start", "start", "начать"}:
+            return JsonResponse(build_main_menu(user))
+
+        if not req:
+            return JsonResponse(build_main_menu(user))
+
+        if not req.current_question:
+            return JsonResponse(build_main_menu(user))
+
+        if req.current_question.question_type in ("text", "number"):
+            return JsonResponse(save_text_or_number_answer(req, text, raw_payload=raw_update))
+
+        if req.current_question.question_type == "photo":
+            return JsonResponse(build_response(
+                text="Сейчас нужно отправить именно фото.",
+                buttons=[[kb_callback("Отмена", "cancel")]],
+            ))
+
+        return JsonResponse(build_response(
+            text="Пожалуйста, используй кнопки под сообщением.",
+            buttons=[[kb_callback("Отмена", "cancel")]],
+        ))
+
+    return JsonResponse(build_main_menu(user))
