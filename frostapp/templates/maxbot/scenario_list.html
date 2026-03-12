@@ -1,0 +1,55 @@
+{% extends "maxbot/base.html" %}
+{% block title %}Сценарии{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Сценарии</h1>
+        <div class="muted">Сценарий — это анкета/цепочка, которая запускается в боте после выбора справочников.</div>
+    </div>
+    <a class="btn btn-primary" href="{% url 'maxbot_scenario_create' %}">+ Добавить</a>
+</div>
+
+<div class="card">
+    <form method="get" class="filters">
+        <input type="text" name="q" value="{{ q }}" placeholder="Название, код или должность" class="form-control" style="max-width:320px;">
+        <button type="submit" class="btn btn-primary">Найти</button>
+        <a class="btn btn-secondary" href="{% url 'maxbot_scenario_list' %}">Сбросить</a>
+    </form>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Должность</th>
+                <th>Код</th>
+                <th>Название</th>
+                <th>Первый вопрос</th>
+                <th>Активен</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for obj in page_obj %}
+            <tr>
+                <td>{{ obj.role }}</td>
+                <td>{{ obj.code }}</td>
+                <td>{{ obj.name }}</td>
+                <td>{{ obj.first_question|default:"-" }}</td>
+                <td>{{ obj.is_active|yesno:"Да,Нет" }}</td>
+                <td>
+                    <div class="actions">
+                        <a class="btn btn-primary" href="{% url 'maxbot_scenario_questions' obj.id %}">Вопросы</a>
+                        <a class="btn btn-secondary" href="{% url 'maxbot_scenario_edit' obj.id %}">Редактировать</a>
+                        <a class="btn btn-danger" href="{% url 'maxbot_scenario_delete' obj.id %}">Удалить</a>
+                    </div>
+                </td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="6">Сценариев нет.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    {% include "maxbot/pagination.html" with page_obj=page_obj %}
+</div>
+{% endblock %}
