@@ -14492,7 +14492,7 @@ def maxbot_role_create(request):
     return render(request, "maxbot/object_form.html", {
         "title": "Новая должность",
         "form": form,
-        "back_url_name": "maxbot_role_list",
+        "back_url": reverse("maxbot_role_list"),
     })
 
 
@@ -14512,7 +14512,7 @@ def maxbot_role_edit(request, pk):
     return render(request, "maxbot/object_form.html", {
         "title": f"Редактирование должности: {obj.name}",
         "form": form,
-        "back_url_name": "maxbot_role_list",
+        "back_url": reverse("maxbot_role_list"),
     })
 
 
@@ -14527,7 +14527,7 @@ def maxbot_role_delete(request, pk):
     return render(request, "maxbot/confirm_delete.html", {
         "title": "Удаление должности",
         "object_name": obj.name,
-        "back_url_name": "maxbot_role_list",
+        "back_url": reverse("maxbot_role_list"),
     })
 
 
