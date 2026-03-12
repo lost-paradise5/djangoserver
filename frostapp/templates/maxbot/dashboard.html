@@ -1,0 +1,98 @@
+{% extends "maxbot/base.html" %}
+{% block title %}MAX Bot — Главная{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Панель управления MAX-ботом</h1>
+        <div class="muted">Через этот раздел ты управляешь справочниками, сценариями и смотришь историю заявок.</div>
+    </div>
+</div>
+
+<div class="grid">
+    <div class="stat">
+        <div>Должности</div>
+        <div class="stat-value">{{ total_roles }}</div>
+    </div>
+    <div class="stat">
+        <div>Сотрудники</div>
+        <div class="stat-value">{{ total_employees }}</div>
+    </div>
+    <div class="stat">
+        <div>Машины</div>
+        <div class="stat-value">{{ total_vehicles }}</div>
+    </div>
+    <div class="stat">
+        <div>Сценарии</div>
+        <div class="stat-value">{{ total_scenarios }}</div>
+    </div>
+</div>
+
+<div class="grid" style="margin-top:16px;">
+    <div class="stat">
+        <div>Всего заявок</div>
+        <div class="stat-value">{{ total_requests }}</div>
+    </div>
+    <div class="stat">
+        <div>Активные</div>
+        <div class="stat-value">{{ active_requests }}</div>
+    </div>
+    <div class="stat">
+        <div>Завершённые</div>
+        <div class="stat-value">{{ completed_requests }}</div>
+    </div>
+    <div class="stat">
+        <div>Аварийные</div>
+        <div class="stat-value">{{ emergency_requests }}</div>
+    </div>
+</div>
+
+<div class="card" style="margin-top:18px;">
+    <div class="actions" style="margin-bottom:14px;">
+        <a class="btn btn-primary" href="{% url 'maxbot_role_create' %}">+ Добавить должность</a>
+        <a class="btn btn-primary" href="{% url 'maxbot_employee_create' %}">+ Добавить сотрудника</a>
+        <a class="btn btn-primary" href="{% url 'maxbot_vehicle_create' %}">+ Добавить машину</a>
+        <a class="btn btn-primary" href="{% url 'maxbot_scenario_create' %}">+ Добавить сценарий</a>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Последние заявки</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>№</th>
+                <th>Кто заполнил</th>
+                <th>Должность</th>
+                <th>Сотрудник</th>
+                <th>Машина</th>
+                <th>Статус</th>
+                <th>Дата</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for req in latest_requests %}
+            <tr>
+                <td>{{ req.request_no }}</td>
+                <td>{{ req.applicant_full_name }}</td>
+                <td>{{ req.role|default:"-" }}</td>
+                <td>{{ req.employee|default:"-" }}</td>
+                <td>{{ req.vehicle|default:"-" }}</td>
+                <td>
+                    {% if req.emergency_flag %}
+                        <span class="badge badge-danger">{{ req.status_label }}</span>
+                    {% else %}
+                        <span class="badge">{{ req.status_label }}</span>
+                    {% endif %}
+                </td>
+                <td>{{ req.created_at|date:"d.m.Y H:i" }}</td>
+                <td><a class="btn btn-secondary" href="{% url 'maxbot_request_detail' req.id %}">Открыть</a></td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="8">Заявок пока нет.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
