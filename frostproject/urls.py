@@ -145,4 +145,52 @@ urlpatterns = [
     path('ui/smstaff/create/', sm_staff_ui_create, name='sm_staff_ui_create'),
 
     path("api/maxbot/process/", maxbot_process_update, name="maxbot_process_update"),
+
+
+
+
+
+
+
+
+
+
+
+
+
+    path("maxbot/", views.maxbot_dashboard, name="maxbot_dashboard"),
+
+    path("maxbot/roles/", views.maxbot_role_list, name="maxbot_role_list"),
+    path("maxbot/roles/create/", views.maxbot_role_create, name="maxbot_role_create"),
+    path("maxbot/roles/<int:pk>/edit/", views.maxbot_role_edit, name="maxbot_role_edit"),
+    path("maxbot/roles/<int:pk>/delete/", views.maxbot_role_delete, name="maxbot_role_delete"),
+
+    path("maxbot/employees/", views.maxbot_employee_list, name="maxbot_employee_list"),
+    path("maxbot/employees/create/", views.maxbot_employee_create, name="maxbot_employee_create"),
+    path("maxbot/employees/<int:pk>/edit/", views.maxbot_employee_edit, name="maxbot_employee_edit"),
+    path("maxbot/employees/<int:pk>/delete/", views.maxbot_employee_delete, name="maxbot_employee_delete"),
+
+    path("maxbot/vehicles/", views.maxbot_vehicle_list, name="maxbot_vehicle_list"),
+    path("maxbot/vehicles/create/", views.maxbot_vehicle_create, name="maxbot_vehicle_create"),
+    path("maxbot/vehicles/<int:pk>/edit/", views.maxbot_vehicle_edit, name="maxbot_vehicle_edit"),
+    path("maxbot/vehicles/<int:pk>/delete/", views.maxbot_vehicle_delete, name="maxbot_vehicle_delete"),
+
+    path("maxbot/scenarios/", views.maxbot_scenario_list, name="maxbot_scenario_list"),
+    path("maxbot/scenarios/create/", views.maxbot_scenario_create, name="maxbot_scenario_create"),
+    path("maxbot/scenarios/<int:pk>/edit/", views.maxbot_scenario_edit, name="maxbot_scenario_edit"),
+    path("maxbot/scenarios/<int:pk>/delete/", views.maxbot_scenario_delete, name="maxbot_scenario_delete"),
+
+    path("maxbot/scenarios/<int:scenario_id>/questions/", views.maxbot_scenario_questions, name="maxbot_scenario_questions"),
+    path("maxbot/scenarios/<int:scenario_id>/questions/create/", views.maxbot_question_create, name="maxbot_question_create"),
+    path("maxbot/questions/<int:pk>/edit/", views.maxbot_question_edit, name="maxbot_question_edit"),
+    path("maxbot/questions/<int:pk>/delete/", views.maxbot_question_delete, name="maxbot_question_delete"),
+    path("maxbot/scenarios/<int:scenario_id>/questions/<int:question_id>/set-first/", views.maxbot_question_set_first, name="maxbot_question_set_first"),
+
+    path("maxbot/questions/<int:question_id>/options/", views.maxbot_question_options, name="maxbot_question_options"),
+    path("maxbot/questions/<int:question_id>/options/create/", views.maxbot_option_create, name="maxbot_option_create"),
+    path("maxbot/options/<int:pk>/edit/", views.maxbot_option_edit, name="maxbot_option_edit"),
+    path("maxbot/options/<int:pk>/delete/", views.maxbot_option_delete, name="maxbot_option_delete"),
+
+    path("maxbot/requests/", views.maxbot_request_list, name="maxbot_request_list"),
+    path("maxbot/requests/<int:pk>/", views.maxbot_request_detail, name="maxbot_request_detail"),
 ]
