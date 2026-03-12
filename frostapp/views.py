@@ -13723,7 +13723,7 @@ def ask_employee(req: MaxBotRequest, role: MaxBotRole):
 def ask_vehicle(req: MaxBotRequest, role: MaxBotRole, employee: Optional[MaxBotEmployee] = None):
     qs = MaxBotVehicle.objects.filter(role=role, is_active=True).order_by("sort_order", "reg_number")
     if employee:
-        filtered = qs.filter(models.Q(employee__isnull=True) | models.Q(employee=employee))
+        filtered = qs.filter(Q(employee__isnull=True) | Q(employee=employee))
     else:
         filtered = qs
 
@@ -13911,7 +13911,7 @@ def handle_vehicle_selection(req: MaxBotRequest, vehicle_id: int):
 
     vehicle_qs = MaxBotVehicle.objects.filter(id=vehicle_id, role=req.role, is_active=True)
     if req.employee:
-        vehicle_qs = vehicle_qs.filter(models.Q(employee__isnull=True) | models.Q(employee=req.employee))
+        vehicle_qs = vehicle_qs.filter(Q(employee__isnull=True) | Q(employee=req.employee))
 
     vehicle = vehicle_qs.first()
     if not vehicle:
