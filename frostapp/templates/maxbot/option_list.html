@@ -1,0 +1,67 @@
+{% extends "maxbot/base.html" %}
+{% block title %}Варианты ответа{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Варианты ответа</h1>
+        <div class="muted">
+            Сценарий: <strong>{{ question.scenario.name }}</strong><br>
+            Вопрос: <strong>{{ question.text }}</strong>
+        </div>
+    </div>
+    <div class="actions">
+        <a class="btn btn-primary" href="{% url 'maxbot_option_create' question.id %}">+ Добавить вариант</a>
+        <a class="btn btn-secondary" href="{% url 'maxbot_scenario_questions' question.scenario.id %}">К вопросам</a>
+    </div>
+</div>
+
+<div class="card">
+    <table>
+        <thead>
+            <tr>
+                <th>Порядок</th>
+                <th>Код</th>
+                <th>Текст</th>
+                <th>Число</th>
+                <th>Переход к вопросу</th>
+                <th>Аварийный</th>
+                <th>Финиш</th>
+                <th>Статус заявки</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for obj in page_obj %}
+            <tr>
+                <td>{{ obj.sort_order }}</td>
+                <td>{{ obj.code }}</td>
+                <td>{{ obj.text }}</td>
+                <td>{{ obj.numeric_value|default:"-" }}</td>
+                <td>{{ obj.next_question|default:"-" }}</td>
+                <td>{{ obj.is_emergency|yesno:"Да,Нет" }}</td>
+                <td>{{ obj.is_finish|yesno:"Да,Нет" }}</td>
+                <td>{{ obj.request_status_on_select|default:"-" }}</td>
+                <td>
+                    <div class="actions">
+                        <a class="btn btn-secondary" href="{% url 'maxbot_option_edit' obj.id %}">Редактировать</a>
+                        <a class="btn btn-danger" href="{% url 'maxbot_option_delete' obj.id %}">Удалить</a>
+                    </div>
+                </td>
+            </tr>
+            <tr>
+                <td></td>
+                <td colspan="8">
+                    <div><strong>Действие для реестра:</strong> {{ obj.registry_action_text|default:"-" }}</div>
+                    <div><strong>Уведомление:</strong> {{ obj.notification_text|default:"-" }}</div>
+                </td>
+            </tr>
+        {% empty %}
+            <tr><td colspan="9">Вариантов ответа пока нет.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    {% include "maxbot/pagination.html" with page_obj=page_obj %}
+</div>
+{% endblock %}
