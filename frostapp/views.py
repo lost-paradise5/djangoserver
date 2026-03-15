@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import requests
+from requests.exceptions import RequestException
 import time
 from typing import Tuple, Optional, Any, Iterable
 import random
@@ -150,7 +151,7 @@ def _oracle_connect(*, user: str, password: str, dsn: str, **kwargs):
 INACTIVE_REPORT_TOKEN="wc3wow"
 UKM5_FULL_XML_STORE_IDS: set[int] = _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", "2013,9016,1003")
 TRM_ID_MAX = 2147483647
-
+_TELEGRAM_SESSION = requests.Session()
 BADGE_REQ_TTL_MINUTES = int(os.getenv("BADGE_REQ_TTL_MINUTES", "10"))
 TG_BOT_API_TOKEN = os.getenv("TG_BOT_API_TOKEN", "")
 
@@ -387,6 +388,99 @@ def _auth_fio_from_session(sess: VpnAccessSession) -> str:
     except Exception:
         pass
     return fio
+
+
+
+def _split_telegram_text(text: str, max_len: int = 4000) -> list[str]:
+    """
+    Режет длинный текст на части до max_len символов,
+    стараясь резать по строкам, а не посередине слова.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ["(пустое сообщение лога)"]
+
+    if len(text) <= max_len:
+        return [text]
+
+    parts = []
+    current = []
+
+    for line in text.splitlines():
+        candidate = "\n".join(current + [line]).strip()
+        if len(candidate) <= max_len:
+            current.append(line)
+            continue
+
+        if current:
+            parts.append("\n".join(current).strip())
+            current = []
+
+        # если одна строка длиннее лимита — режем её принудительно
+        while len(line) > max_len:
+            parts.append(line[:max_len].strip())
+            line = line[max_len:]
+
+        if line:
+            current = [line]
+
+    if current:
+        parts.append("\n".join(current).strip())
+
+    return [p for p in parts if p]
+
+
+
+
+def _telegram_post_with_retry(url: str, payload: dict, retries: int = 3) -> bool:
+    """
+    Надёжная отправка одного сообщения в Telegram:
+    - retry при временной сетевой ошибке
+    - отдельные timeout на connect/read
+    - логирование без падения основного процесса
+    """
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = _TELEGRAM_SESSION.post(
+                url,
+                json=payload,
+                timeout=(3.05, 20), 
+            )
+            resp.raise_for_status()
+
+            data = {}
+            try:
+                data = resp.json()
+            except Exception:
+                pass
+
+            # Telegram API может вернуть HTTP 200, но ok=false
+            if isinstance(data, dict) and data.get("ok") is False:
+                desc = data.get("description", "unknown telegram api error")
+                raise RuntimeError(f"Telegram API error: {desc}")
+
+            return True
+
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"[TELEGRAM] Попытка {attempt}/{retries} не удалась "
+                f"(chat_id={payload.get('chat_id')}): {e}"
+            )
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+
+    logger.error(
+        f"[TELEGRAM] Не удалось отправить сообщение после {retries} попыток "
+        f"(chat_id={payload.get('chat_id')}): {last_error}",
+        exc_info=True
+    )
+    return False
+
+
+
 
 def _target_fio_for_log(inn: str, bitrix_id: int | None) -> tuple[str, int | None]:
     """
@@ -3017,21 +3111,77 @@ def _to_float_or_none(v):
 
 
 
+# def send_telegram_log(message: str) -> None:
+#     """
+#     Отправка читаемых, многострочных логов в несколько Telegram-чатов администраторов.
+
+#     • Не роняет основной поток при ошибках.
+#     • Длинные сообщения режет по ~4000 символов.
+#     • Обрезает лишние пробелы по краям.
+#     • Отключает превью ссылок.
+#     """
+#     if not TELEGRAM_BOT_TOKEN:
+#         return
+
+#     # фильтруем пустые/некорректные chat_id
+#     chat_ids = [cid for cid in TELEGRAM_ADMIN_CHAT_IDS if cid]
+#     if not chat_ids:
+#         return
+
+#     text = (message or "").strip()
+#     if not text:
+#         text = "(пустое сообщение лога)"
+
+#     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+#     max_len = 4000
+
+#     try:
+#         # для каждого админ-чата шлём одно и то же сообщение
+#         for chat_id in chat_ids:
+#             if len(text) <= max_len:
+#                 requests.post(
+#                     url,
+#                     json={
+#                         "chat_id": chat_id,
+#                         "text": text,
+#                         "disable_web_page_preview": True,
+#                     },
+#                     timeout=5,
+#                 )
+#             else:
+#                 # режем по кускам
+#                 for i in range(0, len(text), max_len):
+#                     part = text[i:i + max_len]
+#                     requests.post(
+#                         url,
+#                         json={
+#                             "chat_id": chat_id,
+#                             "text": part,
+#                             "disable_web_page_preview": True,
+#                         },
+#                         timeout=5,
+#                     )
+#     except Exception as e:
+#         logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)     
+
 def send_telegram_log(message: str) -> None:
     """
     Отправка читаемых, многострочных логов в несколько Telegram-чатов администраторов.
 
-    • Не роняет основной поток при ошибках.
-    • Длинные сообщения режет по ~4000 символов.
-    • Обрезает лишние пробелы по краям.
-    • Отключает превью ссылок.
+    Что делает:
+    • не роняет основной поток при ошибках;
+    • длинные сообщения режет на части;
+    • если один chunk не отправился — остальные всё равно продолжают отправляться;
+    • делает retry при временных таймаутах Telegram;
+    • логирует HTTP/Telegram API ошибки.
     """
     if not TELEGRAM_BOT_TOKEN:
+        logger.warning("[TELEGRAM] TELEGRAM_BOT_TOKEN не задан — лог не отправлен")
         return
 
-    # фильтруем пустые/некорректные chat_id
     chat_ids = [cid for cid in TELEGRAM_ADMIN_CHAT_IDS if cid]
     if not chat_ids:
+        logger.warning("[TELEGRAM] TELEGRAM_ADMIN_CHAT_IDS пуст — лог не отправлен")
         return
 
     text = (message or "").strip()
@@ -3039,36 +3189,38 @@ def send_telegram_log(message: str) -> None:
         text = "(пустое сообщение лога)"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    max_len = 4000
+    parts = _split_telegram_text(text, max_len=4000)
 
-    try:
-        # для каждого админ-чата шлём одно и то же сообщение
-        for chat_id in chat_ids:
-            if len(text) <= max_len:
-                requests.post(
-                    url,
-                    json={
-                        "chat_id": chat_id,
-                        "text": text,
-                        "disable_web_page_preview": True,
-                    },
-                    timeout=5,
-                )
+    total_sent = 0
+    total_failed = 0
+
+    for chat_id in chat_ids:
+        for idx, part in enumerate(parts, start=1):
+            payload = {
+                "chat_id": chat_id,
+                "text": part,
+                "disable_web_page_preview": True,
+            }
+
+            ok = _telegram_post_with_retry(url, payload, retries=3)
+            if ok:
+                total_sent += 1
             else:
-                # режем по кускам
-                for i in range(0, len(text), max_len):
-                    part = text[i:i + max_len]
-                    requests.post(
-                        url,
-                        json={
-                            "chat_id": chat_id,
-                            "text": part,
-                            "disable_web_page_preview": True,
-                        },
-                        timeout=5,
-                    )
-    except Exception as e:
-        logger.error(f"[TELEGRAM] Не удалось отправить лог: {e}", exc_info=True)     
+                total_failed += 1
+
+            # Небольшая пауза, чтобы не долбить API слишком быстро длинными логами
+            if idx < len(parts):
+                time.sleep(0.2)
+
+    logger.info(
+        f"[TELEGRAM] Отправка лога завершена: sent={total_sent}, failed={total_failed}, "
+        f"parts_per_chat={len(parts)}, chats={len(chat_ids)}"
+    )
+
+
+
+
+
 
 
 
