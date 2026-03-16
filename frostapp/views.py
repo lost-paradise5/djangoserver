@@ -6064,53 +6064,124 @@ def send_max_to_user(max_user_id, message: str) -> bool:
 
 def send_pin_to_user_channels(user, pin: str) -> dict:
     """
-    Отправляет PIN:
-    - в Telegram, если есть tg_id
-    - в MAX, если есть max_id
+    Отправляет PIN по приоритету каналов:
 
-    Отправка идёт параллельно, чтобы не ждать каналы по очереди.
+    1. Если у пользователя есть max_id -> отправляем ТОЛЬКО в MAX
+    2. Если max_id нет, но есть tg_id -> отправляем ТОЛЬКО в Telegram
+    3. Если нет ни max_id, ни tg_id -> ничего не отправляем
+
+    ВАЖНО:
+    - если есть и max_id, и tg_id, Telegram НЕ используется
+    - fallback с MAX на Telegram НЕ выполняется
     """
     message = f"Ваш код авторизации: {pin}\nОн действителен {PIN_TTL_MINUTES} минут."
 
-    futures = {}
     telegram_sent = False
     max_sent = False
 
-    try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            if getattr(user, "tg_id", None):
-                futures["telegram"] = executor.submit(send_telegram_to_user, user, message)
+    user_id = getattr(user, "id", None)
+    tg_id = getattr(user, "tg_id", None)
+    max_id = getattr(user, "max_id", None)
 
-            if getattr(user, "max_id", None):
-                futures["max"] = executor.submit(send_max_to_user, user.max_id, message)
+    # Приоритет MAX
+    if max_id:
+        try:
+            max_sent = bool(send_max_to_user(max_id, message))
+            if max_sent:
+                logger.info(f"[PIN_DELIVERY] PIN отправлен в MAX user_id={user_id} max_id={max_id}")
+            else:
+                logger.error(f"[PIN_DELIVERY] Не удалось отправить PIN в MAX user_id={user_id} max_id={max_id}")
+        except Exception as e:
+            logger.exception(
+                f"[PIN_DELIVERY] Ошибка отправки PIN в MAX user_id={user_id} "
+                f"max_id={max_id}: {e}"
+            )
+            max_sent = False
 
-            if "telegram" in futures:
-                try:
-                    telegram_sent = bool(futures["telegram"].result())
-                except Exception as e:
-                    logger.exception(
-                        f"[PIN_DELIVERY] Ошибка отправки в Telegram user_id={getattr(user, 'id', None)}: {e}"
-                    )
-                    telegram_sent = False
+        return {
+            "ok": max_sent,
+            "telegram_sent": False,
+            "max_sent": max_sent,
+        }
 
-            if "max" in futures:
-                try:
-                    max_sent = bool(futures["max"].result())
-                except Exception as e:
-                    logger.exception(
-                        f"[PIN_DELIVERY] Ошибка отправки в MAX user_id={getattr(user, 'id', None)} "
-                        f"max_id={getattr(user, 'max_id', None)}: {e}"
-                    )
-                    max_sent = False
+    # Если MAX нет — используем Telegram
+    if tg_id:
+        try:
+            telegram_sent = bool(send_telegram_to_user(user, message))
+            if telegram_sent:
+                logger.info(f"[PIN_DELIVERY] PIN отправлен в Telegram user_id={user_id} tg_id={tg_id}")
+            else:
+                logger.error(f"[PIN_DELIVERY] Не удалось отправить PIN в Telegram user_id={user_id} tg_id={tg_id}")
+        except Exception as e:
+            logger.exception(
+                f"[PIN_DELIVERY] Ошибка отправки PIN в Telegram user_id={user_id} "
+                f"tg_id={tg_id}: {e}"
+            )
+            telegram_sent = False
 
-    except Exception as e:
-        logger.exception(f"[PIN_DELIVERY] Общая ошибка отправки PIN: {e}")
+        return {
+            "ok": telegram_sent,
+            "telegram_sent": telegram_sent,
+            "max_sent": False,
+        }
 
+    # Нет ни одного канала
+    logger.warning(f"[PIN_DELIVERY] У пользователя нет ни max_id, ни tg_id user_id={user_id}")
     return {
-        "ok": telegram_sent or max_sent,
-        "telegram_sent": telegram_sent,
-        "max_sent": max_sent,
+        "ok": False,
+        "telegram_sent": False,
+        "max_sent": False,
     }
+
+# def send_pin_to_user_channels(user, pin: str) -> dict:
+#     """
+#     Отправляет PIN:
+#     - в Telegram, если есть tg_id
+#     - в MAX, если есть max_id
+
+#     Отправка идёт параллельно, чтобы не ждать каналы по очереди.
+#     """
+#     message = f"Ваш код авторизации: {pin}\nОн действителен {PIN_TTL_MINUTES} минут."
+
+#     futures = {}
+#     telegram_sent = False
+#     max_sent = False
+
+#     try:
+#         with ThreadPoolExecutor(max_workers=2) as executor:
+#             if getattr(user, "tg_id", None):
+#                 futures["telegram"] = executor.submit(send_telegram_to_user, user, message)
+
+#             if getattr(user, "max_id", None):
+#                 futures["max"] = executor.submit(send_max_to_user, user.max_id, message)
+
+#             if "telegram" in futures:
+#                 try:
+#                     telegram_sent = bool(futures["telegram"].result())
+#                 except Exception as e:
+#                     logger.exception(
+#                         f"[PIN_DELIVERY] Ошибка отправки в Telegram user_id={getattr(user, 'id', None)}: {e}"
+#                     )
+#                     telegram_sent = False
+
+#             if "max" in futures:
+#                 try:
+#                     max_sent = bool(futures["max"].result())
+#                 except Exception as e:
+#                     logger.exception(
+#                         f"[PIN_DELIVERY] Ошибка отправки в MAX user_id={getattr(user, 'id', None)} "
+#                         f"max_id={getattr(user, 'max_id', None)}: {e}"
+#                     )
+#                     max_sent = False
+
+#     except Exception as e:
+#         logger.exception(f"[PIN_DELIVERY] Общая ошибка отправки PIN: {e}")
+
+#     return {
+#         "ok": telegram_sent or max_sent,
+#         "telegram_sent": telegram_sent,
+#         "max_sent": max_sent,
+#     }
 
 
 def _get_agent_user_stores(user):
