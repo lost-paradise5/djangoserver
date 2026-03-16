@@ -7763,10 +7763,10 @@ def employee_identification(request):
       1) Валидация/нормализация входных данных (как в старой версии).
       2) Подготовка payload для 1С в старом формате: INN/FIO/MX/Datetime.
       3) На любой ошибке:
-         • красивый лог в Telegram
+         • красивый лог в Telegram (асинхронно)
          • запись в qr_issue_logs со статусом 'error'.
       4) На успехе:
-         • красивый лог в Telegram
+         • красивый лог в Telegram (асинхронно)
          • запись в qr_issue_logs со статусом 'ok'/'error' в зависимости от ответа 1С.
     """
     if request.method != 'POST':
@@ -7792,11 +7792,10 @@ def employee_identification(request):
     ) -> JsonResponse:
         """
         Общий обработчик ошибок:
-          • шлёт подробный лог в Telegram
+          • шлёт подробный лог в Telegram асинхронно
           • пишет строку в qr_issue_logs со статусом 'error'
           • возвращает JsonResponse с текстом ошибки
         """
-        # красивый лог в ТГ
         lines = [
             "❌ Ошибка при employee_identification",
             f"🔁 Этап: {stage}",
@@ -7816,9 +7815,8 @@ def employee_identification(request):
             short_body = raw_body if len(raw_body) <= 1000 else raw_body[:1000] + "…"
             lines.extend(["", "📦 Сырой JSON-запрос:", short_body])
 
-        send_telegram_log("\n".join(lines))
+        _send_admin_log_async("\n".join(lines))
 
-        # подготовка полей для записи в qr_issue_logs
         try:
             sm_id_int = int(smstore_raw) if str(smstore_raw).isdigit() else None
         except Exception:
@@ -7831,7 +7829,7 @@ def employee_identification(request):
                 endpoint='employee_identification',
                 method='EMP_IDENT',
                 status='error',
-                user=None,  # при ошибке пользователя можем ещё не знать
+                user=None,
                 employee_inn=inn_raw or "",
                 employee_fio=fio_raw or "",
                 tg_id="",
@@ -7839,15 +7837,14 @@ def employee_identification(request):
                 phone_normalized=phone_norm or "",
                 sm_store_id=sm_id_int,
                 ukm_store_id=ukm_store_id,
-                role_id=None,          # роль для этого эндпоинта не используется
-                qr_data="",       
+                role_id=None,
+                qr_data="",
                 error_message=f"{stage}: {human_msg}",
                 raw_request={"raw_body": raw_body} if raw_body else None,
                 latitude=lat_val,
                 longitude=lon_val,
             )
         except Exception:
-      
             logger.exception("[EMP_IDENT] Ошибка при записи в qr_issue_logs")
 
         return JsonResponse(
@@ -7865,7 +7862,7 @@ def employee_identification(request):
             "Парсинг JSON",
             f"Некорректный JSON: {e}",
         )
-        
+
     # 1.1 Координаты (опционально)
     lat_val = _to_float_or_none(data.get("latitude"))
     lon_val = _to_float_or_none(data.get("longitude"))
@@ -7874,7 +7871,6 @@ def employee_identification(request):
     inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
     fio_raw = (data.get('fio') or data.get('FIO') or "").strip()
 
-    # поддержка storeId / smstore / mx (старое поле)
     smstore_raw = str(
         data.get('storeId')
         or data.get('smstore')
@@ -7884,7 +7880,6 @@ def employee_identification(request):
 
     phone_raw = (data.get('phone') or "").strip()
 
-    # поддержка и "datetime", и "Datetime", и "event_datetime"
     dt_raw = (
         data.get('datetime')
         or data.get('Datetime')
@@ -7893,7 +7888,6 @@ def employee_identification(request):
     )
     dt_raw = dt_raw.strip()
 
-    # направление вход/выход — опционально
     direction = str(data.get('direction') or data.get('event') or "").strip()
 
     logger.info(
@@ -7903,7 +7897,7 @@ def employee_identification(request):
         f"latitude={lat_val!r}, longitude={lon_val!r}"
     )
 
-    # 3. Базовая валидация входных полей (как в старой версии)
+    # 3. Базовая валидация входных полей
     if not inn_raw:
         return _log_and_return_error(
             400,
@@ -7952,16 +7946,13 @@ def employee_identification(request):
             phone_raw=phone_raw,
         )
 
-    # для Store/ukm4store пробуем привести к int, для 1С MX остаётся строкой
     try:
         sm_store_id_int = int(smstore_raw)
     except ValueError:
         sm_store_id_int = None
 
-    # Нормализация телефона (если есть)
     phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
 
-    # Маппинг SMSTORE → ukm4store, чтобы записать его в лог
     ukm_store_id = None
     store_obj = None
     if sm_store_id_int is not None:
@@ -7972,7 +7963,6 @@ def employee_identification(request):
             except (TypeError, ValueError):
                 ukm_store_id = None
 
-    # Парсим дату/время события
     if not dt_raw:
         return _log_and_return_error(
             400,
@@ -8002,15 +7992,14 @@ def employee_identification(request):
     # Пытаемся найти пользователя в PG, чтобы связать запись (если есть)
     user_obj = User.objects.filter(employee_id=plain_inn).first()
 
-    # 4. Собираем payload для 1С в старом формате 
+    # 4. Собираем payload для 1С в старом формате
     onec_payload = {
         "INN": plain_inn,
         "FIO": fio,
-        "MX": smstore_raw,  
-        "Datetime": event_dt_str, 
+        "MX": smstore_raw,
+        "Datetime": event_dt_str,
     }
 
-    # Доп.инфа — только в Extra, старую обработку это не ломает
     if phone_norm or direction or sm_store_id_int is not None or store_obj:
         extra = {
             "EmployeeID": encrypt_inn20(plain_inn),
@@ -8021,7 +8010,6 @@ def employee_identification(request):
         }
         onec_payload["Extra"] = extra
 
-    # Идемпотентный ключ (как раньше — по ИНН/ФИО/магазину/дате)
     idem_key = hashlib.sha256(
         f"{plain_inn}|{fio}|{smstore_raw}|{event_dt_str}".encode("utf-8")
     ).hexdigest()
@@ -8045,7 +8033,6 @@ def employee_identification(request):
     # 6. Анализ ответа 1С и логирование
     ok_1c = (200 <= status_1c < 300)
 
-    # Лог в Telegram (в любом случае)
     resp_short = text_1c if len(text_1c) <= 1000 else text_1c[:1000] + "…"
     tg_lines = [
         "📡 Отметка смены",
@@ -8073,7 +8060,7 @@ def employee_identification(request):
         f"  • HTTP статус: {status_1c}",
         f"  • Тело (обрезано): {resp_short}",
     ]
-    send_telegram_log("\n".join(tg_lines))
+    _send_admin_log_async("\n".join(tg_lines))
 
     # Запись в qr_issue_logs
     try:
@@ -8089,8 +8076,8 @@ def employee_identification(request):
             phone_normalized=phone_norm or "",
             sm_store_id=sm_store_id_int,
             ukm_store_id=ukm_store_id,
-            role_id=None,   # для этого эндпоинта роль не пишем
-            qr_data="",     # факт идентификации, а не выдача QR
+            role_id=None,
+            qr_data="",
             error_message="" if ok_1c else f"1С вернула статус {status_1c}",
             raw_request={
                 "request": data,
@@ -8123,6 +8110,387 @@ def employee_identification(request):
             'onec_body': text_1c,
         }
     )
+# @csrf_exempt
+# def employee_identification(request):
+#     """
+#     POST /employee-identification/
+
+#     ВХОД (JSON, совместим со старой версией):
+#     {
+#       "inn": "7536207278",              # или "employee_id"
+#       "fio": "Иванов Иван Иванович",    # или "FIO"
+#       "storeId": 514,                   # или "smstore" или старый "mx"
+#       "datetime": "24.09.2025 8:45:00", # или "Datetime" или "event_datetime"
+#       // необязательные:
+#       "phone": "8 (924) 000-00-00",
+#       "direction": "IN"                 # или "OUT" / "ENTER" / "EXIT" / "event"
+#       // "roleId" / "roleid" — можно не передавать, оно тут не нужно
+#     }
+
+#     Логика:
+#       1) Валидация/нормализация входных данных (как в старой версии).
+#       2) Подготовка payload для 1С в старом формате: INN/FIO/MX/Datetime.
+#       3) На любой ошибке:
+#          • красивый лог в Telegram
+#          • запись в qr_issue_logs со статусом 'error'.
+#       4) На успехе:
+#          • красивый лог в Telegram
+#          • запись в qr_issue_logs со статусом 'ok'/'error' в зависимости от ответа 1С.
+#     """
+#     if request.method != 'POST':
+#         return JsonResponse(
+#             {'status': 'error', 'message': 'Только POST'},
+#             status=405
+#         )
+
+#     raw_body = request.body.decode('utf-8') if request.body else "{}"
+#     lat_val: float | None = None
+#     lon_val: float | None = None
+
+#     def _log_and_return_error(
+#         http_status: int,
+#         stage: str,
+#         human_msg: str,
+#         *,
+#         inn_raw: str = "",
+#         fio_raw: str = "",
+#         smstore_raw: str = "",
+#         ukm_store_id: int | None = None,
+#         phone_raw: str = "",
+#     ) -> JsonResponse:
+#         """
+#         Общий обработчик ошибок:
+#           • шлёт подробный лог в Telegram
+#           • пишет строку в qr_issue_logs со статусом 'error'
+#           • возвращает JsonResponse с текстом ошибки
+#         """
+#         # красивый лог в ТГ
+#         lines = [
+#             "❌ Ошибка при employee_identification",
+#             f"🔁 Этап: {stage}",
+#             f"ℹ️ Причина: {human_msg}",
+#             "",
+#             "📨 Контекст запроса:",
+#             f"  • ИНН (сырое): {inn_raw or '—'}",
+#             f"  • ФИО (сырое): {fio_raw or '—'}",
+#             f"  • storeId / mx (сырое): {smstore_raw or '—'}",
+#             f"  • Телефон (сырое): {phone_raw or '—'}",
+#             f"  • latitude: {lat_val if lat_val is not None else '—'}",
+#             f"  • longitude: {lon_val if lon_val is not None else '—'}",
+#         ]
+#         if ukm_store_id is not None:
+#             lines.append(f"  • ukm4store: {ukm_store_id}")
+#         if raw_body:
+#             short_body = raw_body if len(raw_body) <= 1000 else raw_body[:1000] + "…"
+#             lines.extend(["", "📦 Сырой JSON-запрос:", short_body])
+
+#         send_telegram_log("\n".join(lines))
+
+#         # подготовка полей для записи в qr_issue_logs
+#         try:
+#             sm_id_int = int(smstore_raw) if str(smstore_raw).isdigit() else None
+#         except Exception:
+#             sm_id_int = None
+
+#         phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
+
+#         try:
+#             log_qr_issue(
+#                 endpoint='employee_identification',
+#                 method='EMP_IDENT',
+#                 status='error',
+#                 user=None,  # при ошибке пользователя можем ещё не знать
+#                 employee_inn=inn_raw or "",
+#                 employee_fio=fio_raw or "",
+#                 tg_id="",
+#                 phone_raw=phone_raw or "",
+#                 phone_normalized=phone_norm or "",
+#                 sm_store_id=sm_id_int,
+#                 ukm_store_id=ukm_store_id,
+#                 role_id=None,          # роль для этого эндпоинта не используется
+#                 qr_data="",       
+#                 error_message=f"{stage}: {human_msg}",
+#                 raw_request={"raw_body": raw_body} if raw_body else None,
+#                 latitude=lat_val,
+#                 longitude=lon_val,
+#             )
+#         except Exception:
+      
+#             logger.exception("[EMP_IDENT] Ошибка при записи в qr_issue_logs")
+
+#         return JsonResponse(
+#             {'status': 'error', 'message': human_msg},
+#             status=http_status
+#         )
+
+#     # 1. Парсинг JSON
+#     try:
+#         data = json.loads(raw_body)
+#     except Exception as e:
+#         logger.error(f"[EMP_IDENT] JSON parse error: {e}; body={raw_body!r}")
+#         return _log_and_return_error(
+#             400,
+#             "Парсинг JSON",
+#             f"Некорректный JSON: {e}",
+#         )
+        
+#     # 1.1 Координаты (опционально)
+#     lat_val = _to_float_or_none(data.get("latitude"))
+#     lon_val = _to_float_or_none(data.get("longitude"))
+
+#     # 2. Вытаскиваем поля из запроса (совместимость со старым и новым форматами)
+#     inn_raw = (data.get('inn') or data.get('employee_id') or "").strip()
+#     fio_raw = (data.get('fio') or data.get('FIO') or "").strip()
+
+#     # поддержка storeId / smstore / mx (старое поле)
+#     smstore_raw = str(
+#         data.get('storeId')
+#         or data.get('smstore')
+#         or data.get('mx')
+#         or ""
+#     ).strip()
+
+#     phone_raw = (data.get('phone') or "").strip()
+
+#     # поддержка и "datetime", и "Datetime", и "event_datetime"
+#     dt_raw = (
+#         data.get('datetime')
+#         or data.get('Datetime')
+#         or data.get('event_datetime')
+#         or ""
+#     )
+#     dt_raw = dt_raw.strip()
+
+#     # направление вход/выход — опционально
+#     direction = str(data.get('direction') or data.get('event') or "").strip()
+
+#     logger.info(
+#         f"[EMP_IDENT] START: inn={inn_raw!r}, fio={fio_raw!r}, "
+#         f"storeId/mx={smstore_raw!r}, phone={phone_raw!r}, "
+#         f"datetime={dt_raw!r}, direction={direction!r},"
+#         f"latitude={lat_val!r}, longitude={lon_val!r}"
+#     )
+
+#     # 3. Базовая валидация входных полей (как в старой версии)
+#     if not inn_raw:
+#         return _log_and_return_error(
+#             400,
+#             "Валидация входных данных",
+#             "Не указан ИНН",
+#             inn_raw=inn_raw,
+#             fio_raw=fio_raw,
+#             smstore_raw=smstore_raw,
+#             phone_raw=phone_raw,
+#         )
+
+#     try:
+#         plain_inn = ensure_plain_inn(inn_raw)
+#     except Exception as e:
+#         logger.error(f"[EMP_IDENT] Bad INN: {e}")
+#         return _log_and_return_error(
+#             400,
+#             "Валидация ИНН",
+#             f"Некорректный ИНН: {e}",
+#             inn_raw=inn_raw,
+#             fio_raw=fio_raw,
+#             smstore_raw=smstore_raw,
+#             phone_raw=phone_raw,
+#         )
+
+#     if not fio_raw:
+#         return _log_and_return_error(
+#             400,
+#             "Валидация входных данных",
+#             "Не указано ФИО",
+#             inn_raw=plain_inn,
+#             fio_raw=fio_raw,
+#             smstore_raw=smstore_raw,
+#             phone_raw=phone_raw,
+#         )
+#     fio = " ".join(fio_raw.split())
+
+#     if not smstore_raw:
+#         return _log_and_return_error(
+#             400,
+#             "Валидация входных данных",
+#             "Не указан storeId / mx (smstore)",
+#             inn_raw=plain_inn,
+#             fio_raw=fio,
+#             smstore_raw=smstore_raw,
+#             phone_raw=phone_raw,
+#         )
+
+#     # для Store/ukm4store пробуем привести к int, для 1С MX остаётся строкой
+#     try:
+#         sm_store_id_int = int(smstore_raw)
+#     except ValueError:
+#         sm_store_id_int = None
+
+#     # Нормализация телефона (если есть)
+#     phone_norm = normalize_phone_ru(phone_raw) if phone_raw else None
+
+#     # Маппинг SMSTORE → ukm4store, чтобы записать его в лог
+#     ukm_store_id = None
+#     store_obj = None
+#     if sm_store_id_int is not None:
+#         store_obj = Store.objects.filter(smstore=sm_store_id_int).first()
+#         if store_obj and store_obj.ukm4store is not None:
+#             try:
+#                 ukm_store_id = int(store_obj.ukm4store)
+#             except (TypeError, ValueError):
+#                 ukm_store_id = None
+
+#     # Парсим дату/время события
+#     if not dt_raw:
+#         return _log_and_return_error(
+#             400,
+#             "Валидация даты/времени",
+#             "Не указан datetime",
+#             inn_raw=plain_inn,
+#             fio_raw=fio,
+#             smstore_raw=smstore_raw,
+#             ukm_store_id=ukm_store_id,
+#             phone_raw=phone_raw,
+#         )
+
+#     try:
+#         event_dt_str = _parse_and_format_dt(dt_raw)
+#     except Exception as e:
+#         return _log_and_return_error(
+#             400,
+#             "Валидация даты/времени",
+#             f"Некорректная дата/время: {e}",
+#             inn_raw=plain_inn,
+#             fio_raw=fio,
+#             smstore_raw=smstore_raw,
+#             ukm_store_id=ukm_store_id,
+#             phone_raw=phone_raw,
+#         )
+
+#     # Пытаемся найти пользователя в PG, чтобы связать запись (если есть)
+#     user_obj = User.objects.filter(employee_id=plain_inn).first()
+
+#     # 4. Собираем payload для 1С в старом формате 
+#     onec_payload = {
+#         "INN": plain_inn,
+#         "FIO": fio,
+#         "MX": smstore_raw,  
+#         "Datetime": event_dt_str, 
+#     }
+
+#     # Доп.инфа — только в Extra, старую обработку это не ломает
+#     if phone_norm or direction or sm_store_id_int is not None or store_obj:
+#         extra = {
+#             "EmployeeID": encrypt_inn20(plain_inn),
+#             "StoreId": sm_store_id_int,
+#             "StoreName": store_obj.name if store_obj else "",
+#             "Phone": phone_norm or phone_raw,
+#             "Direction": direction,
+#         }
+#         onec_payload["Extra"] = extra
+
+#     # Идемпотентный ключ (как раньше — по ИНН/ФИО/магазину/дате)
+#     idem_key = hashlib.sha256(
+#         f"{plain_inn}|{fio}|{smstore_raw}|{event_dt_str}".encode("utf-8")
+#     ).hexdigest()
+
+#     # 5. Отправка в 1С
+#     try:
+#         status_1c, text_1c = _post_to_onec(onec_payload, idem_key=idem_key)
+#     except Exception as e:
+#         logger.exception(f"[EMP_IDENT] Ошибка запроса в 1С: {e}")
+#         return _log_and_return_error(
+#             500,
+#             "Запрос в 1С",
+#             f"Ошибка запроса в 1С: {e}",
+#             inn_raw=plain_inn,
+#             fio_raw=fio,
+#             smstore_raw=smstore_raw,
+#             ukm_store_id=ukm_store_id,
+#             phone_raw=phone_raw,
+#         )
+
+#     # 6. Анализ ответа 1С и логирование
+#     ok_1c = (200 <= status_1c < 300)
+
+#     # Лог в Telegram (в любом случае)
+#     resp_short = text_1c if len(text_1c) <= 1000 else text_1c[:1000] + "…"
+#     tg_lines = [
+#         "📡 Отметка смены",
+#         "",
+#         "👤 Сотрудник:",
+#         f"  • ФИО: {fio}",
+#         f"  • ИНН: {plain_inn}",
+#         f"  • user_id (PostgreSQL): {user_obj.id if user_obj else '—'}",
+#         "",
+#         "🏬 Магазин:",
+#         f"  • MX (из запроса): {smstore_raw}",
+#         f"  • storeId (SMSTORE int): {sm_store_id_int if sm_store_id_int is not None else '—'}",
+#         f"  • ukm4store: {ukm_store_id if ukm_store_id is not None else '—'}",
+#         f"  • Name: {store_obj.name if store_obj else '—'}",
+#         "",
+#         "⚙️ Параметры события:",
+#         f"  • direction: {direction or '—'}",
+#         f"  • datetime: {event_dt_str or dt_raw or '—'}",
+#         "",
+#         "📲 Телефон:",
+#         f"  • raw: {phone_raw or '—'}",
+#         f"  • normalized: {phone_norm or '—'}",
+#         "",
+#         "🔗 1С:",
+#         f"  • HTTP статус: {status_1c}",
+#         f"  • Тело (обрезано): {resp_short}",
+#     ]
+#     send_telegram_log("\n".join(tg_lines))
+
+#     # Запись в qr_issue_logs
+#     try:
+#         log_qr_issue(
+#             endpoint='employee_identification',
+#             method=direction or 'EMP_IDENT',
+#             status='ok' if ok_1c else 'error',
+#             user=user_obj,
+#             employee_inn=plain_inn,
+#             employee_fio=fio,
+#             tg_id=getattr(user_obj, "tg_id", "") if user_obj else "",
+#             phone_raw=phone_raw or "",
+#             phone_normalized=phone_norm or "",
+#             sm_store_id=sm_store_id_int,
+#             ukm_store_id=ukm_store_id,
+#             role_id=None,   # для этого эндпоинта роль не пишем
+#             qr_data="",     # факт идентификации, а не выдача QR
+#             error_message="" if ok_1c else f"1С вернула статус {status_1c}",
+#             raw_request={
+#                 "request": data,
+#                 "onec_payload": onec_payload,
+#                 "onec_status": status_1c,
+#                 "onec_response": text_1c,
+#             },
+#             latitude=lat_val,
+#             longitude=lon_val,
+#         )
+#     except Exception:
+#         logger.exception("[EMP_IDENT] Ошибка при записи успеха/ошибки в qr_issue_logs")
+
+#     # 7. Ответ клиенту
+#     if not ok_1c:
+#         return JsonResponse(
+#             {
+#                 'status': 'error',
+#                 'message': f'1С ответила со статусом {status_1c}',
+#                 'onec_status': status_1c,
+#                 'onec_body': text_1c,
+#             },
+#             status=500
+#         )
+
+#     return JsonResponse(
+#         {
+#             'status': 'ok',
+#             'onec_status': status_1c,
+#             'onec_body': text_1c,
+#         }
+#     )
 
 
 
