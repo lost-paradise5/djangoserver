@@ -10057,6 +10057,51 @@ _SM_USERENABLED_CHOICES = [
     {"value": "0",  "label": "0 — заблокировать пользователя"},
 ]
 
+def _oracle_update_smstaff_after_create(cur, login: str, inn: str, afio: str, offindex: int | None) -> int:
+    """
+    Принудительно обновляет AFIO и OFFINDEX в SMSTAFF после вызова bin_createuser.
+    Это нужно, потому что процедура может не менять AFIO у существующего пользователя.
+    """
+    cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+    upper_cols = {c.upper() for c in cols_set}
+
+    set_parts = []
+    binds = {
+        "b_login": (login or "").strip().lower(),
+    }
+
+    if "AFIO" in upper_cols:
+        set_parts.append("afio = :b_afio")
+        binds["b_afio"] = (afio or "").strip()
+
+    if offindex is not None and "OFFINDEX" in upper_cols:
+        set_parts.append("offindex = :b_offindex")
+        binds["b_offindex"] = offindex
+
+    if not set_parts:
+        return 0
+
+    where_parts = []
+    if "SERVERLOGIN" in upper_cols:
+        where_parts.append("LOWER(TRIM(serverlogin)) = :b_login")
+
+    if "INN" in upper_cols and inn:
+        where_parts.append("TRIM(inn) = :b_inn")
+        binds["b_inn"] = (inn or "").strip()
+
+    if not where_parts:
+        return 0
+
+    sql = f"""
+        UPDATE smstaff
+           SET {", ".join(set_parts)}
+         WHERE {" AND ".join(where_parts)}
+    """
+
+    cur.execute(sql, binds)
+    return int(cur.rowcount or 0)
+
+
 
 def _is_valid_inn_digits(inn: str) -> bool:
     inn = (inn or "").strip()
@@ -11120,12 +11165,16 @@ def sm_staff_ui_create(request):
                             p_afio=afio,
                         )
 
+                        updated_smstaff_rows = 0
+
                         if acheck != 2:
-                            cur.execute("""
-                                UPDATE smstaff
-                                   SET offindex = :b_offindex
-                                 WHERE LOWER(TRIM(serverlogin)) = :b_login
-                            """, b_offindex=adol_offindex, b_login=auser)
+                            updated_smstaff_rows = _oracle_update_smstaff_after_create(
+                                cur=cur,
+                                login=auser,
+                                inn=ainn,
+                                afio=afio,
+                                offindex=adol_offindex,
+                            )
 
                         conn.commit()
 
@@ -11139,28 +11188,33 @@ def sm_staff_ui_create(request):
                         elif exact_exists and acheck == 1:
                             success_message = (
                                 f"Для существующего пользователя {auser} выполнено обновление "
-                                f"(пароль/должность/ФИО). Новый пароль: {created_password}"
+                                f"(пароль/должность/ФИО). Новый пароль: {created_password}. "
+                                f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
                             )
                         elif exact_exists and acheck == -1:
                             success_message = (
                                 f"Для существующего пользователя {auser} выполнено обновление "
-                                f"без создания новой записи. ФИО передано: {afio}"
-                            )
+                                f"без создания новой записи. ФИО: {afio}. "
+                                f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+                            )    
                         elif exact_exists and acheck == 0:
                             success_message = (
                                 f"Пользователь {auser} уже существовал. "
-                                f"Процедура выполнена в режиме ACHECK=0."
+                                f"Процедура выполнена в режиме ACHECK=0. "
+                                f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
                             )
                         else:
                             success_message = (
                                 f"Пользователь успешно обработан в базе {db}. "
-                                f"Сгенерированный пароль: {created_password}"
+                                f"Сгенерированный пароль: {created_password}. "
+                                f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
                             )
 
                         logger.info(
                             f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
                             f"created_rows={len(created_rows)} offindex={adol_offindex} "
-                            f"orarole={adol_orarole} exact_exists={exact_exists}"
+                            f"orarole={adol_orarole} exact_exists={exact_exists} "
+                            f"updated_smstaff_rows={updated_smstaff_rows} afio={afio!r}"
                         )
 
     except Exception as e:
