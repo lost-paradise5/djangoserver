@@ -20,12 +20,18 @@
 
 <div class="container py-4">
   <div class="d-flex justify-content-between align-items-center mb-3">
-    <h3 class="mb-0">Создание пользователя в Supermag</h3>
+    <h3 class="mb-0">Создание / обновление пользователя в Supermag</h3>
     <a class="btn btn-outline-secondary" href="{{ back_url }}">← Назад к списку</a>
   </div>
 
   {% if error %}
-    <div class="alert alert-danger">{{ error }}</div>
+    <div class="alert alert-danger">
+      <div>{{ error }}</div>
+      {% if created_password %}
+        <hr>
+        <div><b>Сгенерированный пароль:</b> <code style="font-size: 1.1rem;">{{ created_password }}</code></div>
+      {% endif %}
+    </div>
   {% endif %}
 
   {% if success_message %}
@@ -59,7 +65,7 @@
     <input type="hidden" name="db" value="{{ db }}">
 
     <div class="card-header">
-      <b>Параметры создания</b>
+      <b>Параметры процедуры bin_createuser</b>
     </div>
 
     <div class="card-body">
@@ -71,25 +77,19 @@
 
         <div class="col-md-4">
           <label class="form-label">AUSER (логин)</label>
-          <input
-            class="form-control"
-            name="auser"
-            value="{{ form.auser }}"
-            placeholder="например t_test"
-            required
-          >
+          <input class="form-control" name="auser" value="{{ form.auser }}" placeholder="например t_test" required>
           <div class="form-text">Латиница, цифры, точка, дефис, нижнее подчёркивание.</div>
         </div>
 
         <div class="col-md-4">
           <label class="form-label">AINN (ИНН)</label>
-          <input
-            class="form-control"
-            name="ainn"
-            value="{{ form.ainn }}"
-            placeholder="10 или 12 цифр"
-            required
-          >
+          <input class="form-control" name="ainn" value="{{ form.ainn }}" placeholder="10 или 12 цифр" required>
+        </div>
+
+        <div class="col-md-6">
+          <label class="form-label">AFIO (ФИО)</label>
+          <input class="form-control" name="afio" value="{{ form.afio }}" placeholder="например Иванов Иван Иванович" required>
+          <div class="form-text">Это значение передаётся в параметр AFIO процедуры.</div>
         </div>
 
         <div class="col-md-6">
@@ -103,7 +103,7 @@
             {% endfor %}
           </select>
           <div class="form-text">
-            В процедуру уйдёт значение <b>SMOFFCFG.ORAROLE</b>, а после выполнения в <b>SMSTAFF.OFFINDEX</b> будет записан выбранный ID.
+            В процедуру уйдёт <b>SMOFFCFG.ORAROLE</b>, а после выполнения в <b>SMSTAFF.OFFINDEX</b> будет записан выбранный ID.
           </div>
         </div>
 
@@ -127,14 +127,16 @@
 
         <div class="col-12">
           <div class="alert alert-secondary mb-0">
-            <b>APASS</b> вводить не нужно — он будет сгенерирован автоматически как 4 цифры.
+            <b>APASS</b> вводить не нужно — он будет сгенерирован автоматически как 4 цифры.<br>
+            Для <b>ACHECK=1</b> это позволит сменить пароль существующему пользователю.<br>
+            Для <b>ACHECK=-1</b> процедура будет вызвана и сможет обновить ФИО существующего пользователя.
           </div>
         </div>
       </div>
     </div>
 
     <div class="card-footer d-flex gap-2">
-      <button class="btn btn-primary">Создать / обработать</button>
+      <button class="btn btn-primary">Выполнить</button>
       <a class="btn btn-outline-secondary" href="{{ back_url }}">Отмена</a>
     </div>
   </form>
@@ -161,7 +163,7 @@
               {% for r in conflicts %}
                 <tr>
                   <td>{{ r.id }}</td>
-                  <td>{{ r.surname }} {{ r.name }} {{ r.patronymic }}</td>
+                  <td>{{ r.afio|default:"—" }}</td>
                   <td><code>{{ r.serverlogin }}</code></td>
                   <td><code>{{ r.inn }}</code></td>
                   <td>
@@ -202,7 +204,7 @@
               {% for r in created_rows %}
                 <tr>
                   <td>{{ r.id }}</td>
-                  <td>{{ r.surname }} {{ r.name }} {{ r.patronymic }}</td>
+                  <td>{{ r.afio|default:"—" }}</td>
                   <td><code>{{ r.serverlogin }}</code></td>
                   <td><code>{{ r.inn }}</code></td>
                   <td>
