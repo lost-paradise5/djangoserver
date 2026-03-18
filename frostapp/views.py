@@ -10433,7 +10433,15 @@ def sm_staff_ui_list(request):
         cur.execute(f"SELECT COUNT(*) {base_from}", binds)
         total = int(cur.fetchone()[0])
 
-        order_expr = "s.afio" if _ui_has_col(cols_set, "afio") else ("s.serverlogin" if _ui_has_col(cols_set, "serverlogin") else "s.id")
+        # ВАЖНО:
+        # сортировка должна идти по алиасам полей из подзапроса t,
+        # а не по s.serverlogin / s.afio
+        if _ui_has_col(cols_set, "afio"):
+            order_expr = "afio"
+        elif _ui_has_col(cols_set, "serverlogin"):
+            order_expr = "serverlogin"
+        else:
+            order_expr = "id"
 
         sql = f"""
             SELECT *
