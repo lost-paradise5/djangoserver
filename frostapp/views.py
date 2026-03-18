@@ -10017,11 +10017,38 @@ def _ui_has_col(cols_set: set[str], col: str) -> bool:
 
 #10.03.2026 Для создания пользователя в СМ (первая версия)
 
+
+def _smstaff_afio_sql(alias: str, cols_set: set[str]) -> str:
+    """
+    Возвращает SQL-выражение AS afio.
+    Приоритет:
+    1) SMSTAFF.AFIO
+    2) fallback из surname/name/patronymic, если AFIO нет
+    """
+    upper_cols = {c.upper() for c in cols_set}
+
+    if "AFIO" in upper_cols:
+        return f"{alias}.afio AS afio"
+
+    parts = []
+    if "SURNAME" in upper_cols:
+        parts.append(f"NVL({alias}.surname, '')")
+    if "NAME" in upper_cols:
+        parts.append(f"NVL({alias}.name, '')")
+    if "PATRONYMIC" in upper_cols:
+        parts.append(f"NVL({alias}.patronymic, '')")
+
+    if parts:
+        joined = " || ' ' || ".join(parts)
+        return f"TRIM(REGEXP_REPLACE({joined}, ' +', ' ')) AS afio"
+
+    return "NULL AS afio"
+
 _SM_ACHECK_CHOICES = [
-    {"value": "-1", "label": "-1 — нового не создавать, работать только с существующим"},
-    {"value": "0",  "label": "0 — если пользователь уже есть, ничего не делать"},
-    {"value": "1",  "label": "1 — если пользователь уже есть, поменять должность/пароль"},
-    {"value": "2",  "label": "2 — удалить пользователя"},
+    {"value": "-1", "label": "-1 — нового не создавать, работать только с существующим, можно обновить ФИО"},
+    {"value": "0",  "label": "0 — если пользователь есть, ничего не делать"},
+    {"value": "1",  "label": "1 — если пользователь есть, поменять пароль/должность/ФИО"},
+    {"value": "2",  "label": "2 — заблокировать пользователя"},
 ]
 
 _SM_USERENABLED_CHOICES = [
@@ -10083,10 +10110,67 @@ def _oracle_fetch_smoffcfg_choices(cur) -> list[dict]:
     return items
 
 
+# def _oracle_fetch_smstaff_conflicts(cur, login: str, inn: str) -> list[dict]:
+#     """
+#     Ищем существующих пользователей по логину и/или ИНН.
+#     Безопасно для баз, где нет части колонок.
+#     """
+#     cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+
+#     def HAS(col: str) -> bool:
+#         return col.upper() in cols_set
+
+#     select_parts = [
+#         "s.id AS id" if HAS("id") else "NULL AS id",
+#         "s.surname AS surname" if HAS("surname") else "NULL AS surname",
+#         "s.name AS name" if HAS("name") else "NULL AS name",
+#         "s.patronymic AS patronymic" if HAS("patronymic") else "NULL AS patronymic",
+#         "s.serverlogin AS serverlogin" if HAS("serverlogin") else "NULL AS serverlogin",
+#         "s.inn AS inn" if HAS("inn") else "NULL AS inn",
+#         "s.userenabled AS userenabled" if HAS("userenabled") else "NULL AS userenabled",
+#         "s.offindex AS offindex" if HAS("offindex") else "NULL AS offindex",
+#     ]
+
+#     if HAS("offindex"):
+#         select_parts.append("""
+#             (
+#                 SELECT c.title
+#                 FROM smoffcfg c
+#                 WHERE c.id = s.offindex
+#                   AND ROWNUM = 1
+#             ) AS off_title
+#         """)
+#     else:
+#         select_parts.append("NULL AS off_title")
+
+#     where_parts = []
+#     binds = {}
+
+#     if HAS("serverlogin") and login:
+#         where_parts.append("LOWER(TRIM(s.serverlogin)) = :b_login")
+#         binds["b_login"] = (login or "").strip().lower()
+
+#     if HAS("inn") and inn:
+#         where_parts.append("TRIM(s.inn) = :b_inn")
+#         binds["b_inn"] = (inn or "").strip()
+
+#     if not where_parts:
+#         return []
+
+#     sql = f"""
+#         SELECT {", ".join(select_parts)}
+#         FROM smstaff s
+#         WHERE {" OR ".join(where_parts)}
+#         ORDER BY s.id
+#     """
+
+#     cur.execute(sql, binds)
+#     return _oracle_rows_to_jsonable(cur)
+
 def _oracle_fetch_smstaff_conflicts(cur, login: str, inn: str) -> list[dict]:
     """
     Ищем существующих пользователей по логину и/или ИНН.
-    Безопасно для баз, где нет части колонок.
+    Возвращаем AFIO, а не surname/name/patronymic.
     """
     cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
 
@@ -10095,9 +10179,7 @@ def _oracle_fetch_smstaff_conflicts(cur, login: str, inn: str) -> list[dict]:
 
     select_parts = [
         "s.id AS id" if HAS("id") else "NULL AS id",
-        "s.surname AS surname" if HAS("surname") else "NULL AS surname",
-        "s.name AS name" if HAS("name") else "NULL AS name",
-        "s.patronymic AS patronymic" if HAS("patronymic") else "NULL AS patronymic",
+        _smstaff_afio_sql("s", cols_set),
         "s.serverlogin AS serverlogin" if HAS("serverlogin") else "NULL AS serverlogin",
         "s.inn AS inn" if HAS("inn") else "NULL AS inn",
         "s.userenabled AS userenabled" if HAS("userenabled") else "NULL AS userenabled",
@@ -10141,10 +10223,59 @@ def _oracle_fetch_smstaff_conflicts(cur, login: str, inn: str) -> list[dict]:
     return _oracle_rows_to_jsonable(cur)
 
 
+
+
+# def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
+#     """
+#     Читаем пользователя по логину.
+#     Безопасно для баз, где нет части колонок.
+#     """
+#     cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+
+#     def HAS(col: str) -> bool:
+#         return col.upper() in cols_set
+
+#     if not HAS("serverlogin"):
+#         return []
+
+#     select_parts = [
+#         "s.id AS id" if HAS("id") else "NULL AS id",
+#         "s.surname AS surname" if HAS("surname") else "NULL AS surname",
+#         "s.name AS name" if HAS("name") else "NULL AS name",
+#         "s.patronymic AS patronymic" if HAS("patronymic") else "NULL AS patronymic",
+#         "s.serverlogin AS serverlogin" if HAS("serverlogin") else "NULL AS serverlogin",
+#         "s.inn AS inn" if HAS("inn") else "NULL AS inn",
+#         "s.userenabled AS userenabled" if HAS("userenabled") else "NULL AS userenabled",
+#         "s.offindex AS offindex" if HAS("offindex") else "NULL AS offindex",
+#     ]
+
+#     if HAS("offindex"):
+#         select_parts.append("""
+#             (
+#                 SELECT c.title
+#                 FROM smoffcfg c
+#                 WHERE c.id = s.offindex
+#                   AND ROWNUM = 1
+#             ) AS off_title
+#         """)
+#     else:
+#         select_parts.append("NULL AS off_title")
+
+#     sql = f"""
+#         SELECT {", ".join(select_parts)}
+#         FROM smstaff s
+#         WHERE LOWER(TRIM(s.serverlogin)) = :b_login
+#         ORDER BY s.id
+#     """
+
+#     cur.execute(sql, b_login=(login or "").strip().lower())
+#     return _oracle_rows_to_jsonable(cur)
+
+
 def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
     """
     Читаем пользователя по логину.
-    Безопасно для баз, где нет части колонок.
+    Возвращаем AFIO, а не surname/name/patronymic.
     """
     cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
 
@@ -10156,9 +10287,7 @@ def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
 
     select_parts = [
         "s.id AS id" if HAS("id") else "NULL AS id",
-        "s.surname AS surname" if HAS("surname") else "NULL AS surname",
-        "s.name AS name" if HAS("name") else "NULL AS name",
-        "s.patronymic AS patronymic" if HAS("patronymic") else "NULL AS patronymic",
+        _smstaff_afio_sql("s", cols_set),
         "s.serverlogin AS serverlogin" if HAS("serverlogin") else "NULL AS serverlogin",
         "s.inn AS inn" if HAS("inn") else "NULL AS inn",
         "s.userenabled AS userenabled" if HAS("userenabled") else "NULL AS userenabled",
@@ -10186,10 +10315,6 @@ def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
 
     cur.execute(sql, b_login=(login or "").strip().lower())
     return _oracle_rows_to_jsonable(cur)
-
-
-
-
 
 
 
@@ -10265,9 +10390,7 @@ def sm_staff_ui_list(request):
 
         select_parts = [
             SEL("s", "id"),
-            SEL("s", "surname"),
-            SEL("s", "name"),
-            SEL("s", "patronymic"),
+            _smstaff_afio_sql("s", cols_set),
             SEL("s", "serverlogin"),
             SEL("s", "inn"),
             SEL("s", "userenabled"),
@@ -10310,7 +10433,7 @@ def sm_staff_ui_list(request):
         cur.execute(f"SELECT COUNT(*) {base_from}", binds)
         total = int(cur.fetchone()[0])
 
-        order_expr = "surname" if _ui_has_col(cols_set, "surname") else "id"
+        order_expr = "s.afio" if _ui_has_col(cols_set, "afio") else ("s.serverlogin" if _ui_has_col(cols_set, "serverlogin") else "s.id")
 
         sql = f"""
             SELECT *
@@ -10388,17 +10511,427 @@ def sm_staff_ui_list(request):
         "next_page_url": next_page_url,
         "last_page_url": last_page_url,
     })
+# @require_http_methods(["GET"])
+# def sm_staff_ui_list(request):
+#     """
+#     UI список SMSTAFF по выбранной базе:
+#     GET /ui/smstaff/?db=BINUU00&login=ivan&inn=123&only_enabled=1&page=1&page_size=50
+#     """
+#     services = _ui_services_list()
+#     db = (request.GET.get("db") or "").strip().upper()
+#     if not db:
+#         db = services[0] if services else "BINUU00"
 
+#     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
+#         return render(request, "frostapp/smstaff_list.html", {
+#             "services": services,
+#             "db": db,
+#             "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
+#             "items": [],
+#         })
+
+#     login = (request.GET.get("login") or "").strip().lower()
+#     inn = (request.GET.get("inn") or "").strip()
+#     only_enabled = (request.GET.get("only_enabled") or "").strip().lower() in ("1", "true", "yes", "on")
+
+#     try:
+#         page = int(request.GET.get("page", "1"))
+#     except ValueError:
+#         page = 1
+
+#     try:
+#         page_size = int(request.GET.get("page_size", "50"))
+#     except ValueError:
+#         page_size = 50
+
+#     page = max(1, page)
+#     page_size = max(10, min(200, page_size))
+#     offset = (page - 1) * page_size
+
+#     conn = cur = None
+#     items = []
+#     total = 0
+#     cols_present = []
+
+#     try:
+#         conn = _connect_oracle_service(db)
+#         cur = conn.cursor()
+
+#         cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+#         cols_present = sorted(list(cols_set))
+
+#         def SEL(alias: str, col: str) -> str:
+#             return f"{alias}.{col} AS {col}" if _ui_has_col(cols_set, col) else f"NULL AS {col}"
+
+#         select_parts = [
+#             SEL("s", "id"),
+#             SEL("s", "surname"),
+#             SEL("s", "name"),
+#             SEL("s", "patronymic"),
+#             SEL("s", "serverlogin"),
+#             SEL("s", "inn"),
+#             SEL("s", "userenabled"),
+#         ]
+
+#         if _ui_has_col(cols_set, "offindex"):
+#             select_parts.append("s.offindex AS offindex")
+#             select_parts.append("""
+#                 (
+#                     SELECT c.title
+#                     FROM smoffcfg c
+#                     WHERE c.id = s.offindex
+#                       AND ROWNUM = 1
+#                 ) AS off_title
+#             """)
+#         else:
+#             select_parts.append("NULL AS offindex")
+#             select_parts.append("NULL AS off_title")
+
+#         select_sql = ", ".join(select_parts)
+
+#         where = []
+#         binds = {}
+
+#         if only_enabled and _ui_has_col(cols_set, "userenabled"):
+#             where.append("(s.userenabled = '1' OR s.userenabled = 1)")
+
+#         if login and _ui_has_col(cols_set, "serverlogin"):
+#             where.append("LOWER(s.serverlogin) LIKE :b_login")
+#             binds["b_login"] = f"%{login}%"
+
+#         if inn and _ui_has_col(cols_set, "inn"):
+#             where.append("TRIM(s.inn) LIKE :b_inn")
+#             binds["b_inn"] = f"%{inn}%"
+
+#         base_from = "FROM smstaff s"
+#         if where:
+#             base_from += " WHERE " + " AND ".join(where)
+
+#         cur.execute(f"SELECT COUNT(*) {base_from}", binds)
+#         total = int(cur.fetchone()[0])
+
+#         order_expr = "surname" if _ui_has_col(cols_set, "surname") else "id"
+
+#         sql = f"""
+#             SELECT *
+#             FROM (
+#                 SELECT t.*, ROW_NUMBER() OVER (ORDER BY {order_expr}) rn
+#                 FROM (
+#                     SELECT {select_sql}
+#                     {base_from}
+#                 ) t
+#             )
+#             WHERE rn > :b_off
+#               AND rn <= :b_to
+#         """
+
+#         binds2 = dict(binds)
+#         binds2["b_off"] = offset
+#         binds2["b_to"] = offset + page_size
+
+#         cur.execute(sql, binds2)
+#         items = _oracle_rows_to_jsonable(cur)
+
+#     except Exception as e:
+#         logger.exception(f"[UI/SMSTAFF] list error db={db}: {e}")
+#         return render(request, "frostapp/smstaff_list.html", {
+#             "services": services,
+#             "db": db,
+#             "error": str(e),
+#             "items": [],
+#         })
+#     finally:
+#         try:
+#             if cur:
+#                 cur.close()
+#             if conn:
+#                 conn.close()
+#         except Exception:
+#             pass
+
+#     pages = max(1, (total + page_size - 1) // page_size)
+
+#     def page_url(p: int) -> str:
+#         if p < 1 or p > pages:
+#             return ""
+#         q = {
+#             "db": db,
+#             "login": login,
+#             "inn": inn,
+#             "only_enabled": "1" if only_enabled else "",
+#             "page_size": str(page_size),
+#             "page": str(p),
+#         }
+#         q = {k: v for k, v in q.items() if v not in ("", None)}
+#         return f"{reverse('sm_staff_ui_list')}?{urlencode(q)}"
+
+#     first_page_url = page_url(1) if pages > 0 else ""
+#     prev_page_url = page_url(page - 1) if page > 1 else ""
+#     next_page_url = page_url(page + 1) if page < pages else ""
+#     last_page_url = page_url(pages) if pages > 0 else ""
+
+#     return render(request, "frostapp/smstaff_list.html", {
+#         "services": services,
+#         "db": db,
+#         "login": login,
+#         "inn": inn,
+#         "only_enabled": only_enabled,
+#         "page": page,
+#         "page_size": page_size,
+#         "pages": pages,
+#         "total": total,
+#         "items": items,
+#         "cols_present": cols_present,
+#         "page_url": page_url,
+#         "first_page_url": first_page_url,
+#         "prev_page_url": prev_page_url,
+#         "next_page_url": next_page_url,
+#         "last_page_url": last_page_url,
+#     })
+
+
+# @require_http_methods(["GET", "POST"])
+# @csrf_protect
+# def sm_staff_ui_create(request):
+#     """
+#     UI создание пользователя в SMSTAFF через процедуру bin_createuser
+#     и последующая установка OFFINDEX по выбранной должности из SMOFFCFG.
+
+#     Важно:
+#     - в процедуру передаётся SMOFFCFG.ORAROLE
+#     - в SMSTAFF.OFFINDEX записывается выбранный SMOFFCFG.ID
+#     - пароль генерируется автоматически (4 цифры) и передаётся в шаблон
+#     """
+#     services = _ui_services_list()
+
+#     if request.method == "POST":
+#         db = (request.POST.get("db") or "").strip().upper()
+#     else:
+#         db = (request.GET.get("db") or "").strip().upper()
+
+#     if not db:
+#         db = services[0] if services else "BINUU00"
+
+#     form = {
+#         "auser": "",
+#         "ainn": "",
+#         "adol": "",
+#         "acheck": "1",
+#         "auserenabled": "1",
+#     }
+
+#     positions = []
+#     conflicts = []
+#     created_rows = []
+#     created_password = ""
+#     success_message = ""
+#     error = ""
+
+#     if request.method == "POST":
+#         form["auser"] = (request.POST.get("auser") or "").strip().lower()
+#         form["ainn"] = (request.POST.get("ainn") or "").strip()
+#         form["adol"] = (request.POST.get("adol") or "").strip()
+#         form["acheck"] = (request.POST.get("acheck") or "1").strip()
+#         form["auserenabled"] = (request.POST.get("auserenabled") or "1").strip()
+
+#     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
+#         return render(request, "frostapp/smstaff_create.html", {
+#             "services": services,
+#             "db": db,
+#             "form": form,
+#             "positions": [],
+#             "acheck_choices": _SM_ACHECK_CHOICES,
+#             "auserenabled_choices": _SM_USERENABLED_CHOICES,
+#             "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
+#             "conflicts": [],
+#             "created_rows": [],
+#             "created_password": "",
+#             "success_message": "",
+#             "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
+#         })
+
+#     conn = cur = None
+#     try:
+#         conn = _connect_oracle_service(db)
+#         cur = conn.cursor()
+
+#         positions = _oracle_fetch_smoffcfg_choices(cur)
+#         positions_map = {str(x["id"]): x for x in positions}
+
+#         if request.method == "POST":
+#             auser = form["auser"]
+#             ainn = form["ainn"]
+#             adol_id = form["adol"]
+#             acheck_raw = form["acheck"]
+#             auserenabled_raw = form["auserenabled"]
+
+#             if not auser:
+#                 error = "Заполни логин (AUSER)."
+
+#             elif not _is_valid_sm_login(auser):
+#                 error = (
+#                     "Логин может содержать только латинские буквы, цифры, "
+#                     "точку, дефис и нижнее подчёркивание."
+#                 )
+
+#             elif not ainn:
+#                 error = "Заполни ИНН (AINN)."
+
+#             elif not _is_valid_inn_digits(ainn):
+#                 error = "ИНН должен состоять из 10 или 12 цифр."
+
+#             elif adol_id not in positions_map:
+#                 error = "Выбери должность из списка."
+
+#             elif acheck_raw not in {x["value"] for x in _SM_ACHECK_CHOICES}:
+#                 error = "Некорректное значение ACHECK."
+
+#             elif auserenabled_raw not in {x["value"] for x in _SM_USERENABLED_CHOICES}:
+#                 error = "Некорректное значение AUSERENABLED."
+
+#             else:
+#                 conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
+
+#                 exact_exists = False
+#                 for row in conflicts:
+#                     row_login = (row.get("serverlogin") or "").strip().lower()
+#                     row_inn = (row.get("inn") or "").strip()
+#                     if row_login == auser and row_inn == ainn:
+#                         exact_exists = True
+#                         break
+
+#                 if exact_exists:
+#                     error = f"Пользователь с логином {auser} и ИНН {ainn} уже существует в базе {db}."
+#                 else:
+#                     selected_pos = positions_map[adol_id]
+
+#                     adol_title = (selected_pos.get("title") or "").strip()
+#                     adol_orarole = (selected_pos.get("orarole") or "").strip()
+#                     adol_offindex = int(selected_pos["id"])
+
+#                     acheck = int(acheck_raw)
+#                     auserenabled = int(auserenabled_raw)
+
+#                     if not adol_orarole:
+#                         error = (
+#                             f"Для выбранной должности "
+#                             f"'{adol_title or adol_offindex}' "
+#                             f"в SMOFFCFG не заполнено поле ORAROLE."
+#                         )
+#                     else:
+#                         created_password = _generate_sm_password(4)
+
+#                         proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
+#                         if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+#                             raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
+
+#                         logger.info(
+#                             f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={ainn} "
+#                             f"offindex={adol_offindex} title={adol_title} orarole={adol_orarole} "
+#                             f"acheck={acheck} auserenabled={auserenabled}"
+#                         )
+
+#                         cur.execute(
+#                             f"""
+#                             BEGIN
+#                                 {proc_name}(
+#                                     AUSER => :p_auser,
+#                                     APASS => :p_apass,
+#                                     ADOL => :p_adol,
+#                                     ACHECK => :p_acheck,
+#                                     AUSERENABLED => :p_auserenabled,
+#                                     AINN => :p_ainn
+#                                 );
+#                             END;
+#                             """,
+#                             p_auser=auser,
+#                             p_apass=created_password,
+#                             p_adol=adol_orarole,
+#                             p_acheck=acheck,
+#                             p_auserenabled=auserenabled,
+#                             p_ainn=ainn,
+#                         )
+
+#                         if acheck != 2:
+#                             cur.execute("""
+#                                 UPDATE smstaff
+#                                    SET offindex = :b_offindex
+#                                  WHERE LOWER(TRIM(serverlogin)) = :b_login
+#                             """, b_offindex=adol_offindex, b_login=auser)
+
+#                         conn.commit()
+
+#                         created_rows = _oracle_fetch_smstaff_by_login(cur, auser)
+
+#                         if acheck == 2:
+#                             success_message = (
+#                                 f"Процедура выполнена для логина {auser}. "
+#                                 f"Режим ACHECK=2 означает удаление пользователя."
+#                             )
+#                         else:
+#                             success_message = (
+#                                 f"Пользователь успешно обработан в базе {db}. "
+#                                 f"Сгенерированный пароль: {created_password}"
+#                             )
+
+#                         logger.info(
+#                             f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
+#                             f"created_rows={len(created_rows)} offindex={adol_offindex} "
+#                             f"orarole={adol_orarole}"
+#                         )
+
+#     except Exception as e:
+#         logger.exception(f"[UI/SMSTAFF_CREATE] error db={db}: {e}")
+
+#         err_text = str(e)
+#         if "ORA-01403" in err_text and "BIN_CREATEUSER" in err_text:
+#             error = (
+#                 "Oracle-процедура BIN_CREATEUSER не смогла найти обязательные данные "
+#                 "для создания пользователя. Вероятно, в выбранной базе отсутствует "
+#                 "связанная запись, которую ожидает процедура."
+#             )
+#         else:
+#             error = err_text
+
+#         try:
+#             if conn:
+#                 conn.rollback()
+#         except Exception:
+#             pass
+
+#     finally:
+#         try:
+#             if cur:
+#                 cur.close()
+#             if conn:
+#                 conn.close()
+#         except Exception:
+#             pass
+
+#     return render(request, "frostapp/smstaff_create.html", {
+#         "services": services,
+#         "db": db,
+#         "form": form,
+#         "positions": positions,
+#         "acheck_choices": _SM_ACHECK_CHOICES,
+#         "auserenabled_choices": _SM_USERENABLED_CHOICES,
+#         "error": error,
+#         "conflicts": conflicts,
+#         "created_rows": created_rows,
+#         "created_password": created_password,
+#         "success_message": success_message,
+#         "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
+#     })
 
 @require_http_methods(["GET", "POST"])
 @csrf_protect
 def sm_staff_ui_create(request):
     """
-    UI создание пользователя в SMSTAFF через процедуру bin_createuser
-    и последующая установка OFFINDEX по выбранной должности из SMOFFCFG.
+    UI создание/обновление пользователя в SMSTAFF через процедуру bin_createuser.
 
     Важно:
     - в процедуру передаётся SMOFFCFG.ORAROLE
+    - в процедуру передаётся AFIO
     - в SMSTAFF.OFFINDEX записывается выбранный SMOFFCFG.ID
     - пароль генерируется автоматически (4 цифры) и передаётся в шаблон
     """
@@ -10415,6 +10948,7 @@ def sm_staff_ui_create(request):
     form = {
         "auser": "",
         "ainn": "",
+        "afio": "",
         "adol": "",
         "acheck": "1",
         "auserenabled": "1",
@@ -10430,6 +10964,7 @@ def sm_staff_ui_create(request):
     if request.method == "POST":
         form["auser"] = (request.POST.get("auser") or "").strip().lower()
         form["ainn"] = (request.POST.get("ainn") or "").strip()
+        form["afio"] = (request.POST.get("afio") or "").strip()
         form["adol"] = (request.POST.get("adol") or "").strip()
         form["acheck"] = (request.POST.get("acheck") or "1").strip()
         form["auserenabled"] = (request.POST.get("auserenabled") or "1").strip()
@@ -10461,6 +10996,7 @@ def sm_staff_ui_create(request):
         if request.method == "POST":
             auser = form["auser"]
             ainn = form["ainn"]
+            afio = form["afio"]
             adol_id = form["adol"]
             acheck_raw = form["acheck"]
             auserenabled_raw = form["auserenabled"]
@@ -10480,6 +11016,12 @@ def sm_staff_ui_create(request):
             elif not _is_valid_inn_digits(ainn):
                 error = "ИНН должен состоять из 10 или 12 цифр."
 
+            elif not afio:
+                error = "Заполни ФИО (AFIO)."
+
+            elif len(afio) > 255:
+                error = "ФИО (AFIO) слишком длинное. Максимум 255 символов."
+
             elif adol_id not in positions_map:
                 error = "Выбери должность из списка."
 
@@ -10493,15 +11035,30 @@ def sm_staff_ui_create(request):
                 conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
 
                 exact_exists = False
+                login_taken_by_other = False
+                inn_taken_by_other = False
+
                 for row in conflicts:
                     row_login = (row.get("serverlogin") or "").strip().lower()
                     row_inn = (row.get("inn") or "").strip()
+
                     if row_login == auser and row_inn == ainn:
                         exact_exists = True
-                        break
+                    elif row_login == auser and row_inn != ainn:
+                        login_taken_by_other = True
+                    elif row_inn == ainn and row_login != auser:
+                        inn_taken_by_other = True
 
-                if exact_exists:
-                    error = f"Пользователь с логином {auser} и ИНН {ainn} уже существует в базе {db}."
+                if login_taken_by_other:
+                    error = (
+                        f"В базе {db} уже есть пользователь с логином {auser}, "
+                        f"но с другим ИНН. Проверь данные."
+                    )
+                elif inn_taken_by_other:
+                    error = (
+                        f"В базе {db} уже есть пользователь с ИНН {ainn}, "
+                        f"но с другим логином. Проверь данные."
+                    )
                 else:
                     selected_pos = positions_map[adol_id]
 
@@ -10527,8 +11084,9 @@ def sm_staff_ui_create(request):
 
                         logger.info(
                             f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={ainn} "
-                            f"offindex={adol_offindex} title={adol_title} orarole={adol_orarole} "
-                            f"acheck={acheck} auserenabled={auserenabled}"
+                            f"afio={afio!r} offindex={adol_offindex} title={adol_title} "
+                            f"orarole={adol_orarole} acheck={acheck} "
+                            f"auserenabled={auserenabled} exact_exists={exact_exists}"
                         )
 
                         cur.execute(
@@ -10540,7 +11098,8 @@ def sm_staff_ui_create(request):
                                     ADOL => :p_adol,
                                     ACHECK => :p_acheck,
                                     AUSERENABLED => :p_auserenabled,
-                                    AINN => :p_ainn
+                                    AINN => :p_ainn,
+                                    AFIO => :p_afio
                                 );
                             END;
                             """,
@@ -10550,6 +11109,7 @@ def sm_staff_ui_create(request):
                             p_acheck=acheck,
                             p_auserenabled=auserenabled,
                             p_ainn=ainn,
+                            p_afio=afio,
                         )
 
                         if acheck != 2:
@@ -10568,6 +11128,21 @@ def sm_staff_ui_create(request):
                                 f"Процедура выполнена для логина {auser}. "
                                 f"Режим ACHECK=2 означает удаление пользователя."
                             )
+                        elif exact_exists and acheck == 1:
+                            success_message = (
+                                f"Для существующего пользователя {auser} выполнено обновление "
+                                f"(пароль/должность/ФИО). Новый пароль: {created_password}"
+                            )
+                        elif exact_exists and acheck == -1:
+                            success_message = (
+                                f"Для существующего пользователя {auser} выполнено обновление "
+                                f"без создания новой записи. ФИО передано: {afio}"
+                            )
+                        elif exact_exists and acheck == 0:
+                            success_message = (
+                                f"Пользователь {auser} уже существовал. "
+                                f"Процедура выполнена в режиме ACHECK=0."
+                            )
                         else:
                             success_message = (
                                 f"Пользователь успешно обработан в базе {db}. "
@@ -10577,22 +11152,12 @@ def sm_staff_ui_create(request):
                         logger.info(
                             f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
                             f"created_rows={len(created_rows)} offindex={adol_offindex} "
-                            f"orarole={adol_orarole}"
+                            f"orarole={adol_orarole} exact_exists={exact_exists}"
                         )
 
     except Exception as e:
         logger.exception(f"[UI/SMSTAFF_CREATE] error db={db}: {e}")
-
-        err_text = str(e)
-        if "ORA-01403" in err_text and "BIN_CREATEUSER" in err_text:
-            error = (
-                "Oracle-процедура BIN_CREATEUSER не смогла найти обязательные данные "
-                "для создания пользователя. Вероятно, в выбранной базе отсутствует "
-                "связанная запись, которую ожидает процедура."
-            )
-        else:
-            error = err_text
-
+        error = str(e)
         try:
             if conn:
                 conn.rollback()
@@ -10622,8 +11187,6 @@ def sm_staff_ui_create(request):
         "success_message": success_message,
         "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
     })
-
-
 
 
 
