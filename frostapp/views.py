@@ -7425,11 +7425,11 @@ def update_cashier(request):
         if not store_ids:
             return JsonResponse({"status": "error", "message": "Некорректный storeid"}, status=400)
 
-        #поиск пользователя (plain/sha/sha20) + нормализованное ФИО
+        # поиск пользователя (plain/sha/sha20) + нормализованное ФИО
         inn_sha = hashlib.sha256(plain_inn.encode("utf-8")).hexdigest()
         inn_sha20 = inn_sha[:20]
 
-        fio_norm = fio  # уже нормализован
+        fio_norm = fio
         user = (
             User.objects.filter(full_name__iexact=fio_norm).filter(
                 Q(employee_id=plain_inn) | Q(encrypted_inn=plain_inn) |
@@ -7459,7 +7459,7 @@ def update_cashier(request):
         added_storeids: list[int] = []
 
         with transaction.atomic():
-            # подстрахуемся: employee_id должен быть plain ИНН (иначе ensure_plain_inn на user.employee_id потом ломается в других местах)
+            # employee_id должен быть plain ИНН
             if (user.employee_id or "").strip() != plain_inn:
                 user.employee_id = plain_inn
                 user.updated_at = timezone.now()
@@ -7467,8 +7467,7 @@ def update_cashier(request):
 
             existing_links = {
                 int(x.storeid): x
-                for x in UKMUser.objects
-                    .filter(user_id=user.id, storeid__in=store_ids)
+                for x in UKMUser.objects.filter(user_id=user.id, storeid__in=store_ids)
             }
 
             for sid in store_ids:
@@ -7484,17 +7483,16 @@ def update_cashier(request):
                     )
                     added_storeids.append(sid)
                 else:
-                    # ✅ если магазин уже есть — обновляем роль
                     if int(link.roleid or 0) != int(role_id_req):
                         link.roleid = int(role_id_req)
                         link.version = 1
                         link.save(update_fields=["roleid", "version"])
 
-            # ВАЖНО: как в rotate_qr_codes.py — всегда генерим новый пароль/QR и пишем в Postgres
+            # всегда генерим новый пароль/QR и пишем в Postgres
             new_password = build_user_password(plain_inn)
             _set_password_pg(user, new_password)
 
-        # После транзакции перечитываем ВСЕ магазины пользователя (чтобы новый пароль применить везде)
+        # После транзакции перечитываем ВСЕ магазины пользователя
         ukm_links = list(
             UKMUser.objects
             .filter(user_id=user.id)
@@ -7510,7 +7508,7 @@ def update_cashier(request):
 
         # allocator новых trm-id: ключим по resolved_host, чтобы не словить дубль,
         # если разные storeid попадают на один и тот же ukmserver
-        trm_alloc: dict[str, dict] = {}  # {resolved_host: {"next": int, "reserved": set[int]}}
+        trm_alloc: dict[str, dict] = {}
 
         def _is_trm_id_taken(resolved_host: str, candidate: int) -> bool:
             conn2 = cur2 = None
@@ -7521,8 +7519,10 @@ def update_cashier(request):
                 return bool(cur2.fetchone())
             finally:
                 try:
-                    if cur2: cur2.close()
-                    if conn2: conn2.close()
+                    if cur2:
+                        cur2.close()
+                    if conn2:
+                        conn2.close()
                 except Exception:
                     pass
 
@@ -7566,7 +7566,6 @@ def update_cashier(request):
             resolved_host = None
 
             try:
-                # Ищем на НУЖНОМ ukmserver (через store_id)
                 existing_id = get_trm_employee_id(
                     plain_inn,
                     fio_norm,
@@ -7622,7 +7621,6 @@ def update_cashier(request):
                     "error": str(e),
                 })
 
-
         try:
             masked = new_password[:6] + "..." + new_password[-4:]
             lines = [
@@ -7648,9 +7646,10 @@ def update_cashier(request):
                 )
                 if r.get("error"):
                     lines.append(f"    error: {r['error']}")
-            send_telegram_log("\n".join(lines))
+
+            _send_admin_log_async("\n".join(lines))
         except Exception as e:
-            logger.error(f"[UPDATE_CASHIER] telegram log failed: {e}", exc_info=True)
+            logger.error(f"[UPDATE_CASHIER] async telegram log enqueue failed: {e}", exc_info=True)
 
         resp = {
             "status": "ok" if errors == 0 else "partial",
@@ -7660,7 +7659,7 @@ def update_cashier(request):
             "fio": fio_norm,
             "added_storeids": added_storeids,
             "rotated": True,
-            "password": new_password,  
+            "password": new_password,
             "stores": per_store,
         }
         return JsonResponse(resp, status=200 if errors == 0 else 207)
@@ -7668,7 +7667,7 @@ def update_cashier(request):
     except Exception as exc:
         logger.exception("[UPDATE_CASHIER] error")
         try:
-            send_telegram_log(
+            _send_admin_log_async(
                 "💥 Ошибка update_cashier\n"
                 f"{exc}\n\n"
                 f"raw_body:\n{raw_body[:1500]}{'…' if len(raw_body) > 1500 else ''}"
