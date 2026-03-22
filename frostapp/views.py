@@ -118,6 +118,12 @@ logger = logging.getLogger(__name__)
 AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "zDFbCQWRzL7pKYxzpfSSLVdqCrAYsHiN7FORRUDt1hE")
 MAX_BOT_INTERNAL_TOKEN = os.getenv("MAX_BOT_INTERNAL_TOKEN", "wc3wow")
 UKM5_FULL_XML_STORE_ID = 2013
+
+ONEC_WORKING_EMPLOYEES_AUTH_USER = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_USER", "")
+ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD", "")
+
+SYNC_DEFAULT_PAGE_SIZE = 100
+
 def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
     raw = os.getenv(name, default_csv) or ""
     out: set[int] = set()
@@ -16224,3 +16230,515 @@ def maxbot_request_detail(request, pk):
         "req": req,
         "answers": answers,
     })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _safe_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _compose_full_name(item: dict) -> str:
+    parts = [
+        _safe_text(item.get("Фамилия")),
+        _safe_text(item.get("Имя")),
+        _safe_text(item.get("Отчество")),
+    ]
+    return " ".join([p for p in parts if p]).strip()
+
+
+def _generate_ks_password() -> str:
+    # Всего 40 символов: KS + 38 букв
+    return "KS" + "".join(random.choices(string.ascii_letters, k=38))
+
+
+def _encrypt_inn_value(inn: str) -> str:
+    # Хеш через HMAC SHA256, длина помещается в 128 символов
+    secret = settings.SECRET_KEY.encode("utf-8")
+    return hmac.new(secret, inn.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _fetch_working_employees_from_1c() -> list[dict]:
+    auth = None
+    if ONEC_WORKING_EMPLOYEES_AUTH_USER and ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD:
+        auth = (ONEC_WORKING_EMPLOYEES_AUTH_USER, ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD)
+
+    response = requests.get(
+        ONEC_WORKING_EMPLOYEES_URL,
+        auth=auth,
+        timeout=(20, 240),
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("Get_WorkingEmployees вернул не список")
+
+    return payload
+
+
+def _build_status_row(
+    idx: int,
+    inn: str,
+    full_name: str,
+    source_storeid: str,
+    target_storeid: Optional[int],
+    status_code: str,
+    status: str,
+    actions: Optional[list[str]] = None,
+    position: str = "",
+    department: str = "",
+) -> dict:
+    return {
+        "index": idx,
+        "employee_id": inn,
+        "full_name": full_name,
+        "source_storeid": source_storeid,
+        "target_storeid": target_storeid,
+        "status_code": status_code,   # success / info / warning / error / skipped
+        "status": status,
+        "actions": actions or [],
+        "position": position,
+        "department": department,
+    }
+
+
+def _sync_working_employees() -> dict:
+    started_dt = timezone.now()
+    started_ts = time.time()
+
+    employees = _fetch_working_employees_from_1c()
+
+    total_received = len(employees)
+    smstore_ids = set()
+    inns = set()
+
+    for item in employees:
+        raw_store = _safe_text(item.get("ИдМагазина"))
+        inn = _safe_text(item.get("ИНН"))
+
+        if raw_store:
+            try:
+                smstore_ids.add(int(raw_store))
+            except ValueError:
+                pass
+
+        if inn:
+            inns.add(inn)
+
+    stores_map = {}
+    for row in Store.objects.filter(smstore__in=smstore_ids).values("smstore", "ukm4store", "name"):
+        smstore = row.get("smstore")
+        if smstore is not None and smstore not in stores_map:
+            stores_map[smstore] = row
+
+    existing_users_qs = User.objects.filter(employee_id__in=inns).only(
+        "id", "employee_id", "full_name", "mail", "phone"
+    ).order_by("id")
+
+    users_map = {}
+    duplicate_user_employee_ids = set()
+    existing_user_ids = []
+
+    for user in existing_users_qs:
+        if user.employee_id in users_map:
+            duplicate_user_employee_ids.add(user.employee_id)
+            continue
+        users_map[user.employee_id] = user
+        existing_user_ids.append(user.id)
+
+    ukm_lookup = set(
+        UKMUser.objects.filter(user_id__in=existing_user_ids).values_list("user_id", "storeid")
+    )
+    open_lookup = set(
+        OpenInSystem.objects.filter(user_id__in=existing_user_ids, system_id=9).values_list("user_id", "system_id")
+    )
+
+    rows = []
+
+    new_users_by_inn = {}
+    pending_ukm_by_inn = defaultdict(set)
+    pending_open_by_inn = set()
+
+    existing_ukm_to_create = []
+    existing_open_to_create = []
+
+    summary = Counter()
+    summary["total_received"] = total_received
+    summary["unique_inn"] = len(inns)
+
+    for idx, item in enumerate(employees, start=1):
+        inn = _safe_text(item.get("ИНН"))
+        raw_store = _safe_text(item.get("ИдМагазина"))
+        full_name = _compose_full_name(item)
+        position = _safe_text(item.get("Должность"))
+        department = _safe_text(item.get("Подразделение"))
+
+        if not raw_store:
+            summary["skipped_no_storeid"] += 1
+            rows.append(
+                _build_status_row(
+                    idx=idx,
+                    inn=inn,
+                    full_name=full_name,
+                    source_storeid=raw_store,
+                    target_storeid=None,
+                    status_code="skipped",
+                    status="пропущен: пустой ИдМагазина",
+                    position=position,
+                    department=department,
+                )
+            )
+            continue
+
+        summary["with_storeid"] += 1
+
+        try:
+            source_smstore = int(raw_store)
+        except ValueError:
+            summary["warning_rows"] += 1
+            rows.append(
+                _build_status_row(
+                    idx=idx,
+                    inn=inn,
+                    full_name=full_name,
+                    source_storeid=raw_store,
+                    target_storeid=None,
+                    status_code="warning",
+                    status="неверный формат ИдМагазина",
+                    position=position,
+                    department=department,
+                )
+            )
+            continue
+
+        store_row = stores_map.get(source_smstore)
+        if not store_row or not store_row.get("ukm4store"):
+            summary["skipped_store_not_mapped"] += 1
+            rows.append(
+                _build_status_row(
+                    idx=idx,
+                    inn=inn,
+                    full_name=full_name,
+                    source_storeid=raw_store,
+                    target_storeid=None,
+                    status_code="warning",
+                    status="не найден stores.smstore или пустой stores.ukm4store",
+                    position=position,
+                    department=department,
+                )
+            )
+            continue
+
+        target_storeid = int(store_row["ukm4store"])
+
+        if not inn:
+            summary["skipped_no_inn"] += 1
+            rows.append(
+                _build_status_row(
+                    idx=idx,
+                    inn=inn,
+                    full_name=full_name,
+                    source_storeid=raw_store,
+                    target_storeid=target_storeid,
+                    status_code="warning",
+                    status="пропущен: пустой ИНН",
+                    position=position,
+                    department=department,
+                )
+            )
+            continue
+
+        existing_user = users_map.get(inn)
+        if existing_user:
+            actions = []
+
+            if inn in duplicate_user_employee_ids:
+                actions.append("в users найдено несколько записей с таким employee_id, использована первая")
+
+            if (existing_user.id, target_storeid) not in ukm_lookup:
+                existing_ukm_to_create.append(
+                    UKMUser(
+                        user_id=existing_user.id,
+                        roleid=1,
+                        storeid=target_storeid,
+                        version=1,
+                    )
+                )
+                ukm_lookup.add((existing_user.id, target_storeid))
+                actions.append(f"добавлен ukm_users(storeid={target_storeid})")
+
+            if (existing_user.id, 9) not in open_lookup:
+                existing_open_to_create.append(
+                    OpenInSystem(
+                        user_id=existing_user.id,
+                        username=(full_name or existing_user.full_name or inn)[:255],
+                        password=_generate_ks_password(),
+                        system_id=9,
+                        status=True,
+                    )
+                )
+                open_lookup.add((existing_user.id, 9))
+                actions.append("добавлен open_in_system(system_id=9)")
+
+            if actions:
+                summary["success_rows"] += 1
+                rows.append(
+                    _build_status_row(
+                        idx=idx,
+                        inn=inn,
+                        full_name=full_name,
+                        source_storeid=raw_store,
+                        target_storeid=target_storeid,
+                        status_code="success",
+                        status="обновлён",
+                        actions=actions,
+                        position=position,
+                        department=department,
+                    )
+                )
+            else:
+                summary["info_rows"] += 1
+                rows.append(
+                    _build_status_row(
+                        idx=idx,
+                        inn=inn,
+                        full_name=full_name,
+                        source_storeid=raw_store,
+                        target_storeid=target_storeid,
+                        status_code="info",
+                        status="без изменений",
+                        position=position,
+                        department=department,
+                    )
+                )
+            continue
+
+        first_new_user = inn not in new_users_by_inn
+        if first_new_user:
+            new_users_by_inn[inn] = User(
+                employee_id=inn,
+                max_id=None,
+                encrypted_inn=_encrypt_inn_value(inn),
+                full_name=(full_name or inn)[:255],
+                mail=_safe_text(item.get("Почта"))[:255],
+                phone=_safe_text(item.get("НомерТелефона"))[:50],
+                department_id=311,
+                position_id=5,
+                active=True,
+                tg_status=False,
+                tg_id=None,
+                created_at=started_dt,
+                updated_at=started_dt,
+            )
+            pending_open_by_inn.add(inn)
+
+        store_relation_is_new = target_storeid not in pending_ukm_by_inn[inn]
+        if store_relation_is_new:
+            pending_ukm_by_inn[inn].add(target_storeid)
+
+        actions = []
+        if first_new_user:
+            actions.append("создан user")
+            actions.append("добавлен open_in_system(system_id=9)")
+        if store_relation_is_new:
+            actions.append(f"добавлен ukm_users(storeid={target_storeid})")
+
+        if actions:
+            summary["success_rows"] += 1
+            rows.append(
+                _build_status_row(
+                    idx=idx,
+                    inn=inn,
+                    full_name=full_name,
+                    source_storeid=raw_store,
+                    target_storeid=target_storeid,
+                    status_code="success",
+                    status="будет создан",
+                    actions=actions,
+                    position=position,
+                    department=department,
+                )
+            )
+        else:
+            summary["info_rows"] += 1
+            rows.append(
+                _build_status_row(
+                    idx=idx,
+                    inn=inn,
+                    full_name=full_name,
+                    source_storeid=raw_store,
+                    target_storeid=target_storeid,
+                    status_code="info",
+                    status="повтор в выгрузке, действий не требуется",
+                    position=position,
+                    department=department,
+                )
+            )
+
+    new_users_list = list(new_users_by_inn.values())
+    new_ukm_to_create = []
+    new_open_to_create = []
+
+    try:
+        with transaction.atomic():
+            if new_users_list:
+                User.objects.bulk_create(new_users_list, batch_size=500)
+
+            created_users_map = {}
+            if new_users_by_inn:
+                for user in User.objects.filter(employee_id__in=list(new_users_by_inn.keys())).order_by("id"):
+                    created_users_map.setdefault(user.employee_id, user)
+
+            for inn, target_store_ids in pending_ukm_by_inn.items():
+                created_user = created_users_map.get(inn)
+                if not created_user:
+                    raise RuntimeError(f"Не удалось повторно получить созданного пользователя по employee_id={inn}")
+
+                for target_storeid in sorted(target_store_ids):
+                    new_ukm_to_create.append(
+                        UKMUser(
+                            user_id=created_user.id,
+                            roleid=1,
+                            storeid=target_storeid,
+                            version=1,
+                        )
+                    )
+
+                if inn in pending_open_by_inn:
+                    new_open_to_create.append(
+                        OpenInSystem(
+                            user_id=created_user.id,
+                            username=(created_user.full_name or inn)[:255],
+                            password=_generate_ks_password(),
+                            system_id=9,
+                            status=True,
+                        )
+                    )
+
+            if existing_ukm_to_create:
+                UKMUser.objects.bulk_create(existing_ukm_to_create, batch_size=1000)
+
+            if existing_open_to_create:
+                OpenInSystem.objects.bulk_create(existing_open_to_create, batch_size=1000)
+
+            if new_ukm_to_create:
+                UKMUser.objects.bulk_create(new_ukm_to_create, batch_size=1000)
+
+            if new_open_to_create:
+                OpenInSystem.objects.bulk_create(new_open_to_create, batch_size=1000)
+
+    except Exception:
+        logger.exception("Ошибка при синхронизации рабочих сотрудников из 1С")
+        raise
+
+    summary["new_users_created"] = len(new_users_list)
+    summary["ukm_users_created"] = len(existing_ukm_to_create) + len(new_ukm_to_create)
+    summary["open_in_system_created"] = len(existing_open_to_create) + len(new_open_to_create)
+    summary["rows_total"] = len(rows)
+
+    # Дополнительно пересчитываем, если что-то не попало
+    summary["success_rows"] = sum(1 for r in rows if r["status_code"] == "success")
+    summary["info_rows"] = sum(1 for r in rows if r["status_code"] == "info")
+    summary["warning_rows"] = sum(1 for r in rows if r["status_code"] == "warning")
+    summary["error_rows"] = sum(1 for r in rows if r["status_code"] == "error")
+    summary["skipped_rows"] = sum(1 for r in rows if r["status_code"] == "skipped")
+
+    duration_sec = round(time.time() - started_ts, 2)
+
+    logger.info(
+        "[WORKING_EMPLOYEES_SYNC] total=%s with_storeid=%s new_users=%s new_ukm=%s new_open=%s duration=%s",
+        summary["total_received"],
+        summary["with_storeid"],
+        summary["new_users_created"],
+        summary["ukm_users_created"],
+        summary["open_in_system_created"],
+        duration_sec,
+    )
+
+    return {
+        "ok": True,
+        "summary": dict(summary),
+        "rows": rows,
+        "meta": {
+            "started_at": started_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_sec": duration_sec,
+            "default_page_size": SYNC_DEFAULT_PAGE_SIZE,
+        },
+    }
+
+
+@never_cache
+@require_GET
+def working_employees_sync_page(request):
+    return render(request, "frostapp/working_employees_sync.html")
+
+
+@never_cache
+@require_POST
+def working_employees_sync_run(request):
+    try:
+        result = _sync_working_employees()
+        return JsonResponse(result, json_dumps_params={"ensure_ascii": False})
+    except RequestException as exc:
+        logger.exception("Ошибка запроса к 1С Get_WorkingEmployees")
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": f"Ошибка запроса к 1С: {str(exc)}",
+            },
+            status=502,
+            json_dumps_params={"ensure_ascii": False},
+        )
+    except Exception as exc:
+        logger.exception("Внутренняя ошибка синхронизации сотрудников")
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": f"Внутренняя ошибка: {str(exc)}",
+            },
+            status=500,
+            json_dumps_params={"ensure_ascii": False},
+        )
