@@ -10086,10 +10086,11 @@ def _smstaff_afio_sql(alias: str, cols_set: set[str]) -> str:
     return "NULL AS afio"
 
 _SM_ACHECK_CHOICES = [
+    {"value": "-2", "label": "-2 — заблокировать пользователя"},
     {"value": "-1", "label": "-1 — нового не создавать, работать только с существующим, можно обновить ФИО"},
     {"value": "0",  "label": "0 — если пользователь есть, ничего не делать"},
     {"value": "1",  "label": "1 — если пользователь есть, поменять пароль/должность/ФИО"},
-    {"value": "2",  "label": "2 — заблокировать пользователя"},
+    {"value": "2",  "label": "2 — удалить пользователя"},
 ]
 
 _SM_USERENABLED_CHOICES = [
@@ -10147,6 +10148,13 @@ def _oracle_update_smstaff_after_create(cur, login: str, inn: str, afio: str, of
 def _is_valid_inn_digits(inn: str) -> bool:
     inn = (inn or "").strip()
     return inn.isdigit() and len(inn) in (10, 12)
+
+def _is_sm_block_mode(acheck_raw: str, auserenabled_raw: str) -> bool:
+    """
+    Режим блокировки:
+    ACHECK = -2 и AUSERENABLED = 0
+    """
+    return (str(acheck_raw).strip() == "-2") and (str(auserenabled_raw).strip() == "0")
 
 
 def _generate_sm_password(length: int = 4) -> str:
@@ -11028,6 +11036,10 @@ def sm_staff_ui_create(request):
     - в процедуру передаётся AFIO
     - в SMSTAFF.OFFINDEX записывается выбранный SMOFFCFG.ID
     - пароль генерируется автоматически (4 цифры) и передаётся в шаблон
+
+    Особый режим:
+    - блокировка пользователя: ACHECK = -2 и AUSERENABLED = 0
+      в этом режиме AINN и AFIO не обязательны
     """
     services = _ui_services_list()
 
@@ -11095,6 +11107,11 @@ def sm_staff_ui_create(request):
             acheck_raw = form["acheck"]
             auserenabled_raw = form["auserenabled"]
 
+            is_block_mode = _is_sm_block_mode(acheck_raw, auserenabled_raw)
+
+            allowed_acheck_values = {x["value"] for x in _SM_ACHECK_CHOICES}
+            allowed_auserenabled_values = {x["value"] for x in _SM_USERENABLED_CHOICES}
+
             if not auser:
                 error = "Заполни логин (AUSER)."
 
@@ -11104,29 +11121,33 @@ def sm_staff_ui_create(request):
                     "точку, дефис и нижнее подчёркивание."
                 )
 
-            elif not ainn:
-                error = "Заполни ИНН (AINN)."
-
-            elif not _is_valid_inn_digits(ainn):
-                error = "ИНН должен состоять из 10 или 12 цифр."
-
-            elif not afio:
-                error = "Заполни ФИО (AFIO)."
-
-            elif len(afio) > 255:
-                error = "ФИО (AFIO) слишком длинное. Максимум 255 символов."
-
             elif adol_id not in positions_map:
                 error = "Выбери должность из списка."
 
-            elif acheck_raw not in {x["value"] for x in _SM_ACHECK_CHOICES}:
+            elif acheck_raw not in allowed_acheck_values:
                 error = "Некорректное значение ACHECK."
 
-            elif auserenabled_raw not in {x["value"] for x in _SM_USERENABLED_CHOICES}:
+            elif auserenabled_raw not in allowed_auserenabled_values:
                 error = "Некорректное значение AUSERENABLED."
 
+            elif not is_block_mode and not ainn:
+                error = "Заполни ИНН (AINN)."
+
+            elif not is_block_mode and not _is_valid_inn_digits(ainn):
+                error = "ИНН должен состоять из 10 или 12 цифр."
+
+            elif not is_block_mode and not afio:
+                error = "Заполни ФИО (AFIO)."
+
+            elif not is_block_mode and len(afio) > 255:
+                error = "ФИО (AFIO) слишком длинное. Максимум 255 символов."
+
             else:
-                conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
+                # Для блокировки ищем только по логину, без конфликтов по ИНН
+                if is_block_mode:
+                    conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, "")
+                else:
+                    conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
 
                 exact_exists = False
                 login_taken_by_other = False
@@ -11136,23 +11157,35 @@ def sm_staff_ui_create(request):
                     row_login = (row.get("serverlogin") or "").strip().lower()
                     row_inn = (row.get("inn") or "").strip()
 
-                    if row_login == auser and row_inn == ainn:
-                        exact_exists = True
-                    elif row_login == auser and row_inn != ainn:
-                        login_taken_by_other = True
-                    elif row_inn == ainn and row_login != auser:
-                        inn_taken_by_other = True
+                    if is_block_mode:
+                        if row_login == auser:
+                            exact_exists = True
+                    else:
+                        if row_login == auser and row_inn == ainn:
+                            exact_exists = True
+                        elif row_login == auser and row_inn != ainn:
+                            login_taken_by_other = True
+                        elif row_inn == ainn and row_login != auser:
+                            inn_taken_by_other = True
 
-                if login_taken_by_other:
+                if is_block_mode and not exact_exists:
+                    error = (
+                        f"В базе {db} не найден пользователь с логином {auser} "
+                        f"для блокировки."
+                    )
+
+                elif not is_block_mode and login_taken_by_other:
                     error = (
                         f"В базе {db} уже есть пользователь с логином {auser}, "
                         f"но с другим ИНН. Проверь данные."
                     )
-                elif inn_taken_by_other:
+
+                elif not is_block_mode and inn_taken_by_other:
                     error = (
                         f"В базе {db} уже есть пользователь с ИНН {ainn}, "
                         f"но с другим логином. Проверь данные."
                     )
+
                 else:
                     selected_pos = positions_map[adol_id]
 
@@ -11176,11 +11209,15 @@ def sm_staff_ui_create(request):
                         if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
                             raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
 
+                        proc_ainn = None if is_block_mode else ainn
+                        proc_afio = None if is_block_mode else afio
+
                         logger.info(
-                            f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={ainn} "
-                            f"afio={afio!r} offindex={adol_offindex} title={adol_title} "
+                            f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={proc_ainn} "
+                            f"afio={proc_afio!r} offindex={adol_offindex} title={adol_title} "
                             f"orarole={adol_orarole} acheck={acheck} "
-                            f"auserenabled={auserenabled} exact_exists={exact_exists}"
+                            f"auserenabled={auserenabled} exact_exists={exact_exists} "
+                            f"is_block_mode={is_block_mode}"
                         )
 
                         cur.execute(
@@ -11202,13 +11239,13 @@ def sm_staff_ui_create(request):
                             p_adol=adol_orarole,
                             p_acheck=acheck,
                             p_auserenabled=auserenabled,
-                            p_ainn=ainn,
-                            p_afio=afio,
+                            p_ainn=proc_ainn,
+                            p_afio=proc_afio,
                         )
 
                         updated_smstaff_rows = 0
 
-                        if acheck != 2:
+                        if not is_block_mode and acheck != 2:
                             updated_smstaff_rows = _oracle_update_smstaff_after_create(
                                 cur=cur,
                                 login=auser,
@@ -11221,7 +11258,11 @@ def sm_staff_ui_create(request):
 
                         created_rows = _oracle_fetch_smstaff_by_login(cur, auser)
 
-                        if acheck == 2:
+                        if is_block_mode:
+                            success_message = (
+                                f"Пользователь {auser} успешно заблокирован в базе {db}."
+                            )
+                        elif acheck == 2:
                             success_message = (
                                 f"Процедура выполнена для логина {auser}. "
                                 f"Режим ACHECK=2 означает удаление пользователя."
@@ -11237,7 +11278,7 @@ def sm_staff_ui_create(request):
                                 f"Для существующего пользователя {auser} выполнено обновление "
                                 f"без создания новой записи. ФИО: {afio}. "
                                 f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
-                            )    
+                            )
                         elif exact_exists and acheck == 0:
                             success_message = (
                                 f"Пользователь {auser} уже существовал. "
@@ -11255,7 +11296,8 @@ def sm_staff_ui_create(request):
                             f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
                             f"created_rows={len(created_rows)} offindex={adol_offindex} "
                             f"orarole={adol_orarole} exact_exists={exact_exists} "
-                            f"updated_smstaff_rows={updated_smstaff_rows} afio={afio!r}"
+                            f"updated_smstaff_rows={updated_smstaff_rows} "
+                            f"is_block_mode={is_block_mode} afio={proc_afio!r}"
                         )
 
     except Exception as e:
