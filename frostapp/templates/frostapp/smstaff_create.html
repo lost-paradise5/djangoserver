@@ -237,7 +237,7 @@
   function isBlockMode() {
     const acheckVal = (acheck?.value || '').trim();
     const auserenabledVal = (auserenabled?.value || '').trim();
-    return acheckVal === '-2' && auserenabledVal === '0';
+    return acheckVal === '2' && auserenabledVal === '0';
   }
 
   function toggleBlockMode() {
@@ -246,21 +246,13 @@
     if (ainn) {
       ainn.required = !blockMode;
       ainn.readOnly = blockMode;
-      if (blockMode) {
-        ainn.placeholder = 'Для блокировки не требуется';
-      } else {
-        ainn.placeholder = '10 или 12 цифр';
-      }
+      ainn.placeholder = blockMode ? 'Для блокировки не требуется' : '10 или 12 цифр';
     }
 
     if (afio) {
       afio.required = !blockMode;
       afio.readOnly = blockMode;
-      if (blockMode) {
-        afio.placeholder = 'Для блокировки не требуется';
-      } else {
-        afio.placeholder = 'например Иванов Иван Иванович';
-      }
+      afio.placeholder = blockMode ? 'Для блокировки не требуется' : 'например Иванов Иван Иванович';
     }
   }
 
