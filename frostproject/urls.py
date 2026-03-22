@@ -197,5 +197,18 @@ urlpatterns = [
 
     path("maxbot/requests/", views.maxbot_request_list, name="maxbot_request_list"),
     path("maxbot/requests/<int:pk>/", views.maxbot_request_detail, name="maxbot_request_detail"),
+
+
+
+    path(
+        "working-employees-sync/",
+        views.working_employees_sync_page,
+        name="working_employees_sync_page",
+    ),
+    path(
+        "working-employees-sync/run/",
+        views.working_employees_sync_run,
+        name="working_employees_sync_run",
+    ),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
