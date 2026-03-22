@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Синхронизация рабочих сотрудников</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f5f7fb;
+            margin: 0;
+            padding: 24px;
+            color: #1f2937;
+        }
+
+        .container {
+            max-width: 1440px;
+            margin: 0 auto;
+        }
+
+        .card {
+            background: #fff;
+            border-radius: 14px;
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            margin-top: 0;
+            margin-bottom: 16px;
+            font-size: 28px;
+        }
+
+        .toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+        }
+
+        button {
+            border: 0;
+            border-radius: 10px;
+            padding: 12px 18px;
+            background: #2563eb;
+            color: #fff;
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .secondary-btn {
+            background: #475569;
+        }
+
+        .muted {
+            color: #64748b;
+            font-size: 14px;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .summary-item {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 14px;
+        }
+
+        .summary-item .label {
+            font-size: 13px;
+            color: #64748b;
+            margin-bottom: 6px;
+        }
+
+        .summary-item .value {
+            font-size: 24px;
+            font-weight: 700;
+        }
+
+        .filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            margin: 12px 0 16px;
+        }
+
+        select, input[type="checkbox"] {
+            cursor: pointer;
+        }
+
+        .table-wrap {
+            overflow: auto;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 1100px;
+            background: #fff;
+        }
+
+        th, td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #e5e7eb;
+            vertical-align: top;
+            text-align: left;
+            font-size: 14px;
+        }
+
+        th {
+            background: #f8fafc;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+
+        .badge {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 12px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .badge-success {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .badge-info {
+            background: #e0f2fe;
+            color: #075985;
+        }
+
+        .badge-warning {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .badge-error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .badge-skipped {
+            background: #e5e7eb;
+            color: #374151;
+        }
+
+        ul.actions {
+            margin: 0;
+            padding-left: 18px;
+        }
+
+        .pager {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            justify-content: flex-end;
+            margin-top: 14px;
+        }
+
+        .pager button {
+            padding: 8px 12px;
+            font-size: 14px;
+        }
+
+        .status-line {
+            margin-top: 10px;
+            font-size: 14px;
+        }
+
+        .error-box {
+            background: #fef2f2;
+            color: #991b1b;
+            border: 1px solid #fecaca;
+            padding: 12px 14px;
+            border-radius: 10px;
+            margin-top: 12px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .small {
+            font-size: 12px;
+            color: #64748b;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="card">
+        <h1>Синхронизация рабочих сотрудников</h1>
+
+        <div class="toolbar">
+            <button id="runBtn">Запуск</button>
+            <span id="runStatus" class="muted">Готов к запуску</span>
+        </div>
+
+        <div id="errorBox" class="error-box hidden"></div>
+
+        <div id="summaryBox" class="summary-grid"></div>
+
+        <div id="metaBox" class="small" style="margin-top: 12px;"></div>
+    </div>
+
+    <div class="card">
+        <div class="filters">
+            <label>
+                Фильтр:
+                <select id="filterSelect">
+                    <option value="important">Только изменения / предупреждения</option>
+                    <option value="all">Все</option>
+                    <option value="success">Только изменения</option>
+                    <option value="warning">Только предупреждения</option>
+                    <option value="error">Только ошибки</option>
+                    <option value="skipped">Только пропущенные</option>
+                    <option value="info">Только без изменений</option>
+                </select>
+            </label>
+
+            <label>
+                Строк на странице:
+                <select id="pageSizeSelect">
+                    <option value="50">50</option>
+                    <option value="100" selected>100</option>
+                    <option value="200">200</option>
+                    <option value="500">500</option>
+                </select>
+            </label>
+        </div>
+
+        <div class="table-wrap">
+            <table>
+                <thead>
+                <tr>
+                    <th>#</th>
+                    <th>ИНН</th>
+                    <th>ФИО</th>
+                    <th>Должность</th>
+                    <th>Подразделение</th>
+                    <th>ИдМагазина (1С)</th>
+                    <th>storeid (ukm4store)</th>
+                    <th>Статус</th>
+                    <th>Действия</th>
+                </tr>
+                </thead>
+                <tbody id="rowsBody">
+                <tr>
+                    <td colspan="9" class="muted">Пока ничего не запускалось</td>
+                </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="pager">
+            <button id="prevPageBtn" class="secondary-btn">Назад</button>
+            <span id="pageInfo" class="muted">0 / 0</span>
+            <button id="nextPageBtn" class="secondary-btn">Вперёд</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    const runBtn = document.getElementById('runBtn');
+    const runStatus = document.getElementById('runStatus');
+    const errorBox = document.getElementById('errorBox');
+    const summaryBox = document.getElementById('summaryBox');
+    const metaBox = document.getElementById('metaBox');
+    const rowsBody = document.getElementById('rowsBody');
+    const filterSelect = document.getElementById('filterSelect');
+    const pageSizeSelect = document.getElementById('pageSizeSelect');
+    const prevPageBtn = document.getElementById('prevPageBtn');
+    const nextPageBtn = document.getElementById('nextPageBtn');
+    const pageInfo = document.getElementById('pageInfo');
+
+    let allRows = [];
+    let currentPage = 1;
+
+    function getCookie(name) {
+        const cookieValue = document.cookie
+            .split('; ')
+            .find(row => row.startsWith(name + '='));
+        return cookieValue ? decodeURIComponent(cookieValue.split('=')[1]) : null;
+    }
+
+    function badgeClass(code) {
+        if (code === 'success') return 'badge badge-success';
+        if (code === 'warning') return 'badge badge-warning';
+        if (code === 'error') return 'badge badge-error';
+        if (code === 'skipped') return 'badge badge-skipped';
+        return 'badge badge-info';
+    }
+
+    function renderSummary(summary) {
+        const items = [
+            ['Всего из 1С', summary.total_received || 0],
+            ['С ИдМагазина', summary.with_storeid || 0],
+            ['Уникальных ИНН', summary.unique_inn || 0],
+            ['Создано users', summary.new_users_created || 0],
+            ['Создано ukm_users', summary.ukm_users_created || 0],
+            ['Создано open_in_system', summary.open_in_system_created || 0],
+            ['Изменений', summary.success_rows || 0],
+            ['Без изменений', summary.info_rows || 0],
+            ['Предупреждений', summary.warning_rows || 0],
+            ['Пропущено', summary.skipped_rows || 0],
+            ['Пустой ИдМагазина', summary.skipped_no_storeid || 0],
+            ['Не сопоставлен магазин', summary.skipped_store_not_mapped || 0],
+        ];
+
+        summaryBox.innerHTML = items.map(([label, value]) => `
+            <div class="summary-item">
+                <div class="label">${label}</div>
+                <div class="value">${value}</div>
+            </div>
+        `).join('');
+    }
+
+    function getFilteredRows() {
+        const filter = filterSelect.value;
+
+        if (filter === 'all') return allRows;
+        if (filter === 'important') {
+            return allRows.filter(r => ['success', 'warning', 'error', 'skipped'].includes(r.status_code));
+        }
+        return allRows.filter(r => r.status_code === filter);
+    }
+
+    function renderRows() {
+        const filteredRows = getFilteredRows();
+        const pageSize = parseInt(pageSizeSelect.value, 10) || 100;
+        const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+
+        if (currentPage > totalPages) currentPage = totalPages;
+        if (currentPage < 1) currentPage = 1;
+
+        const start = (currentPage - 1) * pageSize;
+        const end = start + pageSize;
+        const pageRows = filteredRows.slice(start, end);
+
+        if (!pageRows.length) {
+            rowsBody.innerHTML = `<tr><td colspan="9" class="muted">Нет строк для выбранного фильтра</td></tr>`;
+        } else {
+            rowsBody.innerHTML = pageRows.map(row => `
+                <tr>
+                    <td>${row.index}</td>
+                    <td>${row.employee_id || ''}</td>
+                    <td>${row.full_name || ''}</td>
+                    <td>${row.position || ''}</td>
+                    <td>${row.department || ''}</td>
+                    <td>${row.source_storeid || ''}</td>
+                    <td>${row.target_storeid ?? ''}</td>
+                    <td><span class="${badgeClass(row.status_code)}">${row.status}</span></td>
+                    <td>
+                        ${row.actions && row.actions.length
+                            ? `<ul class="actions">${row.actions.map(a => `<li>${a}</li>`).join('')}</ul>`
+                            : '<span class="muted">—</span>'}
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        pageInfo.textContent = `${currentPage} / ${totalPages} (всего строк: ${filteredRows.length})`;
+        prevPageBtn.disabled = currentPage <= 1;
+        nextPageBtn.disabled = currentPage >= totalPages;
+    }
+
+    async function runSync() {
+        runBtn.disabled = true;
+        errorBox.classList.add('hidden');
+        errorBox.textContent = '';
+        runStatus.textContent = 'Идёт обработка, подожди...';
+
+        try {
+            const response = await fetch("{% url 'working_employees_sync_run' %}", {
+                method: "POST",
+                headers: {
+                    "X-CSRFToken": getCookie("csrftoken"),
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({})
+            });
+
+            const data = await response.json();
+
+            if (!response.ok || !data.ok) {
+                throw new Error(data.error || "Неизвестная ошибка");
+            }
+
+            allRows = Array.isArray(data.rows) ? data.rows : [];
+            currentPage = 1;
+
+            renderSummary(data.summary || {});
+            renderRows();
+
+            const meta = data.meta || {};
+            metaBox.textContent = `Запуск: ${meta.started_at || '-'}, длительность: ${meta.duration_sec || 0} сек`;
+            runStatus.textContent = `Готово. Обработано строк: ${allRows.length}`;
+        } catch (err) {
+            errorBox.textContent = err.message || String(err);
+            errorBox.classList.remove('hidden');
+            runStatus.textContent = 'Ошибка выполнения';
+        } finally {
+            runBtn.disabled = false;
+        }
+    }
+
+    runBtn.addEventListener('click', runSync);
+    filterSelect.addEventListener('change', () => {
+        currentPage = 1;
+        renderRows();
+    });
+    pageSizeSelect.addEventListener('change', () => {
+        currentPage = 1;
+        renderRows();
+    });
+    prevPageBtn.addEventListener('click', () => {
+        currentPage -= 1;
+        renderRows();
+    });
+    nextPageBtn.addEventListener('click', () => {
+        currentPage += 1;
+        renderRows();
+    });
+</script>
+</body>
+</html>
