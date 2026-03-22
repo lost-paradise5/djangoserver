@@ -260,7 +260,7 @@ INN_SYNC_SLOW_STEP_WARN_SEC = float(os.getenv("INN_SYNC_SLOW_STEP_WARN_SEC", "10
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "f9LHodD0cOLB5T7-pExgJ_hpfhRlo6c71eHipQzkJpONY4RosjHynb9NbY6bDk7ermUnV2IJnEbal0A-oRzl")
 MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api.max.ru")
 MAX_HTTP_TIMEOUT = int(os.getenv("MAX_HTTP_TIMEOUT", "10"))
-
+MAX_ADMIN_LOG_USER_ID = int(os.getenv("MAX_ADMIN_LOG_USER_ID", "91759973"))
 
 
 # Report endpoint config
@@ -3232,6 +3232,39 @@ def send_telegram_log(message: str) -> None:
 
 _TELEGRAM_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
+_MAX_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+
+
+def send_max_admin_log(message: str) -> None:
+    """
+    Отправка админ-лога в MAX фиксированному пользователю.
+    Синхронная функция, вызывать её нужно через executor.
+    """
+    text = (message or "").strip()
+    if not text:
+        return
+
+    try:
+        ok = send_max_to_user(MAX_ADMIN_LOG_USER_ID, text)
+        if not ok:
+            logger.error(f"[MAX/ADMIN] Не удалось отправить лог user_id={MAX_ADMIN_LOG_USER_ID}")
+    except Exception as e:
+        logger.exception(f"[MAX/ADMIN] Ошибка отправки лога в MAX: {e}")
+
+
+def _send_max_log_async(message: str) -> None:
+    """
+    Ставит отправку MAX-лога в фон и сразу возвращает управление.
+    """
+    text = (message or "").strip()
+    if not text or not MAX_BOT_TOKEN:
+        return
+
+    try:
+        _MAX_LOG_EXECUTOR.submit(send_max_admin_log, text)
+    except Exception as e:
+        logger.exception(f"[MAX/ASYNC] Не удалось поставить лог в очередь: {e}")
+
 
 def _send_telegram_log_async(message: str) -> None:
     """
@@ -5707,9 +5740,12 @@ def _agent_error(message: str, status: int = 500):
 
 def _send_admin_log_async(message: str) -> None:
     """
-    Совместимый алиас — чтобы не менять остальной код по всему файлу.
+    Совместимый алиас:
+    отправляет админ-лог в Telegram и в MAX асинхронно,
+    не блокируя HTTP-ответ.
     """
     _send_telegram_log_async(message)
+    _send_max_log_async(message)
 # def _send_admin_log_async(message: str) -> None:
 #     """
 #     Не блокирует HTTP-ответ.
@@ -16319,6 +16355,322 @@ def _fetch_working_employees_from_1c() -> list[dict]:
     return payload
 
 
+
+TARGET_SUPERMAG_POSITIONS = {
+    "Администратор магазина",
+    "Приемщик товара",
+    "Директор магазина",
+}
+
+SUPERMAG_CREATE_POSITIONS = {
+    "Администратор магазина",
+    "Приемщик товара",
+}
+
+SUPERMAG_DIRECTOR_POSITION = "Директор магазина"
+SUPERMAG_OFFINDEX_ADMIN = 118
+SUPERMAG_ORAROLE_ADMIN = "OPERATOR_ADMIN"
+WORKING_EMPLOYEES_EXPORT_SUBDIR = "working_employees_sync_exports"
+
+
+def _chunked(seq, size: int):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _translit_to_login_part(text: str) -> str:
+    text = _safe_text(text)
+    out = []
+
+    for ch in text:
+        upper = ch.upper()
+        if upper in _TRANSLIT:
+            out.append(_TRANSLIT[upper].lower())
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch.lower())
+        elif ch in (" ", "-", ".", "_"):
+            out.append("_")
+        # остальное игнорируем
+
+    s = "".join(out)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def _build_sm_login_base(first_name: str, last_name: str, inn: str) -> str:
+    first_part = _translit_to_login_part(first_name)
+    last_part = _translit_to_login_part(last_name)
+
+    if first_part and last_part:
+        base = f"{first_part}_{last_part}"
+    elif first_part:
+        base = first_part
+    elif last_part:
+        base = last_part
+    else:
+        base = f"user_{(inn or '')[-4:]}" if inn else "user"
+
+    base = re.sub(r"_+", "_", base).strip("._-")
+    if not base:
+        base = f"user_{(inn or '')[-4:]}" if inn else "user"
+
+    return base[:64]
+
+
+def _fetch_dbnames_for_smstores(smstore_ids: set[int]) -> dict[int, str]:
+    """
+    Берём REP.DBNAME для списка исходных SMSTORE (из 1С ИдМагазина).
+    """
+    result: dict[int, str] = {}
+    if not smstore_ids:
+        return result
+
+    conn = cur = None
+    try:
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+
+        for chunk in _chunked(sorted(smstore_ids), 500):
+            binds = {}
+            placeholders = []
+            for i, sid in enumerate(chunk):
+                key = f"b{i}"
+                binds[key] = sid
+                placeholders.append(f":{key}")
+
+            sql = f"""
+                SELECT storeloc, propval
+                FROM smstoreproperties
+                WHERE propid = 'REP.DBNAME'
+                  AND storeloc IN ({", ".join(placeholders)})
+            """
+            cur.execute(sql, binds)
+
+            for storeloc, propval in cur.fetchall():
+                if storeloc is not None and propval is not None:
+                    result[int(storeloc)] = str(propval).strip()
+
+        return result
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _oracle_fetch_smstaff_by_inns(cur, inns: set[str]) -> dict[str, list[dict]]:
+    """
+    Возвращает словарь:
+      {
+        "123456789012": [row1, row2, ...],
+        ...
+      }
+    """
+    result: dict[str, list[dict]] = defaultdict(list)
+
+    inns = {str(x).strip() for x in inns if str(x).strip()}
+    if not inns:
+        return result
+
+    cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+    if "INN" not in cols_set:
+        return result
+
+    def HAS(col: str) -> bool:
+        return col.upper() in cols_set
+
+    select_parts = [
+        "s.id AS id" if HAS("id") else "NULL AS id",
+        _smstaff_afio_sql("s", cols_set),
+        "s.serverlogin AS serverlogin" if HAS("serverlogin") else "NULL AS serverlogin",
+        "s.inn AS inn" if HAS("inn") else "NULL AS inn",
+        "s.userenabled AS userenabled" if HAS("userenabled") else "NULL AS userenabled",
+        "s.offindex AS offindex" if HAS("offindex") else "NULL AS offindex",
+    ]
+
+    if HAS("offindex"):
+        select_parts.append("""
+            (
+                SELECT c.title
+                FROM smoffcfg c
+                WHERE c.id = s.offindex
+                  AND ROWNUM = 1
+            ) AS off_title
+        """)
+    else:
+        select_parts.append("NULL AS off_title")
+
+    for chunk in _chunked(sorted(inns), 500):
+        binds = {}
+        placeholders = []
+        for i, inn in enumerate(chunk):
+            key = f"b{i}"
+            binds[key] = inn
+            placeholders.append(f":{key}")
+
+        sql = f"""
+            SELECT {", ".join(select_parts)}
+            FROM smstaff s
+            WHERE TRIM(s.inn) IN ({", ".join(placeholders)})
+            ORDER BY s.id
+        """
+        cur.execute(sql, binds)
+        rows = _oracle_rows_to_jsonable(cur)
+
+        for row in rows:
+            inn_val = _safe_text(row.get("inn"))
+            if inn_val:
+                result[inn_val].append(row)
+
+    return result
+
+
+def _oracle_login_exists(cur, login: str) -> bool:
+    login = _safe_text(login).lower()
+    if not login:
+        return False
+
+    cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+    if "SERVERLOGIN" not in cols_set:
+        return False
+
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM smstaff
+        WHERE LOWER(TRIM(serverlogin)) = :b_login
+        """,
+        b_login=login,
+    )
+    row = cur.fetchone()
+    return bool(row and int(row[0] or 0) > 0)
+
+
+def _resolve_available_sm_login(cur, base_login: str, reserved_logins: set[str]) -> str:
+    base_login = _safe_text(base_login).lower()
+    if not base_login:
+        base_login = "user"
+
+    base_login = re.sub(r"[^a-z0-9_]+", "_", base_login)
+    base_login = re.sub(r"_+", "_", base_login).strip("_")[:64]
+    if not base_login:
+        base_login = "user"
+
+    for n in range(0, 1000):
+        if n == 0:
+            candidate = base_login
+        else:
+            suffix = f"_{n+1}"
+            candidate = f"{base_login[:64 - len(suffix)]}{suffix}"
+
+        candidate = candidate.lower()
+        if candidate in reserved_logins:
+            continue
+
+        if not _oracle_login_exists(cur, candidate):
+            reserved_logins.add(candidate)
+            return candidate
+
+    raise RuntimeError(f"Не удалось подобрать свободный логин для базы '{base_login}'")
+
+
+def _autosize_openpyxl_columns(ws, max_width: int = 60):
+    for col_cells in ws.columns:
+        length = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            val = "" if cell.value is None else str(cell.value)
+            if len(val) > length:
+                length = len(val)
+        ws.column_dimensions[col_letter].width = min(max(length + 2, 12), max_width)
+
+
+def _export_working_employees_result(operation_slug: str, summary: dict, rows: list[dict], meta: dict) -> str:
+    export_dir = Path(settings.MEDIA_ROOT) / WORKING_EMPLOYEES_EXPORT_SUBDIR
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{operation_slug}_{timezone.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.xlsx"
+    filepath = export_dir / filename
+
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+
+    ws_summary.append(["Параметр", "Значение"])
+
+    for k, v in meta.items():
+        ws_summary.append([k, v])
+
+    ws_summary.append([])
+
+    for k, v in summary.items():
+        ws_summary.append([k, v])
+
+    ws_rows = wb.create_sheet("Rows")
+    headers = [
+        "№",
+        "ИНН",
+        "ФИО",
+        "Должность",
+        "Подразделение",
+        "ИдМагазина (1С)",
+        "storeid (ukm4store)",
+        "DBNAME",
+        "user_id",
+        "user_exists",
+        "ukm_link_exists",
+        "oracle_exists",
+        "sm_login",
+        "sm_password",
+        "status_code",
+        "status",
+        "actions",
+    ]
+    ws_rows.append(headers)
+
+    for cell in ws_summary[1]:
+        cell.font = Font(bold=True)
+    for cell in ws_rows[1]:
+        cell.font = Font(bold=True)
+
+    for row in rows:
+        ws_rows.append([
+            row.get("index"),
+            row.get("employee_id"),
+            row.get("full_name"),
+            row.get("position"),
+            row.get("department"),
+            row.get("source_storeid"),
+            row.get("target_storeid"),
+            row.get("sm_db"),
+            row.get("user_id"),
+            row.get("user_exists"),
+            row.get("ukm_link_exists"),
+            row.get("oracle_exists"),
+            row.get("sm_login"),
+            row.get("sm_password"),
+            row.get("status_code"),
+            row.get("status"),
+            "\n".join(row.get("actions") or []),
+        ])
+
+    _autosize_openpyxl_columns(ws_summary)
+    _autosize_openpyxl_columns(ws_rows)
+
+    wb.save(filepath)
+
+    return f"{settings.MEDIA_URL.rstrip('/')}/{WORKING_EMPLOYEES_EXPORT_SUBDIR}/{filename}"
+
+
+
+
+
+
 def _build_status_row(
     idx: int,
     inn: str,
@@ -16330,8 +16682,9 @@ def _build_status_row(
     actions: Optional[list[str]] = None,
     position: str = "",
     department: str = "",
+    **extra,
 ) -> dict:
-    return {
+    row = {
         "index": idx,
         "employee_id": inn,
         "full_name": full_name,
@@ -16343,6 +16696,8 @@ def _build_status_row(
         "position": position,
         "department": department,
     }
+    row.update(extra)
+    return row
 
 
 def _sync_working_employees() -> dict:
@@ -16698,16 +17053,751 @@ def _sync_working_employees() -> dict:
         duration_sec,
     )
 
+    meta = {
+        "started_at": started_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_sec": duration_sec,
+        "default_page_size": SYNC_DEFAULT_PAGE_SIZE,
+        "mode": "sync_users_ukm_open9",
+    }
+
+    export_url = _export_working_employees_result(
+        operation_slug="working_employees_sync",
+        summary=dict(summary),
+        rows=rows,
+        meta=meta,
+    )
+
     return {
         "ok": True,
         "summary": dict(summary),
         "rows": rows,
-        "meta": {
-            "started_at": started_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "duration_sec": duration_sec,
-            "default_page_size": SYNC_DEFAULT_PAGE_SIZE,
-        },
+        "meta": meta,
+        "export_url": export_url,
+        "result_title": "Синхронизация users / ukm_users / open_in_system",
     }
+
+
+
+def _run_working_employees_supermag(dry_run: bool) -> dict:
+    started_dt = timezone.now()
+    started_ts = time.time()
+
+    employees = _fetch_working_employees_from_1c()
+    filtered = [
+        item for item in employees
+        if _safe_text(item.get("Должность")) in TARGET_SUPERMAG_POSITIONS
+    ]
+
+    summary = Counter()
+    summary["total_received"] = len(employees)
+    summary["target_positions"] = len(filtered)
+    summary["create_positions"] = sum(
+        1 for x in filtered if _safe_text(x.get("Должность")) in SUPERMAG_CREATE_POSITIONS
+    )
+    summary["director_positions"] = sum(
+        1 for x in filtered if _safe_text(x.get("Должность")) == SUPERMAG_DIRECTOR_POSITION
+    )
+    summary["dry_run"] = 1 if dry_run else 0
+
+    source_smstore_ids = set()
+    inns = set()
+
+    for item in filtered:
+        raw_store = _safe_text(item.get("ИдМагазина"))
+        inn = _safe_text(item.get("ИНН"))
+
+        if raw_store:
+            try:
+                source_smstore_ids.add(int(raw_store))
+            except ValueError:
+                pass
+
+        if inn:
+            inns.add(inn)
+
+    stores_map = {}
+    for row in Store.objects.filter(smstore__in=source_smstore_ids).values("smstore", "ukm4store", "name"):
+        smstore = row.get("smstore")
+        if smstore is not None and smstore not in stores_map:
+            stores_map[int(smstore)] = row
+
+    dbname_map = _fetch_dbnames_for_smstores(source_smstore_ids)
+
+    existing_users_qs = User.objects.filter(employee_id__in=inns).only(
+        "id", "employee_id", "full_name", "mail", "phone"
+    ).order_by("id")
+
+    users_map = {}
+    duplicate_user_employee_ids = set()
+    existing_user_ids = []
+
+    for user in existing_users_qs:
+        if user.employee_id in users_map:
+            duplicate_user_employee_ids.add(user.employee_id)
+            continue
+        users_map[user.employee_id] = user
+        existing_user_ids.append(user.id)
+
+    ukm_lookup = set(
+        UKMUser.objects.filter(user_id__in=existing_user_ids).values_list("user_id", "storeid")
+    )
+    open4_user_ids = set(
+        OpenInSystem.objects.filter(user_id__in=existing_user_ids, system_id=4).values_list("user_id", flat=True)
+    )
+
+    eligible_by_db = defaultdict(list)
+    results_by_index = {}
+
+    for idx, item in enumerate(filtered, start=1):
+        inn = _safe_text(item.get("ИНН"))
+        raw_store = _safe_text(item.get("ИдМагазина"))
+        full_name = _compose_full_name(item)
+        position = _safe_text(item.get("Должность"))
+        department = _safe_text(item.get("Подразделение"))
+        first_name = _safe_text(item.get("Имя"))
+        last_name = _safe_text(item.get("Фамилия"))
+
+        actions = []
+
+        if not raw_store:
+            summary["skipped_no_storeid"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=None,
+                status_code="skipped",
+                status="пропущен: пустой ИдМагазина",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db="",
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        try:
+            source_smstore = int(raw_store)
+        except ValueError:
+            summary["warning_bad_storeid"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=None,
+                status_code="warning",
+                status="неверный формат ИдМагазина",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db="",
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        store_row = stores_map.get(source_smstore)
+        if not store_row or not store_row.get("ukm4store"):
+            summary["warning_store_not_mapped"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=None,
+                status_code="warning",
+                status="не найден stores.smstore или пустой stores.ukm4store",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db="",
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        target_storeid = int(store_row["ukm4store"])
+
+        dbname = _safe_text(dbname_map.get(source_smstore))
+        if not dbname:
+            summary["warning_dbname_not_found"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="warning",
+                status="не найден REP.DBNAME для магазина",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db="",
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        if dbname.startswith("BINCH"):
+            summary["skipped_binch"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="skipped",
+                status=f"база {dbname} пропущена (BINCH пока не обрабатываем)",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db=dbname,
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        if not dbname.startswith("BINUU"):
+            summary["warning_bad_db_prefix"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="warning",
+                status=f"неподдерживаемая база {dbname}",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db=dbname,
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        if dbname not in ORACLE_TNS_MAP:
+            summary["warning_db_not_configured"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="warning",
+                status=f"база {dbname} не описана в ORACLE_TNS_MAP",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db=dbname,
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        if not inn:
+            summary["warning_no_inn"] += 1
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="warning",
+                status="пропущен: пустой ИНН",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db=dbname,
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        user = users_map.get(inn)
+        if not user:
+            summary["warning_user_not_found"] += 1
+            actions.append("в users запись не найдена")
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="warning",
+                status="нет записи в users",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db=dbname,
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        if inn in duplicate_user_employee_ids:
+            actions.append("в users найдено несколько записей с таким employee_id, использована первая")
+
+        has_ukm_link = (user.id, target_storeid) in ukm_lookup
+        if not has_ukm_link:
+            summary["warning_ukm_link_not_found"] += 1
+            actions.append(f"нет ukm_users для user_id={user.id} и storeid={target_storeid}")
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="warning",
+                status="нет привязки ukm_users к нужному storeid",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db=dbname,
+                user_id=user.id,
+                user_exists=True,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
+        eligible_by_db[dbname].append({
+            "index": idx,
+            "item": item,
+            "inn": inn,
+            "full_name": full_name,
+            "position": position,
+            "department": department,
+            "first_name": first_name,
+            "last_name": last_name,
+            "source_storeid": raw_store,
+            "target_storeid": target_storeid,
+            "sm_db": dbname,
+            "user": user,
+            "duplicate_user": inn in duplicate_user_employee_ids,
+        })
+
+    for dbname, items in eligible_by_db.items():
+        conn = cur = None
+        try:
+            conn = _connect_oracle_service(dbname)
+            cur = conn.cursor()
+
+            existing_sm_by_inn = _oracle_fetch_smstaff_by_inns(cur, {x["inn"] for x in items})
+            reserved_logins = set()
+            processed_inn_in_run = set()
+
+            for item in items:
+                idx = item["index"]
+                inn = item["inn"]
+                full_name = item["full_name"]
+                position = item["position"]
+                department = item["department"]
+                raw_store = item["source_storeid"]
+                target_storeid = item["target_storeid"]
+                user = item["user"]
+
+                actions = []
+                if item["duplicate_user"]:
+                    actions.append("в users найдено несколько записей с таким employee_id, использована первая")
+
+                actions.append(f"user_id={user.id}")
+                actions.append(f"найден ukm_users(storeid={target_storeid})")
+
+                existing_rows = existing_sm_by_inn.get(inn, [])
+                existing_row = existing_rows[0] if existing_rows else None
+
+                if existing_row:
+                    if len(existing_rows) > 1:
+                        actions.append("в SMSTAFF найдено несколько записей с таким ИНН, показана первая")
+
+                    login_existing = _safe_text(existing_row.get("serverlogin"))
+                    if login_existing:
+                        reserved_logins.add(login_existing.lower())
+                        actions.append(f"логин в Супермаге: {login_existing}")
+
+                    if position == SUPERMAG_DIRECTOR_POSITION:
+                        summary["director_exists"] += 1
+                        status_text = "директор уже есть в Супермаге"
+                    else:
+                        summary["sm_exists"] += 1
+                        status_text = "учётная запись уже есть в Супермаге"
+
+                    results_by_index[idx] = _build_status_row(
+                        idx=idx,
+                        inn=inn,
+                        full_name=full_name,
+                        source_storeid=raw_store,
+                        target_storeid=target_storeid,
+                        status_code="info",
+                        status=status_text,
+                        actions=actions,
+                        position=position,
+                        department=department,
+                        sm_db=dbname,
+                        user_id=user.id,
+                        user_exists=True,
+                        ukm_link_exists=True,
+                        oracle_exists=True,
+                        sm_login=login_existing,
+                        sm_password="",
+                    )
+                    processed_inn_in_run.add(inn)
+                    continue
+
+                if inn in processed_inn_in_run:
+                    summary["duplicate_feed_rows"] += 1
+                    results_by_index[idx] = _build_status_row(
+                        idx=idx,
+                        inn=inn,
+                        full_name=full_name,
+                        source_storeid=raw_store,
+                        target_storeid=target_storeid,
+                        status_code="info",
+                        status="дубликат в текущей выгрузке для этой базы, повторное создание не требуется",
+                        actions=actions,
+                        position=position,
+                        department=department,
+                        sm_db=dbname,
+                        user_id=user.id,
+                        user_exists=True,
+                        ukm_link_exists=True,
+                        oracle_exists=False,
+                        sm_login="",
+                        sm_password="",
+                    )
+                    continue
+
+                if position == SUPERMAG_DIRECTOR_POSITION:
+                    summary["director_missing"] += 1
+                    actions.append("для директоров создание не выполняется")
+                    results_by_index[idx] = _build_status_row(
+                        idx=idx,
+                        inn=inn,
+                        full_name=full_name,
+                        source_storeid=raw_store,
+                        target_storeid=target_storeid,
+                        status_code="warning",
+                        status="для директора УЗ в Супермаге не найдена, создание не выполняется",
+                        actions=actions,
+                        position=position,
+                        department=department,
+                        sm_db=dbname,
+                        user_id=user.id,
+                        user_exists=True,
+                        ukm_link_exists=True,
+                        oracle_exists=False,
+                        sm_login="",
+                        sm_password="",
+                    )
+                    processed_inn_in_run.add(inn)
+                    continue
+
+                login_base = _build_sm_login_base(
+                    first_name=item["first_name"],
+                    last_name=item["last_name"],
+                    inn=inn,
+                )
+                login_new = _resolve_available_sm_login(cur, login_base, reserved_logins)
+                pin_code = _generate_pin_code()
+
+                actions.append(f"логин: {login_new}")
+                actions.append(f"пароль: {pin_code}")
+                actions.append(f"AFIO: {full_name}")
+                actions.append(f"ADOL: {SUPERMAG_ORAROLE_ADMIN}")
+                actions.append(f"OFFINDEX: {SUPERMAG_OFFINDEX_ADMIN}")
+
+                if dry_run:
+                    summary["sm_will_create"] += 1
+                    if user.id in open4_user_ids:
+                        summary["open4_will_update"] += 1
+                        actions.append("будет обновлён open_in_system(system_id=4)")
+                    else:
+                        summary["open4_will_create"] += 1
+                        actions.append("будет создан open_in_system(system_id=4)")
+
+                    results_by_index[idx] = _build_status_row(
+                        idx=idx,
+                        inn=inn,
+                        full_name=full_name,
+                        source_storeid=raw_store,
+                        target_storeid=target_storeid,
+                        status_code="success",
+                        status="будет создан в Супермаге (тест)",
+                        actions=actions,
+                        position=position,
+                        department=department,
+                        sm_db=dbname,
+                        user_id=user.id,
+                        user_exists=True,
+                        ukm_link_exists=True,
+                        oracle_exists=False,
+                        sm_login=login_new,
+                        sm_password=pin_code,
+                    )
+                    processed_inn_in_run.add(inn)
+                    continue
+
+                proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
+                if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+                    raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
+
+                try:
+                    cur.execute(
+                        f"""
+                        BEGIN
+                            {proc_name}(
+                                AUSER => :p_auser,
+                                APASS => :p_apass,
+                                ADOL => :p_adol,
+                                ACHECK => :p_acheck,
+                                AUSERENABLED => :p_auserenabled,
+                                AINN => :p_ainn,
+                                AFIO => :p_afio
+                            );
+                        END;
+                        """,
+                        p_auser=login_new,
+                        p_apass=pin_code,
+                        p_adol=SUPERMAG_ORAROLE_ADMIN,
+                        p_acheck=0,
+                        p_auserenabled=1,
+                        p_ainn=inn,
+                        p_afio=full_name,
+                    )
+
+                    updated_smstaff_rows = _oracle_update_smstaff_after_create(
+                        cur=cur,
+                        login=login_new,
+                        inn=inn,
+                        afio=full_name,
+                        offindex=SUPERMAG_OFFINDEX_ADMIN,
+                    )
+
+                    conn.commit()
+
+                except Exception as oracle_exc:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+                    summary["oracle_create_errors"] += 1
+                    results_by_index[idx] = _build_status_row(
+                        idx=idx,
+                        inn=inn,
+                        full_name=full_name,
+                        source_storeid=raw_store,
+                        target_storeid=target_storeid,
+                        status_code="error",
+                        status=f"ошибка создания в Супермаге: {oracle_exc}",
+                        actions=actions,
+                        position=position,
+                        department=department,
+                        sm_db=dbname,
+                        user_id=user.id,
+                        user_exists=True,
+                        ukm_link_exists=True,
+                        oracle_exists=False,
+                        sm_login=login_new,
+                        sm_password=pin_code,
+                    )
+                    continue
+
+                row_status_code = "success"
+                row_status_text = "создан в Супермаге"
+
+                try:
+                    qs = OpenInSystem.objects.filter(user_id=user.id, system_id=4)
+                    if qs.exists():
+                        updated_cnt = qs.update(
+                            username=login_new,
+                            password=pin_code,
+                            status=True,
+                        )
+                        summary["open4_updated"] += 1
+                        actions.append(f"обновлён open_in_system(system_id=4), строк: {updated_cnt}")
+                    else:
+                        OpenInSystem.objects.create(
+                            user_id=user.id,
+                            username=login_new,
+                            password=pin_code,
+                            system_id=4,
+                            status=True,
+                        )
+                        open4_user_ids.add(user.id)
+                        summary["open4_created"] += 1
+                        actions.append("создан open_in_system(system_id=4)")
+                except Exception as pg_exc:
+                    summary["open4_errors"] += 1
+                    row_status_code = "warning"
+                    row_status_text = "создан в Супермаге, но ошибка записи в open_in_system"
+                    actions.append(f"ОШИБКА open_in_system: {pg_exc}")
+
+                if updated_smstaff_rows:
+                    actions.append(f"обновлено строк в SMSTAFF: {updated_smstaff_rows}")
+
+                summary["sm_created"] += 1
+                processed_inn_in_run.add(inn)
+
+                existing_sm_by_inn[inn] = [{
+                    "serverlogin": login_new,
+                    "inn": inn,
+                    "afio": full_name,
+                    "userenabled": 1,
+                    "offindex": SUPERMAG_OFFINDEX_ADMIN,
+                    "off_title": "Администратор",
+                }]
+
+                results_by_index[idx] = _build_status_row(
+                    idx=idx,
+                    inn=inn,
+                    full_name=full_name,
+                    source_storeid=raw_store,
+                    target_storeid=target_storeid,
+                    status_code=row_status_code,
+                    status=row_status_text,
+                    actions=actions,
+                    position=position,
+                    department=department,
+                    sm_db=dbname,
+                    user_id=user.id,
+                    user_exists=True,
+                    ukm_link_exists=True,
+                    oracle_exists=True,
+                    sm_login=login_new,
+                    sm_password=pin_code,
+                )
+
+        except Exception as db_exc:
+            logger.exception("Ошибка обработки базы %s", dbname)
+            for item in items:
+                idx = item["index"]
+                results_by_index[idx] = _build_status_row(
+                    idx=idx,
+                    inn=item["inn"],
+                    full_name=item["full_name"],
+                    source_storeid=item["source_storeid"],
+                    target_storeid=item["target_storeid"],
+                    status_code="error",
+                    status=f"ошибка подключения/обработки базы {dbname}: {db_exc}",
+                    actions=[],
+                    position=item["position"],
+                    department=item["department"],
+                    sm_db=dbname,
+                    user_id=item["user"].id if item.get("user") else None,
+                    user_exists=bool(item.get("user")),
+                    ukm_link_exists=True,
+                    oracle_exists=False,
+                    sm_login="",
+                    sm_password="",
+                )
+                summary["db_errors"] += 1
+
+        finally:
+            try:
+                if cur:
+                    cur.close()
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    rows = [results_by_index[i] for i in range(1, len(filtered) + 1)]
+
+    summary["rows_total"] = len(rows)
+    summary["success_rows"] = sum(1 for r in rows if r["status_code"] == "success")
+    summary["info_rows"] = sum(1 for r in rows if r["status_code"] == "info")
+    summary["warning_rows"] = sum(1 for r in rows if r["status_code"] == "warning")
+    summary["error_rows"] = sum(1 for r in rows if r["status_code"] == "error")
+    summary["skipped_rows"] = sum(1 for r in rows if r["status_code"] == "skipped")
+
+    duration_sec = round(time.time() - started_ts, 2)
+    mode_name = "supermag_test" if dry_run else "supermag_run"
+
+    meta = {
+        "started_at": started_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_sec": duration_sec,
+        "mode": mode_name,
+        "default_page_size": SYNC_DEFAULT_PAGE_SIZE,
+    }
+
+    export_url = _export_working_employees_result(
+        operation_slug=mode_name,
+        summary=dict(summary),
+        rows=rows,
+        meta=meta,
+    )
+
+    logger.info(
+        "[WORKING_EMPLOYEES_SUPERMAG] mode=%s total=%s target=%s sm_created=%s sm_will_create=%s warnings=%s errors=%s duration=%s",
+        mode_name,
+        summary["total_received"],
+        summary["target_positions"],
+        summary.get("sm_created", 0),
+        summary.get("sm_will_create", 0),
+        summary["warning_rows"],
+        summary["error_rows"],
+        duration_sec,
+    )
+
+    return {
+        "ok": True,
+        "summary": dict(summary),
+        "rows": rows,
+        "meta": meta,
+        "export_url": export_url,
+        "result_title": "Создание в Супермаге (ТЕСТ)" if dry_run else "Создание в Супермаге",
+    }
+
+
+
+
+
+
+
+
 
 
 @never_cache
@@ -16734,6 +17824,68 @@ def working_employees_sync_run(request):
         )
     except Exception as exc:
         logger.exception("Внутренняя ошибка синхронизации сотрудников")
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": f"Внутренняя ошибка: {str(exc)}",
+            },
+            status=500,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+
+
+
+
+
+
+
+@never_cache
+@require_POST
+def working_employees_sync_supermag_run(request):
+    try:
+        result = _run_working_employees_supermag(dry_run=False)
+        return JsonResponse(result, json_dumps_params={"ensure_ascii": False})
+    except RequestException as exc:
+        logger.exception("Ошибка запроса к 1С Get_WorkingEmployees для Супермага")
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": f"Ошибка запроса к 1С: {str(exc)}",
+            },
+            status=502,
+            json_dumps_params={"ensure_ascii": False},
+        )
+    except Exception as exc:
+        logger.exception("Внутренняя ошибка создания пользователей в Супермаге")
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": f"Внутренняя ошибка: {str(exc)}",
+            },
+            status=500,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+
+@never_cache
+@require_POST
+def working_employees_sync_supermag_test_run(request):
+    try:
+        result = _run_working_employees_supermag(dry_run=True)
+        return JsonResponse(result, json_dumps_params={"ensure_ascii": False})
+    except RequestException as exc:
+        logger.exception("Ошибка запроса к 1С Get_WorkingEmployees для теста Супермага")
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": f"Ошибка запроса к 1С: {str(exc)}",
+            },
+            status=502,
+            json_dumps_params={"ensure_ascii": False},
+        )
+    except Exception as exc:
+        logger.exception("Внутренняя ошибка тестового создания пользователей в Супермаге")
         return JsonResponse(
             {
                 "ok": False,
