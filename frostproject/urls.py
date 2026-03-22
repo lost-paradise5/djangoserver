@@ -210,5 +210,15 @@ urlpatterns = [
         views.working_employees_sync_run,
         name="working_employees_sync_run",
     ),
+    path(
+        "working-employees-sync/supermag/run/",
+        views.working_employees_sync_supermag_run,
+        name="working_employees_sync_supermag_run",
+    ),
+    path(
+        "working-employees-sync/supermag/test-run/",
+        views.working_employees_sync_supermag_test_run,
+        name="working_employees_sync_supermag_test_run",
+    ),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
