@@ -10086,11 +10086,10 @@ def _smstaff_afio_sql(alias: str, cols_set: set[str]) -> str:
     return "NULL AS afio"
 
 _SM_ACHECK_CHOICES = [
-    {"value": "-2", "label": "-2 — заблокировать пользователя"},
     {"value": "-1", "label": "-1 — нового не создавать, работать только с существующим, можно обновить ФИО"},
     {"value": "0",  "label": "0 — если пользователь есть, ничего не делать"},
     {"value": "1",  "label": "1 — если пользователь есть, поменять пароль/должность/ФИО"},
-    {"value": "2",  "label": "2 — удалить пользователя"},
+    {"value": "2",  "label": "2 — заблокировать пользователя"},
 ]
 
 _SM_USERENABLED_CHOICES = [
@@ -10152,9 +10151,9 @@ def _is_valid_inn_digits(inn: str) -> bool:
 def _is_sm_block_mode(acheck_raw: str, auserenabled_raw: str) -> bool:
     """
     Режим блокировки:
-    ACHECK = -2 и AUSERENABLED = 0
+    ACHECK = 2 и AUSERENABLED = 0
     """
-    return (str(acheck_raw).strip() == "-2") and (str(auserenabled_raw).strip() == "0")
+    return (str(acheck_raw).strip() == "2") and (str(auserenabled_raw).strip() == "0")
 
 
 def _generate_sm_password(length: int = 4) -> str:
@@ -11261,11 +11260,6 @@ def sm_staff_ui_create(request):
                         if is_block_mode:
                             success_message = (
                                 f"Пользователь {auser} успешно заблокирован в базе {db}."
-                            )
-                        elif acheck == 2:
-                            success_message = (
-                                f"Процедура выполнена для логина {auser}. "
-                                f"Режим ACHECK=2 означает удаление пользователя."
                             )
                         elif exact_exists and acheck == 1:
                             success_message = (
