@@ -15,7 +15,7 @@
         }
 
         .container {
-            max-width: 1440px;
+            max-width: 1680px;
             margin: 0 auto;
         }
 
@@ -40,7 +40,7 @@
             align-items: center;
         }
 
-        button {
+        button, .download-link {
             border: 0;
             border-radius: 10px;
             padding: 12px 18px;
@@ -49,6 +49,9 @@
             cursor: pointer;
             font-size: 15px;
             font-weight: 700;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
         }
 
         button:disabled {
@@ -58,6 +61,18 @@
 
         .secondary-btn {
             background: #475569;
+        }
+
+        .warning-btn {
+            background: #0f766e;
+        }
+
+        .danger-btn {
+            background: #7c3aed;
+        }
+
+        .download-link {
+            background: #059669;
         }
 
         .muted {
@@ -111,7 +126,7 @@
         table {
             width: 100%;
             border-collapse: collapse;
-            min-width: 1100px;
+            min-width: 1550px;
             background: #fff;
         }
 
@@ -182,11 +197,6 @@
             font-size: 14px;
         }
 
-        .status-line {
-            margin-top: 10px;
-            font-size: 14px;
-        }
-
         .error-box {
             background: #fef2f2;
             color: #991b1b;
@@ -197,12 +207,30 @@
         }
 
         .hidden {
-            display: none;
+            display: none !important;
         }
 
         .small {
             font-size: 12px;
             color: #64748b;
+        }
+
+        .result-title {
+            font-size: 16px;
+            font-weight: 700;
+            margin-top: 12px;
+        }
+
+        .nowrap {
+            white-space: nowrap;
+        }
+
+        .code {
+            font-family: Consolas, Monaco, monospace;
+            font-size: 13px;
+            background: #f8fafc;
+            padding: 2px 6px;
+            border-radius: 6px;
         }
     </style>
 </head>
@@ -213,13 +241,15 @@
 
         <div class="toolbar">
             <button id="runBtn">Запуск</button>
+            <button id="supermagRunBtn" class="warning-btn">Создать в Супермаге</button>
+            <button id="supermagTestBtn" class="danger-btn">Создать в Супермаге ТЕСТ</button>
+            <a id="downloadLink" class="download-link hidden" href="#" target="_blank" rel="noopener">Скачать файл</a>
             <span id="runStatus" class="muted">Готов к запуску</span>
         </div>
 
+        <div id="resultTitle" class="result-title"></div>
         <div id="errorBox" class="error-box hidden"></div>
-
         <div id="summaryBox" class="summary-grid"></div>
-
         <div id="metaBox" class="small" style="margin-top: 12px;"></div>
     </div>
 
@@ -260,13 +290,17 @@
                     <th>Подразделение</th>
                     <th>ИдМагазина (1С)</th>
                     <th>storeid (ukm4store)</th>
+                    <th>DBNAME</th>
+                    <th>user_id</th>
+                    <th>SM login</th>
+                    <th>SM пароль</th>
                     <th>Статус</th>
                     <th>Действия</th>
                 </tr>
                 </thead>
                 <tbody id="rowsBody">
                 <tr>
-                    <td colspan="9" class="muted">Пока ничего не запускалось</td>
+                    <td colspan="13" class="muted">Пока ничего не запускалось</td>
                 </tr>
                 </tbody>
             </table>
@@ -282,6 +316,8 @@
 
 <script>
     const runBtn = document.getElementById('runBtn');
+    const supermagRunBtn = document.getElementById('supermagRunBtn');
+    const supermagTestBtn = document.getElementById('supermagTestBtn');
     const runStatus = document.getElementById('runStatus');
     const errorBox = document.getElementById('errorBox');
     const summaryBox = document.getElementById('summaryBox');
@@ -292,6 +328,8 @@
     const prevPageBtn = document.getElementById('prevPageBtn');
     const nextPageBtn = document.getElementById('nextPageBtn');
     const pageInfo = document.getElementById('pageInfo');
+    const downloadLink = document.getElementById('downloadLink');
+    const resultTitle = document.getElementById('resultTitle');
 
     let allRows = [];
     let currentPage = 1;
@@ -312,25 +350,72 @@
     }
 
     function renderSummary(summary) {
-        const items = [
-            ['Всего из 1С', summary.total_received || 0],
-            ['С ИдМагазина', summary.with_storeid || 0],
-            ['Уникальных ИНН', summary.unique_inn || 0],
-            ['Создано users', summary.new_users_created || 0],
-            ['Создано ukm_users', summary.ukm_users_created || 0],
-            ['Создано open_in_system', summary.open_in_system_created || 0],
-            ['Изменений', summary.success_rows || 0],
-            ['Без изменений', summary.info_rows || 0],
-            ['Предупреждений', summary.warning_rows || 0],
-            ['Пропущено', summary.skipped_rows || 0],
-            ['Пустой ИдМагазина', summary.skipped_no_storeid || 0],
-            ['Не сопоставлен магазин', summary.skipped_store_not_mapped || 0],
+        const labels = {
+            total_received: 'Всего из 1С',
+            target_positions: 'Целевых должностей',
+            create_positions: 'Создаваемых должностей',
+            director_positions: 'Директоров',
+            with_storeid: 'С ИдМагазина',
+            unique_inn: 'Уникальных ИНН',
+            new_users_created: 'Создано users',
+            ukm_users_created: 'Создано ukm_users',
+            open_in_system_created: 'Создано open_in_system',
+            sm_created: 'Создано в Супермаге',
+            sm_will_create: 'Будет создано в Супермаге',
+            sm_exists: 'Уже есть в Супермаге',
+            director_exists: 'Директоров найдено',
+            director_missing: 'Директоров не найдено',
+            open4_created: 'Создано open_in_system=4',
+            open4_updated: 'Обновлено open_in_system=4',
+            open4_will_create: 'Будет создано open_in_system=4',
+            open4_will_update: 'Будет обновлено open_in_system=4',
+            warning_user_not_found: 'Нет в users',
+            warning_ukm_link_not_found: 'Нет привязки ukm_users',
+            warning_dbname_not_found: 'Не найден DBNAME',
+            skipped_binch: 'Пропущено BINCH',
+            success_rows: 'Успешно',
+            info_rows: 'Без изменений',
+            warning_rows: 'Предупреждений',
+            error_rows: 'Ошибок',
+            skipped_rows: 'Пропущено',
+        };
+
+        const order = [
+            'total_received',
+            'target_positions',
+            'create_positions',
+            'director_positions',
+            'new_users_created',
+            'ukm_users_created',
+            'open_in_system_created',
+            'sm_created',
+            'sm_will_create',
+            'sm_exists',
+            'director_exists',
+            'director_missing',
+            'open4_created',
+            'open4_updated',
+            'open4_will_create',
+            'open4_will_update',
+            'warning_user_not_found',
+            'warning_ukm_link_not_found',
+            'warning_dbname_not_found',
+            'skipped_binch',
+            'success_rows',
+            'info_rows',
+            'warning_rows',
+            'error_rows',
+            'skipped_rows',
         ];
+
+        const items = order
+            .filter(key => Object.prototype.hasOwnProperty.call(summary, key))
+            .map(key => [labels[key] || key, summary[key]]);
 
         summaryBox.innerHTML = items.map(([label, value]) => `
             <div class="summary-item">
                 <div class="label">${label}</div>
-                <div class="value">${value}</div>
+                <div class="value">${value ?? 0}</div>
             </div>
         `).join('');
     }
@@ -358,7 +443,7 @@
         const pageRows = filteredRows.slice(start, end);
 
         if (!pageRows.length) {
-            rowsBody.innerHTML = `<tr><td colspan="9" class="muted">Нет строк для выбранного фильтра</td></tr>`;
+            rowsBody.innerHTML = `<tr><td colspan="13" class="muted">Нет строк для выбранного фильтра</td></tr>`;
         } else {
             rowsBody.innerHTML = pageRows.map(row => `
                 <tr>
@@ -369,6 +454,10 @@
                     <td>${row.department || ''}</td>
                     <td>${row.source_storeid || ''}</td>
                     <td>${row.target_storeid ?? ''}</td>
+                    <td class="nowrap">${row.sm_db || ''}</td>
+                    <td>${row.user_id ?? ''}</td>
+                    <td>${row.sm_login ? `<span class="code">${row.sm_login}</span>` : ''}</td>
+                    <td>${row.sm_password ? `<span class="code">${row.sm_password}</span>` : ''}</td>
                     <td><span class="${badgeClass(row.status_code)}">${row.status}</span></td>
                     <td>
                         ${row.actions && row.actions.length
@@ -384,14 +473,23 @@
         nextPageBtn.disabled = currentPage >= totalPages;
     }
 
-    async function runSync() {
-        runBtn.disabled = true;
+    function setButtonsDisabled(disabled) {
+        runBtn.disabled = disabled;
+        supermagRunBtn.disabled = disabled;
+        supermagTestBtn.disabled = disabled;
+    }
+
+    async function runAction(url, titleText, statusText) {
+        setButtonsDisabled(true);
         errorBox.classList.add('hidden');
         errorBox.textContent = '';
-        runStatus.textContent = 'Идёт обработка, подожди...';
+        downloadLink.classList.add('hidden');
+        downloadLink.href = '#';
+        resultTitle.textContent = titleText;
+        runStatus.textContent = statusText;
 
         try {
-            const response = await fetch("{% url 'working_employees_sync_run' %}", {
+            const response = await fetch(url, {
                 method: "POST",
                 headers: {
                     "X-CSRFToken": getCookie("csrftoken"),
@@ -413,30 +511,63 @@
             renderRows();
 
             const meta = data.meta || {};
-            metaBox.textContent = `Запуск: ${meta.started_at || '-'}, длительность: ${meta.duration_sec || 0} сек`;
+            const title = data.result_title || titleText;
+            resultTitle.textContent = title;
+            metaBox.textContent = `Запуск: ${meta.started_at || '-'}, длительность: ${meta.duration_sec || 0} сек, режим: ${meta.mode || '-'}`;
             runStatus.textContent = `Готово. Обработано строк: ${allRows.length}`;
+
+            if (data.export_url) {
+                downloadLink.href = data.export_url;
+                downloadLink.classList.remove('hidden');
+            }
         } catch (err) {
             errorBox.textContent = err.message || String(err);
             errorBox.classList.remove('hidden');
             runStatus.textContent = 'Ошибка выполнения';
         } finally {
-            runBtn.disabled = false;
+            setButtonsDisabled(false);
         }
     }
 
-    runBtn.addEventListener('click', runSync);
+    runBtn.addEventListener('click', () => {
+        runAction(
+            "{% url 'working_employees_sync_run' %}",
+            "Синхронизация users / ukm_users / open_in_system",
+            "Идёт синхронизация users / ukm_users / open_in_system..."
+        );
+    });
+
+    supermagRunBtn.addEventListener('click', () => {
+        runAction(
+            "{% url 'working_employees_sync_supermag_run' %}",
+            "Создание в Супермаге",
+            "Идёт создание в Супермаге..."
+        );
+    });
+
+    supermagTestBtn.addEventListener('click', () => {
+        runAction(
+            "{% url 'working_employees_sync_supermag_test_run' %}",
+            "Создание в Супермаге (ТЕСТ)",
+            "Идёт тестовый прогон создания в Супермаге..."
+        );
+    });
+
     filterSelect.addEventListener('change', () => {
         currentPage = 1;
         renderRows();
     });
+
     pageSizeSelect.addEventListener('change', () => {
         currentPage = 1;
         renderRows();
     });
+
     prevPageBtn.addEventListener('click', () => {
         currentPage -= 1;
         renderRows();
     });
+
     nextPageBtn.addEventListener('click', () => {
         currentPage += 1;
         renderRows();
