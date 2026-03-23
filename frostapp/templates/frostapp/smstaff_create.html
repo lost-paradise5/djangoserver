@@ -78,24 +78,25 @@
         <div class="col-md-4">
           <label class="form-label">AUSER (логин)</label>
           <input class="form-control" name="auser" value="{{ form.auser }}" placeholder="например t_test" required>
-          <div class="form-text">Латиница, цифры, точка, дефис, нижнее подчёркивание.</div>
+          <div class="form-text">Обязательное поле. Латиница, цифры, точка, дефис, нижнее подчёркивание.</div>
         </div>
 
         <div class="col-md-4">
           <label class="form-label">AINN (ИНН)</label>
-          <input id="id_ainn" class="form-control" name="ainn" value="{{ form.ainn }}" placeholder="10 или 12 цифр">
+          <input id="id_ainn" class="form-control" name="ainn" value="{{ form.ainn }}" placeholder="необязательно, 10 или 12 цифр">
+          <div class="form-text">Необязательное поле. Для сценария создания лучше заполнять.</div>
         </div>
 
         <div class="col-md-6">
           <label class="form-label">AFIO (ФИО)</label>
-          <input id="id_afio" class="form-control" name="afio" value="{{ form.afio }}" placeholder="например Иванов Иван Иванович">
-          <div class="form-text">Это значение передаётся в параметр AFIO процедуры.</div>
+          <input id="id_afio" class="form-control" name="afio" value="{{ form.afio }}" placeholder="необязательно, например Иванов Иван Иванович">
+          <div class="form-text">Необязательное поле. Если указано, передаётся в параметр AFIO процедуры.</div>
         </div>
 
         <div class="col-md-6">
           <label class="form-label">ADOL (должность)</label>
-          <select class="form-select" name="adol" required>
-            <option value="">Выбери должность</option>
+          <select class="form-select" name="adol" id="id_adol">
+            <option value="">Не выбрано</option>
             {% for p in positions %}
               <option value="{{ p.id }}" {% if form.adol == p.id|stringformat:"s" %}selected{% endif %}>
                 {{ p.title|default:"Без названия" }} (ID: {{ p.id }}){% if p.orarole %} — ORAROLE: {{ p.orarole }}{% endif %}
@@ -103,7 +104,7 @@
             {% endfor %}
           </select>
           <div class="form-text">
-            В процедуру уйдёт <b>SMOFFCFG.ORAROLE</b>, а после выполнения в <b>SMSTAFF.OFFINDEX</b> будет записан выбранный ID.
+            Необязательное поле. Если выбрано, в процедуру уйдёт <b>SMOFFCFG.ORAROLE</b>, а после выполнения в <b>SMSTAFF.OFFINDEX</b> будет записан выбранный ID.
           </div>
         </div>
 
@@ -126,10 +127,11 @@
         </div>
 
         <div class="col-12">
-          <div class="alert alert-secondary mb-0">
+          <div class="alert alert-secondary mb-0" id="modeHint">
+            <b>Обязательно только поле AUSER.</b><br>
             <b>APASS</b> вводить не нужно — он будет сгенерирован автоматически как 4 цифры.<br>
-            Для <b>ACHECK=1</b> это позволит сменить пароль существующему пользователю.<br>
-            Для <b>ACHECK=-1</b> процедура будет вызвана и сможет обновить ФИО существующего пользователя.
+            Для обычного создания новой УЗ желательно указывать <b>AINN</b> и <b>ADOL</b>.<br>
+            Для блокировки существующей УЗ можно использовать <b>ACHECK=0</b> и <b>AUSERENABLED=0</b> только с логином.
           </div>
         </div>
       </div>
@@ -224,42 +226,42 @@
   {% endif %}
 </div>
 
-
-
-
 <script>
 (function () {
   const acheck = document.getElementById('id_acheck');
   const auserenabled = document.getElementById('id_auserenabled');
-  const ainn = document.getElementById('id_ainn');
-  const afio = document.getElementById('id_afio');
+  const modeHint = document.getElementById('modeHint');
 
-  function isBlockMode() {
+  function updateHint() {
     const acheckVal = (acheck?.value || '').trim();
     const auserenabledVal = (auserenabled?.value || '').trim();
-    return acheckVal === '2' && auserenabledVal === '0';
-  }
 
-  function toggleBlockMode() {
-    const blockMode = isBlockMode();
-
-    if (ainn) {
-      ainn.required = !blockMode;
-      ainn.readOnly = blockMode;
-      ainn.placeholder = blockMode ? 'Для блокировки не требуется' : '10 или 12 цифр';
+    if (acheckVal === '0' && auserenabledVal === '0') {
+      modeHint.innerHTML =
+        '<b>Режим блокировки.</b><br>' +
+        'Для блокировки существующей УЗ достаточно <b>AUSER</b>.<br>' +
+        '<b>AINN</b>, <b>AFIO</b> и <b>ADOL</b> можно не заполнять.';
+      return;
     }
 
-    if (afio) {
-      afio.required = !blockMode;
-      afio.readOnly = blockMode;
-      afio.placeholder = blockMode ? 'Для блокировки не требуется' : 'например Иванов Иван Иванович';
+    if (acheckVal === '2') {
+      modeHint.innerHTML =
+        '<b>Режим удаления.</b><br>' +
+        'Обычно достаточно <b>AUSER</b>.<br>' +
+        'Дополнительные поля можно не заполнять.';
+      return;
     }
+
+    modeHint.innerHTML =
+      '<b>Обязательно только поле AUSER.</b><br>' +
+      '<b>APASS</b> вводить не нужно — он будет сгенерирован автоматически как 4 цифры.<br>' +
+      'Для обычного создания новой УЗ желательно указывать <b>AINN</b> и <b>ADOL</b>.<br>' +
+      'Для блокировки существующей УЗ можно использовать <b>ACHECK=0</b> и <b>AUSERENABLED=0</b> только с логином.';
   }
 
-  if (acheck) acheck.addEventListener('change', toggleBlockMode);
-  if (auserenabled) auserenabled.addEventListener('change', toggleBlockMode);
-
-  toggleBlockMode();
+  if (acheck) acheck.addEventListener('change', updateHint);
+  if (auserenabled) auserenabled.addEventListener('change', updateHint);
+  updateHint();
 })();
 </script>
 
