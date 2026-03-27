@@ -6548,15 +6548,12 @@ def agent_auth_start(request):
 
         _send_admin_log_async(
             "\n".join([
-                "🔐 Начат вход агента",
-                f"User ID: {user.id}",
-                f"ФИО: {user.full_name}",
+                "🔐 Агент. Запрос",
+                f"{user.full_name}",
                 f"Телефон: {_mask_phone(phone_raw)}",
                 f"Email: {_mask_email(getattr(user, 'mail', '')) if getattr(user, 'mail', None) else 'нет'}",
-                f"Session ID: {session_id}",
-                f"PIN TTL: {PIN_TTL_MINUTES} мин",
-                f"Email отправлен: {'да' if delivery.get('email_sent') else 'нет'}",
-                f"MAX отправлен: {'да' if delivery.get('max_sent') else 'нет'}",
+                f"Email: {'да' if delivery.get('email_sent') else 'нет'}",
+                f"MAX: {'да' if delivery.get('max_sent') else 'нет'}",
             ])
         )
 
@@ -6670,10 +6667,8 @@ def agent_auth_verify_pin(request):
 
         _send_admin_log_async(
             "\n".join([
-                "✅ Агент успешно вошёл",
-                f"User ID: {sess.user.id}",
-                f"ФИО: {sess.user.full_name}",
-                f"Session ID: {session_id}",
+                "✅ Агент. Успешный вход",
+                f"{sess.user.full_name}",
                 f"Магазинов: {len(stores_response)}",
             ])
         )
