@@ -14,6 +14,9 @@ import datetime
 import uuid
 import pymysql
 import hmac
+from django.core.mail import EmailMultiAlternatives
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
@@ -5734,6 +5737,18 @@ def _mask_phone(phone: str) -> str:
     return f"{phone[:2]}***{phone[-2:]}"
 
 
+def _mask_email(email: str) -> str:
+    email = str(email or "").strip()
+    if "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        local_masked = local[:1] + "*"
+    else:
+        local_masked = local[:2] + "***"
+    return f"{local_masked}@{domain}"
+
+
 def _agent_error(message: str, status: int = 500):
     return JsonResponse({"error": str(message)}, status=status)
 
@@ -6104,35 +6119,92 @@ def send_max_to_user(max_user_id, message: str) -> bool:
         return False
 
 
+
+
+def send_email_to_user(user, subject: str, message: str) -> bool:
+    """
+    Отправка email пользователю на адрес из users.mail.
+    Возвращает True/False, исключения наружу не пробрасывает.
+    """
+    user_id = getattr(user, "id", None)
+    email = str(getattr(user, "mail", "") or "").strip()
+
+    if not email:
+        logger.warning(f"[EMAIL] У пользователя отсутствует mail user_id={user_id}")
+        return False
+
+    try:
+        validate_email(email)
+    except ValidationError:
+        logger.error(f"[EMAIL] Некорректный email user_id={user_id} email={email!r}")
+        return False
+
+    from_email = (
+        getattr(settings, "DEFAULT_FROM_EMAIL", None)
+        or getattr(settings, "EMAIL_HOST_USER", None)
+    )
+
+    if not from_email:
+        logger.error("[EMAIL] Не настроен DEFAULT_FROM_EMAIL / EMAIL_HOST_USER")
+        return False
+
+    try:
+        msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=from_email,
+            to=[email],
+        )
+        msg.send(fail_silently=False)
+
+        logger.info(
+            f"[EMAIL] Письмо успешно отправлено user_id={user_id} email={email}"
+        )
+        return True
+
+    except Exception as e:
+        logger.exception(
+            f"[EMAIL] Ошибка отправки письма user_id={user_id} email={email}: {e}"
+        )
+        return False
+
+
+
+
 def send_pin_to_user_channels(user, pin: str) -> dict:
     """
     Отправляет PIN по приоритету каналов:
 
     1. Если у пользователя есть max_id -> отправляем ТОЛЬКО в MAX
-    2. Если max_id нет, но есть tg_id -> отправляем ТОЛЬКО в Telegram
-    3. Если нет ни max_id, ни tg_id -> ничего не отправляем
+    2. Если max_id нет, но есть mail -> отправляем ТОЛЬКО на email
+    3. Если нет ни max_id, ни mail -> ничего не отправляем
 
     ВАЖНО:
-    - если есть и max_id, и tg_id, Telegram НЕ используется
-    - fallback с MAX на Telegram НЕ выполняется
+    - Telegram для PIN сейчас НЕ используется
+    - fallback с MAX на email НЕ выполняется, если max_id есть
     """
-    message = f"Ваш код авторизации: {pin}\nОн действителен {PIN_TTL_MINUTES} минут."
+    ttl_text = f"{PIN_TTL_MINUTES} минут"
+    pin_message = f"Ваш код авторизации: {pin}\nОн действителен {ttl_text}."
 
-    telegram_sent = False
     max_sent = False
+    email_sent = False
 
     user_id = getattr(user, "id", None)
-    tg_id = getattr(user, "tg_id", None)
     max_id = getattr(user, "max_id", None)
+    email = str(getattr(user, "mail", "") or "").strip()
 
     # Приоритет MAX
     if max_id:
         try:
-            max_sent = bool(send_max_to_user(max_id, message))
+            max_sent = bool(send_max_to_user(max_id, pin_message))
             if max_sent:
-                logger.info(f"[PIN_DELIVERY] PIN отправлен в MAX user_id={user_id} max_id={max_id}")
+                logger.info(
+                    f"[PIN_DELIVERY] PIN отправлен в MAX user_id={user_id} max_id={max_id}"
+                )
             else:
-                logger.error(f"[PIN_DELIVERY] Не удалось отправить PIN в MAX user_id={user_id} max_id={max_id}")
+                logger.error(
+                    f"[PIN_DELIVERY] Не удалось отправить PIN в MAX user_id={user_id} max_id={max_id}"
+                )
         except Exception as e:
             logger.exception(
                 f"[PIN_DELIVERY] Ошибка отправки PIN в MAX user_id={user_id} "
@@ -6144,35 +6216,46 @@ def send_pin_to_user_channels(user, pin: str) -> dict:
             "ok": max_sent,
             "telegram_sent": False,
             "max_sent": max_sent,
+            "email_sent": False,
         }
 
-    # Если MAX нет — используем Telegram
-    if tg_id:
+    # Если MAX нет — используем email
+    if email:
         try:
-            telegram_sent = bool(send_telegram_to_user(user, message))
-            if telegram_sent:
-                logger.info(f"[PIN_DELIVERY] PIN отправлен в Telegram user_id={user_id} tg_id={tg_id}")
+            subject = "Код авторизации"
+            email_sent = bool(send_email_to_user(user, subject, pin_message))
+
+            if email_sent:
+                logger.info(
+                    f"[PIN_DELIVERY] PIN отправлен на email user_id={user_id} email={email}"
+                )
             else:
-                logger.error(f"[PIN_DELIVERY] Не удалось отправить PIN в Telegram user_id={user_id} tg_id={tg_id}")
+                logger.error(
+                    f"[PIN_DELIVERY] Не удалось отправить PIN на email user_id={user_id} email={email}"
+                )
         except Exception as e:
             logger.exception(
-                f"[PIN_DELIVERY] Ошибка отправки PIN в Telegram user_id={user_id} "
-                f"tg_id={tg_id}: {e}"
+                f"[PIN_DELIVERY] Ошибка отправки PIN на email user_id={user_id} "
+                f"email={email}: {e}"
             )
-            telegram_sent = False
+            email_sent = False
 
         return {
-            "ok": telegram_sent,
-            "telegram_sent": telegram_sent,
+            "ok": email_sent,
+            "telegram_sent": False,
             "max_sent": False,
+            "email_sent": email_sent,
         }
 
     # Нет ни одного канала
-    logger.warning(f"[PIN_DELIVERY] У пользователя нет ни max_id, ни tg_id user_id={user_id}")
+    logger.warning(
+        f"[PIN_DELIVERY] У пользователя нет ни max_id, ни mail user_id={user_id}"
+    )
     return {
         "ok": False,
         "telegram_sent": False,
         "max_sent": False,
+        "email_sent": False,
     }
 
 # def send_pin_to_user_channels(user, pin: str) -> dict:
@@ -6397,7 +6480,7 @@ def agent_auth_start(request):
         users = list(
             User.objects
             .filter(phone__in=list(phone_candidates))
-            .only('id', 'full_name', 'tg_id', 'max_id')
+            .only('id', 'full_name', 'tg_id', 'max_id', 'mail')
             .order_by('id')[:2]
         )
 
@@ -6416,9 +6499,9 @@ def agent_auth_start(request):
 
         user = users[0]
 
-        if not user.tg_id and not user.max_id:
+        if not user.max_id and not str(getattr(user, "mail", "") or "").strip():
             return _agent_error(
-                'Для пользователя не указан ни tg_id, ни max_id, отправка PIN невозможна',
+                'Для пользователя не указан ни max_id, ни email (mail), отправка PIN невозможна',
                 status=500
             )
 
@@ -6461,7 +6544,7 @@ def agent_auth_start(request):
                 f"[AGENT_AUTH/START] Не удалось отправить PIN user_id={user.id} "
                 f"(telegram_sent={delivery['telegram_sent']}, max_sent={delivery['max_sent']})"
             )
-            return _agent_error('Не удалось отправить PIN ни в Telegram, ни в MAX', status=500)
+            return _agent_error('Не удалось отправить PIN ни в MAX, ни на email', status=500)
 
         _send_admin_log_async(
             "\n".join([
@@ -6469,10 +6552,11 @@ def agent_auth_start(request):
                 f"User ID: {user.id}",
                 f"ФИО: {user.full_name}",
                 f"Телефон: {_mask_phone(phone_raw)}",
+                f"Email: {_mask_email(getattr(user, 'mail', '')) if getattr(user, 'mail', None) else 'нет'}",
                 f"Session ID: {session_id}",
                 f"PIN TTL: {PIN_TTL_MINUTES} мин",
-                f"Telegram отправлен: {'да' if delivery['telegram_sent'] else 'нет'}",
-                f"MAX отправлен: {'да' if delivery['max_sent'] else 'нет'}",
+                f"Email отправлен: {'да' if delivery.get('email_sent') else 'нет'}",
+                f"MAX отправлен: {'да' if delivery.get('max_sent') else 'нет'}",
             ])
         )
 
