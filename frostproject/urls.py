@@ -72,7 +72,9 @@ from frostapp.views import (
     sm_sync_staff_stream,
     sm_sync_staff_run,
     sm_staff_ui_create,
-    maxbot_process_update
+    maxbot_process_update,
+    working_employees_excel_page,
+    working_employees_excel_generate,
 )
 
 urlpatterns = [
@@ -220,5 +222,7 @@ urlpatterns = [
         views.working_employees_sync_supermag_test_run,
         name="working_employees_sync_supermag_test_run",
     ),
+    path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
+    path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
