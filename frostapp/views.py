@@ -4571,7 +4571,7 @@ def _safe_str(value: Any) -> str:
     return str(value).strip()
 
 
-def _safe_int(value: Any) -> Optional[int]:
+def _to_int_or_none(value: Any) -> Optional[int]:
     if value is None:
         return None
     try:
@@ -4742,7 +4742,7 @@ def _normalize_working_employee(raw_item: dict) -> Optional[dict]:
         ] if x
     ).strip()
 
-    store_id_int = _safe_int(store_id)
+    store_id_int = _to_int_or_none(store_id)
 
     return {
         "store_id": store_id_int,
@@ -4823,7 +4823,7 @@ def _fetch_sm_database_items() -> list[dict]:
 
         for smstore, name, dbname in rows:
             items.append({
-                "smstore": _safe_int(smstore),
+                "smstore": _to_int_or_none(smstore),
                 "name": _safe_str(name),
                 "dbname": _safe_str(dbname),
             })
@@ -5411,7 +5411,7 @@ def working_employees_excel_generate(request):
 
         store_map: dict[int, dict] = {}
         for item in sm_items:
-            smstore = _safe_int(item.get("smstore"))
+            smstore = _to_int_or_none(item.get("smstore"))
             if smstore is not None:
                 store_map[smstore] = item
 
