@@ -73,7 +73,7 @@ from functools import wraps
 import io
 import mimetypes
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from decimal import Decimal, InvalidOperation
 from django.db import connection
@@ -176,6 +176,13 @@ ONEC_WORKING_EMPLOYEES_URL = os.getenv(
     "ONEC_WORKING_EMPLOYEES_URL",
     "http://192.168.17.26/zupcorp_http/hs/API/Get_WorkingEmployees",
 )
+
+ALLOWED_WORKING_EMPLOYEE_POSITIONS = {
+    "приемщик магазина",
+    "администратор магазина",
+    "директор магазина",
+    "приемщик товара",
+}
 
 ONEC_WORKING_EMPLOYEES_TIMEOUT = int(os.getenv("ONEC_WORKING_EMPLOYEES_TIMEOUT", "180"))
 
@@ -4555,6 +4562,372 @@ def _oracle_rows_to_jsonable(cur):
 
 
 
+
+#Удалить после 30.03
+
+def _safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
+def _normalize_spaces(value: Any) -> str:
+    return re.sub(r"\s+", " ", _safe_str(value)).strip()
+
+
+def _normalize_position(value: Any) -> str:
+    return _normalize_spaces(value).casefold()
+
+
+def _get_first_present(obj: dict, *keys: str) -> Any:
+    """
+    Ищет значение по нескольким вариантам ключа, без учёта регистра.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    # прямое совпадение
+    for key in keys:
+        if key in obj and obj[key] not in (None, ""):
+            return obj[key]
+
+    # поиск без учёта регистра/лишних пробелов
+    normalized = {
+        str(k).strip().casefold(): v
+        for k, v in obj.items()
+    }
+    for key in keys:
+        found = normalized.get(str(key).strip().casefold(), None)
+        if found not in (None, ""):
+            return found
+
+    return None
+
+
+def _parse_working_employees_text(raw_text: str) -> list[dict]:
+    """
+    Резервный парсер на случай, если 1С отдаёт не JSON, а текст формата:
+
+    1217
+    ИНН   "032626275702"
+    Фамилия "Иванова"
+    ...
+    """
+    items: list[dict] = []
+    current: dict = {}
+    current_id = None
+
+    for raw_line in (raw_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # новая запись начинается с числового ID
+        if re.fullmatch(r"\d+", line):
+            if current:
+                if current_id is not None and "id" not in current:
+                    current["id"] = current_id
+                items.append(current)
+                current = {}
+            current_id = int(line)
+            continue
+
+        if "\t" in line:
+            key, value = line.split("\t", 1)
+        elif ":" in line:
+            key, value = line.split(":", 1)
+        else:
+            continue
+
+        key = key.strip().strip('"')
+        value = value.strip().strip('"')
+
+        if value.lower() == "true":
+            parsed_value = True
+        elif value.lower() == "false":
+            parsed_value = False
+        else:
+            parsed_value = value
+
+        current[key] = parsed_value
+
+    if current:
+        if current_id is not None and "id" not in current:
+            current["id"] = current_id
+        items.append(current)
+
+    return items
+
+
+def _extract_working_employees_items(payload: Any) -> list[dict]:
+    """
+    Поддержка разных форматов ответа:
+    - список объектов
+    - dict с keys: items/data/result/value/employees
+    - текстовый ответ
+    """
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+
+    if isinstance(payload, dict):
+        # сначала ищем типовые контейнеры
+        for key in ("items", "data", "result", "value", "employees", "Работники"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+            if isinstance(value, dict):
+                nested = _extract_working_employees_items(value)
+                if nested:
+                    return nested
+
+        # если это уже одна карточка сотрудника
+        if any(
+            k in payload
+            for k in ("ИНН", "Фамилия", "Имя", "Отчество", "Должность", "ИдМагазина")
+        ):
+            return [payload]
+
+        # пробуем пройтись по вложенным значениям
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                nested = _extract_working_employees_items(value)
+                if nested:
+                    return nested
+
+        return []
+
+    if isinstance(payload, str):
+        text = payload.lstrip("\ufeff").strip()
+        if not text:
+            return []
+
+        # сначала пробуем JSON
+        try:
+            reparsed = json.loads(text)
+            return _extract_working_employees_items(reparsed)
+        except Exception:
+            pass
+
+        # потом текстовый разбор
+        return _parse_working_employees_text(text)
+
+    return []
+
+
+def _normalize_working_employee(raw_item: dict) -> Optional[dict]:
+    if not isinstance(raw_item, dict):
+        return None
+
+    last_name = _get_first_present(raw_item, "Фамилия", "lastname", "last_name")
+    first_name = _get_first_present(raw_item, "Имя", "firstname", "first_name")
+    middle_name = _get_first_present(raw_item, "Отчество", "middlename", "middle_name")
+    position = _get_first_present(raw_item, "Должность", "position")
+    inn = _get_first_present(raw_item, "ИНН", "inn")
+    store_id = _get_first_present(raw_item, "ИдМагазина", "IDМагазина", "id_store", "store_id")
+
+    full_name = " ".join(
+        x for x in [
+            _safe_str(last_name),
+            _safe_str(first_name),
+            _safe_str(middle_name),
+        ] if x
+    ).strip()
+
+    store_id_int = _safe_int(store_id)
+
+    return {
+        "store_id": store_id_int,
+        "inn": _safe_str(inn),
+        "full_name": full_name,
+        "position": _normalize_spaces(position),
+    }
+
+
+def _fetch_working_employees_from_1c() -> list[dict]:
+    """
+    Загружает список работающих сотрудников из 1С.
+    """
+    auth = None
+    if ONEC_WORKING_EMPLOYEES_AUTH_USER or ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD:
+        auth = (
+            ONEC_WORKING_EMPLOYEES_AUTH_USER,
+            ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD,
+        )
+
+    headers = {
+        "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+    }
+
+    logger.info("[WORKING_EMPLOYEES_EXCEL] Requesting 1C employees: %s", ONEC_WORKING_EMPLOYEES_URL)
+    response = requests.get(
+        ONEC_WORKING_EMPLOYEES_URL,
+        auth=auth,
+        headers=headers,
+        timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    raw_text = response.text.lstrip("\ufeff").strip()
+
+    payload: Any
+    try:
+        payload = response.json()
+    except Exception:
+        payload = raw_text
+
+    items = _extract_working_employees_items(payload)
+    logger.info("[WORKING_EMPLOYEES_EXCEL] 1C returned employees: %s", len(items))
+    return items
+
+
+def _fetch_sm_database_items() -> list[dict]:
+    """
+    Общий helper для получения списка магазинов и dbname.
+    Используется и в /sm/databases/, и в Excel-выгрузке.
+    """
+    sql = """
+        SELECT
+          l.id       AS smstore,
+          l.name     AS name,
+          p.propval  AS dbname
+        FROM smstorelocations l
+        LEFT JOIN smstoreproperties p
+          ON p.storeloc = l.id
+         AND p.propid   = 'REP.DBNAME'
+        WHERE
+          l.name NOT LIKE 'я%%'
+          AND l.name NOT LIKE '%%ТЕСТ%%'
+          AND l.formatid IN (19, 20, 9, 8, 6, 22, 23)
+        ORDER BY l.name
+    """
+
+    conn = cur = None
+    try:
+        logger.info("[SM/LIST_DB] Старт запроса списка магазинов + баз")
+        conn = connect_oracle_supermag()
+        cur = conn.cursor()
+        cur.execute(sql)
+
+        items = []
+        rows = cur.fetchall()
+        logger.info("[SM/LIST_DB] Получено строк из Oracle: %s", len(rows))
+
+        for smstore, name, dbname in rows:
+            items.append({
+                "smstore": _safe_int(smstore),
+                "name": _safe_str(name),
+                "dbname": _safe_str(dbname),
+            })
+
+        logger.info("[SM/LIST_DB] Итог: count=%s", len(items))
+        return items
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _build_working_employees_excel(rows: list[dict]) -> io.BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Сотрудники"
+
+    headers = [
+        "Имя локальной базы",
+        "ИДМагазина",
+        "Название магазина",
+        "ФИО сотрудника",
+        "Должность",
+        "ИНН сотрудника",
+    ]
+    ws.append(headers)
+
+    for row in rows:
+        ws.append([
+            row.get("dbname", ""),
+            row.get("store_id", ""),
+            row.get("store_name", ""),
+            row.get("full_name", ""),
+            row.get("position", ""),
+            row.get("inn", ""),
+        ])
+
+    # стили
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin = Side(border_style="thin", color="D9D9D9")
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:F{max(ws.max_row, 1)}"
+
+    column_widths = {
+        "A": 18,
+        "B": 12,
+        "C": 45,
+        "D": 35,
+        "E": 28,
+        "F": 18,
+    }
+    for col_letter, width in column_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    for row_idx in range(2, ws.max_row + 1):
+        ws.row_dimensions[row_idx].height = 24
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @csrf_exempt
 def sm_staff_list(request):
     """
@@ -4919,7 +5292,6 @@ def sm_get_dbname(request):
         logger.exception("[SM/GET_DBNAME] Unexpected error")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
-
 @csrf_exempt
 def sm_list_databases(request):
     """
@@ -4929,69 +5301,193 @@ def sm_list_databases(request):
     if request.method != 'GET':
         return JsonResponse({'status': 'error', 'message': 'Только GET'}, status=405)
 
-    sql = """
-        SELECT
-          l.id       AS smstore,
-          l.name     AS name,
-          p.propval  AS dbname
-        FROM smstorelocations l
-        LEFT JOIN smstoreproperties p
-          ON p.storeloc = l.id
-         AND p.propid   = 'REP.DBNAME'
-        WHERE
-          l.name NOT LIKE 'я%%'
-          AND l.name NOT LIKE '%%ТЕСТ%%'
-          AND l.formatid IN (19, 20, 9, 8, 6, 22, 23)
-        ORDER BY l.name
-    """
-
-    conn = cur = None
     try:
-        logger.info("[SM/LIST_DB] Старт запроса списка магазинов + баз")
-        conn = connect_oracle_supermag()
-        cur = conn.cursor()
-        cur.execute(sql)
-
-        items = []
-        rows = cur.fetchall()
-        logger.info(f"[SM/LIST_DB] Получено строк из Oracle: {len(rows)}")
-
-        for smstore, name, dbname in rows:
-            name_s = (name or "").strip()
-            db_s = (dbname or "").strip() if dbname is not None else ""
-            logger.info(
-                "[SM/LIST_DB] STORE: smstore=%s, name=%r, dbname=%r",
-                smstore, name_s, db_s
-            )
-            items.append({
-                "smstore": smstore,
-                "name": name_s,
-                "dbname": db_s,
-            })
-
-        logger.info(f"[SM/LIST_DB] Итог: count={len(items)}")
+        items = _fetch_sm_database_items()
         return JsonResponse({
             "status": "ok",
             "count": len(items),
             "items": items
         })
-
     except Exception as e:
         logger.exception("[SM/LIST_DB] Unexpected error")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-    finally:
-        try:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
-        except Exception:
-            pass
+# @csrf_exempt
+# def sm_list_databases(request):
+#     """
+#     GET /sm/databases/
+#     Список магазинов + их база (REP.DBNAME)
+#     """
+#     if request.method != 'GET':
+#         return JsonResponse({'status': 'error', 'message': 'Только GET'}, status=405)
+
+#     sql = """
+#         SELECT
+#           l.id       AS smstore,
+#           l.name     AS name,
+#           p.propval  AS dbname
+#         FROM smstorelocations l
+#         LEFT JOIN smstoreproperties p
+#           ON p.storeloc = l.id
+#          AND p.propid   = 'REP.DBNAME'
+#         WHERE
+#           l.name NOT LIKE 'я%%'
+#           AND l.name NOT LIKE '%%ТЕСТ%%'
+#           AND l.formatid IN (19, 20, 9, 8, 6, 22, 23)
+#         ORDER BY l.name
+#     """
+
+#     conn = cur = None
+#     try:
+#         logger.info("[SM/LIST_DB] Старт запроса списка магазинов + баз")
+#         conn = connect_oracle_supermag()
+#         cur = conn.cursor()
+#         cur.execute(sql)
+
+#         items = []
+#         rows = cur.fetchall()
+#         logger.info(f"[SM/LIST_DB] Получено строк из Oracle: {len(rows)}")
+
+#         for smstore, name, dbname in rows:
+#             name_s = (name or "").strip()
+#             db_s = (dbname or "").strip() if dbname is not None else ""
+#             logger.info(
+#                 "[SM/LIST_DB] STORE: smstore=%s, name=%r, dbname=%r",
+#                 smstore, name_s, db_s
+#             )
+#             items.append({
+#                 "smstore": smstore,
+#                 "name": name_s,
+#                 "dbname": db_s,
+#             })
+
+#         logger.info(f"[SM/LIST_DB] Итог: count={len(items)}")
+#         return JsonResponse({
+#             "status": "ok",
+#             "count": len(items),
+#             "items": items
+#         })
+
+#     except Exception as e:
+#         logger.exception("[SM/LIST_DB] Unexpected error")
+#         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+#     finally:
+#         try:
+#             if cur:
+#                 cur.close()
+#             if conn:
+#                 conn.close()
+#         except Exception:
+#             pass
 
 
 
 
+# Убрать после 30.03
 
+@staff_member_required
+@never_cache
+@require_http_methods(["GET"])
+def working_employees_excel_page(request):
+    return render(
+        request,
+        "frostapp/working_employees_excel.html",
+        {
+            "title": "Выгрузка сотрудников по магазинам",
+        }
+    )
+
+
+@staff_member_required
+@csrf_protect
+@require_http_methods(["POST"])
+def working_employees_excel_generate(request):
+    try:
+        allowed_positions = {
+            _normalize_position(x) for x in ALLOWED_WORKING_EMPLOYEE_POSITIONS
+        }
+
+        raw_employees = _fetch_working_employees_from_1c()
+        sm_items = _fetch_sm_database_items()
+
+        store_map: dict[int, dict] = {}
+        for item in sm_items:
+            smstore = _safe_int(item.get("smstore"))
+            if smstore is not None:
+                store_map[smstore] = item
+
+        rows: list[dict] = []
+        missing_store_ids: set[int] = set()
+
+        for raw_item in raw_employees:
+            employee = _normalize_working_employee(raw_item)
+            if not employee:
+                continue
+
+            position_norm = _normalize_position(employee.get("position"))
+            if position_norm not in allowed_positions:
+                continue
+
+            store_id = employee.get("store_id")
+            store_info = store_map.get(store_id) if store_id is not None else None
+
+            if store_id is not None and not store_info:
+                missing_store_ids.add(store_id)
+
+            rows.append({
+                "dbname": _safe_str(store_info.get("dbname")) if store_info else "",
+                "store_id": store_id or "",
+                "store_name": _safe_str(store_info.get("name")) if store_info else "",
+                "full_name": _safe_str(employee.get("full_name")),
+                "position": _safe_str(employee.get("position")),
+                "inn": _safe_str(employee.get("inn")),
+            })
+
+        rows.sort(
+            key=lambda x: (
+                str(x.get("dbname", "")),
+                str(x.get("store_id", "")),
+                str(x.get("full_name", "")),
+            )
+        )
+
+        logger.info(
+            "[WORKING_EMPLOYEES_EXCEL] filtered_rows=%s missing_store_ids=%s",
+            len(rows),
+            sorted(missing_store_ids),
+        )
+
+        excel_file = _build_working_employees_excel(rows)
+        filename = f"working_employees_{timezone.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        response = HttpResponse(
+            excel_file.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    except requests.RequestException as e:
+        logger.exception("[WORKING_EMPLOYEES_EXCEL] 1C request error")
+        return render(
+            request,
+            "frostapp/working_employees_excel.html",
+            {
+                "title": "Выгрузка сотрудников по магазинам",
+                "error": f"Ошибка запроса к 1С: {e}",
+            },
+            status=500,
+        )
+    except Exception as e:
+        logger.exception("[WORKING_EMPLOYEES_EXCEL] Unexpected error")
+        return render(
+            request,
+            "frostapp/working_employees_excel.html",
+            {
+                "title": "Выгрузка сотрудников по магазинам",
+                "error": str(e),
+            },
+            status=500,
+        )
 
 
 
