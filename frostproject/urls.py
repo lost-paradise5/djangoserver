@@ -75,6 +75,7 @@ from frostapp.views import (
     maxbot_process_update,
     working_employees_excel_page,
     working_employees_excel_generate,
+    export_stores_excel,
 )
 
 urlpatterns = [
@@ -91,6 +92,7 @@ urlpatterns = [
     path('queue/delete_cashier/', delete_cashier, name='delete_cashier'),
     path('get_qr_code_by_employee_id/', get_qr_code_by_employee_id, name='get_qr_code_by_employee_id'),
     path('export/stores/xml/', export_stores_xml, name='export_stores_xml'),
+    path('export/stores/excel/', export_stores_excel, name='export_stores_excel'),
     path('employee-identification/', employee_identification, name='employee_identification'),
     path('sm/dbname/', sm_get_dbname, name='sm_get_dbname'),
     path('sm/databases/', sm_list_databases, name='sm_list_databases'),
