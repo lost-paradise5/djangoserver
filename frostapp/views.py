@@ -5602,6 +5602,200 @@ def _fetch_stores(q: str, region: str, only_active: bool):
             pass
     return rows
 
+
+
+
+
+STORE_COMPARE_FIELDS = (
+    'region',
+    'name',
+    'address',
+    'close_date',
+    'ukm4store',
+    'ukm4ip',
+    'ukm5store',
+    'latitude',
+    'longitude',
+)
+
+
+def _store_json_value(value):
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return format(value, 'f')
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    return value
+
+
+def _store_norm_text(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def _store_norm_int(value, field_name: str, smstore_hint=None, problems=None):
+    if value is None or value == '':
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    try:
+        return int(s)
+    except Exception:
+        try:
+            d = Decimal(s.replace(',', '.'))
+            if d == d.to_integral_value():
+                return int(d)
+        except Exception:
+            pass
+
+    if problems is not None:
+        problems.append({
+            'smstore': smstore_hint,
+            'field': field_name,
+            'raw_value': s,
+            'problem': 'invalid_int',
+        })
+    return None
+
+
+def _store_norm_date(value, field_name: str, smstore_hint=None, problems=None):
+    if value is None or value == '':
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    for fmt in ('%d.%m.%Y', '%d.%m.%Y %H:%M:%S', '%Y-%m-%d'):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+
+    if problems is not None:
+        problems.append({
+            'smstore': smstore_hint,
+            'field': field_name,
+            'raw_value': s,
+            'problem': 'invalid_date',
+        })
+    return None
+
+
+def _store_norm_ip(value, field_name: str, smstore_hint=None, problems=None):
+    if value is None or value == '':
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    try:
+        return str(ipaddress.ip_address(s))
+    except Exception:
+        if problems is not None:
+            problems.append({
+                'smstore': smstore_hint,
+                'field': field_name,
+                'raw_value': s,
+                'problem': 'invalid_ip',
+            })
+        return None
+
+
+def _store_norm_decimal(value, field_name: str, smstore_hint=None, problems=None):
+    if value is None or value == '':
+        return None
+
+    try:
+        return Decimal(str(value).strip().replace(',', '.')).quantize(Decimal('0.000001'))
+    except (InvalidOperation, ValueError, TypeError):
+        if problems is not None:
+            problems.append({
+                'smstore': smstore_hint,
+                'field': field_name,
+                'raw_value': str(value),
+                'problem': 'invalid_decimal',
+            })
+        return None
+
+
+def _normalize_oracle_store_row(row: dict, problems: list):
+    smstore_raw = row.get('smstore')
+    smstore = _store_norm_int(smstore_raw, 'smstore', smstore_raw, problems)
+
+    return {
+        'region': _store_norm_text(row.get('region')),
+        'smstore': smstore,
+        'name': _store_norm_text(row.get('name')),
+        'address': _store_norm_text(row.get('address')),
+        'close_date': _store_norm_date(row.get('closedate'), 'closedate', smstore_raw, problems),
+        'ukm4store': _store_norm_int(row.get('ukm4store'), 'ukm4store', smstore_raw, problems),
+        'ukm4ip': _store_norm_ip(row.get('ukm4ip'), 'ukm4ip', smstore_raw, problems),
+        'ukm5store': _store_norm_int(row.get('ukm5store'), 'ukm5store', smstore_raw, problems),
+        'latitude': _store_norm_decimal(row.get('latitude'), 'latitude', smstore_raw, problems),
+        'longitude': _store_norm_decimal(row.get('longitude'), 'longitude', smstore_raw, problems),
+    }
+
+
+def _normalize_pg_store_obj(store: Store):
+    return {
+        'id': store.id,
+        'region': _store_norm_text(store.region),
+        'smstore': store.smstore,
+        'name': _store_norm_text(store.name),
+        'address': _store_norm_text(store.address),
+        'close_date': store.close_date,
+        'ukm4store': store.ukm4store,
+        'ukm4ip': _store_norm_text(store.ukm4ip),
+        'ukm5store': store.ukm5store,
+        'latitude': _store_norm_decimal(store.latitude, 'latitude'),
+        'longitude': _store_norm_decimal(store.longitude, 'longitude'),
+    }
+
+
+def _build_store_diff(pg_store: Store, oracle_row: dict):
+    current = _normalize_pg_store_obj(pg_store)
+    diff = {}
+
+    for field in STORE_COMPARE_FIELDS:
+        old_val = current.get(field)
+        new_val = oracle_row.get(field)
+        if old_val != new_val:
+            diff[field] = {
+                'db': _store_json_value(old_val),
+                'oracle': _store_json_value(new_val),
+            }
+
+    return diff
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @csrf_exempt
 def export_stores_xml(request):
     """
@@ -5770,6 +5964,199 @@ def export_stores_excel(request):
     except Exception as e:
         logger.exception("export_stores_excel error")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
+
+
+@require_GET
+def sync_stores_postgres(request):
+    """
+    GET /sync/stores/?q=&region=&only_active=0
+
+    Что делает:
+    - берет магазины из Oracle через _fetch_stores
+    - сравнивает с PostgreSQL stores по smstore
+    - если записи нет -> добавляет
+    - если запись есть -> НЕ меняет, только фиксирует различия
+    - пишет подробные логи и возвращает JSON
+    """
+    try:
+        q = (request.GET.get('q') or '').strip()
+        region = (request.GET.get('region') or '').strip()
+        only_active = (request.GET.get('only_active') or '0') in ('1', 'true', 'True')
+
+        logger.info(
+            "[stores_sync] start q=%r region=%r only_active=%s",
+            q, region, only_active
+        )
+
+        oracle_rows_raw = _fetch_stores(q, region, only_active)
+
+        normalization_problems = []
+        source_duplicates = []
+        skipped_source_rows = []
+
+        oracle_by_smstore = {}
+
+        for raw in oracle_rows_raw:
+            normalized = _normalize_oracle_store_row(raw, normalization_problems)
+            smstore = normalized.get('smstore')
+
+            if smstore is None:
+                skipped_source_rows.append({
+                    'raw_row': raw,
+                    'reason': 'smstore_is_null_or_invalid',
+                })
+                logger.warning("[stores_sync] skipped source row without valid smstore: %r", raw)
+                continue
+
+            if smstore in oracle_by_smstore:
+                source_duplicates.append({
+                    'smstore': smstore,
+                    'first_row': oracle_by_smstore[smstore],
+                    'duplicate_row': normalized,
+                })
+                logger.warning("[stores_sync] duplicate smstore in Oracle source: smstore=%s", smstore)
+                continue
+
+            oracle_by_smstore[smstore] = normalized
+
+        db_duplicates = []
+        db_by_smstore = {}
+
+        for store in Store.objects.all().order_by('id'):
+            if store.smstore is None:
+                continue
+
+            if store.smstore in db_by_smstore:
+                db_duplicates.append({
+                    'smstore': store.smstore,
+                    'kept_id': db_by_smstore[store.smstore].id,
+                    'duplicate_id': store.id,
+                })
+                logger.warning(
+                    "[stores_sync] duplicate smstore in PostgreSQL stores: smstore=%s kept_id=%s duplicate_id=%s",
+                    store.smstore, db_by_smstore[store.smstore].id, store.id
+                )
+                continue
+
+            db_by_smstore[store.smstore] = store
+
+        added = []
+        needs_update = []
+        unchanged_count = 0
+
+        with transaction.atomic():
+            for smstore, oracle_row in oracle_by_smstore.items():
+                existing = db_by_smstore.get(smstore)
+
+                if existing is None:
+                    created = Store.objects.create(
+                        region=oracle_row.get('region'),
+                        smstore=oracle_row.get('smstore'),
+                        name=oracle_row.get('name'),
+                        address=oracle_row.get('address'),
+                        close_date=oracle_row.get('close_date'),
+                        ukm4store=oracle_row.get('ukm4store'),
+                        ukm4ip=oracle_row.get('ukm4ip'),
+                        ukm5store=oracle_row.get('ukm5store'),
+                        latitude=oracle_row.get('latitude'),
+                        longitude=oracle_row.get('longitude'),
+                    )
+
+                    add_info = {
+                        'id': created.id,
+                        'smstore': created.smstore,
+                        'name': created.name,
+                        'region': created.region,
+                        'ukm4store': created.ukm4store,
+                        'ukm4ip': created.ukm4ip,
+                        'ukm5store': created.ukm5store,
+                    }
+                    added.append(add_info)
+
+                    logger.info(
+                        "[stores_sync] ADDED store id=%s smstore=%s name=%r region=%r ukm4store=%r ukm4ip=%r ukm5store=%r",
+                        created.id,
+                        created.smstore,
+                        created.name,
+                        created.region,
+                        created.ukm4store,
+                        created.ukm4ip,
+                        created.ukm5store,
+                    )
+                    continue
+
+                diff = _build_store_diff(existing, oracle_row)
+                if diff:
+                    item = {
+                        'id': existing.id,
+                        'smstore': existing.smstore,
+                        'name_db': existing.name,
+                        'name_oracle': oracle_row.get('name'),
+                        'differences': diff,
+                    }
+                    needs_update.append(item)
+
+                    logger.warning(
+                        "[stores_sync] NEEDS_UPDATE id=%s smstore=%s diff=%s",
+                        existing.id,
+                        existing.smstore,
+                        json.dumps(diff, ensure_ascii=False)
+                    )
+                else:
+                    unchanged_count += 1
+
+        result = {
+            'status': 'ok',
+            'filters': {
+                'q': q,
+                'region': region,
+                'only_active': only_active,
+            },
+            'source_count_raw': len(oracle_rows_raw),
+            'source_count_unique': len(oracle_by_smstore),
+            'db_count_total': Store.objects.count(),
+            'added_count': len(added),
+            'needs_update_count': len(needs_update),
+            'unchanged_count': unchanged_count,
+            'skipped_source_rows_count': len(skipped_source_rows),
+            'source_duplicates_count': len(source_duplicates),
+            'db_duplicates_count': len(db_duplicates),
+            'normalization_problems_count': len(normalization_problems),
+
+            'added': added,
+            'needs_update': needs_update,
+            'skipped_source_rows': skipped_source_rows,
+            'source_duplicates': source_duplicates,
+            'db_duplicates': db_duplicates,
+            'normalization_problems': normalization_problems,
+        }
+
+        logger.info(
+            "[stores_sync] finish source_raw=%s source_unique=%s added=%s needs_update=%s unchanged=%s skipped=%s source_duplicates=%s db_duplicates=%s normalization_problems=%s",
+            len(oracle_rows_raw),
+            len(oracle_by_smstore),
+            len(added),
+            len(needs_update),
+            unchanged_count,
+            len(skipped_source_rows),
+            len(source_duplicates),
+            len(db_duplicates),
+            len(normalization_problems),
+        )
+
+        return JsonResponse(result, json_dumps_params={'ensure_ascii': False, 'indent': 2})
+
+    except Exception as e:
+        logger.exception("sync_stores_postgres error")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
 
 
 
