@@ -76,6 +76,7 @@ from frostapp.views import (
     working_employees_excel_page,
     working_employees_excel_generate,
     export_stores_excel,
+    sync_stores_postgres,
 )
 
 urlpatterns = [
@@ -226,5 +227,6 @@ urlpatterns = [
     ),
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
+    path('sync/stores/', sync_stores_postgres, name='sync_stores_postgres'),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
