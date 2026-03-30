@@ -4588,6 +4588,13 @@ def _normalize_position(value: Any) -> str:
     return _normalize_spaces(value).casefold()
 
 
+def _is_discounter_store_name(store_name: Any) -> bool:
+    """
+    True, если в названии магазина встречается 'ДИСКАУНТЕР'
+    в любом виде: 'ДИСКАУНТЕР', 'ДИСКАУНТЕР12', '... ДИСКАУНТЕР ...'
+    """
+    return "дискаунтер" in _normalize_spaces(store_name).casefold()
+
 def _get_first_present(obj: dict, *keys: str) -> Any:
     """
     Ищет значение по нескольким вариантам ключа, без учёта регистра.
@@ -17736,7 +17743,19 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
         if smstore is not None and smstore not in stores_map:
             stores_map[int(smstore)] = row
 
-    dbname_map = _fetch_dbnames_for_smstores(source_smstore_ids)
+    # Берём те же данные, что и sm_list_databases: smstore + name + dbname
+    sm_info_map = {}
+    for row in _fetch_sm_database_items():
+        smstore = _to_int_or_none(row.get("smstore"))
+        if smstore is None:
+            continue
+        if smstore not in source_smstore_ids:
+            continue
+        if smstore not in sm_info_map:
+            sm_info_map[smstore] = {
+                "name": _safe_text(row.get("name")),
+                "dbname": _safe_text(row.get("dbname")),
+            }
 
     existing_users_qs = User.objects.filter(employee_id__in=inns).only(
         "id", "employee_id", "full_name", "mail", "phone"
@@ -17848,7 +17867,36 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
 
         target_storeid = int(store_row["ukm4store"])
 
-        dbname = _safe_text(dbname_map.get(source_smstore))
+        sm_info = sm_info_map.get(source_smstore) or {}
+        store_name = _safe_text(sm_info.get("name"))
+        dbname = _safe_text(sm_info.get("dbname"))
+
+        # Новый фильтр: если в названии магазина есть "ДИСКАУНТЕР" — не создаём
+        if _is_discounter_store_name(store_name):
+            summary["skipped_discounter"] += 1
+            actions.append(f"магазин: {store_name or source_smstore}")
+            actions.append("создание в Супермаге для магазинов с 'ДИСКАУНТЕР' отключено")
+            results_by_index[idx] = _build_status_row(
+                idx=idx,
+                inn=inn,
+                full_name=full_name,
+                source_storeid=raw_store,
+                target_storeid=target_storeid,
+                status_code="skipped",
+                status="пропущен: магазин относится к ДИСКАУНТЕР",
+                actions=actions,
+                position=position,
+                department=department,
+                sm_db=dbname,
+                user_id=None,
+                user_exists=False,
+                ukm_link_exists=False,
+                oracle_exists=False,
+                sm_login="",
+                sm_password="",
+            )
+            continue
+
         if not dbname:
             summary["warning_dbname_not_found"] += 1
             results_by_index[idx] = _build_status_row(
@@ -18386,7 +18434,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
     )
 
     logger.info(
-        "[WORKING_EMPLOYEES_SUPERMAG] mode=%s total=%s target=%s sm_created=%s sm_will_create=%s warnings=%s errors=%s duration=%s",
+        "[WORKING_EMPLOYEES_SUPERMAG] mode=%s total=%s target=%s sm_created=%s sm_will_create=%s warnings=%s errors=%s skipped_discounter=%s duration=%s",
         mode_name,
         summary["total_received"],
         summary["target_positions"],
@@ -18394,6 +18442,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
         summary.get("sm_will_create", 0),
         summary["warning_rows"],
         summary["error_rows"],
+        summary.get("skipped_discounter", 0),
         duration_sec,
     )
 
