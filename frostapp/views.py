@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import requests
+from io import BytesIO
 from requests.exceptions import RequestException
 import time
 from typing import Tuple, Optional, Any, Iterable
@@ -5648,6 +5649,129 @@ def export_stores_xml(request):
     except Exception as e:
         logger.exception("export_stores_xml error")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+
+@csrf_exempt
+def export_stores_excel(request):
+    """
+    GET /export/stores/excel/?q=&region=&only_active=1
+
+    Формирует Excel со всеми полями магазинов и сразу отдает его на скачивание.
+    """
+    try:
+        q = (request.GET.get('q') or '').strip()
+        region = (request.GET.get('region') or '').strip()
+        only_active = (request.GET.get('only_active') or '1') in ('1', 'true', 'True')
+
+        rows = _fetch_stores(q, region, only_active)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Stores"
+
+        headers = [
+            ("region", "Регион"),
+            ("smstore", "SMSTORE"),
+            ("name", "Название"),
+            ("address", "Адрес"),
+            ("closedate", "Дата закрытия"),
+            ("ukm4store", "UKM4 Store"),
+            ("ukm4ip", "UKM4 IP"),
+            ("ukm5store", "UKM5 Store"),
+            ("latitude", "Широта"),
+            ("longitude", "Долгота"),
+        ]
+
+        # Заголовок
+        ws.append([title for _, title in headers])
+
+        header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+        header_font = Font(bold=True, color="FFFFFF")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin = Side(style="thin", color="D9D9D9")
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        # Данные
+        for row in rows:
+            ws.append([
+                row.get("region"),
+                row.get("smstore"),
+                row.get("name"),
+                row.get("address"),
+                row.get("closedate"),
+                row.get("ukm4store"),
+                row.get("ukm4ip"),
+                row.get("ukm5store"),
+                row.get("latitude"),
+                row.get("longitude"),
+            ])
+
+        # Форматирование тела
+        body_alignment = Alignment(vertical="top", wrap_text=True)
+
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = body_alignment
+                cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        # Числовой формат для координат
+        for row_idx in range(2, ws.max_row + 1):
+            ws[f"I{row_idx}"].number_format = "0.000000"
+            ws[f"J{row_idx}"].number_format = "0.000000"
+
+        # Закрепляем заголовок
+        ws.freeze_panes = "A2"
+
+        # Автофильтр
+        ws.auto_filter.ref = f"A1:J{max(ws.max_row, 1)}"
+
+        # Ширина колонок
+        max_widths = {
+            "A": 20,  # region
+            "B": 12,  # smstore
+            "C": 35,  # name
+            "D": 50,  # address
+            "E": 16,  # closedate
+            "F": 14,  # ukm4store
+            "G": 18,  # ukm4ip
+            "H": 14,  # ukm5store
+            "I": 14,  # latitude
+            "J": 14,  # longitude
+        }
+
+        for col_letter, width in max_widths.items():
+            ws.column_dimensions[col_letter].width = width
+
+        # Немного увеличим высоту заголовка
+        ws.row_dimensions[1].height = 24
+
+        ts = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        fname = f"stores_{ts}.xlsx"
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        response = HttpResponse(
+            output.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        response["Content-Disposition"] = f'attachment; filename="{fname}"'
+
+        return response
+
+    except Exception as e:
+        logger.exception("export_stores_excel error")
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
 
 
 @csrf_exempt
