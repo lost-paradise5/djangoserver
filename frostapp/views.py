@@ -17458,6 +17458,30 @@ def _compose_full_name(item: dict) -> str:
     return " ".join([p for p in parts if p]).strip()
 
 
+def _build_short_sm_afio(first_name: str, last_name: str) -> str:
+    """
+    Укороченный AFIO для Супермага: только 'Имя Фамилия'
+    """
+    first_name = _safe_text(first_name)
+    last_name = _safe_text(last_name)
+    return " ".join([x for x in [first_name, last_name] if x]).strip()
+
+
+def _is_smstaff_surname_too_long_error(exc: Exception) -> bool:
+    """
+    Ловим конкретный кейс:
+    ORA-12899 ... SUPERMAG.SMSTAFF.SURNAME ...
+    """
+    text = _safe_text(exc).upper()
+    return (
+        "ORA-12899" in text
+        and "SMSTAFF" in text
+        and "SURNAME" in text
+    )
+
+
+
+
 def _generate_ks_password() -> str:
     # Всего 40 символов: KS + 38 букв
     return "KS" + "".join(random.choices(string.ascii_letters, k=38))
@@ -18756,7 +18780,16 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                 proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
                 if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
                     raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
-
+                
+                primary_afio = full_name
+                fallback_afio = _build_short_sm_afio(
+                    first_name=item["first_name"],
+                    last_name=item["last_name"],
+                )
+                
+                updated_smstaff_rows = 0
+                used_afio = primary_afio
+                
                 try:
                     cur.execute(
                         f"""
@@ -18778,46 +18811,130 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                         p_acheck=0,
                         p_auserenabled=1,
                         p_ainn=inn,
-                        p_afio=full_name,
+                        p_afio=primary_afio,
                     )
-
+                
                     updated_smstaff_rows = _oracle_update_smstaff_after_create(
                         cur=cur,
                         login=login_new,
                         inn=inn,
-                        afio=full_name,
+                        afio=primary_afio,
                         offindex=SUPERMAG_OFFINDEX_ADMIN,
                     )
-
+                
                     conn.commit()
-
+                
                 except Exception as oracle_exc:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-
-                    summary["oracle_create_errors"] += 1
-                    results_by_index[idx] = _build_status_row(
-                        idx=idx,
-                        inn=inn,
-                        full_name=full_name,
-                        source_storeid=raw_store,
-                        target_storeid=target_storeid,
-                        status_code="error",
-                        status=f"ошибка создания в Супермаге: {oracle_exc}",
-                        actions=actions,
-                        position=position,
-                        department=department,
-                        sm_db=dbname,
-                        user_id=user.id,
-                        user_exists=True,
-                        ukm_link_exists=True,
-                        oracle_exists=False,
-                        sm_login=login_new,
-                        sm_password=pin_code,
-                    )
-                    continue
+                    retried_with_short_afio = False
+                
+                    if (
+                        _is_smstaff_surname_too_long_error(oracle_exc)
+                        and fallback_afio
+                        and fallback_afio != primary_afio
+                    ):
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                
+                        retried_with_short_afio = True
+                        used_afio = fallback_afio
+                        actions.append(
+                            f"полный AFIO не поместился, повторяем создание с AFIO: {fallback_afio}"
+                        )
+                
+                        try:
+                            cur.execute(
+                                f"""
+                                BEGIN
+                                    {proc_name}(
+                                        AUSER => :p_auser,
+                                        APASS => :p_apass,
+                                        ADOL => :p_adol,
+                                        ACHECK => :p_acheck,
+                                        AUSERENABLED => :p_auserenabled,
+                                        AINN => :p_ainn,
+                                        AFIO => :p_afio
+                                    );
+                                END;
+                                """,
+                                p_auser=login_new,
+                                p_apass=pin_code,
+                                p_adol=SUPERMAG_ORAROLE_ADMIN,
+                                p_acheck=0,
+                                p_auserenabled=1,
+                                p_ainn=inn,
+                                p_afio=fallback_afio,
+                            )
+                
+                            updated_smstaff_rows = _oracle_update_smstaff_after_create(
+                                cur=cur,
+                                login=login_new,
+                                inn=inn,
+                                afio=fallback_afio,
+                                offindex=SUPERMAG_OFFINDEX_ADMIN,
+                            )
+                
+                            conn.commit()
+                
+                        except Exception as retry_exc:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                
+                            summary["oracle_create_errors"] += 1
+                            results_by_index[idx] = _build_status_row(
+                                idx=idx,
+                                inn=inn,
+                                full_name=full_name,
+                                source_storeid=raw_store,
+                                target_storeid=target_storeid,
+                                status_code="error",
+                                status=f"ошибка создания в Супермаге после повтора с коротким AFIO: {retry_exc}",
+                                actions=actions,
+                                position=position,
+                                department=department,
+                                sm_db=dbname,
+                                user_id=user.id,
+                                user_exists=True,
+                                ukm_link_exists=True,
+                                oracle_exists=False,
+                                sm_login=login_new,
+                                sm_password=pin_code,
+                            )
+                            continue
+                
+                    else:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                
+                        summary["oracle_create_errors"] += 1
+                        results_by_index[idx] = _build_status_row(
+                            idx=idx,
+                            inn=inn,
+                            full_name=full_name,
+                            source_storeid=raw_store,
+                            target_storeid=target_storeid,
+                            status_code="error",
+                            status=f"ошибка создания в Супермаге: {oracle_exc}",
+                            actions=actions,
+                            position=position,
+                            department=department,
+                            sm_db=dbname,
+                            user_id=user.id,
+                            user_exists=True,
+                            ukm_link_exists=True,
+                            oracle_exists=False,
+                            sm_login=login_new,
+                            sm_password=pin_code,
+                        )
+                        continue
+                
+                if used_afio != primary_afio:
+                    actions.append(f"создано с укороченным AFIO: {used_afio}")
 
                 row_status_code = "success"
                 row_status_text = "создан в Супермаге"
