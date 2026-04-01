@@ -7,6 +7,9 @@
         <h1>История заявок</h1>
         <div class="muted">Здесь видно, кто проходил сценарий, какие ответы дал и были ли аварийные ситуации.</div>
     </div>
+    <a class="btn btn-success" href="{% url 'maxbot_request_export_excel' %}?q={{ q|urlencode }}&status={{ status|urlencode }}&emergency={{ emergency|urlencode }}">
+        Скачать Excel
+    </a>
 </div>
 
 <div class="card">
@@ -45,7 +48,7 @@
         </thead>
         <tbody>
         {% for req in page_obj %}
-            <tr>
+            <tr class="{% if req.status == 'emergency_stop' or req.emergency_flag %}row-danger{% elif req.status == 'cancelled' %}row-warning{% endif %}">
                 <td>{{ req.request_no }}</td>
                 <td>{{ req.applicant_full_name }}</td>
                 <td>{{ req.role|default:"-" }}</td>
