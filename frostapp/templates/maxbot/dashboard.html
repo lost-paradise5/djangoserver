@@ -60,7 +60,7 @@
     <h2>Последние заявки</h2>
     <table>
         <thead>
-            <tr>
+            <tr class="{% if req.status == 'emergency_stop' or req.emergency_flag %}row-danger{% elif req.status == 'cancelled' %}row-warning{% endif %}">
                 <th>№</th>
                 <th>Кто заполнил</th>
                 <th>Должность</th>
