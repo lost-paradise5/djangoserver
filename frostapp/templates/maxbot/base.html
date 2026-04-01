@@ -228,6 +228,32 @@
             gap: 18px;
         }
 
+
+
+        .row-danger td {
+            background: #fee2e2 !important;
+            color: #7f1d1d;
+            font-weight: 600;
+        }
+    
+        .row-warning td {
+            background: #fef3c7 !important;
+            color: #92400e;
+        }
+    
+        .help-box {
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1e3a8a;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 18px;
+        }
+    
+        .mono {
+            font-family: Consolas, Monaco, monospace;
+        }
+
         @media (max-width: 1100px) {
             .grid, .two-col {
                 grid-template-columns: 1fr 1fr;
@@ -254,12 +280,12 @@
     <aside class="sidebar">
         <h2>MAX Bot</h2>
         <a href="{% url 'maxbot_dashboard' %}">Главная</a>
-        <a href="{% url 'maxbot_role_list' %}">Должности</a>
-        <a href="{% url 'maxbot_employee_list' %}">Сотрудники</a>
+        <a href="{% url 'maxbot_role_list' %}">Должности / роли</a>
+        <a href="{% url 'maxbot_employee_list' %}">Сотрудники для автопривязки</a>
         <a href="{% url 'maxbot_vehicle_list' %}">Машины</a>
         <a href="{% url 'maxbot_scenario_list' %}">Сценарии</a>
-        <a href="{% url 'maxbot_request_list' %}">История заявок</a>
-        <a href="/admin/" target="_blank">Вход / админ-пользователь</a>
+        <a href="{% url 'maxbot_request_list' %}">Журнал заявок</a>
+        <a href="/admin/" target="_blank">Админка Django</a>
     </aside>
 
     <main class="content">
