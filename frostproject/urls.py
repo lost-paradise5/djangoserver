@@ -202,6 +202,7 @@ urlpatterns = [
 
     path("maxbot/requests/", views.maxbot_request_list, name="maxbot_request_list"),
     path("maxbot/requests/<int:pk>/", views.maxbot_request_detail, name="maxbot_request_detail"),
+    path("maxbot/requests/export/", views.maxbot_request_export_excel, name="maxbot_request_export_excel"),
 
 
 
