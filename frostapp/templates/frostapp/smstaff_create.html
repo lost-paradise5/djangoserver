@@ -29,39 +29,60 @@
       <div>{{ error }}</div>
       {% if created_password %}
         <hr>
-        <div><b>Сгенерированный пароль:</b> <code style="font-size: 1.1rem;">{{ created_password }}</code></div>
+        <div><b>Пароль, переданный в процедуру:</b> <code style="font-size: 1.1rem;">{{ created_password }}</code></div>
       {% endif %}
     </div>
   {% endif %}
 
   {% if success_message %}
-    <div class="alert alert-success">
+    <div class="alert alert-info">
       <div>{{ success_message }}</div>
       {% if created_password %}
         <hr>
-        <div><b>Сгенерированный пароль:</b> <code style="font-size: 1.1rem;">{{ created_password }}</code></div>
+        <div><b>Пароль, переданный в процедуру:</b> <code style="font-size: 1.1rem;">{{ created_password }}</code></div>
       {% endif %}
     </div>
   {% endif %}
 
   <form method="get" class="card card-body mb-3">
-    <div class="row g-2 align-items-end">
-      <div class="col-md-4">
-        <label class="form-label">База</label>
-        <select class="form-select" name="db">
+    <div class="row g-3 align-items-end">
+      <div class="col-md-6">
+        <label class="form-label">Базы</label>
+        <select class="form-select" name="dbs" multiple size="12">
           {% for s in services %}
-            <option value="{{ s }}" {% if s == db %}selected{% endif %}>{{ s }}</option>
+            <option value="{{ s }}" {% if s in selected_dbs %}selected{% endif %}>{{ s }}</option>
           {% endfor %}
         </select>
+        <div class="form-text">
+          Можно выбрать сразу несколько баз. Для множественного выбора используй Ctrl / Cmd.
+        </div>
       </div>
-      <div class="col-md-8">
-        <button class="btn btn-outline-primary">Загрузить должности для выбранной базы</button>
+
+      <div class="col-md-4">
+        <label class="form-label">База для списка должностей</label>
+        <select class="form-select" name="position_source_db">
+          {% for s in services %}
+            <option value="{{ s }}" {% if s == position_source_db %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+        <div class="form-text">
+          Из этой базы загружается список должностей. Затем должность сопоставляется в остальных базах.
+        </div>
+      </div>
+
+      <div class="col-md-2">
+        <button class="btn btn-outline-primary w-100">Загрузить должности</button>
       </div>
     </div>
   </form>
 
   <form method="post" class="card shadow-sm">
     {% csrf_token %}
+
+    {% for s in selected_dbs %}
+      <input type="hidden" name="dbs" value="{{ s }}">
+    {% endfor %}
+    <input type="hidden" name="position_source_db" value="{{ position_source_db }}">
     <input type="hidden" name="db" value="{{ db }}">
 
     <div class="card-header">
@@ -70,9 +91,20 @@
 
     <div class="card-body">
       <div class="row g-3">
+        <div class="col-12">
+          <label class="form-label">Выбранные базы</label>
+          <div class="border rounded p-3 bg-light">
+            {% for s in selected_dbs %}
+              <span class="badge text-bg-secondary me-1 mb-1">{{ s }}</span>
+            {% empty %}
+              <span class="text-muted">Базы не выбраны</span>
+            {% endfor %}
+          </div>
+        </div>
+
         <div class="col-md-4">
-          <label class="form-label">База</label>
-          <input class="form-control" value="{{ db }}" disabled>
+          <label class="form-label">База-источник должностей</label>
+          <input class="form-control" value="{{ position_source_db }}" disabled>
         </div>
 
         <div class="col-md-4">
@@ -82,12 +114,20 @@
         </div>
 
         <div class="col-md-4">
+          <label class="form-label">APASS (пароль)</label>
+          <input class="form-control" name="apass" value="{{ form.apass }}" placeholder="если пусто — будет сгенерирован">
+          <div class="form-text">
+            Необязательное поле. Если заполнено — этот пароль уйдёт во все выбранные базы.
+          </div>
+        </div>
+
+        <div class="col-md-4">
           <label class="form-label">AINN (ИНН)</label>
           <input id="id_ainn" class="form-control" name="ainn" value="{{ form.ainn }}" placeholder="необязательно, 10 или 12 цифр">
           <div class="form-text">Необязательное поле. Для сценария создания лучше заполнять.</div>
         </div>
 
-        <div class="col-md-6">
+        <div class="col-md-8">
           <label class="form-label">AFIO (ФИО)</label>
           <input id="id_afio" class="form-control" name="afio" value="{{ form.afio }}" placeholder="необязательно, например Иванов Иван Иванович">
           <div class="form-text">Необязательное поле. Если указано, передаётся в параметр AFIO процедуры.</div>
@@ -104,7 +144,7 @@
             {% endfor %}
           </select>
           <div class="form-text">
-            Необязательное поле. Если выбрано, в процедуру уйдёт <b>SMOFFCFG.ORAROLE</b>, а после выполнения в <b>SMSTAFF.OFFINDEX</b> будет записан выбранный ID.
+            Должность выбирается по базе <b>{{ position_source_db }}</b>, после чего сопоставляется в каждой выбранной базе.
           </div>
         </div>
 
@@ -129,7 +169,8 @@
         <div class="col-12">
           <div class="alert alert-secondary mb-0" id="modeHint">
             <b>Обязательно только поле AUSER.</b><br>
-            <b>APASS</b> вводить не нужно — он будет сгенерирован автоматически как 4 цифры.<br>
+            <b>APASS</b> можно указать вручную. Если его не заполнить — пароль будет сгенерирован автоматически.<br>
+            Операция будет выполнена сразу по всем выбранным базам.<br>
             Для обычного создания новой УЗ желательно указывать <b>AINN</b> и <b>ADOL</b>.<br>
             Для блокировки существующей УЗ можно использовать <b>ACHECK=0</b> и <b>AUSERENABLED=0</b> только с логином.
           </div>
@@ -143,86 +184,123 @@
     </div>
   </form>
 
-  {% if conflicts %}
-    <div class="card mt-4">
-      <div class="card-header">
-        <b>Найдены существующие записи с таким логином и/или ИНН</b>
-      </div>
-      <div class="card-body p-0">
-        <div class="table-responsive">
-          <table class="table table-sm table-striped mb-0">
-            <thead class="table-light">
-              <tr>
-                <th>ID</th>
-                <th>ФИО</th>
-                <th>Логин</th>
-                <th>ИНН</th>
-                <th>Должность</th>
-                <th>Enabled</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for r in conflicts %}
-                <tr>
-                  <td>{{ r.id }}</td>
-                  <td>{{ r.afio|default:"—" }}</td>
-                  <td><code>{{ r.serverlogin }}</code></td>
-                  <td><code>{{ r.inn }}</code></td>
-                  <td>
-                    {{ r.off_title|default:"—" }}
-                    {% if r.offindex %}
-                      <div class="text-muted small">OFFINDEX: {{ r.offindex }}</div>
-                    {% endif %}
-                  </td>
-                  <td>{{ r.userenabled }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+  {% if db_results %}
+    {% for result in db_results %}
+      <div class="card mt-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <b>Результат по базе {{ result.db }}</b>
+          {% if result.error %}
+            <span class="badge text-bg-danger">Ошибка</span>
+          {% else %}
+            <span class="badge text-bg-success">Успешно</span>
+          {% endif %}
         </div>
-      </div>
-    </div>
-  {% endif %}
 
-  {% if created_rows %}
-    <div class="card mt-4">
-      <div class="card-header">
-        <b>Текущие записи пользователя после выполнения процедуры</b>
-      </div>
-      <div class="card-body p-0">
-        <div class="table-responsive">
-          <table class="table table-sm table-striped mb-0">
-            <thead class="table-light">
-              <tr>
-                <th>ID</th>
-                <th>ФИО</th>
-                <th>Логин</th>
-                <th>ИНН</th>
-                <th>Должность</th>
-                <th>Enabled</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for r in created_rows %}
-                <tr>
-                  <td>{{ r.id }}</td>
-                  <td>{{ r.afio|default:"—" }}</td>
-                  <td><code>{{ r.serverlogin }}</code></td>
-                  <td><code>{{ r.inn }}</code></td>
-                  <td>
-                    {{ r.off_title|default:"—" }}
-                    {% if r.offindex %}
-                      <div class="text-muted small">OFFINDEX: {{ r.offindex }}</div>
-                    {% endif %}
-                  </td>
-                  <td>{{ r.userenabled }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+        <div class="card-body">
+          {% if result.error %}
+            <div class="alert alert-danger mb-3">
+              <div>{{ result.error }}</div>
+              {% if result.used_password %}
+                <hr>
+                <div><b>Пароль, переданный в процедуру:</b> <code>{{ result.used_password }}</code></div>
+              {% endif %}
+            </div>
+          {% endif %}
+
+          {% if result.success_message %}
+            <div class="alert alert-success mb-3">
+              <div>{{ result.success_message }}</div>
+              {% if result.used_password %}
+                <hr>
+                <div><b>Пароль, переданный в процедуру:</b> <code>{{ result.used_password }}</code></div>
+              {% endif %}
+            </div>
+          {% endif %}
+
+          {% if result.conflicts %}
+            <div class="card mb-3">
+              <div class="card-header">
+                <b>Найдены существующие записи с таким логином и/или ИНН</b>
+              </div>
+              <div class="card-body p-0">
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped mb-0">
+                    <thead class="table-light">
+                      <tr>
+                        <th>ID</th>
+                        <th>ФИО</th>
+                        <th>Логин</th>
+                        <th>ИНН</th>
+                        <th>Должность</th>
+                        <th>Enabled</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for r in result.conflicts %}
+                        <tr>
+                          <td>{{ r.id }}</td>
+                          <td>{{ r.afio|default:"—" }}</td>
+                          <td><code>{{ r.serverlogin }}</code></td>
+                          <td><code>{{ r.inn }}</code></td>
+                          <td>
+                            {{ r.off_title|default:"—" }}
+                            {% if r.offindex %}
+                              <div class="text-muted small">OFFINDEX: {{ r.offindex }}</div>
+                            {% endif %}
+                          </td>
+                          <td>{{ r.userenabled }}</td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          {% endif %}
+
+          {% if result.created_rows %}
+            <div class="card">
+              <div class="card-header">
+                <b>Текущие записи пользователя после выполнения процедуры</b>
+              </div>
+              <div class="card-body p-0">
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped mb-0">
+                    <thead class="table-light">
+                      <tr>
+                        <th>ID</th>
+                        <th>ФИО</th>
+                        <th>Логин</th>
+                        <th>ИНН</th>
+                        <th>Должность</th>
+                        <th>Enabled</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for r in result.created_rows %}
+                        <tr>
+                          <td>{{ r.id }}</td>
+                          <td>{{ r.afio|default:"—" }}</td>
+                          <td><code>{{ r.serverlogin }}</code></td>
+                          <td><code>{{ r.inn }}</code></td>
+                          <td>
+                            {{ r.off_title|default:"—" }}
+                            {% if r.offindex %}
+                              <div class="text-muted small">OFFINDEX: {{ r.offindex }}</div>
+                            {% endif %}
+                          </td>
+                          <td>{{ r.userenabled }}</td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          {% endif %}
         </div>
       </div>
-    </div>
+    {% endfor %}
   {% endif %}
 </div>
 
@@ -240,21 +318,26 @@
       modeHint.innerHTML =
         '<b>Режим блокировки.</b><br>' +
         'Для блокировки существующей УЗ достаточно <b>AUSER</b>.<br>' +
-        '<b>AINN</b>, <b>AFIO</b> и <b>ADOL</b> можно не заполнять.';
+        '<b>APASS</b> можно не заполнять — при пустом значении он будет сгенерирован автоматически.<br>' +
+        '<b>AINN</b>, <b>AFIO</b> и <b>ADOL</b> можно не заполнять.<br>' +
+        'Операция будет выполнена по всем выбранным базам.';
       return;
     }
 
     if (acheckVal === '2') {
       modeHint.innerHTML =
-        '<b>Режим удаления.</b><br>' +
+        '<b>Режим ACHECK=2.</b><br>' +
         'Обычно достаточно <b>AUSER</b>.<br>' +
-        'Дополнительные поля можно не заполнять.';
+        '<b>APASS</b> можно не заполнять — при пустом значении он будет сгенерирован автоматически.<br>' +
+        'Дополнительные поля можно не заполнять.<br>' +
+        'Операция будет выполнена по всем выбранным базам.';
       return;
     }
 
     modeHint.innerHTML =
       '<b>Обязательно только поле AUSER.</b><br>' +
-      '<b>APASS</b> вводить не нужно — он будет сгенерирован автоматически как 4 цифры.<br>' +
+      '<b>APASS</b> можно указать вручную. Если его не заполнить — пароль будет сгенерирован автоматически.<br>' +
+      'Операция будет выполнена сразу по всем выбранным базам.<br>' +
       'Для обычного создания новой УЗ желательно указывать <b>AINN</b> и <b>ADOL</b>.<br>' +
       'Для блокировки существующей УЗ можно использовать <b>ACHECK=0</b> и <b>AUSERENABLED=0</b> только с логином.';
   }
