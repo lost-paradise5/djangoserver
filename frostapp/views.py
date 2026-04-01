@@ -16988,7 +16988,7 @@ def create_new_request_for_user(user: User, max_user_id: int, max_chat_id: Optio
     req = MaxBotRequest.objects.create(
         request_no=generate_request_no(),
         applicant_user=user,
-        applicant_full_name=user.full_name,
+        applicant_full_name=user.full_name or "",
         max_user_id=max_user_id,
         max_chat_id=max_chat_id,
         status="awaiting_role",
@@ -17237,36 +17237,34 @@ def start_scenario_after_directory(req: MaxBotRequest):
 def handle_role_selection(req: MaxBotRequest, user: User, role_id: int):
     role = MaxBotRole.objects.filter(id=role_id, is_active=True).first()
     if not role:
-        return build_response(text="Должность не найдена.", buttons=[[kb_message("Начать")]])
+        return build_response(
+            text="Должность не найдена.",
+            buttons=[[kb_message("Начать")]],
+        )
 
     scenario = get_active_scenario_for_role(role)
-    employee = resolve_employee_for_user_and_role(user, role)
 
     req.role = role
     req.scenario = scenario
-    req.employee = employee
+    req.employee = None  # больше не используем maxbot_employee для сценария
+    req.applicant_user = user
+    req.applicant_full_name = user.full_name or req.applicant_full_name
     req.updated_at = timezone.now()
 
-    update_fields = ["role", "scenario", "employee", "updated_at"]
-
-    if role.requires_employee and not employee:
-        req.status = "awaiting_role"
-        update_fields.append("status")
-        req.save(update_fields=update_fields)
-        return build_response(
-            text=(
-                "Не удалось автоматически определить сотрудника для этой должности.\n\n"
-                "Проверь в веб-интерфейсе справочник <b>Сотрудники</b>: "
-                "у записи должен быть связан нужный <b>User</b> или совпадать ФИО/телефон."
-            ),
-            buttons=[[kb_message("Начать")]],
-        )
+    update_fields = [
+        "role",
+        "scenario",
+        "employee",
+        "applicant_user",
+        "applicant_full_name",
+        "updated_at",
+    ]
 
     if role.requires_vehicle:
         req.status = "awaiting_vehicle"
         update_fields.append("status")
         req.save(update_fields=update_fields)
-        return ask_vehicle(req, role, employee)
+        return ask_vehicle(req, role, None)
 
     req.save(update_fields=update_fields)
     return start_scenario_after_directory(req)
@@ -17551,14 +17549,19 @@ def handle_callback_event(user: User, payload: str, max_user_id: int, max_chat_i
 def handle_message_event(user: User, text: str, max_user_id: int, max_chat_id: Optional[int], raw_data: dict):
     cleaned = (text or "").strip()
     normalized = _normalize_choice_text(cleaned)
-    req = get_open_request(max_user_id)
+
+    # "Начать" должно ВСЕГДА реально запускать новый сценарий,
+    # а не просто показывать снова приветствие.
+    if normalized in {"/start", "start", "начать"}:
+        req = create_new_request_for_user(user, max_user_id, max_chat_id, raw_event=raw_data)
+        return ask_role(req)
 
     if normalized in {"отмена", "cancel"}:
         return _cancel_request(max_user_id)
 
+    req = get_open_request(max_user_id)
+
     if not req:
-        if normalized in {"/start", "start", "начать"}:
-            return build_main_menu(user)
         return build_main_menu(user)
 
     if req.status == "awaiting_role":
