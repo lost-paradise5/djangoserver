@@ -16544,7 +16544,26 @@ def sm_sync_staff_run(request):
 
 
 
+MAXBOT_REQUEST_STATUS_LABELS = {
+    "draft": "Черновик",
+    "awaiting_role": "Ожидание выбора должности",
+    "awaiting_employee": "Ожидание автопривязки сотрудника",
+    "awaiting_vehicle": "Ожидание выбора машины",
+    "awaiting_answer": "Ожидание ответа",
+    "completed": "Завершено",
+    "emergency_stop": "АВАРИЙНЫЙ СТОП",
+    "cancelled": "Отменено",
+}
 
+MAXBOT_QUESTION_TYPE_LABELS = {
+    "single_choice": "Кнопки / один вариант",
+    "text": "Текстовый ответ",
+    "number": "Числовой ответ",
+    "photo": "Фото / несколько фото",
+}
+
+MAX_BOT_API_BASE = "https://platform-api.max.ru"
+MAXBOT_ALERT_USER_ID = int(os.getenv("MAXBOT_ALERT_USER_ID", "91759973") or "91759973")
 
 
 
@@ -16633,6 +16652,10 @@ def kb_callback(text: str, payload: str):
     return {"type": "callback", "text": text, "payload": payload}
 
 
+def kb_message(text: str):
+    return {"type": "message", "text": text}
+
+
 def kb_contact(text: str):
     return {"type": "request_contact", "text": text}
 
@@ -16645,6 +16668,258 @@ def build_response(text=None, buttons=None, notification=None, fmt="html"):
         "notification": notification,
         "format": fmt,
     }
+
+def _normalize_choice_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def _prepend_text(response: dict, prefix: str) -> dict:
+    result = dict(response or {})
+    original = result.get("text") or ""
+    result["text"] = f"{prefix}\n\n{original}".strip()
+    return result
+
+def _safe_answer_value(ans: MaxBotRequestAnswer) -> str:
+    if ans.option_text:
+        return ans.option_text
+    if ans.answer_text:
+        return ans.answer_text
+    if ans.answer_number is not None:
+        return str(ans.answer_number)
+    if ans.photo_file or ans.photo_url:
+        return "Фото приложено"
+    return "-"
+
+def _question_button_rows(options):
+    return [[kb_message(opt.text)] for opt in options]
+
+
+def _photo_step_buttons():
+    return [
+        [kb_message("Продолжить")],
+        [kb_message("Отмена")],
+    ]
+
+
+def _cancel_request(max_user_id: int):
+    req = get_open_request(max_user_id)
+    if req:
+        req.status = "cancelled"
+        req.updated_at = timezone.now()
+        req.finished_at = timezone.now()
+        req.save(update_fields=["status", "updated_at", "finished_at"])
+
+    return build_response(
+        text="Текущий сценарий отменён.",
+        buttons=[[kb_message("Начать")]],
+        notification="Отменено",
+    )
+
+
+def _maxbot_api_request(path: str, method: str = "GET", json_body: Optional[dict] = None):
+    if not MAX_BOT_TOKEN:
+        return None
+
+    response = requests.request(
+        method=method,
+        url=f"{MAX_BOT_API_BASE}{path}",
+        headers={
+            "Authorization": MAX_BOT_TOKEN,
+            "Content-Type": "application/json",
+        },
+        json=json_body,
+        timeout=30,
+    )
+    raw = response.text
+
+    try:
+        data = response.json() if raw else {}
+    except Exception:
+        data = {"raw": raw}
+
+    if not response.ok:
+        raise RuntimeError(f"MAX API {method} {path} failed: {response.status_code} {raw}")
+
+    return data
+
+def _maxbot_send_user_message(user_id: int, text: str, attachments: Optional[list] = None):
+    if not MAX_BOT_TOKEN or not user_id:
+        return None
+
+    body = {
+        "text": text or "",
+        "format": "html",
+    }
+    if attachments:
+        body["attachments"] = attachments
+
+    for delay in (0, 1, 2, 4):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _maxbot_api_request(
+                f"/messages?user_id={int(user_id)}",
+                method="POST",
+                json_body=body,
+            )
+        except Exception as exc:
+            if "attachment.not.ready" in str(exc) and delay != 4:
+                continue
+            raise
+
+
+def _maxbot_upload_bytes(filename: str, content: bytes, content_type: str = "image/jpeg", upload_type: str = "image"):
+    if not MAX_BOT_TOKEN:
+        return None
+
+    init_data = _maxbot_api_request(f"/uploads?type={upload_type}", method="POST")
+    upload_url = (init_data or {}).get("url")
+    if not upload_url:
+        raise RuntimeError("MAX /uploads не вернул URL для загрузки")
+
+    resp = requests.post(
+        upload_url,
+        headers={"Authorization": MAX_BOT_TOKEN},
+        files={"data": (filename, content, content_type)},
+        timeout=60,
+    )
+    raw = resp.text
+
+    try:
+        data = resp.json() if raw else {}
+    except Exception:
+        data = {"raw": raw}
+
+    if not resp.ok:
+        raise RuntimeError(f"MAX upload failed: {resp.status_code} {raw}")
+
+    return data
+
+
+def _maxbot_image_attachment_from_answer(answer: MaxBotRequestAnswer):
+    if answer.photo_file:
+        try:
+            path = answer.photo_file.path
+            with open(path, "rb") as fh:
+                content = fh.read()
+            mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+            payload = _maxbot_upload_bytes(os.path.basename(path), content, mime, upload_type="image")
+            return {"type": "image", "payload": payload}
+        except Exception:
+            logger.exception("Не удалось загрузить локальное фото answer_id=%s в MAX", answer.id)
+
+    if answer.photo_url:
+        try:
+            resp = requests.get(answer.photo_url, timeout=30)
+            resp.raise_for_status()
+            content_type = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+            ext = mimetypes.guess_extension(content_type) or ".jpg"
+            payload = _maxbot_upload_bytes(
+                f"maxbot_{answer.id}{ext}",
+                resp.content,
+                content_type,
+                upload_type="image",
+            )
+            return {"type": "image", "payload": payload}
+        except Exception:
+            logger.exception("Не удалось скачать/загрузить фото по URL answer_id=%s", answer.id)
+
+    return None
+
+
+def _maxbot_build_alert_text(req: MaxBotRequest, reason: str, extra_text: Optional[str] = None) -> str:
+    lines = [
+        "<b>MAX-бот: аварийное уведомление</b>",
+        "",
+        f"<b>Причина:</b> {escape(reason)}",
+        f"<b>Заявка:</b> {escape(req.request_no)}",
+        f"<b>Кто заполнил:</b> {escape(req.applicant_full_name or '-')}",
+        f"<b>MAX user ID:</b> {req.max_user_id}",
+        f"<b>Должность:</b> {escape(str(req.role) if req.role else '-')}",
+        f"<b>Сотрудник:</b> {escape(str(req.employee) if req.employee else '-')}",
+        f"<b>Машина:</b> {escape(str(req.vehicle) if req.vehicle else '-')}",
+        f"<b>Сценарий:</b> {escape(str(req.scenario) if req.scenario else '-')}",
+        f"<b>Статус:</b> {escape(MAXBOT_REQUEST_STATUS_LABELS.get(req.status, req.status))}",
+        f"<b>Создано:</b> {req.created_at.strftime('%d.%m.%Y %H:%M:%S') if req.created_at else '-'}",
+        f"<b>Завершено:</b> {req.finished_at.strftime('%d.%m.%Y %H:%M:%S') if req.finished_at else '-'}",
+    ]
+
+    if extra_text:
+        lines.extend(["", f"<b>Комментарий:</b> {escape(extra_text)}"])
+
+    answers = req.answers.order_by("created_at", "id")
+    if answers.exists():
+        lines.extend(["", "<b>Журнал прохождения:</b>"])
+        for ans in answers:
+            created = ans.created_at.strftime("%d.%m.%Y %H:%M:%S") if ans.created_at else "-"
+            value = escape(_safe_answer_value(ans))
+            qtext = escape(ans.question_text or "-")
+            mark = " <b>[АВАРИЙНО]</b>" if ans.is_emergency else ""
+            lines.append(f"• {created} — <b>{qtext}</b>: {value}{mark}")
+
+    result = "\n".join(lines)
+    if len(result) > 3800:
+        result = result[:3790] + "…"
+    return result
+
+
+def _maxbot_send_alert(req: MaxBotRequest, reason: str, extra_text: Optional[str] = None):
+    if not MAXBOT_ALERT_USER_ID or not MAX_BOT_TOKEN or not req:
+        return
+
+    try:
+        text = _maxbot_build_alert_text(req, reason, extra_text)
+        _maxbot_send_user_message(MAXBOT_ALERT_USER_ID, text)
+
+        photo_answers = [
+            ans for ans in req.answers.order_by("created_at", "id")
+            if ans.photo_file or ans.photo_url
+        ]
+        total = len(photo_answers)
+
+        for index, ans in enumerate(photo_answers, start=1):
+            attachment = _maxbot_image_attachment_from_answer(ans)
+            if attachment:
+                caption = (
+                    f"<b>Фото {index}/{total}</b>\n"
+                    f"Заявка: <b>{escape(req.request_no)}</b>\n"
+                    f"Шаг: {escape(ans.question_text or '-')}"
+                )
+                _maxbot_send_user_message(
+                    MAXBOT_ALERT_USER_ID,
+                    caption,
+                    attachments=[attachment],
+                )
+            elif ans.photo_url:
+                _maxbot_send_user_message(
+                    MAXBOT_ALERT_USER_ID,
+                    (
+                        f"<b>Фото {index}/{total}</b>\n"
+                        f"Заявка: <b>{escape(req.request_no)}</b>\n"
+                        f"Шаг: {escape(ans.question_text or '-')}\n"
+                        f"URL: {escape(ans.photo_url)}"
+                    ),
+                )
+    except Exception:
+        logger.exception("Не удалось отправить аварийное уведомление в MAX")
+
+
+def _maxbot_send_exception_alert(max_user_id: Optional[int], raw_update: dict, exc: Exception):
+    if not MAXBOT_ALERT_USER_ID or not MAX_BOT_TOKEN:
+        return
+
+    text = (
+        "<b>MAX-бот: ошибка обработки</b>\n\n"
+        f"<b>MAX user ID:</b> {escape(str(max_user_id or '-'))}\n"
+        f"<b>Ошибка:</b> {escape(str(exc))}\n\n"
+        f"<b>raw_update:</b>\n<pre>{escape(json.dumps(raw_update, ensure_ascii=False, indent=2)[:2500])}</pre>"
+    )
+    try:
+        _maxbot_send_user_message(MAXBOT_ALERT_USER_ID, text)
+    except Exception:
+        logger.exception("Не удалось отправить exception alert в MAX")
+
+
 
 
 def build_auth_response():
@@ -16661,11 +16936,10 @@ def build_main_menu(user: User):
     return build_response(
         text=(
             f"Привет, <b>{escape(user.full_name)}</b>!\n\n"
-            "Нажми <b>«Начать»</b>, чтобы пройти сценарий и сохранить запись в реестр."
+            "Нажми кнопку <b>«Начать»</b>, чтобы пройти сценарий.\n"
+            "Все выбранные ответы будут видны прямо в истории чата."
         ),
-        buttons=[
-            [kb_callback("Начать", "start")],
-        ],
+        buttons=[[kb_message("Начать")]],
     )
 
 
@@ -16738,13 +17012,48 @@ def get_active_scenario_for_role(role: MaxBotRole) -> Optional[MaxBotScenario]:
     )
 
 
+
+def resolve_employee_for_user_and_role(user: User, role: MaxBotRole) -> Optional[MaxBotEmployee]:
+    if not user or not role:
+        return None
+
+    qs = MaxBotEmployee.objects.filter(role=role, is_active=True).order_by("sort_order", "full_name")
+
+    by_user = qs.filter(user_id=user.id).first()
+    if by_user:
+        return by_user
+
+    if user.full_name:
+        by_name = qs.filter(full_name__iexact=user.full_name.strip()).first()
+        if by_name:
+            return by_name
+
+    user_phone = normalize_phone(user.phone or "")
+    if user_phone:
+        user_last10 = user_phone[-10:]
+        for emp in qs.exclude(phone__isnull=True).exclude(phone__exact=""):
+            emp_phone = normalize_phone(emp.phone or "")
+            if emp_phone and (emp_phone == user_phone or emp_phone[-10:] == user_last10):
+                return emp
+
+    return None
+
+
+
+
 def ask_role(req: MaxBotRequest):
     roles = list(get_active_roles())
-    buttons = [[kb_callback(role.name, f"role:{role.id}")] for role in roles]
-    buttons.append([kb_callback("Отмена", "cancel")])
+    if not roles:
+        return build_response(
+            text="Активных должностей пока нет. Добавь их в веб-интерфейсе.",
+            buttons=[],
+        )
+
+    buttons = [[kb_message(role.name)] for role in roles]
+    buttons.append([kb_message("Отмена")])
 
     return build_response(
-        text="Выберите должность:",
+        text="Выберите свою должность:",
         buttons=buttons,
     )
 
@@ -16771,24 +17080,24 @@ def ask_employee(req: MaxBotRequest, role: MaxBotRole):
 def ask_vehicle(req: MaxBotRequest, role: MaxBotRole, employee: Optional[MaxBotEmployee] = None):
     qs = MaxBotVehicle.objects.filter(role=role, is_active=True).order_by("sort_order", "reg_number")
     if employee:
-        filtered = qs.filter(Q(employee__isnull=True) | Q(employee=employee))
-    else:
-        filtered = qs
+        qs = qs.filter(Q(employee__isnull=True) | Q(employee=employee))
 
-    vehicles = list(filtered)
+    vehicles = list(qs)
     if not vehicles:
         return build_response(
-            text="Для этой должности пока нет автомобилей в справочнике.",
-            buttons=[[kb_callback("В главное меню", "main_menu")]],
+            text="Для этой должности пока нет машин в справочнике.",
+            buttons=[[kb_message("Начать")]],
         )
 
-    buttons = [[kb_callback(v.title or v.reg_number, f"vehicle:{v.id}")] for v in vehicles]
-    buttons.append([kb_callback("Отмена", "cancel")])
+    buttons = [[kb_message(v.title or v.reg_number)] for v in vehicles]
+    buttons.append([kb_message("Отмена")])
 
-    return build_response(
-        text="Выберите автомобиль:",
-        buttons=buttons,
-    )
+    if employee:
+        text = f"Сотрудник определён автоматически: <b>{escape(employee.full_name)}</b>\n\nВыберите машину:"
+    else:
+        text = "Выберите машину:"
+
+    return build_response(text=text, buttons=buttons)
 
 
 def ask_question(req: MaxBotRequest, question: MaxBotQuestion, notification: Optional[str] = None):
@@ -16797,37 +17106,52 @@ def ask_question(req: MaxBotRequest, question: MaxBotQuestion, notification: Opt
     req.updated_at = timezone.now()
     req.save(update_fields=["current_question", "status", "updated_at"])
 
+    text = question.text or ""
+    if question.help_text:
+        text += f"\n\n<i>{escape(question.help_text)}</i>"
+
     if question.question_type == "single_choice":
         options = list(question.options.filter(is_active=True).order_by("sort_order", "id"))
-        buttons = [[kb_callback(opt.text, f"answer:{opt.id}")] for opt in options]
-        buttons.append([kb_callback("Отмена", "cancel")])
-        return build_response(text=question.text, buttons=buttons, notification=notification)
+        buttons = _question_button_rows(options)
+        buttons.append([kb_message("Отмена")])
+        return build_response(text=text, buttons=buttons, notification=notification)
 
     if question.question_type == "photo":
+        text += "\n\nОтправьте одно или несколько фото, затем нажмите <b>«Продолжить»</b>."
         return build_response(
-            text=question.text,
-            buttons=[[kb_callback("Отмена", "cancel")]],
+            text=text,
+            buttons=_photo_step_buttons(),
             notification=notification,
         )
 
     if question.question_type in ("text", "number"):
         return build_response(
-            text=question.text,
-            buttons=[[kb_callback("Отмена", "cancel")]],
+            text=text,
+            buttons=[[kb_message("Отмена")]],
             notification=notification,
         )
 
     return build_response(
         text="Тип вопроса не поддерживается.",
-        buttons=[[kb_callback("В главное меню", "main_menu")]],
+        buttons=[[kb_message("Начать")]],
     )
 
 
 def rebuild_request_summary(req: MaxBotRequest) -> str:
     lines = []
+    photo_counts = defaultdict(int)
+    photo_order = []
+
     answers = req.answers.order_by("created_at", "id")
 
     for ans in answers:
+        if ans.photo_file or ans.photo_url:
+            key = ans.question_text or "Фото"
+            if key not in photo_counts:
+                photo_order.append(key)
+            photo_counts[key] += 1
+            continue
+
         if ans.registry_action_text:
             lines.append(ans.registry_action_text)
             continue
@@ -16844,9 +17168,8 @@ def rebuild_request_summary(req: MaxBotRequest) -> str:
             lines.append(f"{ans.question_text}: {ans.answer_number}")
             continue
 
-        if ans.photo_file or ans.photo_url:
-            lines.append(f"{ans.question_text}: приложено фото")
-            continue
+    for key in photo_order:
+        lines.append(f"{key}: приложено фото ({photo_counts[key]})")
 
     return "\n".join(lines)
 
@@ -16862,18 +17185,19 @@ def finish_request(req: MaxBotRequest, status: str = "completed", notification: 
     if status == "emergency_stop":
         text = (
             f"Заявка <b>{req.request_no}</b> сохранена.\n\n"
-            f"<b>СТОП!</b> Машину не выгонять из гаража, ставим на ремонт.\n\n"
+            f"<b style='color:#b91c1c;'>СТОП!</b> Машину не выгонять из гаража, ставим на ремонт.\n\n"
             f"<b>Итог:</b>\n{escape(req.summary or '-')}"
         )
+        _maxbot_send_alert(req, "Аварийный СТОП")
     else:
         text = (
-            f"Готово. Заявка <b>{req.request_no}</b> сохранена в реестр.\n\n"
+            f"Готово. Заявка <b>{req.request_no}</b> сохранена.\n\n"
             f"<b>Итог:</b>\n{escape(req.summary or '-')}"
         )
 
     return build_response(
         text=text,
-        buttons=[[kb_callback("Начать заново", "start")]],
+        buttons=[[kb_message("Начать")]],
         notification=notification,
     )
 
@@ -16903,43 +17227,58 @@ def start_scenario_after_directory(req: MaxBotRequest):
     if not req.scenario or not req.scenario.first_question:
         return build_response(
             text="Для выбранной должности сценарий ещё не настроен.",
-            buttons=[[kb_callback("В главное меню", "main_menu")]],
+            buttons=[[kb_message("Начать")]],
         )
 
     return ask_question(req, req.scenario.first_question)
 
 
-def handle_role_selection(req: MaxBotRequest, role_id: int):
+
+def handle_role_selection(req: MaxBotRequest, user: User, role_id: int):
     role = MaxBotRole.objects.filter(id=role_id, is_active=True).first()
     if not role:
-        return build_response(text="Должность не найдена.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Должность не найдена.", buttons=[[kb_message("Начать")]])
 
     scenario = get_active_scenario_for_role(role)
+    employee = resolve_employee_for_user_and_role(user, role)
+
     req.role = role
     req.scenario = scenario
+    req.employee = employee
     req.updated_at = timezone.now()
 
-    if role.requires_employee:
-        req.status = "awaiting_employee"
-        req.save(update_fields=["role", "scenario", "status", "updated_at"])
-        return ask_employee(req, role)
+    update_fields = ["role", "scenario", "employee", "updated_at"]
+
+    if role.requires_employee and not employee:
+        req.status = "awaiting_role"
+        update_fields.append("status")
+        req.save(update_fields=update_fields)
+        return build_response(
+            text=(
+                "Не удалось автоматически определить сотрудника для этой должности.\n\n"
+                "Проверь в веб-интерфейсе справочник <b>Сотрудники</b>: "
+                "у записи должен быть связан нужный <b>User</b> или совпадать ФИО/телефон."
+            ),
+            buttons=[[kb_message("Начать")]],
+        )
 
     if role.requires_vehicle:
         req.status = "awaiting_vehicle"
-        req.save(update_fields=["role", "scenario", "status", "updated_at"])
-        return ask_vehicle(req, role, None)
+        update_fields.append("status")
+        req.save(update_fields=update_fields)
+        return ask_vehicle(req, role, employee)
 
-    req.save(update_fields=["role", "scenario", "updated_at"])
+    req.save(update_fields=update_fields)
     return start_scenario_after_directory(req)
 
 
 def handle_employee_selection(req: MaxBotRequest, employee_id: int):
     if not req.role:
-        return build_response(text="Сначала выберите должность.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Сначала выберите должность.", buttons=[[kb_message("Начать")]])
 
     employee = MaxBotEmployee.objects.filter(id=employee_id, role=req.role, is_active=True).first()
     if not employee:
-        return build_response(text="Сотрудник не найден.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Сотрудник не найден.", buttons=[[kb_message("Начать")]])
 
     req.employee = employee
     req.updated_at = timezone.now()
@@ -16955,7 +17294,7 @@ def handle_employee_selection(req: MaxBotRequest, employee_id: int):
 
 def handle_vehicle_selection(req: MaxBotRequest, vehicle_id: int):
     if not req.role:
-        return build_response(text="Сначала выберите должность.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Сначала выберите должность.", buttons=[[kb_message("Начать")]])
 
     vehicle_qs = MaxBotVehicle.objects.filter(id=vehicle_id, role=req.role, is_active=True)
     if req.employee:
@@ -16963,7 +17302,7 @@ def handle_vehicle_selection(req: MaxBotRequest, vehicle_id: int):
 
     vehicle = vehicle_qs.first()
     if not vehicle:
-        return build_response(text="Автомобиль не найден.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Машина не найдена.", buttons=[[kb_message("Начать")]])
 
     req.vehicle = vehicle
     req.updated_at = timezone.now()
@@ -16972,13 +17311,49 @@ def handle_vehicle_selection(req: MaxBotRequest, vehicle_id: int):
     return start_scenario_after_directory(req)
 
 
+def find_role_by_text(text: str) -> Optional[MaxBotRole]:
+    normalized = _normalize_choice_text(text)
+    for role in get_active_roles():
+        if _normalize_choice_text(role.name) == normalized:
+            return role
+    return None
+
+
+def find_vehicle_by_text(req: MaxBotRequest, text: str) -> Optional[MaxBotVehicle]:
+    if not req.role:
+        return None
+
+    normalized = _normalize_choice_text(text)
+    qs = MaxBotVehicle.objects.filter(role=req.role, is_active=True).order_by("sort_order", "reg_number")
+    if req.employee:
+        qs = qs.filter(Q(employee__isnull=True) | Q(employee=req.employee))
+
+    for vehicle in qs:
+        label = vehicle.title or vehicle.reg_number
+        if _normalize_choice_text(label) == normalized:
+            return vehicle
+    return None
+
+
+def find_option_by_text(question: MaxBotQuestion, text: str) -> Optional[MaxBotQuestionOption]:
+    normalized = _normalize_choice_text(text)
+    options = question.options.filter(is_active=True).order_by("sort_order", "id")
+    for opt in options:
+        if _normalize_choice_text(opt.text) == normalized:
+            return opt
+    return None
+
+
+
+
+
 def save_option_answer(req: MaxBotRequest, option: MaxBotQuestionOption, raw_payload=None):
     question = req.current_question
     if not question:
-        return build_response(text="Нет активного вопроса.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Нет активного вопроса.", buttons=[[kb_message("Начать")]])
 
     if option.question_id != question.id:
-        return ask_question(req, question, notification="Этот ответ уже не актуален. Повтори выбор.")
+        return ask_question(req, question, notification="Этот ответ уже не актуален. Повторите выбор.")
 
     MaxBotRequestAnswer.objects.create(
         request=req,
@@ -17000,15 +17375,16 @@ def save_option_answer(req: MaxBotRequest, option: MaxBotQuestionOption, raw_pay
     req.updated_at = timezone.now()
     req.raw_last_event = raw_payload or {}
 
+    req.save(update_fields=["emergency_flag", "updated_at", "raw_last_event"])
+
     if option.request_status_on_select == "emergency_stop":
-        req.save(update_fields=["emergency_flag", "updated_at", "raw_last_event"])
         return finish_request(req, status="emergency_stop", notification=option.notification_text)
 
-    if option.is_finish and not next_question:
-        req.save(update_fields=["emergency_flag", "updated_at", "raw_last_event"])
-        return finish_request(req, status="completed", notification=option.notification_text)
+    if option.is_emergency:
+        _maxbot_send_alert(req, f"Аварийный ответ: {option.text}")
 
-    req.save(update_fields=["emergency_flag", "updated_at", "raw_last_event"])
+    if option.is_finish and not next_question:
+        return finish_request(req, status="completed", notification=option.notification_text)
 
     if next_question:
         return ask_question(req, next_question, notification=option.notification_text)
@@ -17019,7 +17395,7 @@ def save_option_answer(req: MaxBotRequest, option: MaxBotQuestionOption, raw_pay
 def save_text_or_number_answer(req: MaxBotRequest, text_value: str, raw_payload=None):
     question = req.current_question
     if not question:
-        return build_response(text="Нет активного вопроса.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Нет активного вопроса.", buttons=[[kb_message("Начать")]])
 
     answer_number = None
     answer_text = text_value
@@ -17032,7 +17408,7 @@ def save_text_or_number_answer(req: MaxBotRequest, text_value: str, raw_payload=
         except (InvalidOperation, AttributeError):
             return build_response(
                 text="Нужно отправить число. Например: 1 или 1.5",
-                buttons=[[kb_callback("Отмена", "cancel")]],
+                buttons=[[kb_message("Отмена")]],
             )
 
     MaxBotRequestAnswer.objects.create(
@@ -17056,33 +17432,72 @@ def save_text_or_number_answer(req: MaxBotRequest, text_value: str, raw_payload=
     return finish_request(req, status="completed")
 
 
-def save_photo_answer(req: MaxBotRequest, photo_url: str, raw_payload=None):
+def save_photo_answers(req: MaxBotRequest, photo_urls: list[str], raw_payload=None):
     question = req.current_question
     if not question:
-        return build_response(text="Нет активного вопроса.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Нет активного вопроса.", buttons=[[kb_message("Начать")]])
 
     if question.question_type != "photo":
-        return build_response(text="Сейчас бот не ждёт фото.", buttons=[[kb_callback("В главное меню", "main_menu")]])
+        return build_response(text="Сейчас бот не ждёт фото.", buttons=[[kb_message("Начать")]])
 
-    ans = MaxBotRequestAnswer.objects.create(
-        request=req,
-        question=question,
-        question_text=question.text,
-        registry_action_text="Приложено фото",
-        raw_payload=raw_payload or {},
-        created_at=timezone.now(),
-    )
-    save_photo_to_answer(ans, photo_url)
+    created_count = 0
+    for photo_url in [u for u in (photo_urls or []) if u]:
+        ans = MaxBotRequestAnswer.objects.create(
+            request=req,
+            question=question,
+            question_text=question.text,
+            registry_action_text=None,
+            raw_payload=raw_payload or {},
+            created_at=timezone.now(),
+        )
+        save_photo_to_answer(ans, photo_url)
+        created_count += 1
 
     req.updated_at = timezone.now()
     req.raw_last_event = raw_payload or {}
     req.save(update_fields=["updated_at", "raw_last_event"])
+
+    total_count = sum(
+        1 for ans in req.answers.filter(question=question).order_by("id")
+        if ans.photo_file or ans.photo_url
+    )
+
+    return build_response(
+        text=(
+            f"Фото сохранено: <b>+{created_count}</b>.\n"
+            f"Всего фото по этому шагу: <b>{total_count}</b>.\n\n"
+            "Можно отправить ещё фото или нажать <b>«Продолжить»</b>."
+        ),
+        buttons=_photo_step_buttons(),
+    )
+
+
+def complete_photo_step(req: MaxBotRequest):
+    question = req.current_question
+    if not question or question.question_type != "photo":
+        return build_response(text="Нет активного фото-шагa.", buttons=[[kb_message("Начать")]])
+
+    total_count = sum(
+        1 for ans in req.answers.filter(question=question).order_by("id")
+        if ans.photo_file or ans.photo_url
+    )
+
+    if question.is_required and total_count == 0:
+        return build_response(
+            text="Сначала отправьте хотя бы одно фото.",
+            buttons=_photo_step_buttons(),
+        )
 
     next_question = question.default_next_question
     if next_question:
         return ask_question(req, next_question)
 
     return finish_request(req, status="completed")
+
+
+
+
+
 
 
 def handle_callback_event(user: User, payload: str, max_user_id: int, max_chat_id: Optional[int], raw_data: dict):
@@ -17096,28 +17511,18 @@ def handle_callback_event(user: User, payload: str, max_user_id: int, max_chat_i
         return ask_role(req)
 
     if payload == "cancel":
-        req = get_open_request(max_user_id)
-        if req:
-            req.status = "cancelled"
-            req.updated_at = timezone.now()
-            req.finished_at = timezone.now()
-            req.save(update_fields=["status", "updated_at", "finished_at"])
-        return build_response(
-            text="Текущий сценарий отменён.",
-            buttons=[[kb_callback("Начать заново", "start")]],
-            notification="Отменено",
-        )
+        return _cancel_request(max_user_id)
 
     req = get_open_request(max_user_id)
     if not req:
         return build_response(
             text="Нет активного сценария. Нажми «Начать».",
-            buttons=[[kb_callback("Начать", "start")]],
+            buttons=[[kb_message("Начать")]],
         )
 
     if payload.startswith("role:"):
         role_id = int(payload.split(":", 1)[1])
-        return handle_role_selection(req, role_id)
+        return handle_role_selection(req, user, role_id)
 
     if payload.startswith("employee:"):
         employee_id = int(payload.split(":", 1)[1])
@@ -17133,14 +17538,77 @@ def handle_callback_event(user: User, payload: str, max_user_id: int, max_chat_i
         if not option:
             return build_response(
                 text="Вариант ответа не найден.",
-                buttons=[[kb_callback("В главное меню", "main_menu")]],
+                buttons=[[kb_message("Начать")]],
             )
         return save_option_answer(req, option, raw_payload=raw_data)
 
     return build_response(
         text="Неизвестная команда.",
-        buttons=[[kb_callback("В главное меню", "main_menu")]],
+        buttons=[[kb_message("Начать")]],
     )
+
+
+def handle_message_event(user: User, text: str, max_user_id: int, max_chat_id: Optional[int], raw_data: dict):
+    cleaned = (text or "").strip()
+    normalized = _normalize_choice_text(cleaned)
+    req = get_open_request(max_user_id)
+
+    if normalized in {"отмена", "cancel"}:
+        return _cancel_request(max_user_id)
+
+    if not req:
+        if normalized in {"/start", "start", "начать"}:
+            return build_main_menu(user)
+        return build_main_menu(user)
+
+    if req.status == "awaiting_role":
+        role = find_role_by_text(cleaned)
+        if not role:
+            return _prepend_text(
+                ask_role(req),
+                "Не удалось понять выбор должности. Нажмите кнопку ещё раз.",
+            )
+        return handle_role_selection(req, user, role.id)
+
+    if req.status == "awaiting_vehicle":
+        vehicle = find_vehicle_by_text(req, cleaned)
+        if not vehicle:
+            return _prepend_text(
+                ask_vehicle(req, req.role, req.employee),
+                "Не удалось понять выбор машины. Нажмите кнопку ещё раз.",
+            )
+        return handle_vehicle_selection(req, vehicle.id)
+
+    if not req.current_question:
+        return build_main_menu(user)
+
+    question = req.current_question
+
+    if question.question_type == "single_choice":
+        option = find_option_by_text(question, cleaned)
+        if not option:
+            return _prepend_text(
+                ask_question(req, question),
+                "Не удалось понять выбор ответа. Нажмите кнопку ещё раз.",
+            )
+        return save_option_answer(req, option, raw_payload=raw_data)
+
+    if question.question_type == "photo":
+        if normalized in {"продолжить", "готово", "дальше", "далее"}:
+            return complete_photo_step(req)
+
+        return build_response(
+            text="Сейчас я жду фото. Отправьте одно или несколько фото, затем нажмите «Продолжить».",
+            buttons=_photo_step_buttons(),
+        )
+
+    if question.question_type in {"text", "number"}:
+        return save_text_or_number_answer(req, cleaned, raw_payload=raw_data)
+
+    return build_main_menu(user)
+
+
+
 
 
 @csrf_exempt
@@ -17149,91 +17617,241 @@ def handle_callback_event(user: User, payload: str, max_user_id: int, max_chat_i
 def maxbot_process_update(request):
     data = parse_json_body(request)
 
-    event_type = (data.get("event_type") or "").strip()
     max_user_id = data.get("max_user_id")
-    max_chat_id = data.get("chat_id")
-    text = (data.get("text") or "").strip()
-    phone = (data.get("phone") or "").strip()
-    payload = (data.get("payload") or "").strip()
-    photo_url = (data.get("photo_url") or "").strip()
     raw_update = data.get("raw_update") or data
 
-    if not max_user_id:
-        return JsonResponse({"ok": False, "error": "max_user_id is required"}, status=400)
+    try:
+        event_type = (data.get("event_type") or "").strip()
+        max_chat_id = data.get("chat_id")
+        text = (data.get("text") or "").strip()
+        phone = (data.get("phone") or "").strip()
+        payload = (data.get("payload") or "").strip()
+        photo_url = (data.get("photo_url") or "").strip()
+        photo_urls = data.get("photo_urls") or ([] if not photo_url else [photo_url])
 
-    max_user_id = int(max_user_id)
-    if max_chat_id is not None:
-        try:
-            max_chat_id = int(max_chat_id)
-        except Exception:
-            max_chat_id = None
+        if not max_user_id:
+            return JsonResponse({"ok": False, "error": "max_user_id is required"}, status=400)
 
-    user = find_user_by_max_id(max_user_id)
+        max_user_id = int(max_user_id)
 
-    # 1. Пользователь ещё не привязан
-    if not user:
+        if max_chat_id is not None:
+            try:
+                max_chat_id = int(max_chat_id)
+            except Exception:
+                max_chat_id = None
+
+        user = find_user_by_max_id(max_user_id)
+
+        if not user:
+            if event_type == "contact_shared":
+                user, error = bind_max_user_to_phone(max_user_id, phone)
+                if error:
+                    return JsonResponse(build_response(
+                        text=(
+                            f"{escape(error)}\n\n"
+                            "Нажми кнопку «Отправить контакт» ещё раз или обратись к администратору."
+                        ),
+                        buttons=[[kb_contact("Отправить контакт")]],
+                    ))
+
+                return JsonResponse(build_main_menu(user))
+
+            return JsonResponse(build_auth_response())
+
+        if event_type == "bot_started":
+            return JsonResponse(build_main_menu(user))
+
         if event_type == "contact_shared":
-            user, error = bind_max_user_to_phone(max_user_id, phone)
-            if error:
+            return JsonResponse(build_main_menu(user))
+
+        if event_type == "callback":
+            result = handle_callback_event(user, payload, max_user_id, max_chat_id, raw_update)
+            return JsonResponse(result)
+
+        if event_type == "photo_message":
+            req = get_open_request(max_user_id)
+            if not req:
                 return JsonResponse(build_response(
-                    text=(
-                        f"{escape(error)}\n\n"
-                        "Нажми кнопку «Отправить контакт» ещё раз или обратись к администратору."
-                    ),
-                    buttons=[[kb_contact("Отправить контакт")]],
+                    text="Нет активного сценария. Нажми «Начать».",
+                    buttons=[[kb_message("Начать")]],
                 ))
 
-            return JsonResponse(build_main_menu(user))
+            return JsonResponse(save_photo_answers(req, photo_urls, raw_payload=raw_update))
 
-        return JsonResponse(build_auth_response())
+        if event_type == "message":
+            result = handle_message_event(user, text, max_user_id, max_chat_id, raw_update)
+            return JsonResponse(result)
 
-    # 2. Уже привязан
-    if event_type == "bot_started":
         return JsonResponse(build_main_menu(user))
 
-    if event_type == "contact_shared":
-        return JsonResponse(build_main_menu(user))
-
-    if event_type == "callback":
-        result = handle_callback_event(user, payload, max_user_id, max_chat_id, raw_update)
-        return JsonResponse(result)
-
-    req = get_open_request(max_user_id)
-
-    if event_type == "photo_message":
-        if not req:
-            return JsonResponse(build_response(
-                text="Нет активного сценария. Нажми «Начать».",
-                buttons=[[kb_callback("Начать", "start")]],
-            ))
-
-        return JsonResponse(save_photo_answer(req, photo_url, raw_payload=raw_update))
-
-    if event_type == "message":
-        if text.lower() in {"/start", "start", "начать"}:
-            return JsonResponse(build_main_menu(user))
-
-        if not req:
-            return JsonResponse(build_main_menu(user))
-
-        if not req.current_question:
-            return JsonResponse(build_main_menu(user))
-
-        if req.current_question.question_type in ("text", "number"):
-            return JsonResponse(save_text_or_number_answer(req, text, raw_payload=raw_update))
-
-        if req.current_question.question_type == "photo":
-            return JsonResponse(build_response(
-                text="Сейчас нужно отправить именно фото.",
-                buttons=[[kb_callback("Отмена", "cancel")]],
-            ))
-
+    except Exception as exc:
+        logger.exception("Ошибка в maxbot_process_update")
+        _maxbot_send_exception_alert(max_user_id, raw_update, exc)
         return JsonResponse(build_response(
-            text="Пожалуйста, используй кнопки под сообщением.",
-            buttons=[[kb_callback("Отмена", "cancel")]],
+            text=(
+                "Произошла ошибка при обработке сообщения.\n\n"
+                "Попробуйте ещё раз или нажмите «Начать»."
+            ),
+            buttons=[[kb_message("Начать")]],
         ))
 
-    return JsonResponse(build_main_menu(user))
+
+
+
+def _maxbot_fit_columns(ws):
+    for column_cells in ws.columns:
+        length = 0
+        col_letter = get_column_letter(column_cells[0].column)
+        for cell in column_cells:
+            try:
+                length = max(length, len(str(cell.value or "")))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(length + 2, 14), 60)
+
+
+@staff_member_required
+def maxbot_request_export_excel(request):
+    q = (request.GET.get("q") or "").strip()
+    status = (request.GET.get("status") or "").strip()
+    emergency = (request.GET.get("emergency") or "").strip()
+
+    qs = (
+        MaxBotRequest.objects
+        .select_related("role", "employee", "vehicle", "scenario", "applicant_user")
+        .order_by("-created_at")
+    )
+
+    if q:
+        qs = qs.filter(
+            Q(request_no__icontains=q) |
+            Q(applicant_full_name__icontains=q) |
+            Q(employee__full_name__icontains=q) |
+            Q(vehicle__reg_number__icontains=q) |
+            Q(summary__icontains=q)
+        )
+
+    if status:
+        qs = qs.filter(status=status)
+
+    if emergency == "1":
+        qs = qs.filter(emergency_flag=True)
+    elif emergency == "0":
+        qs = qs.filter(emergency_flag=False)
+
+    request_ids = list(qs.values_list("id", flat=True))
+
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Заявки"
+
+    header_fill = PatternFill("solid", fgColor="DCEBFF")
+    emergency_fill = PatternFill("solid", fgColor="FFD6D6")
+    cancelled_fill = PatternFill("solid", fgColor="FFF3CD")
+    border = Border(
+        left=Side(style="thin", color="D1D5DB"),
+        right=Side(style="thin", color="D1D5DB"),
+        top=Side(style="thin", color="D1D5DB"),
+        bottom=Side(style="thin", color="D1D5DB"),
+    )
+
+    headers1 = [
+        "№ заявки", "Кто заполнил", "MAX user ID", "Чат",
+        "Должность", "Сотрудник", "Машина", "Сценарий",
+        "Статус", "Аварийность", "Итог",
+        "Создано", "Завершено",
+    ]
+    ws1.append(headers1)
+
+    for cell in ws1[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
+        cell.border = border
+
+    for req in qs:
+        status_label = MAXBOT_REQUEST_STATUS_LABELS.get(req.status, req.status)
+        ws1.append([
+            req.request_no,
+            req.applicant_full_name,
+            req.max_user_id,
+            req.max_chat_id or "",
+            str(req.role) if req.role else "",
+            str(req.employee) if req.employee else "",
+            str(req.vehicle) if req.vehicle else "",
+            str(req.scenario) if req.scenario else "",
+            status_label,
+            "Да" if req.emergency_flag else "Нет",
+            req.summary or "",
+            req.created_at.strftime("%d.%m.%Y %H:%M:%S") if req.created_at else "",
+            req.finished_at.strftime("%d.%m.%Y %H:%M:%S") if req.finished_at else "",
+        ])
+
+        current_row = ws1.max_row
+        fill = None
+        if req.status == "emergency_stop" or req.emergency_flag:
+            fill = emergency_fill
+        elif req.status == "cancelled":
+            fill = cancelled_fill
+
+        for cell in ws1[current_row]:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.border = border
+            if fill:
+                cell.fill = fill
+
+    _maxbot_fit_columns(ws1)
+
+    ws2 = wb.create_sheet("Шаги")
+    headers2 = [
+        "№ заявки", "Дата шага", "Вопрос", "Ответ",
+        "Действие для реестра", "Аварийный шаг", "Фото", "URL фото"
+    ]
+    ws2.append(headers2)
+
+    for cell in ws2[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
+        cell.border = border
+
+    answers = (
+        MaxBotRequestAnswer.objects
+        .filter(request_id__in=request_ids)
+        .select_related("request", "question", "option")
+        .order_by("request_id", "created_at", "id")
+    )
+
+    for ans in answers:
+        has_photo = bool(ans.photo_file or ans.photo_url)
+        ws2.append([
+            ans.request.request_no if ans.request_id else "",
+            ans.created_at.strftime("%d.%m.%Y %H:%M:%S") if ans.created_at else "",
+            ans.question_text or "",
+            _safe_answer_value(ans),
+            ans.registry_action_text or "",
+            "Да" if ans.is_emergency else "Нет",
+            "Да" if has_photo else "Нет",
+            ans.photo_url or (ans.photo_file.url if ans.photo_file else ""),
+        ])
+
+        current_row = ws2.max_row
+        fill = emergency_fill if ans.is_emergency else None
+        for cell in ws2[current_row]:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.border = border
+            if fill:
+                cell.fill = fill
+
+    _maxbot_fit_columns(ws2)
+
+    response = HttpResponse(
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    filename = f"maxbot_requests_{timezone.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    wb.save(response)
+    return response
 
 
 
@@ -17261,24 +17879,6 @@ def maxbot_process_update(request):
 
 
 
-
-
-
-
-
-
-
-
-MAXBOT_REQUEST_STATUS_LABELS = {
-    "draft": "Черновик",
-    "awaiting_role": "Ожидание выбора должности",
-    "awaiting_employee": "Ожидание выбора сотрудника",
-    "awaiting_vehicle": "Ожидание выбора машины",
-    "awaiting_answer": "Ожидание ответа",
-    "completed": "Завершено",
-    "emergency_stop": "Аварийный стоп",
-    "cancelled": "Отменено",
-}
 
 
 def _maxbot_stamp_and_save(obj):
@@ -17653,6 +18253,9 @@ def maxbot_scenario_questions(request, scenario_id):
 
     questions = scenario.questions.order_by("sort_order", "id").prefetch_related("options")
     page_obj = _maxbot_paginate(request, questions, per_page=50)
+
+    for obj in page_obj.object_list:
+        obj.question_type_label = MAXBOT_QUESTION_TYPE_LABELS.get(obj.question_type, obj.question_type)
 
     return render(request, "maxbot/question_list.html", {
         "scenario": scenario,
