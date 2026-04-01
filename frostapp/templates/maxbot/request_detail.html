@@ -19,7 +19,7 @@
                 <tr><th>MAX user ID</th><td>{{ req.max_user_id }}</td></tr>
                 <tr><th>Чат</th><td>{{ req.max_chat_id|default:"-" }}</td></tr>
                 <tr><th>Должность</th><td>{{ req.role|default:"-" }}</td></tr>
-                <tr><th>Сотрудник (автоопределение)</th><td>{{ req.employee|default:"-" }}</td></tr>
+                <tr><th>Сотрудник</th><td>{{ req.employee|default:req.applicant_full_name }}</td></tr>
                 <tr><th>Машина</th><td>{{ req.vehicle|default:"-" }}</td></tr>
                 <tr><th>Сценарий</th><td>{{ req.scenario|default:"-" }}</td></tr>
                 <tr><th>Статус</th><td>{{ req.status_label }}</td></tr>
