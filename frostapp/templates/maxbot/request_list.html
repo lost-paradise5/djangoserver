@@ -52,7 +52,7 @@
                 <td>{{ req.request_no }}</td>
                 <td>{{ req.applicant_full_name }}</td>
                 <td>{{ req.role|default:"-" }}</td>
-                <td>{{ req.employee|default:"-" }}</td>
+                <td>{{ req.employee|default:req.applicant_full_name }}</td>
                 <td>{{ req.vehicle|default:"-" }}</td>
                 <td>
                     {% if req.emergency_flag %}
