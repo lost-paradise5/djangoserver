@@ -284,7 +284,7 @@ BITRIX_DISK_FOLDER_UPLOAD_URL  = "https://gkbin.bitrix24.ru/rest/61518/p1rrvrb3e
 BITRIX_IM_DISK_FILE_COMMIT_URL = "https://gkbin.bitrix24.ru/rest/61518/s0rg1x8c02bym84s/im.disk.file.commit.json"
 
 
-MAX_BOT_LOGISTIC_TOKEN = os.getenv("MAX_BOT_TOKEN", "f9LHodD0cOLT-XniJsjaAhiKj8WenkdE58WQpUG1AOO57s7ryJU3NMZbLgrPJhbPSrICFIfWRcVLuLE56fpp")
+MAX_BOT_LOGISTIC_TOKEN = os.getenv("MAX_BOT_LOGISTIC_TOKEN", "f9LHodD0cOLT-XniJsjaAhiKj8WenkdE58WQpUG1AOO57s7ryJU3NMZbLgrPJhbPSrICFIfWRcVLuLE56fpp")
 
 
 
