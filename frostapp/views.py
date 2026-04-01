@@ -11506,7 +11506,138 @@ def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
 
 
 
+def _normalize_selected_services(raw_items: Iterable[str]) -> list[str]:
+    """
+    Нормализует и фильтрует список выбранных баз.
+    Сохраняет порядок, убирает дубли.
+    """
+    out = []
+    seen = set()
 
+    for raw in raw_items or []:
+        db = _normalize_service_key(raw)
+        if not db:
+            continue
+        if db in seen:
+            continue
+        if not _is_allowed_service(db):
+            continue
+        if db not in ORACLE_TNS_MAP:
+            continue
+        out.append(db)
+        seen.add(db)
+
+    return out
+
+
+def _oracle_resolve_position_for_target_db(cur, source_position: dict | None) -> dict | None:
+    """
+    Находит соответствующую должность в целевой базе.
+    Сопоставление:
+    1) по ORAROLE
+    2) по ID
+    3) по TITLE
+    """
+    if not source_position:
+        return None
+
+    target_positions = _oracle_fetch_smoffcfg_choices(cur)
+
+    source_id = str(source_position.get("id") or "").strip()
+    source_title = (source_position.get("title") or "").strip().lower()
+    source_orarole = (source_position.get("orarole") or "").strip().lower()
+
+    matched = None
+
+    if source_orarole:
+        matched = next(
+            (
+                x for x in target_positions
+                if (x.get("orarole") or "").strip().lower() == source_orarole
+            ),
+            None
+        )
+
+    if not matched and source_id:
+        matched = next(
+            (
+                x for x in target_positions
+                if str(x.get("id")) == source_id
+            ),
+            None
+        )
+
+    if not matched and source_title:
+        matched = next(
+            (
+                x for x in target_positions
+                if (x.get("title") or "").strip().lower() == source_title
+            ),
+            None
+        )
+
+    return {
+        "matched": bool(matched),
+        "id": int(matched["id"]) if matched and matched.get("id") is not None else None,
+        "title": (
+            (matched.get("title") if matched else source_position.get("title")) or ""
+        ).strip(),
+        "orarole": (
+            (matched.get("orarole") if matched else source_position.get("orarole")) or ""
+        ).strip(),
+    }
+
+
+def _build_smstaff_success_message(
+    *,
+    db: str,
+    auser: str,
+    acheck: int,
+    exact_exists: bool,
+    is_block_mode: bool,
+    is_delete_mode: bool,
+    updated_smstaff_rows: int,
+    used_password: str,
+) -> str:
+    if is_block_mode:
+        return (
+            f"Для пользователя {auser} в базе {db} выполнена блокировка "
+            f"(ACHECK=0, AUSERENABLED=0). "
+            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+        )
+
+    if is_delete_mode:
+        return (
+            f"Процедура выполнена для логина {auser} в базе {db}. "
+            f"Режим ACHECK=2."
+        )
+
+    if exact_exists and acheck == 1:
+        return (
+            f"Для существующего пользователя {auser} в базе {db} выполнено обновление. "
+            f"Пароль: {used_password}. "
+            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+        )
+
+    if exact_exists and acheck == -1:
+        return (
+            f"Для существующего пользователя {auser} в базе {db} выполнено обновление "
+            f"без создания новой записи. "
+            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+        )
+
+    if exact_exists and acheck == 0:
+        return (
+            f"Пользователь {auser} уже существовал в базе {db}. "
+            f"Процедура выполнена в режиме ACHECK=0. "
+            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+        )
+
+    return (
+        f"Пользователь успешно обработан в базе {db}. "
+        f"Пароль: {used_password}. "
+        f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+    )
 
 
 
@@ -12123,28 +12254,40 @@ def sm_staff_ui_create(request):
     """
     UI создание/обновление пользователя в SMSTAFF через процедуру bin_createuser.
 
-    Правила:
-    - обязательный только AUSER
-    - AINN / AFIO / ADOL не обязательны на уровне Django
-    - проверки конфликтов по логину/ИНН выполняются только для сценария создания
-    - режим блокировки для текущего кейса:
-        ACHECK = 0
-        AUSERENABLED = 0
-    - если ADOL не выбран, в процедуру уходит NULL
-    - если AINN / AFIO пустые, в процедуру уходит NULL
+    Новое:
+    - можно выбрать сразу несколько баз;
+    - можно передать APASS вручную;
+    - если APASS пустой, пароль генерируется автоматически;
+    - должность выбирается по "базе-источнику", затем сопоставляется в каждой целевой базе.
     """
     services = _ui_services_list()
 
     if request.method == "POST":
-        db = (request.POST.get("db") or "").strip().upper()
+        raw_selected_dbs = request.POST.getlist("dbs")
+        fallback_db = (request.POST.get("db") or "").strip().upper()
+        position_source_db = (request.POST.get("position_source_db") or "").strip().upper()
     else:
-        db = (request.GET.get("db") or "").strip().upper()
+        raw_selected_dbs = request.GET.getlist("dbs")
+        fallback_db = (request.GET.get("db") or "").strip().upper()
+        position_source_db = (request.GET.get("position_source_db") or "").strip().upper()
 
-    if not db:
-        db = services[0] if services else "BINUU00"
+    selected_dbs = _normalize_selected_services(raw_selected_dbs)
+
+    if not selected_dbs and fallback_db:
+        selected_dbs = _normalize_selected_services([fallback_db])
+
+    if not selected_dbs:
+        selected_dbs = [services[0]] if services else ["BINUU00"]
+
+    if not position_source_db or position_source_db not in selected_dbs:
+        position_source_db = selected_dbs[0]
+
+    # Для совместимости со старым шаблоном/ссылками
+    db = position_source_db
 
     form = {
         "auser": "",
+        "apass": "",
         "ainn": "",
         "afio": "",
         "adol": "",
@@ -12153,158 +12296,208 @@ def sm_staff_ui_create(request):
     }
 
     positions = []
-    conflicts = []
-    created_rows = []
+    positions_map = {}
+    db_results = []
     created_password = ""
     success_message = ""
     error = ""
 
     if request.method == "POST":
         form["auser"] = (request.POST.get("auser") or "").strip().lower()
+        form["apass"] = (request.POST.get("apass") or "").strip()
         form["ainn"] = (request.POST.get("ainn") or "").strip()
         form["afio"] = (request.POST.get("afio") or "").strip()
         form["adol"] = (request.POST.get("adol") or "").strip()
         form["acheck"] = (request.POST.get("acheck") or "1").strip()
         form["auserenabled"] = (request.POST.get("auserenabled") or "1").strip()
 
-    if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
-        return render(request, "frostapp/smstaff_create.html", {
-            "services": services,
-            "db": db,
-            "form": form,
-            "positions": [],
-            "acheck_choices": _SM_ACHECK_CHOICES,
-            "auserenabled_choices": _SM_USERENABLED_CHOICES,
-            "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
-            "conflicts": [],
-            "created_rows": [],
-            "created_password": "",
-            "success_message": "",
-            "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
-        })
-
-    conn = cur = None
+    # Загружаем должности из базы-источника
+    src_conn = src_cur = None
     try:
-        conn = _connect_oracle_service(db)
-        cur = conn.cursor()
+        if not _is_allowed_service(position_source_db) or position_source_db not in ORACLE_TNS_MAP:
+            raise ValueError(f"Неизвестная база position_source_db={position_source_db!r}.")
 
-        positions = _oracle_fetch_smoffcfg_choices(cur)
+        src_conn = _connect_oracle_service(position_source_db)
+        src_cur = src_conn.cursor()
+        positions = _oracle_fetch_smoffcfg_choices(src_cur)
         positions_map = {str(x["id"]): x for x in positions}
+    except Exception as e:
+        logger.exception(f"[UI/SMSTAFF_CREATE] load positions error db={position_source_db}: {e}")
+        error = str(e)
+    finally:
+        try:
+            if src_cur:
+                src_cur.close()
+            if src_conn:
+                src_conn.close()
+        except Exception:
+            pass
 
-        if request.method == "POST":
-            auser = form["auser"]
-            ainn = form["ainn"]
-            afio = form["afio"]
-            adol_id = form["adol"]
-            acheck_raw = form["acheck"]
-            auserenabled_raw = form["auserenabled"]
+    if request.method == "POST" and not error:
+        auser = form["auser"]
+        manual_password = form["apass"]
+        ainn = form["ainn"]
+        afio = form["afio"]
+        adol_id = form["adol"]
+        acheck_raw = form["acheck"]
+        auserenabled_raw = form["auserenabled"]
 
-            allowed_acheck_values = {x["value"] for x in _SM_ACHECK_CHOICES}
-            allowed_auserenabled_values = {x["value"] for x in _SM_USERENABLED_CHOICES}
+        allowed_acheck_values = {x["value"] for x in _SM_ACHECK_CHOICES}
+        allowed_auserenabled_values = {x["value"] for x in _SM_USERENABLED_CHOICES}
 
-            is_block_mode = (acheck_raw == "0" and auserenabled_raw == "0")
-            is_delete_mode = (acheck_raw == "2")
+        is_block_mode = (acheck_raw == "0" and auserenabled_raw == "0")
+        is_delete_mode = (acheck_raw == "2")
 
-            # Считаем "созданием" только сценарий, когда реально передают данные
-            # для новой УЗ и это не блокировка/не удаление.
-            is_creation_mode = (
-                not is_block_mode
-                and not is_delete_mode
-                and acheck_raw in {"0", "1"}
-                and bool(ainn)
-                and bool(adol_id)
+        is_creation_mode = (
+            not is_block_mode
+            and not is_delete_mode
+            and acheck_raw in {"0", "1"}
+            and bool(ainn)
+            and bool(adol_id)
+        )
+
+        if not selected_dbs:
+            error = "Выбери хотя бы одну базу."
+
+        elif not auser:
+            error = "Заполни логин (AUSER)."
+
+        elif not _is_valid_sm_login(auser):
+            error = (
+                "Логин может содержать только латинские буквы, цифры, "
+                "точку, дефис и нижнее подчёркивание."
             )
 
-            if not auser:
-                error = "Заполни логин (AUSER)."
+        elif manual_password and len(manual_password) > 128:
+            error = "Пароль слишком длинный. Максимум 128 символов."
 
-            elif not _is_valid_sm_login(auser):
+        elif acheck_raw not in allowed_acheck_values:
+            error = "Некорректное значение ACHECK."
+
+        elif auserenabled_raw not in allowed_auserenabled_values:
+            error = "Некорректное значение AUSERENABLED."
+
+        elif ainn and not _is_valid_inn_digits(ainn):
+            error = "ИНН должен состоять из 10 или 12 цифр."
+
+        elif afio and len(afio) > 255:
+            error = "ФИО (AFIO) слишком длинное. Максимум 255 символов."
+
+        elif adol_id and adol_id not in positions_map:
+            error = "Выбери корректную должность из списка."
+
+        if not error:
+            selected_source_pos = positions_map.get(adol_id) if adol_id else None
+
+            source_adol_title = (selected_source_pos.get("title") or "").strip() if selected_source_pos else ""
+            source_adol_orarole = (selected_source_pos.get("orarole") or "").strip() if selected_source_pos else None
+
+            if is_creation_mode and selected_source_pos and not source_adol_orarole:
                 error = (
-                    "Логин может содержать только латинские буквы, цифры, "
-                    "точку, дефис и нижнее подчёркивание."
+                    f"Для выбранной должности "
+                    f"'{source_adol_title or selected_source_pos.get('id')}' "
+                    f"в SMOFFCFG не заполнено поле ORAROLE."
                 )
 
-            elif acheck_raw not in allowed_acheck_values:
-                error = "Некорректное значение ACHECK."
+        if not error:
+            acheck = int(acheck_raw)
+            auserenabled = int(auserenabled_raw)
 
-            elif auserenabled_raw not in allowed_auserenabled_values:
-                error = "Некорректное значение AUSERENABLED."
+            used_password = manual_password if manual_password else _generate_sm_password(4)
+            created_password = used_password
 
-            elif ainn and not _is_valid_inn_digits(ainn):
-                error = "ИНН должен состоять из 10 или 12 цифр."
+            proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+                error = "Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC."
 
-            elif afio and len(afio) > 255:
-                error = "ФИО (AFIO) слишком длинное. Максимум 255 символов."
+        if not error:
+            for target_db in selected_dbs:
+                result_item = {
+                    "db": target_db,
+                    "error": "",
+                    "success_message": "",
+                    "conflicts": [],
+                    "created_rows": [],
+                    "used_password": created_password,
+                }
 
-            elif adol_id and adol_id not in positions_map:
-                error = "Выбери корректную должность из списка."
+                conn = cur = None
+                try:
+                    conn = _connect_oracle_service(target_db)
+                    cur = conn.cursor()
 
-            else:
-                selected_pos = positions_map.get(adol_id) if adol_id else None
+                    selected_pos_for_db = None
+                    adol_offindex = None
+                    adol_title = ""
+                    proc_adol = None
 
-                adol_title = (selected_pos.get("title") or "").strip() if selected_pos else ""
-                adol_orarole = (selected_pos.get("orarole") or "").strip() if selected_pos else None
-                adol_offindex = int(selected_pos["id"]) if selected_pos else None
+                    if selected_source_pos:
+                        if target_db == position_source_db:
+                            selected_pos_for_db = {
+                                "matched": True,
+                                "id": int(selected_source_pos["id"]) if selected_source_pos.get("id") is not None else None,
+                                "title": (selected_source_pos.get("title") or "").strip(),
+                                "orarole": (selected_source_pos.get("orarole") or "").strip(),
+                            }
+                        else:
+                            selected_pos_for_db = _oracle_resolve_position_for_target_db(cur, selected_source_pos)
 
-                # Для сценария создания должность должна иметь ORAROLE
-                if is_creation_mode and not adol_orarole:
-                    error = (
-                        f"Для выбранной должности "
-                        f"'{adol_title or adol_offindex}' "
-                        f"в SMOFFCFG не заполнено поле ORAROLE."
-                    )
+                        if (
+                            selected_source_pos
+                            and not is_block_mode
+                            and not is_delete_mode
+                            and not (selected_pos_for_db and selected_pos_for_db.get("matched"))
+                        ):
+                            raise ValueError(
+                                f"В базе {target_db} не найдена должность, соответствующая "
+                                f"выбранной позиции из базы {position_source_db}. "
+                                f"Сопоставление идёт по ORAROLE, затем по ID, затем по TITLE."
+                            )
 
-                exact_exists = False
-                login_taken_by_other = False
-                inn_taken_by_other = False
+                        proc_adol = (selected_pos_for_db.get("orarole") or "").strip() or None if selected_pos_for_db else None
+                        adol_offindex = selected_pos_for_db.get("id") if selected_pos_for_db else None
+                        adol_title = (selected_pos_for_db.get("title") or "").strip() if selected_pos_for_db else ""
 
-                # Проверки конфликтов — только для создания
-                if not error and is_creation_mode:
-                    conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
+                    exact_exists = False
+                    login_taken_by_other = False
+                    inn_taken_by_other = False
 
-                    for row in conflicts:
-                        row_login = (row.get("serverlogin") or "").strip().lower()
-                        row_inn = (row.get("inn") or "").strip()
+                    if is_creation_mode:
+                        result_item["conflicts"] = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
 
-                        if row_login == auser and row_inn == ainn:
-                            exact_exists = True
-                        elif row_login == auser and row_inn != ainn:
-                            login_taken_by_other = True
-                        elif row_inn == ainn and row_login != auser:
-                            inn_taken_by_other = True
+                        for row in result_item["conflicts"]:
+                            row_login = (row.get("serverlogin") or "").strip().lower()
+                            row_inn = (row.get("inn") or "").strip()
 
-                    if login_taken_by_other:
-                        error = (
-                            f"В базе {db} уже есть пользователь с логином {auser}, "
-                            f"но с другим ИНН. Проверь данные."
-                        )
-                    elif inn_taken_by_other:
-                        error = (
-                            f"В базе {db} уже есть пользователь с ИНН {ainn}, "
-                            f"но с другим логином. Проверь данные."
-                        )
+                            if row_login == auser and row_inn == ainn:
+                                exact_exists = True
+                            elif row_login == auser and row_inn != ainn:
+                                login_taken_by_other = True
+                            elif row_inn == ainn and row_login != auser:
+                                inn_taken_by_other = True
 
-                if not error:
-                    acheck = int(acheck_raw)
-                    auserenabled = int(auserenabled_raw)
+                        if login_taken_by_other:
+                            raise ValueError(
+                                f"В базе {target_db} уже есть пользователь с логином {auser}, "
+                                f"но с другим ИНН. Проверь данные."
+                            )
 
-                    created_password = _generate_sm_password(4)
-
-                    proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
-                    if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
-                        raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
+                        if inn_taken_by_other:
+                            raise ValueError(
+                                f"В базе {target_db} уже есть пользователь с ИНН {ainn}, "
+                                f"но с другим логином. Проверь данные."
+                            )
 
                     proc_ainn = ainn or None
                     proc_afio = afio or None
-                    proc_adol = adol_orarole or None
 
                     logger.info(
-                        f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={proc_ainn!r} "
+                        f"[UI/SMSTAFF_CREATE] start db={target_db} login={auser} inn={proc_ainn!r} "
                         f"afio={proc_afio!r} offindex={adol_offindex} title={adol_title!r} "
                         f"orarole={proc_adol!r} acheck={acheck} "
                         f"auserenabled={auserenabled} exact_exists={exact_exists} "
                         f"is_block_mode={is_block_mode} is_delete_mode={is_delete_mode} "
-                        f"is_creation_mode={is_creation_mode}"
+                        f"is_creation_mode={is_creation_mode} password_mode={'manual' if manual_password else 'auto'}"
                     )
 
                     cur.execute(
@@ -12332,7 +12525,6 @@ def sm_staff_ui_create(request):
 
                     updated_smstaff_rows = 0
 
-                    # Обновляем AFIO/OFFINDEX только если реально что-то передано
                     if not is_delete_mode and (proc_afio or adol_offindex is not None):
                         updated_smstaff_rows = _oracle_update_smstaff_after_create(
                             cur=cur,
@@ -12344,85 +12536,376 @@ def sm_staff_ui_create(request):
 
                     conn.commit()
 
-                    created_rows = _oracle_fetch_smstaff_by_login(cur, auser)
-
-                    if is_block_mode:
-                        success_message = (
-                            f"Для пользователя {auser} выполнена блокировка "
-                            f"(ACHECK=0, AUSERENABLED=0). "
-                            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
-                        )
-                    elif is_delete_mode:
-                        success_message = (
-                            f"Процедура выполнена для логина {auser}. "
-                            f"Режим ACHECK=2 означает удаление пользователя."
-                        )
-                    elif exact_exists and acheck == 1:
-                        success_message = (
-                            f"Для существующего пользователя {auser} выполнено обновление. "
-                            f"Новый пароль: {created_password}. "
-                            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
-                        )
-                    elif exact_exists and acheck == -1:
-                        success_message = (
-                            f"Для существующего пользователя {auser} выполнено обновление "
-                            f"без создания новой записи. "
-                            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
-                        )
-                    elif exact_exists and acheck == 0:
-                        success_message = (
-                            f"Пользователь {auser} уже существовал. "
-                            f"Процедура выполнена в режиме ACHECK=0. "
-                            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
-                        )
-                    else:
-                        success_message = (
-                            f"Пользователь успешно обработан в базе {db}. "
-                            f"Сгенерированный пароль: {created_password}. "
-                            f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
-                        )
+                    result_item["created_rows"] = _oracle_fetch_smstaff_by_login(cur, auser)
+                    result_item["success_message"] = _build_smstaff_success_message(
+                        db=target_db,
+                        auser=auser,
+                        acheck=acheck,
+                        exact_exists=exact_exists,
+                        is_block_mode=is_block_mode,
+                        is_delete_mode=is_delete_mode,
+                        updated_smstaff_rows=updated_smstaff_rows,
+                        used_password=created_password,
+                    )
 
                     logger.info(
-                        f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
-                        f"created_rows={len(created_rows)} offindex={adol_offindex} "
+                        f"[UI/SMSTAFF_CREATE] success db={target_db} login={auser} "
+                        f"created_rows={len(result_item['created_rows'])} offindex={adol_offindex} "
                         f"orarole={proc_adol!r} exact_exists={exact_exists} "
                         f"updated_smstaff_rows={updated_smstaff_rows} "
                         f"is_block_mode={is_block_mode} is_delete_mode={is_delete_mode} "
                         f"is_creation_mode={is_creation_mode} afio={proc_afio!r}"
                     )
 
-    except Exception as e:
-        logger.exception(f"[UI/SMSTAFF_CREATE] error db={db}: {e}")
-        error = str(e)
-        try:
-            if conn:
-                conn.rollback()
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.exception(f"[UI/SMSTAFF_CREATE] error db={target_db}: {e}")
+                    result_item["error"] = str(e)
+                    try:
+                        if conn:
+                            conn.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        if cur:
+                            cur.close()
+                        if conn:
+                            conn.close()
+                    except Exception:
+                        pass
 
-    finally:
-        try:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
-        except Exception:
-            pass
+                db_results.append(result_item)
+
+            ok_count = sum(1 for x in db_results if not x["error"])
+            err_count = sum(1 for x in db_results if x["error"])
+
+            success_message = (
+                f"Обработано баз: {len(db_results)}. "
+                f"Успешно: {ok_count}. "
+                f"С ошибкой: {err_count}."
+            )
 
     return render(request, "frostapp/smstaff_create.html", {
         "services": services,
         "db": db,
+        "selected_dbs": selected_dbs,
+        "position_source_db": position_source_db,
         "form": form,
         "positions": positions,
         "acheck_choices": _SM_ACHECK_CHOICES,
         "auserenabled_choices": _SM_USERENABLED_CHOICES,
         "error": error,
-        "conflicts": conflicts,
-        "created_rows": created_rows,
+        "db_results": db_results,
         "created_password": created_password,
         "success_message": success_message,
         "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
     })
+# @require_http_methods(["GET", "POST"])
+# @csrf_protect
+# def sm_staff_ui_create(request):
+#     """
+#     UI создание/обновление пользователя в SMSTAFF через процедуру bin_createuser.
+
+#     Правила:
+#     - обязательный только AUSER
+#     - AINN / AFIO / ADOL не обязательны на уровне Django
+#     - проверки конфликтов по логину/ИНН выполняются только для сценария создания
+#     - режим блокировки для текущего кейса:
+#         ACHECK = 0
+#         AUSERENABLED = 0
+#     - если ADOL не выбран, в процедуру уходит NULL
+#     - если AINN / AFIO пустые, в процедуру уходит NULL
+#     """
+#     services = _ui_services_list()
+
+#     if request.method == "POST":
+#         db = (request.POST.get("db") or "").strip().upper()
+#     else:
+#         db = (request.GET.get("db") or "").strip().upper()
+
+#     if not db:
+#         db = services[0] if services else "BINUU00"
+
+#     form = {
+#         "auser": "",
+#         "ainn": "",
+#         "afio": "",
+#         "adol": "",
+#         "acheck": "1",
+#         "auserenabled": "1",
+#     }
+
+#     positions = []
+#     conflicts = []
+#     created_rows = []
+#     created_password = ""
+#     success_message = ""
+#     error = ""
+
+#     if request.method == "POST":
+#         form["auser"] = (request.POST.get("auser") or "").strip().lower()
+#         form["ainn"] = (request.POST.get("ainn") or "").strip()
+#         form["afio"] = (request.POST.get("afio") or "").strip()
+#         form["adol"] = (request.POST.get("adol") or "").strip()
+#         form["acheck"] = (request.POST.get("acheck") or "1").strip()
+#         form["auserenabled"] = (request.POST.get("auserenabled") or "1").strip()
+
+#     if not _is_allowed_service(db) or db not in ORACLE_TNS_MAP:
+#         return render(request, "frostapp/smstaff_create.html", {
+#             "services": services,
+#             "db": db,
+#             "form": form,
+#             "positions": [],
+#             "acheck_choices": _SM_ACHECK_CHOICES,
+#             "auserenabled_choices": _SM_USERENABLED_CHOICES,
+#             "error": f"Неизвестная база db={db!r}. Добавь её в ORACLE_TNS_MAP.",
+#             "conflicts": [],
+#             "created_rows": [],
+#             "created_password": "",
+#             "success_message": "",
+#             "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
+#         })
+
+#     conn = cur = None
+#     try:
+#         conn = _connect_oracle_service(db)
+#         cur = conn.cursor()
+
+#         positions = _oracle_fetch_smoffcfg_choices(cur)
+#         positions_map = {str(x["id"]): x for x in positions}
+
+#         if request.method == "POST":
+#             auser = form["auser"]
+#             ainn = form["ainn"]
+#             afio = form["afio"]
+#             adol_id = form["adol"]
+#             acheck_raw = form["acheck"]
+#             auserenabled_raw = form["auserenabled"]
+
+#             allowed_acheck_values = {x["value"] for x in _SM_ACHECK_CHOICES}
+#             allowed_auserenabled_values = {x["value"] for x in _SM_USERENABLED_CHOICES}
+
+#             is_block_mode = (acheck_raw == "0" and auserenabled_raw == "0")
+#             is_delete_mode = (acheck_raw == "2")
+
+#             # Считаем "созданием" только сценарий, когда реально передают данные
+#             # для новой УЗ и это не блокировка/не удаление.
+#             is_creation_mode = (
+#                 not is_block_mode
+#                 and not is_delete_mode
+#                 and acheck_raw in {"0", "1"}
+#                 and bool(ainn)
+#                 and bool(adol_id)
+#             )
+
+#             if not auser:
+#                 error = "Заполни логин (AUSER)."
+
+#             elif not _is_valid_sm_login(auser):
+#                 error = (
+#                     "Логин может содержать только латинские буквы, цифры, "
+#                     "точку, дефис и нижнее подчёркивание."
+#                 )
+
+#             elif acheck_raw not in allowed_acheck_values:
+#                 error = "Некорректное значение ACHECK."
+
+#             elif auserenabled_raw not in allowed_auserenabled_values:
+#                 error = "Некорректное значение AUSERENABLED."
+
+#             elif ainn and not _is_valid_inn_digits(ainn):
+#                 error = "ИНН должен состоять из 10 или 12 цифр."
+
+#             elif afio and len(afio) > 255:
+#                 error = "ФИО (AFIO) слишком длинное. Максимум 255 символов."
+
+#             elif adol_id and adol_id not in positions_map:
+#                 error = "Выбери корректную должность из списка."
+
+#             else:
+#                 selected_pos = positions_map.get(adol_id) if adol_id else None
+
+#                 adol_title = (selected_pos.get("title") or "").strip() if selected_pos else ""
+#                 adol_orarole = (selected_pos.get("orarole") or "").strip() if selected_pos else None
+#                 adol_offindex = int(selected_pos["id"]) if selected_pos else None
+
+#                 # Для сценария создания должность должна иметь ORAROLE
+#                 if is_creation_mode and not adol_orarole:
+#                     error = (
+#                         f"Для выбранной должности "
+#                         f"'{adol_title or adol_offindex}' "
+#                         f"в SMOFFCFG не заполнено поле ORAROLE."
+#                     )
+
+#                 exact_exists = False
+#                 login_taken_by_other = False
+#                 inn_taken_by_other = False
+
+#                 # Проверки конфликтов — только для создания
+#                 if not error and is_creation_mode:
+#                     conflicts = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
+
+#                     for row in conflicts:
+#                         row_login = (row.get("serverlogin") or "").strip().lower()
+#                         row_inn = (row.get("inn") or "").strip()
+
+#                         if row_login == auser and row_inn == ainn:
+#                             exact_exists = True
+#                         elif row_login == auser and row_inn != ainn:
+#                             login_taken_by_other = True
+#                         elif row_inn == ainn and row_login != auser:
+#                             inn_taken_by_other = True
+
+#                     if login_taken_by_other:
+#                         error = (
+#                             f"В базе {db} уже есть пользователь с логином {auser}, "
+#                             f"но с другим ИНН. Проверь данные."
+#                         )
+#                     elif inn_taken_by_other:
+#                         error = (
+#                             f"В базе {db} уже есть пользователь с ИНН {ainn}, "
+#                             f"но с другим логином. Проверь данные."
+#                         )
+
+#                 if not error:
+#                     acheck = int(acheck_raw)
+#                     auserenabled = int(auserenabled_raw)
+
+#                     created_password = _generate_sm_password(4)
+
+#                     proc_name = os.getenv("SM_BIN_CREATEUSER_PROC", "bin_createuser").strip()
+#                     if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+#                         raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
+
+#                     proc_ainn = ainn or None
+#                     proc_afio = afio or None
+#                     proc_adol = adol_orarole or None
+
+#                     logger.info(
+#                         f"[UI/SMSTAFF_CREATE] start db={db} login={auser} inn={proc_ainn!r} "
+#                         f"afio={proc_afio!r} offindex={adol_offindex} title={adol_title!r} "
+#                         f"orarole={proc_adol!r} acheck={acheck} "
+#                         f"auserenabled={auserenabled} exact_exists={exact_exists} "
+#                         f"is_block_mode={is_block_mode} is_delete_mode={is_delete_mode} "
+#                         f"is_creation_mode={is_creation_mode}"
+#                     )
+
+#                     cur.execute(
+#                         f"""
+#                         BEGIN
+#                             {proc_name}(
+#                                 AUSER => :p_auser,
+#                                 APASS => :p_apass,
+#                                 ADOL => :p_adol,
+#                                 ACHECK => :p_acheck,
+#                                 AUSERENABLED => :p_auserenabled,
+#                                 AINN => :p_ainn,
+#                                 AFIO => :p_afio
+#                             );
+#                         END;
+#                         """,
+#                         p_auser=auser,
+#                         p_apass=created_password,
+#                         p_adol=proc_adol,
+#                         p_acheck=acheck,
+#                         p_auserenabled=auserenabled,
+#                         p_ainn=proc_ainn,
+#                         p_afio=proc_afio,
+#                     )
+
+#                     updated_smstaff_rows = 0
+
+#                     # Обновляем AFIO/OFFINDEX только если реально что-то передано
+#                     if not is_delete_mode and (proc_afio or adol_offindex is not None):
+#                         updated_smstaff_rows = _oracle_update_smstaff_after_create(
+#                             cur=cur,
+#                             login=auser,
+#                             inn=(proc_ainn or ""),
+#                             afio=(proc_afio or ""),
+#                             offindex=adol_offindex,
+#                         )
+
+#                     conn.commit()
+
+#                     created_rows = _oracle_fetch_smstaff_by_login(cur, auser)
+
+#                     if is_block_mode:
+#                         success_message = (
+#                             f"Для пользователя {auser} выполнена блокировка "
+#                             f"(ACHECK=0, AUSERENABLED=0). "
+#                             f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+#                         )
+#                     elif is_delete_mode:
+#                         success_message = (
+#                             f"Процедура выполнена для логина {auser}. "
+#                             f"Режим ACHECK=2 означает удаление пользователя."
+#                         )
+#                     elif exact_exists and acheck == 1:
+#                         success_message = (
+#                             f"Для существующего пользователя {auser} выполнено обновление. "
+#                             f"Новый пароль: {created_password}. "
+#                             f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+#                         )
+#                     elif exact_exists and acheck == -1:
+#                         success_message = (
+#                             f"Для существующего пользователя {auser} выполнено обновление "
+#                             f"без создания новой записи. "
+#                             f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+#                         )
+#                     elif exact_exists and acheck == 0:
+#                         success_message = (
+#                             f"Пользователь {auser} уже существовал. "
+#                             f"Процедура выполнена в режиме ACHECK=0. "
+#                             f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+#                         )
+#                     else:
+#                         success_message = (
+#                             f"Пользователь успешно обработан в базе {db}. "
+#                             f"Сгенерированный пароль: {created_password}. "
+#                             f"Принудительно обновлено строк в SMSTAFF: {updated_smstaff_rows}."
+#                         )
+
+#                     logger.info(
+#                         f"[UI/SMSTAFF_CREATE] success db={db} login={auser} "
+#                         f"created_rows={len(created_rows)} offindex={adol_offindex} "
+#                         f"orarole={proc_adol!r} exact_exists={exact_exists} "
+#                         f"updated_smstaff_rows={updated_smstaff_rows} "
+#                         f"is_block_mode={is_block_mode} is_delete_mode={is_delete_mode} "
+#                         f"is_creation_mode={is_creation_mode} afio={proc_afio!r}"
+#                     )
+
+#     except Exception as e:
+#         logger.exception(f"[UI/SMSTAFF_CREATE] error db={db}: {e}")
+#         error = str(e)
+#         try:
+#             if conn:
+#                 conn.rollback()
+#         except Exception:
+#             pass
+
+#     finally:
+#         try:
+#             if cur:
+#                 cur.close()
+#             if conn:
+#                 conn.close()
+#         except Exception:
+#             pass
+
+#     return render(request, "frostapp/smstaff_create.html", {
+#         "services": services,
+#         "db": db,
+#         "form": form,
+#         "positions": positions,
+#         "acheck_choices": _SM_ACHECK_CHOICES,
+#         "auserenabled_choices": _SM_USERENABLED_CHOICES,
+#         "error": error,
+#         "conflicts": conflicts,
+#         "created_rows": created_rows,
+#         "created_password": created_password,
+#         "success_message": success_message,
+#         "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
+#     })
 
 
 
