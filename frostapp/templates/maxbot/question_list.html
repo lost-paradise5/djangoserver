@@ -40,7 +40,8 @@
                     {% endif %}
                 </td>
                 <td>{{ obj.text }}</td>
-                <td>{{ obj.question_type }}</td>
+                <!-- <td>{{ obj.question_type }}</td> -->
+                <td>{{ obj.question_type_label }}</td>
                 <td>{{ obj.default_next_question|default:"-" }}</td>
                 <td>{{ obj.options.count }}</td>
                 <td>
