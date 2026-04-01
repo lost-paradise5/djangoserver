@@ -284,7 +284,7 @@ BITRIX_DISK_FOLDER_UPLOAD_URL  = "https://gkbin.bitrix24.ru/rest/61518/p1rrvrb3e
 BITRIX_IM_DISK_FILE_COMMIT_URL = "https://gkbin.bitrix24.ru/rest/61518/s0rg1x8c02bym84s/im.disk.file.commit.json"
 
 
-
+MAX_BOT_LOGISTIC_TOKEN = os.getenv("MAX_BOT_TOKEN", "f9LHodD0cOLT-XniJsjaAhiKj8WenkdE58WQpUG1AOO57s7ryJU3NMZbLgrPJhbPSrICFIfWRcVLuLE56fpp")
 
 
 
@@ -16717,14 +16717,14 @@ def _cancel_request(max_user_id: int):
 
 
 def _maxbot_api_request(path: str, method: str = "GET", json_body: Optional[dict] = None):
-    if not MAX_BOT_TOKEN:
+    if not MAX_BOT_LOGISTIC_TOKEN:
         return None
 
     response = requests.request(
         method=method,
         url=f"{MAX_BOT_API_BASE}{path}",
         headers={
-            "Authorization": MAX_BOT_TOKEN,
+            "Authorization": MAX_BOT_LOGISTIC_TOKEN,
             "Content-Type": "application/json",
         },
         json=json_body,
@@ -16743,7 +16743,7 @@ def _maxbot_api_request(path: str, method: str = "GET", json_body: Optional[dict
     return data
 
 def _maxbot_send_user_message(user_id: int, text: str, attachments: Optional[list] = None):
-    if not MAX_BOT_TOKEN or not user_id:
+    if not MAX_BOT_LOGISTIC_TOKEN or not user_id:
         return None
 
     body = {
@@ -16769,7 +16769,7 @@ def _maxbot_send_user_message(user_id: int, text: str, attachments: Optional[lis
 
 
 def _maxbot_upload_bytes(filename: str, content: bytes, content_type: str = "image/jpeg", upload_type: str = "image"):
-    if not MAX_BOT_TOKEN:
+    if not MAX_BOT_LOGISTIC_TOKEN:
         return None
 
     init_data = _maxbot_api_request(f"/uploads?type={upload_type}", method="POST")
@@ -16779,7 +16779,7 @@ def _maxbot_upload_bytes(filename: str, content: bytes, content_type: str = "ima
 
     resp = requests.post(
         upload_url,
-        headers={"Authorization": MAX_BOT_TOKEN},
+        headers={"Authorization": MAX_BOT_LOGISTIC_TOKEN},
         files={"data": (filename, content, content_type)},
         timeout=60,
     )
@@ -16834,9 +16834,7 @@ def _maxbot_build_alert_text(req: MaxBotRequest, reason: str, extra_text: Option
         f"<b>Причина:</b> {escape(reason)}",
         f"<b>Заявка:</b> {escape(req.request_no)}",
         f"<b>Кто заполнил:</b> {escape(req.applicant_full_name or '-')}",
-        f"<b>MAX user ID:</b> {req.max_user_id}",
         f"<b>Должность:</b> {escape(str(req.role) if req.role else '-')}",
-        f"<b>Сотрудник:</b> {escape(str(req.employee) if req.employee else '-')}",
         f"<b>Машина:</b> {escape(str(req.vehicle) if req.vehicle else '-')}",
         f"<b>Сценарий:</b> {escape(str(req.scenario) if req.scenario else '-')}",
         f"<b>Статус:</b> {escape(MAXBOT_REQUEST_STATUS_LABELS.get(req.status, req.status))}",
@@ -16849,7 +16847,7 @@ def _maxbot_build_alert_text(req: MaxBotRequest, reason: str, extra_text: Option
 
     answers = req.answers.order_by("created_at", "id")
     if answers.exists():
-        lines.extend(["", "<b>Журнал прохождения:</b>"])
+        lines.extend(["", "<b>История прохождения:</b>"])
         for ans in answers:
             created = ans.created_at.strftime("%d.%m.%Y %H:%M:%S") if ans.created_at else "-"
             value = escape(_safe_answer_value(ans))
@@ -16864,7 +16862,7 @@ def _maxbot_build_alert_text(req: MaxBotRequest, reason: str, extra_text: Option
 
 
 def _maxbot_send_alert(req: MaxBotRequest, reason: str, extra_text: Optional[str] = None):
-    if not MAXBOT_ALERT_USER_ID or not MAX_BOT_TOKEN or not req:
+    if not MAXBOT_ALERT_USER_ID or not MAX_BOT_LOGISTIC_TOKEN or not req:
         return
 
     try:
@@ -16905,7 +16903,7 @@ def _maxbot_send_alert(req: MaxBotRequest, reason: str, extra_text: Optional[str
 
 
 def _maxbot_send_exception_alert(max_user_id: Optional[int], raw_update: dict, exc: Exception):
-    if not MAXBOT_ALERT_USER_ID or not MAX_BOT_TOKEN:
+    if not MAXBOT_ALERT_USER_ID or not MAX_BOT_LOGISTIC_TOKEN:
         return
 
     text = (
