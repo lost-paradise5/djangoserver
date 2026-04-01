@@ -15,11 +15,11 @@
         <h2>Основная информация</h2>
         <table>
             <tbody>
-                <tr><th>Кто заполнил</th><td>{{ req.applicant_full_name }}</td></tr>
+                <tr><th>Кто заполнил в MAX</th><td>{{ req.applicant_full_name }}</td></tr>
                 <tr><th>MAX user ID</th><td>{{ req.max_user_id }}</td></tr>
                 <tr><th>Чат</th><td>{{ req.max_chat_id|default:"-" }}</td></tr>
                 <tr><th>Должность</th><td>{{ req.role|default:"-" }}</td></tr>
-                <tr><th>Сотрудник</th><td>{{ req.employee|default:"-" }}</td></tr>
+                <tr><th>Сотрудник (автоопределение)</th><td>{{ req.employee|default:"-" }}</td></tr>
                 <tr><th>Машина</th><td>{{ req.vehicle|default:"-" }}</td></tr>
                 <tr><th>Сценарий</th><td>{{ req.scenario|default:"-" }}</td></tr>
                 <tr><th>Статус</th><td>{{ req.status_label }}</td></tr>
@@ -54,7 +54,7 @@
         </thead>
         <tbody>
         {% for ans in answers %}
-            <tr>
+            <tr class="{% if ans.is_emergency %}row-danger{% endif %}">
                 <td>{{ ans.created_at|date:"d.m.Y H:i:s" }}</td>
                 <td>{{ ans.question_text }}</td>
                 <td>
