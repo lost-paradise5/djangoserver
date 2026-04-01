@@ -14,6 +14,10 @@
         <a class="btn btn-primary" href="{% url 'maxbot_option_create' question.id %}">+ Добавить вариант</a>
         <a class="btn btn-secondary" href="{% url 'maxbot_scenario_questions' question.scenario.id %}">К вопросам</a>
     </div>
+    <div class="help-box">
+        Варианты ответа теперь отправляются в MAX как обычные сообщения пользователя.
+        Поэтому внутри одного вопроса тексты кнопок должны быть понятными и не совпадать между собой.
+    </div>
 </div>
 
 <div class="card">
