@@ -158,16 +158,30 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 
-EMAIL_HOST = 'smtp.mail.ru'
+# EMAIL_HOST = 'smtp.mail.ru'
+# EMAIL_PORT = 465
+
+# EMAIL_HOST_USER = 'denis.lomaster@mail.ru'
+# EMAIL_HOST_PASSWORD = 'a61hEWZvzhNRPxjnhEIA'
+
+# EMAIL_USE_SSL = True
+# EMAIL_USE_TLS = False
+
+# DEFAULT_FROM_EMAIL = 'denis.lomaster@mail.ru'
+# SERVER_EMAIL = 'denis.lomaster@mail.ru'
+
+# EMAIL_TIMEOUT = 15
+
+EMAIL_HOST = 'smtp.yandex.ru'
 EMAIL_PORT = 465
 
-EMAIL_HOST_USER = 'denis.lomaster@mail.ru'
-EMAIL_HOST_PASSWORD = 'a61hEWZvzhNRPxjnhEIA'
+EMAIL_HOST_USER = 'St.frostq@yandex.ru'
+EMAIL_HOST_PASSWORD = 'xkzuyzwzuavpcbpc'
 
 EMAIL_USE_SSL = True
 EMAIL_USE_TLS = False
 
-DEFAULT_FROM_EMAIL = 'denis.lomaster@mail.ru'
-SERVER_EMAIL = 'denis.lomaster@mail.ru'
+DEFAULT_FROM_EMAIL = 'St.frostq@yandex.ru'
+SERVER_EMAIL = 'St.frostq@yandex.ru'
 
-EMAIL_TIMEOUT = 15
+EMAIL_TIMEOUT = 25
