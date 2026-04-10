@@ -18602,16 +18602,24 @@ def _fetch_working_employees_from_1c() -> list[dict]:
 
 TARGET_SUPERMAG_POSITIONS = {
     "Администратор магазина",
+    "Администратор",
     "Приемщик товара",
+    "Приемщик",
     "Директор магазина",
+    "Директор",
 }
 
 SUPERMAG_CREATE_POSITIONS = {
     "Администратор магазина",
+    "Администратор",
     "Приемщик товара",
+    "Приемщик",
 }
 
-SUPERMAG_DIRECTOR_POSITION = "Директор магазина"
+SUPERMAG_DIRECTOR_POSITIONS = {
+    "Директор магазина",
+    "Директор",
+}
 SUPERMAG_OFFINDEX_ADMIN = 118
 SUPERMAG_ORAROLE_ADMIN = "OPERATOR_ADMIN"
 WORKING_EMPLOYEES_EXPORT_SUBDIR = "working_employees_sync_exports"
@@ -19339,7 +19347,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
         1 for x in filtered if _safe_text(x.get("Должность")) in SUPERMAG_CREATE_POSITIONS
     )
     summary["director_positions"] = sum(
-        1 for x in filtered if _safe_text(x.get("Должность")) == SUPERMAG_DIRECTOR_POSITION
+        1 for x in filtered if _safe_text(x.get("Должность")) in SUPERMAG_DIRECTOR_POSITIONS
     )
     summary["dry_run"] = 1 if dry_run else 0
 
@@ -19742,7 +19750,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                         reserved_logins.add(login_existing.lower())
                         actions.append(f"логин в Супермаге: {login_existing}")
 
-                    if position == SUPERMAG_DIRECTOR_POSITION:
+                    if position in SUPERMAG_DIRECTOR_POSITIONS:
                         summary["director_exists"] += 1
                         status_text = "директор уже есть в Супермаге"
                     else:
@@ -19794,7 +19802,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                     )
                     continue
 
-                if position == SUPERMAG_DIRECTOR_POSITION:
+                if position == SUPERMAG_DIRECTOR_POSITIONS:
                     summary["director_missing"] += 1
                     actions.append("для директоров создание не выполняется")
                     results_by_index[idx] = _build_status_row(
