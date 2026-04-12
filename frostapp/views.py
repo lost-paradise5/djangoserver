@@ -18547,11 +18547,46 @@ def _compose_full_name(item: dict) -> str:
 
 def _build_short_sm_afio(first_name: str, last_name: str) -> str:
     """
-    Укороченный AFIO для Супермага: только 'Имя Фамилия'
+    Укороченный AFIO для Супермага: только 'Фамилия Имя'
     """
     first_name = _safe_text(first_name)
     last_name = _safe_text(last_name)
-    return " ".join([x for x in [first_name, last_name] if x]).strip()
+    return " ".join([x for x in [last_name, first_name] if x]).strip()
+
+
+def _choose_sm_afio_for_create(last_name: str, first_name: str, middle_name: str) -> tuple[str, str]:
+    """
+    Возвращает AFIO для создания в Супермаге.
+
+    Правила:
+    1) Если 'Фамилия Имя Отчество' <= 28 символов — отправляем полное.
+    2) Если полное ФИО > 28 символов — отправляем 'Фамилия Имя'.
+    3) Если 'Фамилия Имя' > 29 символов — жёстко режем до 29 символов,
+       чтобы не словить ORA-12899 повторно.
+
+    Возврат:
+      (afio, mode)
+      mode: full / short / short_trimmed / empty
+    """
+    last_name = _safe_text(last_name)
+    first_name = _safe_text(first_name)
+    middle_name = _safe_text(middle_name)
+
+    full_afio = " ".join([x for x in [last_name, first_name, middle_name] if x]).strip()
+    short_afio = _build_short_sm_afio(first_name=first_name, last_name=last_name)
+
+    if full_afio and len(full_afio) <= SM_AFIO_FULL_MAX:
+        return full_afio, "full"
+
+    if short_afio:
+        if len(short_afio) <= SM_AFIO_SHORT_MAX:
+            return short_afio, "short"
+        return short_afio[:SM_AFIO_SHORT_MAX].rstrip(), "short_trimmed"
+
+    if full_afio:
+        return full_afio[:SM_AFIO_SHORT_MAX].rstrip(), "short_trimmed"
+
+    return "", "empty"
 
 
 def _is_smstaff_surname_too_long_error(exc: Exception) -> bool:
@@ -18624,6 +18659,8 @@ SUPERMAG_OFFINDEX_ADMIN = 118
 SUPERMAG_ORAROLE_ADMIN = "OPERATOR_ADMIN"
 WORKING_EMPLOYEES_EXPORT_SUBDIR = "working_employees_sync_exports"
 
+SM_AFIO_FULL_MAX = 28
+SM_AFIO_SHORT_MAX = 29
 
 def _chunked(seq, size: int):
     seq = list(seq)
@@ -19420,6 +19457,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
         department = _safe_text(item.get("Подразделение"))
         first_name = _safe_text(item.get("Имя"))
         last_name = _safe_text(item.get("Фамилия"))
+        middle_name = _safe_text(item.get("Отчество"))
 
         actions = []
 
@@ -19704,6 +19742,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
             "department": department,
             "first_name": first_name,
             "last_name": last_name,
+            "middle_name": middle_name,
             "source_storeid": raw_store,
             "target_storeid": target_storeid,
             "sm_db": dbname,
@@ -19802,7 +19841,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                     )
                     continue
 
-                if position == SUPERMAG_DIRECTOR_POSITIONS:
+                if position in SUPERMAG_DIRECTOR_POSITIONS:
                     summary["director_missing"] += 1
                     actions.append("для директоров создание не выполняется")
                     results_by_index[idx] = _build_status_row(
@@ -19834,10 +19873,23 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                 )
                 login_new = _resolve_available_sm_login(cur, login_base, reserved_logins)
                 pin_code = _generate_pin_code()
-
+                
+                chosen_afio, afio_mode = _choose_sm_afio_for_create(
+                    last_name=item["last_name"],
+                    first_name=item["first_name"],
+                    middle_name=item.get("middle_name", ""),
+                )
+                
+                if not chosen_afio:
+                    chosen_afio = full_name
+                
                 actions.append(f"логин: {login_new}")
                 actions.append(f"пароль: {pin_code}")
-                actions.append(f"AFIO: {full_name}")
+                actions.append(f"AFIO: {chosen_afio}")
+                if afio_mode == "short":
+                    actions.append("AFIO сокращён до 'Фамилия Имя', потому что полное ФИО длиннее 28 символов")
+                elif afio_mode == "short_trimmed":
+                    actions.append("AFIO сокращён и обрезан до 29 символов")
                 actions.append(f"ADOL: {SUPERMAG_ORAROLE_ADMIN}")
                 actions.append(f"OFFINDEX: {SUPERMAG_OFFINDEX_ADMIN}")
 
@@ -19876,14 +19928,8 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                 if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
                     raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER_PROC.")
                 
-                primary_afio = full_name
-                fallback_afio = _build_short_sm_afio(
-                    first_name=item["first_name"],
-                    last_name=item["last_name"],
-                )
-                
+                used_afio = chosen_afio
                 updated_smstaff_rows = 0
-                used_afio = primary_afio
                 
                 try:
                     cur.execute(
@@ -19906,39 +19952,45 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                         p_acheck=0,
                         p_auserenabled=1,
                         p_ainn=inn,
-                        p_afio=primary_afio,
+                        p_afio=used_afio,
                     )
                 
                     updated_smstaff_rows = _oracle_update_smstaff_after_create(
                         cur=cur,
                         login=login_new,
                         inn=inn,
-                        afio=primary_afio,
+                        afio=used_afio,
                         offindex=SUPERMAG_OFFINDEX_ADMIN,
                     )
                 
                     conn.commit()
                 
                 except Exception as oracle_exc:
-                    retried_with_short_afio = False
+                    # На случай, если даже заранее сокращённый AFIO всё равно не влез
+                    fallback_afio = _build_short_sm_afio(
+                        first_name=item["first_name"],
+                        last_name=item["last_name"],
+                    )
+                    if fallback_afio and len(fallback_afio) > SM_AFIO_SHORT_MAX:
+                        fallback_afio = fallback_afio[:SM_AFIO_SHORT_MAX].rstrip()
                 
                     if (
                         _is_smstaff_surname_too_long_error(oracle_exc)
                         and fallback_afio
-                        and fallback_afio != primary_afio
+                        and fallback_afio != used_afio
                     ):
                         try:
                             conn.rollback()
                         except Exception:
                             pass
                 
-                        retried_with_short_afio = True
-                        used_afio = fallback_afio
                         actions.append(
-                            f"полный AFIO не поместился, повторяем создание с AFIO: {fallback_afio}"
+                            f"AFIO не поместился, повторяем создание с AFIO: {fallback_afio}"
                         )
                 
                         try:
+                            used_afio = fallback_afio
+                
                             cur.execute(
                                 f"""
                                 BEGIN
@@ -19959,14 +20011,14 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                                 p_acheck=0,
                                 p_auserenabled=1,
                                 p_ainn=inn,
-                                p_afio=fallback_afio,
+                                p_afio=used_afio,
                             )
                 
                             updated_smstaff_rows = _oracle_update_smstaff_after_create(
                                 cur=cur,
                                 login=login_new,
                                 inn=inn,
-                                afio=fallback_afio,
+                                afio=used_afio,
                                 offindex=SUPERMAG_OFFINDEX_ADMIN,
                             )
                 
@@ -20027,9 +20079,6 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                             sm_password=pin_code,
                         )
                         continue
-                
-                if used_afio != primary_afio:
-                    actions.append(f"создано с укороченным AFIO: {used_afio}")
 
                 row_status_code = "success"
                 row_status_text = "создан в Супермаге"
