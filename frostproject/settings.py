@@ -175,13 +175,14 @@ EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.yandex.ru'
 EMAIL_PORT = 465
 
-EMAIL_HOST_USER = 'St.frostq@yandex.ru'
-EMAIL_HOST_PASSWORD = 'xkzuyzwzuavpcbpc'
+EMAIL_HOST_USER = 'informant@retail03.ru'
+# EMAIL_HOST_PASSWORD = 'xkzuyzwzuavpcbpc'
 
+EMAIL_HOST_PASSWORD = 'inzpkxlgmjgsejwn'
 EMAIL_USE_SSL = True
 EMAIL_USE_TLS = False
 
-DEFAULT_FROM_EMAIL = 'St.frostq@yandex.ru'
-SERVER_EMAIL = 'St.frostq@yandex.ru'
+DEFAULT_FROM_EMAIL = 'informant@retail03.ru'
+SERVER_EMAIL = 'informant@retail03.ru'
 
 EMAIL_TIMEOUT = 25
