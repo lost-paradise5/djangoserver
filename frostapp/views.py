@@ -183,6 +183,20 @@ ALLOWED_WORKING_EMPLOYEE_POSITIONS = {
     "администратор магазина",
     "директор магазина",
     "приемщик товара",
+
+    "специалист торгового зала 1 категории",
+    "специалист торгового зала 2 категории",
+    "специалист торгового зала 3 категории",
+    "администратор",
+    "приемщик",
+    "директор",
+    "контролер торгового зала",
+    "специалист торгового зала",
+    "старший специалист торгового зала",
+    "администратор мобильного подразделения",
+    "контролер торгового зала 1 категории",
+    "контролер торгового зала 2 категории",
+    "контролер торгового зала 3 категории",
 }
 
 ONEC_WORKING_EMPLOYEES_TIMEOUT = int(os.getenv("ONEC_WORKING_EMPLOYEES_TIMEOUT", "180"))
@@ -4849,6 +4863,200 @@ def _fetch_sm_database_items() -> list[dict]:
             pass
 
 
+
+
+def _connect_oracle_supermag_by_service(service_name: str):
+    """
+    Подключение к конкретной локальной базе Супермага по имени сервиса,
+    например BINCH8 / BINUU04 и т.п.
+    """
+    service_name = _safe_str(service_name).upper()
+    if not service_name:
+        raise ValueError("Не передано имя Oracle service_name/dbname")
+
+    cfg = ORACLE_TNS_MAP.get(service_name)
+    if not cfg:
+        raise ValueError(f"База {service_name!r} не найдена в ORACLE_TNS_MAP")
+
+    hosts = cfg.get("hosts") or [cfg.get("host")]
+    port = int(cfg.get("port") or 1521)
+    service = _safe_str(cfg.get("service_name") or service_name)
+
+    user = os.getenv("ORACLE_USER", "supermag")
+    password = os.getenv("ORACLE_PASSWORD", "qqq")
+
+    last_error = None
+    for host in hosts:
+        host = _safe_str(host)
+        if not host:
+            continue
+        try:
+            dsn = cx_Oracle.makedsn(host, port, service_name=service)
+            return _oracle_connect(user=user, password=password, dsn=dsn)
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "[WORKING_EMPLOYEES_EXCEL] Не удалось подключиться к %s (%s:%s/%s): %s",
+                service_name, host, port, service, e
+            )
+
+    if last_error:
+        raise last_error
+
+    raise ValueError(f"Не удалось подготовить подключение к базе {service_name!r}")
+
+
+def _sm_oracle_get_table_columns_set(cur, owner: str, table: str) -> set[str]:
+    cur.execute(
+        """
+        SELECT column_name
+        FROM all_tab_columns
+        WHERE owner = :owner
+          AND table_name = :table
+        """,
+        {
+            "owner": _safe_str(owner).upper(),
+            "table": _safe_str(table).upper(),
+        }
+    )
+    return {str(row[0]).strip().upper() for row in cur.fetchall()}
+
+
+def _smstaff_fio_expr(alias: str, cols_set: set[str]) -> str:
+    """
+    SQL-выражение, возвращающее ФИО сотрудника из SMSTAFF.
+    Если есть AFIO — используем его.
+    Иначе собираем из surname/name/patronymic.
+    """
+    upper_cols = {c.upper() for c in cols_set}
+
+    if "AFIO" in upper_cols:
+        return f"TRIM(REGEXP_REPLACE(NVL({alias}.afio, ''), ' +', ' '))"
+
+    parts = []
+    if "SURNAME" in upper_cols:
+        parts.append(f"NVL({alias}.surname, '')")
+    if "NAME" in upper_cols:
+        parts.append(f"NVL({alias}.name, '')")
+    if "PATRONYMIC" in upper_cols:
+        parts.append(f"NVL({alias}.patronymic, '')")
+
+    if parts:
+        joined = " || ' ' || ".join(parts)
+        return f"TRIM(REGEXP_REPLACE({joined}, ' +', ' '))"
+
+    return "''"
+
+
+def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name: str) -> list[str]:
+    """
+    Ищет логины пользователя в таблице SMSTAFF конкретной базы.
+    Поиск:
+      1) по ИНН
+      2) по ФИО
+    Возвращает список логинов.
+    """
+    dbname = _safe_str(dbname).upper()
+    inn = _safe_str(inn)
+    full_name_norm = _normalize_spaces(full_name).upper()
+
+    if not dbname:
+        return []
+
+    if not inn and not full_name_norm:
+        return []
+
+    conn = cur = None
+    try:
+        conn = _connect_oracle_supermag_by_service(dbname)
+        cur = conn.cursor()
+
+        cols_set = _sm_oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+        upper_cols = {c.upper() for c in cols_set}
+
+        if "SERVERLOGIN" not in upper_cols:
+            logger.warning(
+                "[WORKING_EMPLOYEES_EXCEL] В %s нет колонки SERVERLOGIN в SMSTAFF",
+                dbname
+            )
+            return []
+
+        where_parts = []
+        binds = {}
+
+        if inn and "INN" in upper_cols:
+            where_parts.append("TRIM(s.inn) = :b_inn")
+            binds["b_inn"] = inn
+
+        if full_name_norm:
+            fio_expr = _smstaff_fio_expr("s", cols_set)
+            where_parts.append(f"UPPER({fio_expr}) = :b_fio")
+            binds["b_fio"] = full_name_norm
+
+        if not where_parts:
+            return []
+
+        sql = f"""
+            SELECT DISTINCT TRIM(s.serverlogin) AS serverlogin
+            FROM smstaff s
+            WHERE ({' OR '.join(where_parts)})
+              AND s.serverlogin IS NOT NULL
+            ORDER BY s.serverlogin
+        """
+
+        cur.execute(sql, binds)
+
+        result = []
+        seen = set()
+        for row in cur.fetchall():
+            login = _safe_str(row[0])
+            if not login:
+                continue
+            k = login.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            result.append(login)
+
+        return result
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _get_smstaff_logins_for_employee_cached(
+    *,
+    dbname: str,
+    inn: str,
+    full_name: str,
+    cache: dict,
+) -> list[str]:
+    key = (
+        _safe_str(dbname).upper(),
+        _safe_str(inn),
+        _normalize_spaces(full_name).upper(),
+    )
+    if key in cache:
+        return cache[key]
+
+    logins = _fetch_smstaff_logins_for_employee_from_db(
+        dbname=dbname,
+        inn=inn,
+        full_name=full_name,
+    )
+    cache[key] = logins
+    return logins
+
+
+
+
+
 def _build_working_employees_excel(rows: list[dict]) -> io.BytesIO:
     wb = Workbook()
     ws = wb.active
@@ -4861,6 +5069,7 @@ def _build_working_employees_excel(rows: list[dict]) -> io.BytesIO:
         "ФИО сотрудника",
         "Должность",
         "ИНН сотрудника",
+        "Логин в СМ",
     ]
     ws.append(headers)
 
@@ -4872,9 +5081,9 @@ def _build_working_employees_excel(rows: list[dict]) -> io.BytesIO:
             row.get("full_name", ""),
             row.get("position", ""),
             row.get("inn", ""),
+            row.get("sm_login", ""),
         ])
 
-    # стили
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(bold=True, color="FFFFFF")
     thin = Side(border_style="thin", color="D9D9D9")
@@ -4891,15 +5100,16 @@ def _build_working_employees_excel(rows: list[dict]) -> io.BytesIO:
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:F{max(ws.max_row, 1)}"
+    ws.auto_filter.ref = f"A1:G{max(ws.max_row, 1)}"
 
     column_widths = {
         "A": 18,
         "B": 12,
         "C": 45,
         "D": 35,
-        "E": 28,
+        "E": 34,
         "F": 18,
+        "G": 24,
     }
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
@@ -5425,6 +5635,8 @@ def working_employees_excel_generate(request):
 
         rows: list[dict] = []
         missing_store_ids: set[int] = set()
+        login_lookup_cache: dict = {}
+        failed_login_lookup: list[dict] = []
 
         for raw_item in raw_employees:
             employee = _normalize_working_employee(raw_item)
@@ -5441,13 +5653,46 @@ def working_employees_excel_generate(request):
             if store_id is not None and not store_info:
                 missing_store_ids.add(store_id)
 
+            dbname = _safe_str(store_info.get("dbname")) if store_info else ""
+            store_name = _safe_str(store_info.get("name")) if store_info else ""
+            full_name = _safe_str(employee.get("full_name"))
+            position = _safe_str(employee.get("position"))
+            inn = _safe_str(employee.get("inn"))
+
+            sm_login = ""
+
+            # Логин ищем только если есть привязка к магазину и известна база
+            if dbname:
+                try:
+                    logins = _get_smstaff_logins_for_employee_cached(
+                        dbname=dbname,
+                        inn=inn,
+                        full_name=full_name,
+                        cache=login_lookup_cache,
+                    )
+                    sm_login = ", ".join(logins)
+                except Exception as e:
+                    failed_login_lookup.append({
+                        "dbname": dbname,
+                        "store_id": store_id,
+                        "full_name": full_name,
+                        "inn": inn,
+                        "error": str(e),
+                    })
+                    logger.exception(
+                        "[WORKING_EMPLOYEES_EXCEL] Ошибка поиска логина в СМ: "
+                        "dbname=%s store_id=%s full_name=%r inn=%r",
+                        dbname, store_id, full_name, inn
+                    )
+
             rows.append({
-                "dbname": _safe_str(store_info.get("dbname")) if store_info else "",
+                "dbname": dbname,
                 "store_id": store_id or "",
-                "store_name": _safe_str(store_info.get("name")) if store_info else "",
-                "full_name": _safe_str(employee.get("full_name")),
-                "position": _safe_str(employee.get("position")),
-                "inn": _safe_str(employee.get("inn")),
+                "store_name": store_name,
+                "full_name": full_name,
+                "position": position,
+                "inn": inn,
+                "sm_login": sm_login,
             })
 
         rows.sort(
@@ -5459,10 +5704,17 @@ def working_employees_excel_generate(request):
         )
 
         logger.info(
-            "[WORKING_EMPLOYEES_EXCEL] filtered_rows=%s missing_store_ids=%s",
+            "[WORKING_EMPLOYEES_EXCEL] filtered_rows=%s missing_store_ids=%s failed_login_lookup=%s",
             len(rows),
             sorted(missing_store_ids),
+            len(failed_login_lookup),
         )
+
+        if failed_login_lookup:
+            logger.warning(
+                "[WORKING_EMPLOYEES_EXCEL] Не удалось получить логины для части сотрудников: %s",
+                failed_login_lookup[:20],
+            )
 
         excel_file = _build_working_employees_excel(rows)
         filename = f"working_employees_{timezone.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
