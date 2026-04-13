@@ -5043,7 +5043,29 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
         except Exception:
             pass
 
+def _get_smstaff_logins_for_employee_cached(
+    *,
+    dbname: str,
+    inn: str,
+    full_name: str,
+    cache: dict,
+) -> list[str]:
+    key = (
+        _safe_str(dbname).upper(),
+        _safe_str(inn),
+        _normalize_spaces(full_name).upper(),
+    )
 
+    if key in cache:
+        return cache[key]
+
+    logins = _fetch_smstaff_logins_for_employee_from_db(
+        dbname=dbname,
+        inn=inn,
+        full_name=full_name,
+    )
+    cache[key] = logins
+    return logins
 
 
 
