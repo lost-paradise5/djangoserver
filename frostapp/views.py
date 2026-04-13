@@ -4863,60 +4863,27 @@ def _fetch_sm_database_items() -> list[dict]:
             pass
 
 
+def _split_full_name(full_name: str) -> tuple[str, str, str]:
+    parts = _normalize_spaces(full_name).split()
+    last_name = parts[0] if len(parts) > 0 else ""
+    first_name = parts[1] if len(parts) > 1 else ""
+    patronymic = parts[2] if len(parts) > 2 else ""
+    return last_name, first_name, patronymic
 
 
-def _connect_oracle_supermag_by_service(service_name: str):
-    """
-    Подключение к конкретной локальной базе Супермага по имени сервиса,
-    например BINCH8 / BINUU04 и т.п.
-    """
-    service_name = _safe_str(service_name).upper()
-    if not service_name:
-        raise ValueError("Не передано имя Oracle service_name/dbname")
-
-    cfg = ORACLE_TNS_MAP.get(service_name)
-    if not cfg:
-        raise ValueError(f"База {service_name!r} не найдена в ORACLE_TNS_MAP")
-
-    hosts = cfg.get("hosts") or [cfg.get("host")]
-    port = int(cfg.get("port") or 1521)
-    service = _safe_str(cfg.get("service_name") or service_name)
-
-    user = os.getenv("ORACLE_USER", "supermag")
-    password = os.getenv("ORACLE_PASSWORD", "qqq")
-
-    last_error = None
-    for host in hosts:
-        host = _safe_str(host)
-        if not host:
-            continue
-        try:
-            dsn = cx_Oracle.makedsn(host, port, service_name=service)
-            return _oracle_connect(user=user, password=password, dsn=dsn)
-        except Exception as e:
-            last_error = e
-            logger.warning(
-                "[WORKING_EMPLOYEES_EXCEL] Не удалось подключиться к %s (%s:%s/%s): %s",
-                service_name, host, port, service, e
-            )
-
-    if last_error:
-        raise last_error
-
-    raise ValueError(f"Не удалось подготовить подключение к базе {service_name!r}")
 
 
-def _sm_oracle_get_table_columns_set(cur, owner: str, table: str) -> set[str]:
+def _sm_oracle_get_table_columns_set(cur, owner: str, table_name: str) -> set[str]:
     cur.execute(
         """
         SELECT column_name
         FROM all_tab_columns
-        WHERE owner = :owner
-          AND table_name = :table
+        WHERE owner = :p_owner
+          AND table_name = :p_table_name
         """,
         {
-            "owner": _safe_str(owner).upper(),
-            "table": _safe_str(table).upper(),
+            "p_owner": _safe_str(owner).upper(),
+            "p_table_name": _safe_str(table_name).upper(),
         }
     )
     return {str(row[0]).strip().upper() for row in cur.fetchall()}
@@ -4954,7 +4921,7 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
     Поиск:
       1) по ИНН
       2) по ФИО
-    Возвращает список логинов.
+      3) fallback по вариантам логина, собранным из ФИО
     """
     dbname = _safe_str(dbname).upper()
     inn = _safe_str(inn)
@@ -4968,10 +4935,10 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
 
     conn = cur = None
     try:
-        conn = _connect_oracle_supermag_by_service(dbname)
+        conn = _connect_oracle_service(dbname)
         cur = conn.cursor()
 
-        cols_set = _sm_oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+        cols_set = _sm_oracle_get_table_columns_set(cur, owner="SUPERMAG", table_name="SMSTAFF")
         upper_cols = {c.upper() for c in cols_set}
 
         if "SERVERLOGIN" not in upper_cols:
@@ -4985,38 +4952,85 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
         binds = {}
 
         if inn and "INN" in upper_cols:
-            where_parts.append("TRIM(s.inn) = :b_inn")
-            binds["b_inn"] = inn
+            where_parts.append("TRIM(s.inn) = :p_inn")
+            binds["p_inn"] = inn
 
         if full_name_norm:
             fio_expr = _smstaff_fio_expr("s", cols_set)
-            where_parts.append(f"UPPER({fio_expr}) = :b_fio")
-            binds["b_fio"] = full_name_norm
-
-        if not where_parts:
-            return []
-
-        sql = f"""
-            SELECT DISTINCT TRIM(s.serverlogin) AS serverlogin
-            FROM smstaff s
-            WHERE ({' OR '.join(where_parts)})
-              AND s.serverlogin IS NOT NULL
-            ORDER BY s.serverlogin
-        """
-
-        cur.execute(sql, binds)
+            where_parts.append(f"UPPER({fio_expr}) = :p_fio")
+            binds["p_fio"] = full_name_norm
 
         result = []
         seen = set()
-        for row in cur.fetchall():
-            login = _safe_str(row[0])
-            if not login:
-                continue
-            k = login.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            result.append(login)
+
+        if where_parts:
+            sql = f"""
+                SELECT DISTINCT TRIM(s.serverlogin) AS serverlogin
+                FROM smstaff s
+                WHERE ({' OR '.join(where_parts)})
+                  AND s.serverlogin IS NOT NULL
+                ORDER BY s.serverlogin
+            """
+
+            cur.execute(sql, binds)
+
+            for row in cur.fetchall():
+                login = _safe_str(row[0])
+                if not login:
+                    continue
+                k = login.lower()
+                if k in seen:
+                    continue
+                seen.add(k)
+                result.append(login)
+
+        # fallback: если по ИНН/ФИО не нашли, попробуем сгенерировать типовые логины
+        if not result and full_name_norm:
+            last_name, first_name, patronymic = _split_full_name(full_name)
+
+            candidate_logins = set()
+            try:
+                candidate_logins = _build_candidate_logins(last_name, first_name, patronymic)
+            except Exception as e:
+                logger.warning(
+                    "[WORKING_EMPLOYEES_EXCEL] Не удалось построить candidate logins для %r: %s",
+                    full_name, e
+                )
+                candidate_logins = set()
+
+            candidate_logins = {
+                _safe_str(x).lower()
+                for x in candidate_logins
+                if _safe_str(x)
+            }
+
+            if candidate_logins:
+                bind_names = []
+                bind_map = {}
+
+                for idx, login in enumerate(sorted(candidate_logins)):
+                    bind_name = f"p_login_{idx}"
+                    bind_names.append(f":{bind_name}")
+                    bind_map[bind_name] = login
+
+                sql2 = f"""
+                    SELECT DISTINCT TRIM(s.serverlogin) AS serverlogin
+                    FROM smstaff s
+                    WHERE LOWER(TRIM(s.serverlogin)) IN ({", ".join(bind_names)})
+                    ORDER BY s.serverlogin
+                """
+
+                cur.execute(sql2, bind_map)
+
+                for row in cur.fetchall():
+                    login = _safe_str(row[0])
+                    if not login:
+                        continue
+                    k = login.lower()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    result.append(login)
 
         return result
 
@@ -5028,30 +5042,6 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
                 conn.close()
         except Exception:
             pass
-
-
-def _get_smstaff_logins_for_employee_cached(
-    *,
-    dbname: str,
-    inn: str,
-    full_name: str,
-    cache: dict,
-) -> list[str]:
-    key = (
-        _safe_str(dbname).upper(),
-        _safe_str(inn),
-        _normalize_spaces(full_name).upper(),
-    )
-    if key in cache:
-        return cache[key]
-
-    logins = _fetch_smstaff_logins_for_employee_from_db(
-        dbname=dbname,
-        inn=inn,
-        full_name=full_name,
-    )
-    cache[key] = logins
-    return logins
 
 
 
