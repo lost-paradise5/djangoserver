@@ -4969,7 +4969,7 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
                 FROM smstaff s
                 WHERE ({' OR '.join(where_parts)})
                   AND s.serverlogin IS NOT NULL
-                ORDER BY s.serverlogin
+                ORDER BY 1
             """
 
             cur.execute(sql, binds)
@@ -4984,7 +4984,7 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
                 seen.add(k)
                 result.append(login)
 
-        # fallback: если по ИНН/ФИО не нашли, попробуем сгенерировать типовые логины
+        # fallback: если по ИНН/ФИО не нашли, пробуем типовые варианты логина
         if not result and full_name_norm:
             last_name, first_name, patronymic = _split_full_name(full_name)
 
@@ -5017,7 +5017,7 @@ def _fetch_smstaff_logins_for_employee_from_db(dbname: str, inn: str, full_name:
                     SELECT DISTINCT TRIM(s.serverlogin) AS serverlogin
                     FROM smstaff s
                     WHERE LOWER(TRIM(s.serverlogin)) IN ({", ".join(bind_names)})
-                    ORDER BY s.serverlogin
+                    ORDER BY 1
                 """
 
                 cur.execute(sql2, bind_map)
