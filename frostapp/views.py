@@ -9,6 +9,7 @@ import time
 from typing import Tuple, Optional, Any, Iterable
 import random
 import string
+from logging.handlers import RotatingFileHandler
 import ldap
 from ldap.filter import escape_filter_chars
 import datetime
@@ -122,6 +123,29 @@ logger = logging.getLogger(__name__)
 AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "zDFbCQWRzL7pKYxzpfSSLVdqCrAYsHiN7FORRUDt1hE")
 MAX_BOT_INTERNAL_TOKEN = os.getenv("MAX_BOT_INTERNAL_TOKEN", "wc3wow")
 UKM5_FULL_XML_STORE_ID = 2013
+
+# Для логов auth_start и auth_verify_pin
+AGENT_AUTH_AUDIT_LOG_FILE = os.getenv(
+    "AGENT_AUTH_AUDIT_LOG_FILE",
+    "/app/logs/agent_auth_audit.log"
+)
+AGENT_AUTH_AUDIT_LOG_MAX_BYTES = int(
+    os.getenv("AGENT_AUTH_AUDIT_LOG_MAX_BYTES", str(20 * 1024 * 1024))
+)
+AGENT_AUTH_AUDIT_LOG_BACKUP_COUNT = int(
+    os.getenv("AGENT_AUTH_AUDIT_LOG_BACKUP_COUNT", "10")
+)
+
+_AGENT_AUTH_AUDIT_LOGGER = None
+_AGENT_AUTH_SENSITIVE_KEYS = {
+    "pin",
+    "pin_input",
+    "pin_hash",
+    "password",
+    "token",
+    "authorization",
+}
+
 
 ONEC_WORKING_EMPLOYEES_AUTH_USER = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_USER", "")
 ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD", "")
@@ -7712,42 +7736,308 @@ def _build_agent_stores_response(user):
     return stores, cred, stores_response
 
 
+## Для логов auth_start/auth_verify
+
+def _mask_secret_value(value, keep_start: int = 4, keep_end: int = 2) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return text
+    if len(text) <= keep_start + keep_end:
+        return "*" * len(text)
+    return f"{text[:keep_start]}***{text[-keep_end:]}"
+
+
+def _sanitize_for_agent_audit(value, parent_key: str = ""):
+    key = str(parent_key or "").lower()
+
+    if key in {"phone"}:
+        return _mask_phone(value)
+
+    if key in {"mail", "email"}:
+        return _mask_email(value)
+
+    if key in {"max_id", "tg_id"}:
+        return _mask_secret_value(value, keep_start=2, keep_end=2)
+
+    if key in {"session_id"}:
+        return _mask_secret_value(value, keep_start=8, keep_end=4)
+
+    if key in _AGENT_AUTH_SENSITIVE_KEYS or key.endswith("_token"):
+        return "***"
+
+    if isinstance(value, dict):
+        return {k: _sanitize_for_agent_audit(v, k) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [_sanitize_for_agent_audit(v, parent_key) for v in value]
+
+    if isinstance(value, tuple):
+        return [_sanitize_for_agent_audit(v, parent_key) for v in value]
+
+    return value
+
+
+def _get_agent_auth_audit_logger():
+    global _AGENT_AUTH_AUDIT_LOGGER
+
+    if _AGENT_AUTH_AUDIT_LOGGER is not None:
+        return _AGENT_AUTH_AUDIT_LOGGER
+
+    log_file = AGENT_AUTH_AUDIT_LOG_FILE
+    log_dir = os.path.dirname(log_file) or "/app/logs"
+    os.makedirs(log_dir, exist_ok=True)
+
+    audit_logger = logging.getLogger("agent_auth_audit")
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
+
+    if not audit_logger.handlers:
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=AGENT_AUTH_AUDIT_LOG_MAX_BYTES,
+            backupCount=AGENT_AUTH_AUDIT_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger.addHandler(handler)
+
+    _AGENT_AUTH_AUDIT_LOGGER = audit_logger
+    return audit_logger
+
+
+def _get_request_ip(request) -> str:
+    xff = (request.META.get("HTTP_X_FORWARDED_FOR") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+
+    return (
+        (request.META.get("HTTP_X_REAL_IP") or "").strip()
+        or (request.META.get("REMOTE_ADDR") or "").strip()
+    )
+
+
+def _get_agent_user_store_brief(user):
+    if not user:
+        return []
+
+    store_ids = list(
+        UKMUser.objects
+        .filter(user=user)
+        .order_by("storeid")
+        .values_list("storeid", flat=True)
+        .distinct()
+    )
+
+    if not store_ids:
+        return []
+
+    store_name_map = {
+        s.ukm4store: (s.name or "")
+        for s in Store.objects.filter(ukm4store__in=store_ids).only("ukm4store", "name")
+    }
+
+    return [
+        {
+            "ukm_storeid": sid,
+            "name": store_name_map.get(sid, ""),
+        }
+        for sid in store_ids
+    ]
+
+
+def _build_agent_auth_requester(user=None, **extra):
+    payload = {}
+
+    if user:
+        payload.update({
+            "user_id": user.id,
+            "full_name": getattr(user, "full_name", "") or "",
+            "phone": getattr(user, "phone", "") or "",
+            "mail": getattr(user, "mail", "") or "",
+            "max_id": getattr(user, "max_id", "") or "",
+        })
+
+    payload.update(extra or {})
+    return payload
+
+
+def _write_agent_auth_audit_log(
+    *,
+    event: str,
+    request=None,
+    request_payload=None,
+    response_payload=None,
+    status_code=None,
+    requester=None,
+    stores=None,
+    extra=None,
+):
+    try:
+        ua = (request.META.get("HTTP_USER_AGENT") or "").strip() if request else ""
+
+        lines = [
+            "=" * 120,
+            f"Время: {timezone.localtime(timezone.now()).strftime('%Y-%m-%d %H:%M:%S %z')}",
+            f"Событие: {event}",
+            f"Метод: {request.method if request else '-'}",
+            f"URL: {request.path if request else '-'}",
+            f"IP: {_get_request_ip(request) if request else '-'}",
+            f"User-Agent: {ua[:1000]}",
+            "Кто запросил:",
+            json.dumps(
+                _sanitize_for_agent_audit(requester or {}),
+                ensure_ascii=False,
+                default=str,
+                indent=2,
+            ),
+            "Магазины:",
+            json.dumps(
+                _sanitize_for_agent_audit(stores or []),
+                ensure_ascii=False,
+                default=str,
+                indent=2,
+            ),
+            "Тело запроса:",
+            json.dumps(
+                _sanitize_for_agent_audit(request_payload or {}),
+                ensure_ascii=False,
+                default=str,
+                indent=2,
+            ),
+            f"Ответ HTTP {status_code}:",
+            json.dumps(
+                _sanitize_for_agent_audit(response_payload or {}),
+                ensure_ascii=False,
+                default=str,
+                indent=2,
+            ),
+        ]
+
+        if extra:
+            lines.extend([
+                "Дополнительно:",
+                json.dumps(
+                    _sanitize_for_agent_audit(extra),
+                    ensure_ascii=False,
+                    default=str,
+                    indent=2,
+                ),
+            ])
+
+        _get_agent_auth_audit_logger().info("\n".join(lines))
+
+    except Exception as e:
+        logger.exception(f"[AGENT_AUTH_AUDIT] Ошибка записи audit-лога: {e}")
+
+
+def _agent_audit_json_response(
+    request,
+    *,
+    event: str,
+    payload: dict,
+    status: int,
+    request_payload=None,
+    requester=None,
+    stores=None,
+    extra=None,
+    json_dumps_params=None,
+):
+    _write_agent_auth_audit_log(
+        event=event,
+        request=request,
+        request_payload=request_payload,
+        response_payload=payload,
+        status_code=status,
+        requester=requester,
+        stores=stores,
+        extra=extra,
+    )
+
+    if json_dumps_params:
+        return JsonResponse(payload, status=status, json_dumps_params=json_dumps_params)
+
+    return JsonResponse(payload, status=status)
+
+
+def _agent_audit_error(
+    request,
+    *,
+    event: str,
+    message: str,
+    status: int = 500,
+    request_payload=None,
+    requester=None,
+    stores=None,
+    extra=None,
+):
+    return _agent_audit_json_response(
+        request,
+        event=event,
+        payload={"error": str(message)},
+        status=status,
+        request_payload=request_payload,
+        requester=requester,
+        stores=stores,
+        extra=extra,
+    )
+
+
+
+
+
+
+
+
+
+##
+
 @csrf_exempt
 @agent_token_required
 def agent_auth_start(request):
     """
     POST /agent/auth/start/
-    body:
-    {
-      "phone": "+7924..."
-    }
-
-    Успех:
-    200
-    {
-      "session_id": "..."
-    }
-
-    Ошибка:
-    404 -> сервис недоступен
-    500 -> { "error": "..." }
-
-    Оптимизация:
-    - здесь НЕ тянем Oracle и НЕ собираем полные данные магазинов
-    - только проверяем, что у пользователя есть хотя бы один магазин
     """
+    event = "agent_auth_start"
+    raw_body = request.body.decode("utf-8", errors="replace") if request.body else ""
+    request_payload = {"_raw_body": raw_body} if raw_body else {}
+    requester = {}
+    stores_for_log = []
+
     if request.method != 'POST':
-        return _agent_error('Сервис недоступен', status=404)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message='Сервис недоступен',
+            status=404,
+            request_payload=request_payload,
+        )
 
     try:
-        data = json.loads(request.body.decode('utf-8') if request.body else "{}")
+        data = json.loads(raw_body if raw_body else "{}")
+        request_payload = data
     except Exception as e:
         logger.error(f"[AGENT_AUTH/START] JSON parse error: {e}")
-        return _agent_error('Некорректный JSON', status=500)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message='Некорректный JSON',
+            status=500,
+            request_payload=request_payload,
+            extra={"parse_error": str(e)},
+        )
 
     phone_raw = str(data.get('phone') or "").strip()
+    requester = _build_agent_auth_requester(phone=phone_raw)
+
     if not phone_raw:
-        return _agent_error('Не указан phone', status=500)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message='Не указан phone',
+            status=500,
+            request_payload=request_payload,
+            requester=requester,
+        )
 
     try:
         phone_norm = normalize_phone_ru(phone_raw)
@@ -7763,39 +8053,77 @@ def agent_auth_start(request):
         )
 
         if not users:
-            return _agent_error('Пользователь с таким номером не найден', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Пользователь с таким номером не найден',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                extra={"phone_candidates": list(phone_candidates)},
+            )
 
         if len(users) > 1:
             logger.error(
                 f"[AGENT_AUTH/START] Несколько пользователей для phone={phone_candidates}: "
                 f"ids={[u.id for u in users]}"
             )
-            return _agent_error(
-                'Найдено несколько пользователей с таким номером, обратитесь к администратору',
-                status=500
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Найдено несколько пользователей с таким номером, обратитесь к администратору',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                extra={
+                    "phone_candidates": list(phone_candidates),
+                    "user_ids": [u.id for u in users],
+                },
             )
 
         user = users[0]
+        requester = _build_agent_auth_requester(
+            user,
+            phone=phone_raw,
+        )
+        stores_for_log = _get_agent_user_store_brief(user)
 
         if not user.max_id and not str(getattr(user, "mail", "") or "").strip():
-            return _agent_error(
-                'Для пользователя не указан ни max_id, ни email (mail), отправка PIN невозможна',
-                status=500
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Для пользователя не указан ни max_id, ни email (mail), отправка PIN невозможна',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
             )
 
-        # ВАЖНО: вместо _get_agent_user_stores(user) — только быстрая проверка наличия магазина
         has_store = UKMUser.objects.filter(user=user).exists()
         if not has_store:
-            return _agent_error('У пользователя нет магазинов в ukm_users', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='У пользователя нет магазинов в ukm_users',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+            )
 
         cred = _get_agent_primary_credentials(user.id)
         if not cred:
             logger.error(
                 f"[AGENT_AUTH/START] Нет активных записей в open_in_system для user_id={user.id}, system_id=4"
             )
-            return _agent_error(
-                'Для пользователя не найдены активные учётные данные (open_in_system, system_id=4)',
-                status=500
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Для пользователя не найдены активные учётные данные (open_in_system, system_id=4)',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
             )
 
         session_uuid = uuid.uuid4()
@@ -7822,7 +8150,16 @@ def agent_auth_start(request):
                 f"[AGENT_AUTH/START] Не удалось отправить PIN user_id={user.id} "
                 f"(telegram_sent={delivery['telegram_sent']}, max_sent={delivery['max_sent']})"
             )
-            return _agent_error('Не удалось отправить PIN ни в MAX, ни на email', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Не удалось отправить PIN ни в MAX, ни на email',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+                extra={"delivery": delivery},
+            )
 
         _send_admin_log_async(
             "\n".join([
@@ -7835,13 +8172,37 @@ def agent_auth_start(request):
             ])
         )
 
-        return JsonResponse({
+        response_payload = {
             'session_id': session_id,
-        }, status=200)
+        }
+
+        return _agent_audit_json_response(
+            request,
+            event=event,
+            payload=response_payload,
+            status=200,
+            request_payload=request_payload,
+            requester=requester,
+            stores=stores_for_log,
+            extra={
+                "delivery": delivery,
+                "expires_at": expires_at,
+                "pin_ttl_minutes": PIN_TTL_MINUTES,
+            },
+        )
 
     except Exception as e:
         logger.exception(f"[AGENT_AUTH/START] Unexpected error: {e}")
-        return _agent_error(f'Ошибка при запуске авторизации: {e}', status=500)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message=f'Ошибка при запуске авторизации: {e}',
+            status=500,
+            request_payload=request_payload,
+            requester=requester,
+            stores=stores_for_log,
+            extra={"exception": str(e)},
+        )
 
 
 @csrf_exempt
@@ -7849,40 +8210,52 @@ def agent_auth_start(request):
 def agent_auth_verify_pin(request):
     """
     POST /agent/auth/verify_pin/
-    body:
-    {
-      "session_id": "...",
-      "pin": "1234"
-    }
-
-    Успех:
-    200
-    {
-      "user": {
-        "id": ...,
-        "fio": "..."
-      },
-      "stores": [...]
-    }
-
-    Ошибка:
-    404 -> сервис недоступен
-    500 -> { "error": "..." }
     """
+    event = "agent_auth_verify_pin"
+    raw_body = request.body.decode("utf-8", errors="replace") if request.body else ""
+    request_payload = {"_raw_body": raw_body} if raw_body else {}
+    requester = {}
+    stores_for_log = []
+
     if request.method != 'POST':
-        return _agent_error('Сервис недоступен', status=404)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message='Сервис недоступен',
+            status=404,
+            request_payload=request_payload,
+        )
 
     try:
-        data = json.loads(request.body.decode('utf-8') if request.body else "{}")
+        data = json.loads(raw_body if raw_body else "{}")
+        request_payload = data
     except Exception as e:
         logger.error(f"[AGENT_AUTH/VERIFY_PIN] JSON parse error: {e}")
-        return _agent_error('Некорректный JSON', status=500)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message='Некорректный JSON',
+            status=500,
+            request_payload=request_payload,
+            extra={"parse_error": str(e)},
+        )
 
     session_id = str(data.get('session_id') or "").strip()
     pin_input = str(data.get('pin') or "").strip()
 
+    requester = {
+        "session_id": session_id,
+    }
+
     if not session_id or not pin_input:
-        return _agent_error('Нужны session_id и pin', status=500)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message='Нужны session_id и pin',
+            status=500,
+            request_payload=request_payload,
+            requester=requester,
+        )
 
     try:
         sess = (
@@ -7892,25 +8265,66 @@ def agent_auth_verify_pin(request):
             .first()
         )
         if not sess:
-            return _agent_error('Сессия не найдена или уже истекла', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Сессия не найдена или уже истекла',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+            )
+
+        requester = _build_agent_auth_requester(
+            sess.user,
+            session_id=session_id,
+        )
+        stores_for_log = _get_agent_user_store_brief(sess.user)
 
         now = timezone.now()
 
         if now > sess.expires_at:
+            old_status = sess.status
             sess.status = 'expired'
             sess.save(update_fields=['status', 'updated_at'])
-            return _agent_error('PIN истёк, начните авторизацию заново', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='PIN истёк, начните авторизацию заново',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+                extra={
+                    "session_status_before": old_status,
+                    "expires_at": sess.expires_at,
+                },
+            )
 
         if sess.status != 'pin_sent':
-            return _agent_error(
-                f'Неверное состояние сессии: {sess.status}, начните заново',
-                status=500
+            return _agent_audit_error(
+                request,
+                event=event,
+                message=f'Неверное состояние сессии: {sess.status}, начните заново',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+                extra={"session_status": sess.status},
             )
 
         if sess.attempts >= MAX_PIN_ATTEMPTS:
             sess.status = 'blocked'
             sess.save(update_fields=['status', 'updated_at'])
-            return _agent_error('Превышено количество попыток, начните заново', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Превышено количество попыток, начните заново',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+                extra={"attempts": sess.attempts},
+            )
 
         pin_hash_input = hashlib.sha256(pin_input.encode('utf-8')).hexdigest()
         if pin_hash_input != (sess.pin_hash or ""):
@@ -7921,9 +8335,35 @@ def agent_auth_verify_pin(request):
 
             attempts_left = max(0, MAX_PIN_ATTEMPTS - sess.attempts)
             if attempts_left == 0:
-                return _agent_error('Неверный PIN, попытки закончились', status=500)
+                return _agent_audit_error(
+                    request,
+                    event=event,
+                    message='Неверный PIN, попытки закончились',
+                    status=500,
+                    request_payload=request_payload,
+                    requester=requester,
+                    stores=stores_for_log,
+                    extra={
+                        "attempts": sess.attempts,
+                        "attempts_left": attempts_left,
+                        "session_status": sess.status,
+                    },
+                )
 
-            return _agent_error(f'Неверный PIN. Осталось попыток: {attempts_left}', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message=f'Неверный PIN. Осталось попыток: {attempts_left}',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+                extra={
+                    "attempts": sess.attempts,
+                    "attempts_left": attempts_left,
+                    "session_status": sess.status,
+                },
+            )
 
         sess.status = 'success'
         sess.save(update_fields=['status', 'updated_at'])
@@ -7932,15 +8372,28 @@ def agent_auth_verify_pin(request):
 
         if not stores_payload:
             logger.error(f"[AGENT_AUTH/VERIFY_PIN] У пользователя нет магазинов user_id={sess.user.id}")
-            return _agent_error('У пользователя нет магазинов в ukm_users', status=500)
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='У пользователя нет магазинов в ukm_users',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+            )
 
         if not cred:
             logger.error(
                 f"[AGENT_AUTH/VERIFY_PIN] Нет записей в open_in_system для user_id={sess.user.id}, system_id=4"
             )
-            return _agent_error(
-                'Для пользователя не найдены учётные данные (open_in_system, system_id=4)',
-                status=500
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Для пользователя не найдены учётные данные (open_in_system, system_id=4)',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
             )
 
         _send_admin_log_async(
@@ -7959,11 +8412,33 @@ def agent_auth_verify_pin(request):
             'stores': stores_response,
         }
 
-        return JsonResponse(response, json_dumps_params={'ensure_ascii': False}, status=200)
+        return _agent_audit_json_response(
+            request,
+            event=event,
+            payload=response,
+            status=200,
+            request_payload=request_payload,
+            requester=requester,
+            stores=stores_response,
+            extra={
+                "stores_count": len(stores_response),
+                "session_status": sess.status,
+            },
+            json_dumps_params={'ensure_ascii': False},
+        )
 
     except Exception as e:
         logger.exception(f"[AGENT_AUTH/VERIFY_PIN] Unexpected error: {e}")
-        return _agent_error(f'Ошибка при проверке PIN: {e}', status=500)
+        return _agent_audit_error(
+            request,
+            event=event,
+            message=f'Ошибка при проверке PIN: {e}',
+            status=500,
+            request_payload=request_payload,
+            requester=requester,
+            stores=stores_for_log,
+            extra={"exception": str(e)},
+        )
 
 
 
