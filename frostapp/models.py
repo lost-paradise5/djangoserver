@@ -104,6 +104,7 @@ class OpenInSystem(models.Model):
     password = models.CharField(max_length=128)
     system_id = models.IntegerField()
     status = models.BooleanField()
+    isnot2fa = models.BooleanField(db_column='isnot2fa', null=True, blank=True, default=False)
 
     class Meta:
         db_table = 'open_in_system'
