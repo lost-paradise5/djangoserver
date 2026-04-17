@@ -8171,8 +8171,8 @@ def agent_auth_start(request):
                 stores=stores_for_log,
             )
 
-        # Новый режим: если is2fa=True, сразу возвращаем магазины и логины без паролей
-        if cred.get('is2fa'):
+        # Новый режим: если isnot2fa=True, сразу возвращаем магазины и логины без паролей
+        if cred.get('isnot2fa'):
             stores_payload, _, stores_response = _build_agent_stores_response(
                 user,
                 include_password=False,
@@ -8192,7 +8192,7 @@ def agent_auth_start(request):
 
             _send_admin_log_async(
                 "\n".join([
-                    "🔓 Агент. Вход без PIN (is2fa=true)",
+                    "🔓 Агент. Вход без PIN (isnot2fa=true)",
                     f"{user.full_name}",
                     f"Магазинов: {len(stores_response)}",
                 ])
@@ -8204,7 +8204,7 @@ def agent_auth_start(request):
                     'fio': user.full_name,
                 },
                 'stores': stores_response,
-                'is2fa': True,
+                'isnot2fa': True,
                 'pin_required': False,
             }
 
@@ -8219,12 +8219,12 @@ def agent_auth_start(request):
                 extra={
                     "stores_count": len(stores_response),
                     "auth_mode": "direct",
-                    "is2fa": True,
+                    "isnot2fa": True,
                 },
                 json_dumps_params={'ensure_ascii': False},
             )
 
-        # Старый режим: если is2fa=False/null, всё как раньше
+        # Старый режим: если isnot2fa=False/null, всё как раньше
         if not user.max_id and not str(getattr(user, "mail", "") or "").strip():
             return _agent_audit_error(
                 request,
@@ -8299,7 +8299,7 @@ def agent_auth_start(request):
                 "expires_at": expires_at,
                 "pin_ttl_minutes": PIN_TTL_MINUTES,
                 "auth_mode": "pin",
-                "is2fa": False,
+                "isnot2fa": False,
             },
         )
 
