@@ -7681,10 +7681,34 @@ def _get_agent_user_stores(user):
     return stores_payload
 
 
+# def _get_agent_primary_credentials(user_id):
+#     """
+#     Возвращает первую активную username/password пользователя
+#     из open_in_system только для system_id = 4.
+#     """
+#     cred = (
+#         OpenInSystem.objects
+#         .filter(
+#             user_id=user_id,
+#             system_id=4,
+#             status=True
+#         )
+#         .only('username', 'password')
+#         .order_by('id')
+#         .first()
+#     )
+
+#     if not cred:
+#         return None
+
+#     return {
+#         'username': cred.username,
+#         'password': cred.password,
+#     }
 def _get_agent_primary_credentials(user_id):
     """
-    Возвращает первую активную username/password пользователя
-    из open_in_system только для system_id = 4.
+    Возвращает первую активную запись из open_in_system
+    только для system_id = 4.
     """
     cred = (
         OpenInSystem.objects
@@ -7693,7 +7717,7 @@ def _get_agent_primary_credentials(user_id):
             system_id=4,
             status=True
         )
-        .only('username', 'password')
+        .only('username', 'password', 'isnot2fa')
         .order_by('id')
         .first()
     )
@@ -7704,20 +7728,48 @@ def _get_agent_primary_credentials(user_id):
     return {
         'username': cred.username,
         'password': cred.password,
+        'isnot2fa': bool(getattr(cred, 'isnot2fa', False)),
     }
 
 
-def _build_agent_stores_response(user):
+# def _build_agent_stores_response(user):
+#     """
+#     Формирует список магазинов, где в каждом магазине
+#     лежат плоские username/password.
+#     """
+#     stores = _get_agent_user_stores(user)
+#     cred = _get_agent_primary_credentials(user.id)
+
+#     stores_response = []
+#     for store in stores:
+#         stores_response.append({
+#             'ukm_storeid': store['ukm_storeid'],
+#             'smstore': store['smstore'],
+#             'name': store['name'],
+#             'address': store['address'],
+#             'roleid': store['roleid'],
+#             'dbname': store['dbname'],
+#             'ukm_server_ip': store['ukm_server_ip'],
+#             'inn': store['inn'],
+#             'kpp': store['kpp'],
+#             'fsrar_id': store['fsrar_id'],
+#             'market': store['market'],
+#             'username': cred['username'] if cred else None,
+#             'password': cred['password'] if cred else None,
+#         })
+
+#     return stores, cred, stores_response
+def _build_agent_stores_response(user, include_password=True):
     """
     Формирует список магазинов, где в каждом магазине
-    лежат плоские username/password.
+    лежат плоские username и опционально password.
     """
     stores = _get_agent_user_stores(user)
     cred = _get_agent_primary_credentials(user.id)
 
     stores_response = []
     for store in stores:
-        stores_response.append({
+        item = {
             'ukm_storeid': store['ukm_storeid'],
             'smstore': store['smstore'],
             'name': store['name'],
@@ -7730,8 +7782,12 @@ def _build_agent_stores_response(user):
             'fsrar_id': store['fsrar_id'],
             'market': store['market'],
             'username': cred['username'] if cred else None,
-            'password': cred['password'] if cred else None,
-        })
+        }
+
+        if include_password:
+            item['password'] = cred['password'] if cred else None
+
+        stores_response.append(item)
 
     return stores, cred, stores_response
 
@@ -8088,17 +8144,6 @@ def agent_auth_start(request):
         )
         stores_for_log = _get_agent_user_store_brief(user)
 
-        if not user.max_id and not str(getattr(user, "mail", "") or "").strip():
-            return _agent_audit_error(
-                request,
-                event=event,
-                message='Для пользователя не указан ни max_id, ни email (mail), отправка PIN невозможна',
-                status=500,
-                request_payload=request_payload,
-                requester=requester,
-                stores=stores_for_log,
-            )
-
         has_store = UKMUser.objects.filter(user=user).exists()
         if not has_store:
             return _agent_audit_error(
@@ -8120,6 +8165,71 @@ def agent_auth_start(request):
                 request,
                 event=event,
                 message='Для пользователя не найдены активные учётные данные (open_in_system, system_id=4)',
+                status=500,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_for_log,
+            )
+
+        # Новый режим: если is2fa=True, сразу возвращаем магазины и логины без паролей
+        if cred.get('is2fa'):
+            stores_payload, _, stores_response = _build_agent_stores_response(
+                user,
+                include_password=False,
+            )
+
+            if not stores_payload:
+                logger.error(f"[AGENT_AUTH/START] У пользователя нет магазинов user_id={user.id}")
+                return _agent_audit_error(
+                    request,
+                    event=event,
+                    message='У пользователя нет магазинов в ukm_users',
+                    status=500,
+                    request_payload=request_payload,
+                    requester=requester,
+                    stores=stores_for_log,
+                )
+
+            _send_admin_log_async(
+                "\n".join([
+                    "🔓 Агент. Вход без PIN (is2fa=true)",
+                    f"{user.full_name}",
+                    f"Магазинов: {len(stores_response)}",
+                ])
+            )
+
+            response_payload = {
+                'user': {
+                    'id': user.id,
+                    'fio': user.full_name,
+                },
+                'stores': stores_response,
+                'is2fa': True,
+                'pin_required': False,
+            }
+
+            return _agent_audit_json_response(
+                request,
+                event=event,
+                payload=response_payload,
+                status=200,
+                request_payload=request_payload,
+                requester=requester,
+                stores=stores_response,
+                extra={
+                    "stores_count": len(stores_response),
+                    "auth_mode": "direct",
+                    "is2fa": True,
+                },
+                json_dumps_params={'ensure_ascii': False},
+            )
+
+        # Старый режим: если is2fa=False/null, всё как раньше
+        if not user.max_id and not str(getattr(user, "mail", "") or "").strip():
+            return _agent_audit_error(
+                request,
+                event=event,
+                message='Для пользователя не указан ни max_id, ни email (mail), отправка PIN невозможна',
                 status=500,
                 request_payload=request_payload,
                 requester=requester,
@@ -8188,6 +8298,8 @@ def agent_auth_start(request):
                 "delivery": delivery,
                 "expires_at": expires_at,
                 "pin_ttl_minutes": PIN_TTL_MINUTES,
+                "auth_mode": "pin",
+                "is2fa": False,
             },
         )
 
@@ -8203,6 +8315,218 @@ def agent_auth_start(request):
             stores=stores_for_log,
             extra={"exception": str(e)},
         )
+# @csrf_exempt
+# @agent_token_required
+# def agent_auth_start(request):
+#     """
+#     POST /agent/auth/start/
+#     """
+#     event = "agent_auth_start"
+#     raw_body = request.body.decode("utf-8", errors="replace") if request.body else ""
+#     request_payload = {"_raw_body": raw_body} if raw_body else {}
+#     requester = {}
+#     stores_for_log = []
+
+#     if request.method != 'POST':
+#         return _agent_audit_error(
+#             request,
+#             event=event,
+#             message='Сервис недоступен',
+#             status=404,
+#             request_payload=request_payload,
+#         )
+
+#     try:
+#         data = json.loads(raw_body if raw_body else "{}")
+#         request_payload = data
+#     except Exception as e:
+#         logger.error(f"[AGENT_AUTH/START] JSON parse error: {e}")
+#         return _agent_audit_error(
+#             request,
+#             event=event,
+#             message='Некорректный JSON',
+#             status=500,
+#             request_payload=request_payload,
+#             extra={"parse_error": str(e)},
+#         )
+
+#     phone_raw = str(data.get('phone') or "").strip()
+#     requester = _build_agent_auth_requester(phone=phone_raw)
+
+#     if not phone_raw:
+#         return _agent_audit_error(
+#             request,
+#             event=event,
+#             message='Не указан phone',
+#             status=500,
+#             request_payload=request_payload,
+#             requester=requester,
+#         )
+
+#     try:
+#         phone_norm = normalize_phone_ru(phone_raw)
+#         phone_candidates = {phone_raw}
+#         if phone_norm:
+#             phone_candidates.add(phone_norm)
+
+#         users = list(
+#             User.objects
+#             .filter(phone__in=list(phone_candidates))
+#             .only('id', 'full_name', 'tg_id', 'max_id', 'mail')
+#             .order_by('id')[:2]
+#         )
+
+#         if not users:
+#             return _agent_audit_error(
+#                 request,
+#                 event=event,
+#                 message='Пользователь с таким номером не найден',
+#                 status=500,
+#                 request_payload=request_payload,
+#                 requester=requester,
+#                 extra={"phone_candidates": list(phone_candidates)},
+#             )
+
+#         if len(users) > 1:
+#             logger.error(
+#                 f"[AGENT_AUTH/START] Несколько пользователей для phone={phone_candidates}: "
+#                 f"ids={[u.id for u in users]}"
+#             )
+#             return _agent_audit_error(
+#                 request,
+#                 event=event,
+#                 message='Найдено несколько пользователей с таким номером, обратитесь к администратору',
+#                 status=500,
+#                 request_payload=request_payload,
+#                 requester=requester,
+#                 extra={
+#                     "phone_candidates": list(phone_candidates),
+#                     "user_ids": [u.id for u in users],
+#                 },
+#             )
+
+#         user = users[0]
+#         requester = _build_agent_auth_requester(
+#             user,
+#             phone=phone_raw,
+#         )
+#         stores_for_log = _get_agent_user_store_brief(user)
+
+#         if not user.max_id and not str(getattr(user, "mail", "") or "").strip():
+#             return _agent_audit_error(
+#                 request,
+#                 event=event,
+#                 message='Для пользователя не указан ни max_id, ни email (mail), отправка PIN невозможна',
+#                 status=500,
+#                 request_payload=request_payload,
+#                 requester=requester,
+#                 stores=stores_for_log,
+#             )
+
+#         has_store = UKMUser.objects.filter(user=user).exists()
+#         if not has_store:
+#             return _agent_audit_error(
+#                 request,
+#                 event=event,
+#                 message='У пользователя нет магазинов в ukm_users',
+#                 status=500,
+#                 request_payload=request_payload,
+#                 requester=requester,
+#                 stores=stores_for_log,
+#             )
+
+#         cred = _get_agent_primary_credentials(user.id)
+#         if not cred:
+#             logger.error(
+#                 f"[AGENT_AUTH/START] Нет активных записей в open_in_system для user_id={user.id}, system_id=4"
+#             )
+#             return _agent_audit_error(
+#                 request,
+#                 event=event,
+#                 message='Для пользователя не найдены активные учётные данные (open_in_system, system_id=4)',
+#                 status=500,
+#                 request_payload=request_payload,
+#                 requester=requester,
+#                 stores=stores_for_log,
+#             )
+
+#         session_uuid = uuid.uuid4()
+#         session_id = str(session_uuid)
+
+#         pin = _generate_pin_code()
+#         expires_at = timezone.now() + datetime.timedelta(minutes=PIN_TTL_MINUTES)
+#         pin_hash = hashlib.sha256(pin.encode('utf-8')).hexdigest()
+
+#         AuthSession.objects.create(
+#             session_id=session_uuid,
+#             user=user,
+#             storeid=None,
+#             pin_hash=pin_hash,
+#             status='pin_sent',
+#             attempts=0,
+#             expires_at=expires_at,
+#         )
+
+#         delivery = send_pin_to_user_channels(user, pin)
+
+#         if not delivery["ok"]:
+#             logger.error(
+#                 f"[AGENT_AUTH/START] Не удалось отправить PIN user_id={user.id} "
+#                 f"(telegram_sent={delivery['telegram_sent']}, max_sent={delivery['max_sent']})"
+#             )
+#             return _agent_audit_error(
+#                 request,
+#                 event=event,
+#                 message='Не удалось отправить PIN ни в MAX, ни на email',
+#                 status=500,
+#                 request_payload=request_payload,
+#                 requester=requester,
+#                 stores=stores_for_log,
+#                 extra={"delivery": delivery},
+#             )
+
+#         _send_admin_log_async(
+#             "\n".join([
+#                 "🔐 Агент. Запрос",
+#                 f"{user.full_name}",
+#                 f"Телефон: {_mask_phone(phone_raw)}",
+#                 f"Email: {_mask_email(getattr(user, 'mail', '')) if getattr(user, 'mail', None) else 'нет'}",
+#                 f"Email: {'да' if delivery.get('email_sent') else 'нет'}",
+#                 f"MAX: {'да' if delivery.get('max_sent') else 'нет'}",
+#             ])
+#         )
+
+#         response_payload = {
+#             'session_id': session_id,
+#         }
+
+#         return _agent_audit_json_response(
+#             request,
+#             event=event,
+#             payload=response_payload,
+#             status=200,
+#             request_payload=request_payload,
+#             requester=requester,
+#             stores=stores_for_log,
+#             extra={
+#                 "delivery": delivery,
+#                 "expires_at": expires_at,
+#                 "pin_ttl_minutes": PIN_TTL_MINUTES,
+#             },
+#         )
+
+#     except Exception as e:
+#         logger.exception(f"[AGENT_AUTH/START] Unexpected error: {e}")
+#         return _agent_audit_error(
+#             request,
+#             event=event,
+#             message=f'Ошибка при запуске авторизации: {e}',
+#             status=500,
+#             request_payload=request_payload,
+#             requester=requester,
+#             stores=stores_for_log,
+#             extra={"exception": str(e)},
+#         )
 
 
 @csrf_exempt
