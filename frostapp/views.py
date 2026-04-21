@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 import ldap
 from ldap.filter import escape_filter_chars
 import datetime
+from zoneinfo import ZoneInfo
 import uuid
 import pymysql
 import hmac
@@ -74,7 +75,7 @@ from urllib.parse import urlencode
 from functools import wraps
 import io
 import mimetypes
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from decimal import Decimal, InvalidOperation
@@ -323,6 +324,26 @@ MAX_ADMIN_LOG_USER_ID = int(os.getenv("MAX_ADMIN_LOG_USER_ID", "91759973"))
 
 # НОВЫЙ_БОТ
 MAXBOT_CHECKLIST_REPORTS_DIR = os.getenv("MAXBOT_CHECKLIST_REPORTS_DIR", "/app/reports")
+MAXBOT_CHECKLIST_REPORT_TEMPLATE = os.getenv(
+    "MAXBOT_CHECKLIST_REPORT_TEMPLATE",
+    "/app/media/ТЗ на чат-бот.xlsx"
+)
+MAXBOT_LOCAL_TZ = ZoneInfo(os.getenv("MAXBOT_LOCAL_TZ", "Asia/Irkutsk"))
+CHECKLIST_STEP_META = {
+    "sorting": (1, "Сортировка"),
+    "set_workplace": (2, "Создай рабочее место"),
+    "cleanliness": (3, "Содержание в чистоте"),
+    "standardization": (4, "Стандартизация"),
+    "improvement": (5, "Совершенствование"),
+}
+
+CHECKLIST_STEP_START_ROW = {
+    "sorting": 5,
+    "set_workplace": 12,
+    "cleanliness": 19,
+    "standardization": 26,
+    "improvement": 33,
+}
 
 CHECKLIST_STEP_ORDER = [
     ("sorting", "СОРТИРОВКА"),
@@ -21560,23 +21581,52 @@ def working_employees_sync_supermag_test_run(request):
 
 # НОВЫЙ_БОТ
 
+def _local_now():
+    return timezone.now().astimezone(MAXBOT_LOCAL_TZ)
+
+def _db_now():
+    # Для managed=False и naive timestamp в PostgreSQL
+    return _local_now().replace(tzinfo=None)
+
 def _safe_local_dt(dt):
-    dt = dt or timezone.now()
+    if not dt:
+        return _db_now()
     if timezone.is_naive(dt):
         return dt
-    return timezone.localtime(dt)
+    return dt.astimezone(MAXBOT_LOCAL_TZ).replace(tzinfo=None)
 
-def generate_checklist_session_no() -> str:
-    return f"MAX7S-{timezone.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
-
-
-def _safe_fs_name(value: str) -> str:
+def _safe_fs_name(value: str, max_len: int = 120) -> str:
     value = (value or "").strip()
     value = re.sub(r'[\\/:*?"<>|]+', " ", value)
     value = re.sub(r"\s+", " ", value).strip()
-    return value[:120] or "unknown"
+    return value[:max_len] or "unknown"
 
+def _safe_file_part(value: str, max_len: int = 80) -> str:
+    value = (value or "").strip()
+    value = re.sub(r'[\\/:*?"<>|]+', " ", value)
+    value = re.sub(r"\s+", "_", value).strip("._ ")
+    return value[:max_len] or "part"
 
+def _step_display(step_code: str, fallback_name: str = ""):
+    return CHECKLIST_STEP_META.get(step_code, (0, fallback_name or step_code))
+
+def _question_row(step_code: str, question_no: int) -> int:
+    base = CHECKLIST_STEP_START_ROW[step_code]
+    return base + int(question_no) - 1
+
+def _photo_saved_name(session, answer, seq_no: int, ext: str) -> str:
+    step_no, step_title = _step_display(answer.step_code, answer.step_name)
+    question_stub = _safe_file_part(answer.question_text or "", 45)
+    return (
+        f"{_safe_file_part(session.workplace_name, 40)}"
+        f"__Шаг-{step_no}_{_safe_file_part(step_title, 30)}"
+        f"__Вопрос-{int(answer.question_no):02d}"
+        f"__{question_stub}"
+        f"__Фото-{seq_no:02d}{ext}"
+    )
+    
+def generate_checklist_session_no() -> str:
+    return f"MAX7S-{_local_now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
 
 def find_checklist_department_by_text(user: User, text: str):
     normalized = _normalize_choice_text(text)
@@ -21668,8 +21718,8 @@ def cancel_previous_open_checklist_sessions(max_user_id: int):
         ],
     ).update(
         status="cancelled",
-        updated_at=timezone.now(),
-        finished_at=timezone.now(),
+        updated_at=_db_now(),
+        finished_at=_db_now(),
     )
 
 
@@ -21685,8 +21735,8 @@ def create_new_checklist_session_for_user(user: User, max_user_id: int, max_chat
         max_chat_id=max_chat_id,
         status="awaiting_department",
         raw_last_event=raw_event or {},
-        created_at=timezone.now(),
-        updated_at=timezone.now(),
+        created_at=_db_now(),
+        updated_at=_db_now(),
     )
 
 
@@ -21694,28 +21744,34 @@ def _cancel_checklist_session(max_user_id: int):
     session = get_open_checklist_session(max_user_id)
     if session:
         session.status = "cancelled"
-        session.updated_at = timezone.now()
-        session.finished_at = timezone.now()
+        session.updated_at = _db_now()
+        session.finished_at = _db_now()
         session.save(update_fields=["status", "updated_at", "finished_at"])
 
     return build_response(
         text="Текущий чек-лист 7С отменён.",
-        buttons=[[kb_callback("7С чек-лист", "checklist:start")], [kb_message("Начать")]],
+        buttons=[[kb_message("7С чек-лист")], [kb_message("Начать")]],
         notification="Отменено",
     )
 
 
 def _ensure_checklist_report_dir(session: MaxBotChecklistSession) -> Path:
-    department_name = session.department_name or (session.checklist_department.name if session.checklist_department else "Без подразделения")
+    department_name = session.department_name or (
+        session.checklist_department.name if session.checklist_department else "Без подразделения"
+    )
     inspector = session.applicant_full_name or f"user_{session.max_user_id}"
     stamp = _safe_local_dt(session.created_at).strftime("%Y-%m-%d_%H-%M-%S")
 
-    directory = Path(MAXBOT_CHECKLIST_REPORTS_DIR) / _safe_fs_name(department_name) / f"{stamp}_{_safe_fs_name(inspector)}"
+    directory = (
+        Path(MAXBOT_CHECKLIST_REPORTS_DIR)
+        / _safe_fs_name(department_name)
+        / f"{stamp}_{_safe_fs_name(inspector)}"
+    )
     directory.mkdir(parents=True, exist_ok=True)
 
     if session.report_dir != str(directory):
         session.report_dir = str(directory)
-        session.updated_at = timezone.now()
+        session.updated_at = _db_now()
         session.save(update_fields=["report_dir", "updated_at"])
 
     return directory
@@ -21730,7 +21786,7 @@ def ask_checklist_department(session: MaxBotChecklistSession):
         )
 
     session.status = "awaiting_department"
-    session.updated_at = timezone.now()
+    session.updated_at = _db_now()
     session.save(update_fields=["status", "updated_at"])
 
     buttons = [[kb_message(dep.name)] for dep in departments]
@@ -21756,7 +21812,7 @@ def ask_checklist_location(session: MaxBotChecklistSession):
         )
 
     session.status = "awaiting_location"
-    session.updated_at = timezone.now()
+    session.updated_at = _db_now()
     session.save(update_fields=["status", "updated_at"])
 
     buttons = [[kb_message(loc.name)] for loc in locations]
@@ -21782,7 +21838,7 @@ def ask_checklist_workplace(session: MaxBotChecklistSession):
         )
 
     session.status = "awaiting_workplace"
-    session.updated_at = timezone.now()
+    session.updated_at = _db_now()
     session.save(update_fields=["status", "updated_at"])
 
     buttons = [[kb_message(wp.name)] for wp in workplaces]
@@ -21819,7 +21875,7 @@ def get_next_checklist_question(question: MaxBotChecklistQuestion) -> Optional[M
 def ask_checklist_question(session: MaxBotChecklistSession, question: MaxBotChecklistQuestion, notification: Optional[str] = None):
     session.current_question = question
     session.status = "awaiting_answer"
-    session.updated_at = timezone.now()
+    session.updated_at = _db_now()
     session.save(update_fields=["current_question", "status", "updated_at"])
 
     step_index = CHECKLIST_STEP_INDEX.get(question.step_code, 0)
@@ -21883,11 +21939,11 @@ def save_checklist_boolean_answer(session: MaxBotChecklistSession, question: Max
         score=score,
         photo_required=photo_required,
         raw_payload=raw_payload or {},
-        created_at=timezone.now(),
+        created_at=_db_now(),
     )
 
     session.raw_last_event = raw_payload or {}
-    session.updated_at = timezone.now()
+    session.updated_at = _db_now()
 
     if photo_required:
         session.status = "awaiting_photo"
@@ -21932,12 +21988,10 @@ def _download_and_save_checklist_photo(
 
         content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
         ext = mimetypes.guess_extension(content_type) or ".jpg"
+        if ext == ".jpe":
+            ext = ".jpg"
 
-        saved_name = (
-            f"{_safe_fs_name(session.workplace_name)}"
-            f"__{answer.step_code}_{answer.question_no:02d}"
-            f"__{seq_no:02d}{ext}"
-        )
+        saved_name = _photo_saved_name(session, answer, seq_no, ext)
         full_path = report_dir / saved_name
 
         with open(full_path, "wb") as fh:
@@ -21956,14 +22010,14 @@ def save_checklist_photo_answers(session: MaxBotChecklistSession, photo_urls: li
     if session.status != "awaiting_photo":
         return build_response(
             text="Сейчас фото для чек-листа не ожидаются.",
-            buttons=[[kb_callback("7С чек-лист", "checklist:start")]],
+            buttons=[[kb_message("7С чек-лист")]],
         )
 
     pending = _get_pending_checklist_answer(session)
     if not pending:
         return build_response(
             text="Не найден вопрос, к которому сейчас нужно фото.",
-            buttons=[[kb_callback("7С чек-лист", "checklist:start")]],
+            buttons=[[kb_message("7С чек-лист")]],
         )
 
     created_count = 0
@@ -21973,13 +22027,13 @@ def save_checklist_photo_answers(session: MaxBotChecklistSession, photo_urls: li
         photo_obj = MaxBotChecklistAnswerPhoto.objects.create(
             answer=pending,
             photo_url=photo_url,
-            created_at=timezone.now(),
+            created_at=_db_now(),
         )
         _download_and_save_checklist_photo(session, pending, photo_obj, i)
         created_count += 1
 
     session.raw_last_event = raw_payload or {}
-    session.updated_at = timezone.now()
+    session.updated_at = _db_now()
     session.save(update_fields=["raw_last_event", "updated_at"])
 
     total_count = pending.photos.count()
@@ -22027,116 +22081,74 @@ def build_checklist_summary(session: MaxBotChecklistSession) -> tuple[int, str]:
     return total_score, "\n".join(lines)
 
 
+
+
+
 def generate_checklist_excel_report(session: MaxBotChecklistSession) -> str:
     report_dir = _ensure_checklist_report_dir(session)
     report_path = report_dir / "report.xlsx"
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Отчет"
+    wb = load_workbook(MAXBOT_CHECKLIST_REPORT_TEMPLATE)
+    ws = wb["Отчет"]
 
-    header_fill = PatternFill("solid", fgColor="DCEBFF")
-    step_fill = PatternFill("solid", fgColor="E2F0D9")
-    border = Border(
-        left=Side(style="thin", color="D1D5DB"),
-        right=Side(style="thin", color="D1D5DB"),
-        top=Side(style="thin", color="D1D5DB"),
-        bottom=Side(style="thin", color="D1D5DB"),
-    )
+    # Оставляем только лист "Отчет"
+    for sheet_name in list(wb.sheetnames):
+        if sheet_name != "Отчет":
+            del wb[sheet_name]
 
-    ws["A1"] = "Мониторинг 7С"
-    ws["A1"].font = Font(bold=True, size=14)
+    # Скрываем лишние колонки рабочих мест справа, если они есть в шаблоне
+    for col in range(9, 50):  # I:AX с запасом
+        ws.column_dimensions[get_column_letter(col)].hidden = True
 
-    ws["A3"] = "Дата:"
-    ws["B3"] = _safe_local_dt(session.created_at).strftime("%d.%m.%Y %H:%M:%S") if session.created_at else ""
+    # Объединяем H2:H4 под одно рабочее место, если ещё не объединено
+    try:
+        ws.merge_cells("H2:H4")
+    except Exception:
+        pass
 
-    ws["A4"] = "Подразделение:"
-    ws["B4"] = session.department_name
+    created_str = _safe_local_dt(session.created_at).strftime("%d.%m.%Y %H:%M:%S")
 
-    ws["A5"] = "Месторасположение:"
-    ws["B5"] = session.location_name
+    # Шапка
+    ws["D2"] = "Дата:"
+    ws["D3"] = "Подразделение:"
+    ws["D4"] = "Месторасположение:"
 
-    ws["A6"] = "Рабочее место:"
-    ws["B6"] = session.workplace_name
+    ws["E2"] = created_str
+    ws["E3"] = session.department_name or ""
+    ws["E4"] = session.location_name or ""
 
-    ws["A7"] = "Ответственный:"
-    ws["B7"] = session.responsible_name or ""
+    ws["H2"] = f"Рабочее место\n{session.workplace_name or ''}"
+    ws["H2"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws["H2"].font = Font(bold=True)
 
-    ws["A8"] = "Проверяющий:"
-    ws["B8"] = session.applicant_full_name or ""
+    # Сбрасываем значения по вопросам в колонке H
+    for step_code in CHECKLIST_STEP_START_ROW:
+        for qn in range(1, 7):
+            ws.cell(_question_row(step_code, qn), 8).value = 0
 
-    row = 10
-    headers = ["Шаг", "№", "Критерий", "Ответ", "Балл", "Фото"]
-    for col_idx, title in enumerate(headers, start=1):
-        cell = ws.cell(row=row, column=col_idx, value=title)
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(vertical="top", wrap_text=True)
-        cell.border = border
-
-    row += 1
-
-    answers = list(
-        session.answers
-        .prefetch_related("photos")
-        .order_by("question__sort_order", "id")
-    )
-
-    grouped = defaultdict(list)
+    # Подставляем ответы
+    answers = session.answers.order_by("question__sort_order", "id")
     for ans in answers:
-        grouped[ans.step_name].append(ans)
+        row = _question_row(ans.step_code, int(ans.question_no))
+        ws.cell(row, 8).value = int(ans.score)
 
-    total_score = 0
+    # Формулы сумм
+    ws["H11"] = "=SUM(H5:H10)"
+    ws["H18"] = "=SUM(H12:H17)"
+    ws["H25"] = "=SUM(H19:H24)"
+    ws["H32"] = "=SUM(H26:H31)"
+    ws["H39"] = "=SUM(H33:H38)"
+    ws["H40"] = "=SUM(H11,H18,H25,H32,H39)"
 
-    for _, step_name in CHECKLIST_STEP_ORDER:
-        if step_name not in grouped:
-            continue
+    # Печать на A4
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = "portrait"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_area = "A1:H42"
 
-        step_start_row = row
-
-        for ans in grouped[step_name]:
-            photo_names = "\n".join(
-                [p.saved_name or os.path.basename(p.photo_file or "") for p in ans.photos.all()]
-            )
-
-            ws.cell(row=row, column=1, value=ans.step_name)
-            ws.cell(row=row, column=2, value=ans.question_no)
-            ws.cell(row=row, column=3, value=ans.question_text)
-            ws.cell(row=row, column=4, value=ans.answer_label)
-            ws.cell(row=row, column=5, value=ans.score)
-            ws.cell(row=row, column=6, value=photo_names)
-
-            for c in range(1, 7):
-                ws.cell(row=row, column=c).alignment = Alignment(vertical="top", wrap_text=True)
-                ws.cell(row=row, column=c).border = border
-
-            total_score += ans.score
-            row += 1
-
-        ws.cell(row=row, column=1, value=f"СУММА БАЛЛОВ ПО ШАГУ: {step_name}")
-        ws.cell(row=row, column=5, value=f"=SUM(E{step_start_row}:E{row-1})")
-        for c in range(1, 7):
-            ws.cell(row=row, column=c).font = Font(bold=True)
-            ws.cell(row=row, column=c).fill = step_fill
-            ws.cell(row=row, column=c).border = border
-            ws.cell(row=row, column=c).alignment = Alignment(vertical="top", wrap_text=True)
-        row += 1
-
-    ws.cell(row=row, column=1, value="ОБЩАЯ СУММА БАЛЛОВ")
-    ws.cell(row=row, column=5, value=total_score)
-    for c in range(1, 7):
-        ws.cell(row=row, column=c).font = Font(bold=True)
-        ws.cell(row=row, column=c).fill = header_fill
-        ws.cell(row=row, column=c).border = border
-        ws.cell(row=row, column=c).alignment = Alignment(vertical="top", wrap_text=True)
-
-    row += 3
-    ws.cell(row=row, column=1, value="Подпись эксперта")
-    ws.cell(row=row + 1, column=1, value="Подпись ответственного за рабочее место")
-
-    _maxbot_fit_columns(ws)
     wb.save(str(report_path))
-
     return str(report_path)
 
 
@@ -22149,8 +22161,8 @@ def finish_checklist_session(session: MaxBotChecklistSession, notification: Opti
     session.total_score = total_score
     session.summary = summary
     session.report_file = report_file
-    session.finished_at = timezone.now()
-    session.updated_at = timezone.now()
+    session.finished_at = _db_now()
+    session.updated_at = _db_now()
     session.save(
         update_fields=[
             "status",
@@ -22171,7 +22183,7 @@ def finish_checklist_session(session: MaxBotChecklistSession, notification: Opti
             f"<b>Рабочее место:</b> {escape(session.workplace_name)}\n"
             f"<b>Итог:</b> {session.total_score} баллов"
         ),
-        buttons=[[kb_callback("7С чек-лист", "checklist:start")], [kb_message("Начать")]],
+        buttons=[[kb_message("7С чек-лист")], [kb_message("Начать")]],
         notification=notification,
     )
 
@@ -22212,7 +22224,7 @@ def handle_checklist_callback_event(user: User, payload: str, max_user_id: int, 
         session.location_name = ""
         session.workplace_name = ""
         session.responsible_name = ""
-        session.updated_at = timezone.now()
+        session.updated_at = _db_now()
         session.save(
             update_fields=[
                 "checklist_department",
@@ -22242,7 +22254,7 @@ def handle_checklist_callback_event(user: User, payload: str, max_user_id: int, 
         session.workplace = None
         session.workplace_name = ""
         session.responsible_name = ""
-        session.updated_at = timezone.now()
+        session.updated_at = _db_now()
         session.save(
             update_fields=[
                 "location",
@@ -22268,7 +22280,7 @@ def handle_checklist_callback_event(user: User, payload: str, max_user_id: int, 
         session.workplace = workplace
         session.workplace_name = workplace.name
         session.responsible_name = workplace.responsible_name or ""
-        session.updated_at = timezone.now()
+        session.updated_at = _db_now()
         session.save(
             update_fields=[
                 "workplace",
@@ -22335,7 +22347,7 @@ def handle_checklist_message_event(user: User, text: str, max_user_id: int, max_
         session.location_name = ""
         session.workplace_name = ""
         session.responsible_name = ""
-        session.updated_at = timezone.now()
+        session.updated_at = _db_now()
         session.save(
             update_fields=[
                 "checklist_department",
@@ -22363,7 +22375,7 @@ def handle_checklist_message_event(user: User, text: str, max_user_id: int, max_
         session.workplace = None
         session.workplace_name = ""
         session.responsible_name = ""
-        session.updated_at = timezone.now()
+        session.updated_at = _db_now()
         session.save(
             update_fields=[
                 "location",
@@ -22387,7 +22399,7 @@ def handle_checklist_message_event(user: User, text: str, max_user_id: int, max_
         session.workplace = workplace
         session.workplace_name = workplace.name
         session.responsible_name = workplace.responsible_name or ""
-        session.updated_at = timezone.now()
+        session.updated_at = _db_now()
         session.save(
             update_fields=[
                 "workplace",
