@@ -18032,18 +18032,14 @@ def build_main_menu(user: User):
     buttons = []
 
     if user_has_checklist_access(user):
-        buttons.append([kb_callback("7С чек-лист", "checklist:start")])
+        buttons.append([kb_message("7С чек-лист")])
 
     buttons.append([kb_message("Начать")])
 
     text = (
         f"Привет, <b>{escape(user.full_name)}</b>!\n\n"
-        "Выберите действие:\n"
-        "• <b>Начать</b> — старая логика бота\n"
+        "Выберите действие:"
     )
-
-    if user_has_checklist_access(user):
-        text += "• <b>7С чек-лист</b> — новая ветка мониторинга\n"
 
     return build_response(text=text, buttons=buttons)
 
@@ -21564,6 +21560,12 @@ def working_employees_sync_supermag_test_run(request):
 
 # НОВЫЙ_БОТ
 
+def _safe_local_dt(dt):
+    dt = dt or timezone.now()
+    if timezone.is_naive(dt):
+        return dt
+    return timezone.localtime(dt)
+
 def generate_checklist_session_no() -> str:
     return f"MAX7S-{timezone.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
 
@@ -21573,6 +21575,47 @@ def _safe_fs_name(value: str) -> str:
     value = re.sub(r'[\\/:*?"<>|]+', " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value[:120] or "unknown"
+
+
+
+def find_checklist_department_by_text(user: User, text: str):
+    normalized = _normalize_choice_text(text)
+    for dep in get_user_checklist_departments(user):
+        if _normalize_choice_text(dep.name) == normalized:
+            return dep
+    return None
+
+
+def find_checklist_location_by_text(session: MaxBotChecklistSession, text: str):
+    if not session.checklist_department_id:
+        return None
+
+    normalized = _normalize_choice_text(text)
+    qs = (
+        MaxBotChecklistLocation.objects
+        .filter(checklist_department=session.checklist_department, is_active=True)
+        .order_by("sort_order", "name")
+    )
+    for loc in qs:
+        if _normalize_choice_text(loc.name) == normalized:
+            return loc
+    return None
+
+
+def find_checklist_workplace_by_text(session: MaxBotChecklistSession, text: str):
+    if not session.location_id:
+        return None
+
+    normalized = _normalize_choice_text(text)
+    qs = (
+        MaxBotChecklistWorkplace.objects
+        .filter(location=session.location, is_active=True)
+        .order_by("sort_order", "name")
+    )
+    for wp in qs:
+        if _normalize_choice_text(wp.name) == normalized:
+            return wp
+    return None
 
 
 def get_user_checklist_departments(user: User):
@@ -21665,7 +21708,7 @@ def _cancel_checklist_session(max_user_id: int):
 def _ensure_checklist_report_dir(session: MaxBotChecklistSession) -> Path:
     department_name = session.department_name or (session.checklist_department.name if session.checklist_department else "Без подразделения")
     inspector = session.applicant_full_name or f"user_{session.max_user_id}"
-    stamp = timezone.localtime(session.created_at or timezone.now()).strftime("%Y-%m-%d_%H-%M-%S")
+    stamp = _safe_local_dt(session.created_at).strftime("%Y-%m-%d_%H-%M-%S")
 
     directory = Path(MAXBOT_CHECKLIST_REPORTS_DIR) / _safe_fs_name(department_name) / f"{stamp}_{_safe_fs_name(inspector)}"
     directory.mkdir(parents=True, exist_ok=True)
@@ -21690,8 +21733,8 @@ def ask_checklist_department(session: MaxBotChecklistSession):
     session.updated_at = timezone.now()
     session.save(update_fields=["status", "updated_at"])
 
-    buttons = [[kb_callback(dep.name, f"checklist:department:{dep.id}")] for dep in departments]
-    buttons.append([kb_callback("Отмена", "checklist:cancel")])
+    buttons = [[kb_message(dep.name)] for dep in departments]
+    buttons.append([kb_message("Отмена")])
 
     return build_response(
         text="Выберите подразделение:",
@@ -21709,15 +21752,15 @@ def ask_checklist_location(session: MaxBotChecklistSession):
     if not locations:
         return build_response(
             text="Для этого подразделения нет месторасположений.",
-            buttons=[[kb_callback("Отмена", "checklist:cancel")]],
+            buttons=[[kb_message("Отмена")]],
         )
 
     session.status = "awaiting_location"
     session.updated_at = timezone.now()
     session.save(update_fields=["status", "updated_at"])
 
-    buttons = [[kb_callback(loc.name, f"checklist:location:{loc.id}")] for loc in locations]
-    buttons.append([kb_callback("Отмена", "checklist:cancel")])
+    buttons = [[kb_message(loc.name)] for loc in locations]
+    buttons.append([kb_message("Отмена")])
 
     return build_response(
         text=f"Подразделение: <b>{escape(session.department_name)}</b>\n\nВыберите месторасположение:",
@@ -21735,18 +21778,15 @@ def ask_checklist_workplace(session: MaxBotChecklistSession):
     if not workplaces:
         return build_response(
             text="Для этого месторасположения нет рабочих мест.",
-            buttons=[[kb_callback("Отмена", "checklist:cancel")]],
+            buttons=[[kb_message("Отмена")]],
         )
 
     session.status = "awaiting_workplace"
     session.updated_at = timezone.now()
     session.save(update_fields=["status", "updated_at"])
 
-    buttons = [
-        [kb_callback(wp.name, f"checklist:workplace:{wp.id}")]
-        for wp in workplaces
-    ]
-    buttons.append([kb_callback("Отмена", "checklist:cancel")])
+    buttons = [[kb_message(wp.name)] for wp in workplaces]
+    buttons.append([kb_message("Отмена")])
 
     return build_response(
         text=(
@@ -21795,11 +21835,8 @@ def ask_checklist_question(session: MaxBotChecklistSession, question: MaxBotChec
     )
 
     buttons = [
-        [
-            kb_callback("Да", f"checklist:answer:1:{question.id}"),
-            kb_callback("Нет", f"checklist:answer:0:{question.id}")
-        ],
-        [kb_callback("Отмена", "checklist:cancel")],
+        [kb_message("Да"), kb_message("Нет")],
+        [kb_message("Отмена")],
     ]
 
     return build_response(text=text, buttons=buttons, notification=notification)
@@ -22011,7 +22048,7 @@ def generate_checklist_excel_report(session: MaxBotChecklistSession) -> str:
     ws["A1"].font = Font(bold=True, size=14)
 
     ws["A3"] = "Дата:"
-    ws["B3"] = timezone.localtime(session.created_at).strftime("%d.%m.%Y %H:%M:%S") if session.created_at else ""
+    ws["B3"] = _safe_local_dt(session.created_at).strftime("%d.%m.%Y %H:%M:%S") if session.created_at else ""
 
     ws["A4"] = "Подразделение:"
     ws["B4"] = session.department_name
@@ -22283,10 +22320,117 @@ def handle_checklist_message_event(user: User, text: str, max_user_id: int, max_
     if normalized in {"отмена", "cancel"}:
         return _cancel_checklist_session(max_user_id)
 
-    if session.status == "awaiting_photo" and normalized in {"продолжить", "готово", "дальше", "далее"}:
-        return complete_checklist_photo_step(session)
+    if session.status == "awaiting_department":
+        department = find_checklist_department_by_text(user, cleaned)
+        if not department:
+            return _prepend_text(
+                ask_checklist_department(session),
+                "Не удалось понять выбор подразделения. Нажмите кнопку ещё раз.",
+            )
 
-    return build_response(
-        text="Для чек-листа 7С используйте кнопки бота. Если нужно выйти — нажмите «Отмена».",
-        buttons=[[kb_message("Отмена")]],
-    )
+        session.checklist_department = department
+        session.department_name = department.name
+        session.location = None
+        session.workplace = None
+        session.location_name = ""
+        session.workplace_name = ""
+        session.responsible_name = ""
+        session.updated_at = timezone.now()
+        session.save(
+            update_fields=[
+                "checklist_department",
+                "department_name",
+                "location",
+                "workplace",
+                "location_name",
+                "workplace_name",
+                "responsible_name",
+                "updated_at",
+            ]
+        )
+        return ask_checklist_location(session)
+
+    if session.status == "awaiting_location":
+        location = find_checklist_location_by_text(session, cleaned)
+        if not location:
+            return _prepend_text(
+                ask_checklist_location(session),
+                "Не удалось понять выбор месторасположения. Нажмите кнопку ещё раз.",
+            )
+
+        session.location = location
+        session.location_name = location.name
+        session.workplace = None
+        session.workplace_name = ""
+        session.responsible_name = ""
+        session.updated_at = timezone.now()
+        session.save(
+            update_fields=[
+                "location",
+                "location_name",
+                "workplace",
+                "workplace_name",
+                "responsible_name",
+                "updated_at",
+            ]
+        )
+        return ask_checklist_workplace(session)
+
+    if session.status == "awaiting_workplace":
+        workplace = find_checklist_workplace_by_text(session, cleaned)
+        if not workplace:
+            return _prepend_text(
+                ask_checklist_workplace(session),
+                "Не удалось понять выбор рабочего места. Нажмите кнопку ещё раз.",
+            )
+
+        session.workplace = workplace
+        session.workplace_name = workplace.name
+        session.responsible_name = workplace.responsible_name or ""
+        session.updated_at = timezone.now()
+        session.save(
+            update_fields=[
+                "workplace",
+                "workplace_name",
+                "responsible_name",
+                "updated_at",
+            ]
+        )
+
+        _ensure_checklist_report_dir(session)
+
+        first_question = get_first_checklist_question()
+        if not first_question:
+            return build_response(
+                text="Справочник вопросов чек-листа пуст.",
+                buttons=[[kb_message("Начать")]],
+            )
+
+        return ask_checklist_question(session, first_question)
+
+    if session.status == "awaiting_answer":
+        question = session.current_question
+        if not question:
+            return build_response(text="Нет активного вопроса.", buttons=[[kb_message("Начать")]])
+
+        if normalized == "да":
+            return save_checklist_boolean_answer(session, question, True, raw_payload=raw_data)
+
+        if normalized == "нет":
+            return save_checklist_boolean_answer(session, question, False, raw_payload=raw_data)
+
+        return _prepend_text(
+            ask_checklist_question(session, question),
+            "Нужно выбрать только «Да» или «Нет».",
+        )
+
+    if session.status == "awaiting_photo":
+        if normalized in {"продолжить", "готово", "дальше", "далее"}:
+            return complete_checklist_photo_step(session)
+
+        return build_response(
+            text="Сейчас я жду фото. Отправьте одно или несколько фото, затем нажмите «Продолжить».",
+            buttons=_photo_step_buttons(),
+        )
+
+    return build_main_menu(user)
