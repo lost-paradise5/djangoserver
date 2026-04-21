@@ -710,3 +710,273 @@ class MaxBotRequestAnswer(models.Model):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#НОВЫЙ_БОТ
+
+
+
+
+class MaxBotChecklistDepartment(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    code = models.CharField(max_length=64, unique=True)
+    name = models.CharField(max_length=255, unique=True)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_checklist_department"
+        managed = False
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class MaxBotChecklistDepartmentAccess(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    checklist_department = models.ForeignKey(
+        MaxBotChecklistDepartment,
+        db_column="checklist_department_id",
+        on_delete=models.CASCADE,
+        related_name="access_rows",
+    )
+    user_department_id = models.IntegerField()
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_checklist_department_access"
+        managed = False
+        unique_together = ("checklist_department", "user_department_id")
+
+
+class MaxBotChecklistLocation(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    checklist_department = models.ForeignKey(
+        MaxBotChecklistDepartment,
+        db_column="checklist_department_id",
+        on_delete=models.CASCADE,
+        related_name="locations",
+    )
+    name = models.CharField(max_length=255)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_checklist_location"
+        managed = False
+        ordering = ["sort_order", "name"]
+        unique_together = ("checklist_department", "name")
+
+    def __str__(self):
+        return self.name
+
+
+class MaxBotChecklistWorkplace(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    location = models.ForeignKey(
+        MaxBotChecklistLocation,
+        db_column="location_id",
+        on_delete=models.CASCADE,
+        related_name="workplaces",
+    )
+    registry_no = models.CharField(max_length=32, null=True, blank=True)
+    name = models.CharField(max_length=255)
+    responsible_name = models.CharField(max_length=255, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_checklist_workplace"
+        managed = False
+        ordering = ["sort_order", "name"]
+        unique_together = ("location", "name")
+
+    def __str__(self):
+        return self.name
+
+
+class MaxBotChecklistQuestion(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    step_code = models.CharField(max_length=64)
+    step_name = models.CharField(max_length=255)
+    question_no = models.IntegerField()
+    text = models.TextField()
+    yes_score = models.IntegerField(default=1)
+    no_score = models.IntegerField(default=0)
+    photo_required_if_no = models.BooleanField(default=False)
+    photo_required_if_yes = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=100)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_checklist_question"
+        managed = False
+        ordering = ["sort_order", "id"]
+        unique_together = ("step_code", "question_no")
+
+    def __str__(self):
+        return f"{self.step_name} / {self.question_no}"
+
+
+class MaxBotChecklistSession(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    session_no = models.CharField(max_length=64, unique=True)
+    applicant_user = models.ForeignKey(
+        User,
+        db_column="applicant_user_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="maxbot_checklist_sessions",
+    )
+    applicant_full_name = models.CharField(max_length=255)
+    max_user_id = models.BigIntegerField()
+    max_chat_id = models.BigIntegerField(null=True, blank=True)
+
+    checklist_department = models.ForeignKey(
+        MaxBotChecklistDepartment,
+        db_column="checklist_department_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sessions",
+    )
+    location = models.ForeignKey(
+        MaxBotChecklistLocation,
+        db_column="location_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sessions",
+    )
+    workplace = models.ForeignKey(
+        MaxBotChecklistWorkplace,
+        db_column="workplace_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sessions",
+    )
+
+    department_name = models.CharField(max_length=255, blank=True, default="")
+    location_name = models.CharField(max_length=255, blank=True, default="")
+    workplace_name = models.CharField(max_length=255, blank=True, default="")
+    responsible_name = models.CharField(max_length=255, null=True, blank=True)
+
+    current_question = models.ForeignKey(
+        MaxBotChecklistQuestion,
+        db_column="current_question_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="current_sessions",
+    )
+
+    status = models.CharField(max_length=32, default="awaiting_department")
+    total_score = models.IntegerField(default=0)
+    summary = models.TextField(null=True, blank=True)
+    report_dir = models.TextField(null=True, blank=True)
+    report_file = models.TextField(null=True, blank=True)
+    raw_last_event = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "maxbot_checklist_session"
+        managed = False
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.session_no
+
+
+class MaxBotChecklistAnswer(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    session = models.ForeignKey(
+        MaxBotChecklistSession,
+        db_column="session_id",
+        on_delete=models.CASCADE,
+        related_name="answers",
+    )
+    question = models.ForeignKey(
+        MaxBotChecklistQuestion,
+        db_column="question_id",
+        on_delete=models.CASCADE,
+        related_name="answers",
+    )
+    step_code = models.CharField(max_length=64)
+    step_name = models.CharField(max_length=255)
+    question_no = models.IntegerField()
+    question_text = models.TextField()
+    answer_value = models.BooleanField()
+    answer_label = models.CharField(max_length=16)
+    score = models.IntegerField(default=0)
+    photo_required = models.BooleanField(default=False)
+    raw_payload = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_checklist_answer"
+        managed = False
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.session.session_no} / {self.step_name} / {self.question_no}"
+
+
+class MaxBotChecklistAnswerPhoto(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    answer = models.ForeignKey(
+        MaxBotChecklistAnswer,
+        db_column="answer_id",
+        on_delete=models.CASCADE,
+        related_name="photos",
+    )
+    photo_url = models.TextField(null=True, blank=True)
+    photo_file = models.CharField(max_length=512, null=True, blank=True)
+    original_name = models.CharField(max_length=255, null=True, blank=True)
+    saved_name = models.CharField(max_length=255, null=True, blank=True)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "maxbot_checklist_answer_photo"
+        managed = False
+        ordering = ["created_at", "id"]
+
+
+
+
+
