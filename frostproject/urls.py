@@ -229,5 +229,6 @@ urlpatterns = [
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
     path('sync/stores/', sync_stores_postgres, name='sync_stores_postgres'),
+    path("ui/smstaff/create2/", views.sm_staff_ui_create2, name="sm_staff_ui_create2"),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
