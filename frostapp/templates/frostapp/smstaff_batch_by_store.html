@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Массовая обработка сотрудников по магазинам</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="{% url 'sm_staff_ui_list' %}">SMSTAFF</a>
+    <div class="d-flex gap-2">
+      <a class="btn btn-outline-light btn-sm" href="{{ back_url }}">К списку</a>
+      <a class="btn btn-outline-light btn-sm" href="/admin/">Admin</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 class="mb-0">Массовая обработка сотрудников по id магазинов</h3>
+    <a class="btn btn-outline-secondary" href="{{ back_url }}">← Назад к списку</a>
+  </div>
+
+  {% if error %}
+    <div class="alert alert-danger">{{ error }}</div>
+  {% endif %}
+
+  {% if success_message %}
+    <div class="alert alert-info">{{ success_message }}</div>
+  {% endif %}
+
+  <form method="post" class="card shadow-sm mb-4">
+    {% csrf_token %}
+    <div class="card-header">
+      <b>Параметры запуска</b>
+    </div>
+    <div class="card-body">
+      <div class="row g-3 align-items-end">
+        <div class="col-md-10">
+          <label class="form-label">ID магазинов Supermag</label>
+          <input
+            class="form-control"
+            name="store_ids"
+            value="{{ form.store_ids }}"
+            placeholder="например: 114, 157, 200"
+            required
+          >
+          <div class="form-text">
+            Можно указать один или несколько id магазинов через запятую, пробел или перенос строки.
+          </div>
+        </div>
+        <div class="col-md-2">
+          <button class="btn btn-primary w-100">Начать</button>
+        </div>
+      </div>
+
+      <div class="alert alert-secondary mt-3 mb-0">
+        <b>Что делает запуск:</b><br>
+        1. Загружает сотрудников из 1С.<br>
+        2. Оставляет только должности: Администратор, Администратор магазина, Приемщик, Приемщик товара.<br>
+        3. Находит базу магазина по REP.DBNAME.<br>
+        4. В SMSTAFF ищет сотрудника по INN или FIO.<br>
+        5. Если найден — вызывает <code>bin_createuser2</code> с <code>APASS = NULL</code>, <code>ACHECK = -1</code>, <code>AUSERENABLED = -1</code>.<br>
+        6. Показывает подробные логи и даёт скачать Excel.
+      </div>
+    </div>
+  </form>
+
+  {% if summary %}
+    <div class="row g-3 mb-4">
+      <div class="col-md-3">
+        <div class="card border-0 shadow-sm">
+          <div class="card-body">
+            <div class="text-muted small">Магазинов запрошено</div>
+            <div class="fs-4 fw-bold">{{ summary.stores_requested }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="card border-0 shadow-sm">
+          <div class="card-body">
+            <div class="text-muted small">Сотрудников после фильтра 1С</div>
+            <div class="fs-4 fw-bold">{{ summary.employees_from_1c_filtered }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-2">
+        <div class="card border-0 shadow-sm">
+          <div class="card-body">
+            <div class="text-muted small">Успешно</div>
+            <div class="fs-4 fw-bold text-success">{{ summary.success_count }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-2">
+        <div class="card border-0 shadow-sm">
+          <div class="card-body">
+            <div class="text-muted small">Предупреждения</div>
+            <div class="fs-4 fw-bold text-warning">{{ summary.warning_count }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-2">
+        <div class="card border-0 shadow-sm">
+          <div class="card-body">
+            <div class="text-muted small">Ошибки</div>
+            <div class="fs-4 fw-bold text-danger">{{ summary.error_count }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+
+  {% if export_token %}
+    <div class="mb-4">
+      <a
+        class="btn btn-success"
+        href="{% url 'sm_staff_ui_batch_by_store_download' %}?token={{ export_token }}"
+      >
+        Скачать Excel с логами
+      </a>
+    </div>
+  {% endif %}
+
+  {% if result_rows %}
+    <div class="card shadow-sm mb-4">
+      <div class="card-header">
+        <b>Итог по сотрудникам</b>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead class="table-light">
+              <tr>
+                <th>ИД магазина</th>
+                <th>Название магазина</th>
+                <th>База</th>
+                <th>ИНН</th>
+                <th>ФИО из 1С</th>
+                <th>Должность</th>
+                <th>Логин SMSTAFF</th>
+                <th>ФИО SMSTAFF</th>
+                <th>Статус</th>
+                <th>Действие</th>
+                <th>Сообщение</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in result_rows %}
+                <tr>
+                  <td>{{ row.store_id }}</td>
+                  <td>{{ row.store_name|default:"—" }}</td>
+                  <td>{{ row.dbname|default:"—" }}</td>
+                  <td><code>{{ row.inn|default:"" }}</code></td>
+                  <td>{{ row.fio_1c|default:"—" }}</td>
+                  <td>{{ row.position_1c|default:"—" }}</td>
+                  <td><code>{{ row.login|default:"" }}</code></td>
+                  <td>{{ row.smstaff_fio|default:"—" }}</td>
+                  <td>
+                    {% if row.status == "Успешно" %}
+                      <span class="badge text-bg-success">{{ row.status }}</span>
+                    {% elif row.status == "Не найден" %}
+                      <span class="badge text-bg-warning">{{ row.status }}</span>
+                    {% elif row.status == "Ошибка" %}
+                      <span class="badge text-bg-danger">{{ row.status }}</span>
+                    {% else %}
+                      <span class="badge text-bg-secondary">{{ row.status }}</span>
+                    {% endif %}
+                  </td>
+                  <td>{{ row.action|default:"—" }}</td>
+                  <td style="min-width: 280px;">{{ row.message }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+
+  {% if log_rows %}
+    <div class="card shadow-sm">
+      <div class="card-header">
+        <b>Подробные логи</b>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead class="table-light">
+              <tr>
+                <th>Уровень</th>
+                <th>Шаг</th>
+                <th>ИД магазина</th>
+                <th>Название магазина</th>
+                <th>База</th>
+                <th>ИНН</th>
+                <th>ФИО из 1С</th>
+                <th>Логин</th>
+                <th>Сообщение</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in log_rows %}
+                <tr>
+                  <td>
+                    {% if row.level == "ERROR" %}
+                      <span class="badge text-bg-danger">{{ row.level }}</span>
+                    {% elif row.level == "WARNING" %}
+                      <span class="badge text-bg-warning">{{ row.level }}</span>
+                    {% else %}
+                      <span class="badge text-bg-info">{{ row.level }}</span>
+                    {% endif %}
+                  </td>
+                  <td>{{ row.step }}</td>
+                  <td>{{ row.store_id|default:"" }}</td>
+                  <td>{{ row.store_name|default:"—" }}</td>
+                  <td>{{ row.dbname|default:"—" }}</td>
+                  <td><code>{{ row.inn|default:"" }}</code></td>
+                  <td>{{ row.fio_1c|default:"—" }}</td>
+                  <td><code>{{ row.login|default:"" }}</code></td>
+                  <td style="min-width: 420px;">{{ row.message }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+</div>
+
+</body>
+</html>
