@@ -12328,6 +12328,331 @@ _SM2_USERENABLED_CHOICES = [
 ]
 
 
+
+
+
+## Часть для прогона новой функции 
+_SM2_BATCH_ALLOWED_POSITION_MAP = {
+    "администратор": "Администратор",
+    "администратор магазина": "Администратор магазина",
+    "приемщик": "Приемщик",
+    "приемщик товара": "Приемщик товара",
+}
+
+
+def _normalize_fio_for_compare(value: Any) -> str:
+    return _normalize_spaces(value).replace("Ё", "Е").replace("ё", "е").upper()
+
+
+def _parse_smstore_ids_input(raw_value: str) -> list[int]:
+    """
+    Парсит строку вида:
+    114
+    114,157
+    114, 157, 200
+    114 157 200
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+
+    for part in re.split(r"[,\s;]+", _safe_str(raw_value)):
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except Exception:
+            continue
+        if value <= 0:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+
+    return out
+
+
+def _append_smstaff_batch_log(
+    log_rows: list[dict],
+    *,
+    level: str,
+    step: str,
+    message: str,
+    store_id: Optional[int] = None,
+    store_name: str = "",
+    dbname: str = "",
+    inn: str = "",
+    fio_1c: str = "",
+    login: str = "",
+):
+    log_rows.append({
+        "level": _safe_str(level).upper() or "INFO",
+        "step": _safe_str(step),
+        "message": _safe_str(message),
+        "store_id": store_id if store_id is not None else "",
+        "store_name": _safe_str(store_name),
+        "dbname": _safe_str(dbname),
+        "inn": _safe_str(inn),
+        "fio_1c": _safe_str(fio_1c),
+        "login": _safe_str(login),
+    })
+
+
+def _oracle_fetch_smstaff_candidates_for_employee(cur, *, inn: str, full_name: str) -> list[dict]:
+    """
+    Ищем кандидатов в SMSTAFF:
+    - по ИНН
+    - или по ФИО
+    """
+    cols_set = _oracle_get_table_columns_set(cur, owner="SUPERMAG", table="SMSTAFF")
+
+    def HAS(col: str) -> bool:
+        return col.upper() in cols_set
+
+    select_parts = [
+        "s.id AS id" if HAS("ID") else "NULL AS id",
+        _smstaff_afio_sql("s", cols_set),
+        "s.serverlogin AS serverlogin" if HAS("SERVERLOGIN") else "NULL AS serverlogin",
+        "s.inn AS inn" if HAS("INN") else "NULL AS inn",
+        "s.userenabled AS userenabled" if HAS("USERENABLED") else "NULL AS userenabled",
+        "s.offindex AS offindex" if HAS("OFFINDEX") else "NULL AS offindex",
+    ]
+
+    if HAS("OFFINDEX"):
+        select_parts.append("""
+            (
+                SELECT c.title
+                FROM smoffcfg c
+                WHERE c.id = s.offindex
+                  AND ROWNUM = 1
+            ) AS off_title
+        """)
+    else:
+        select_parts.append("NULL AS off_title")
+
+    where_parts = []
+    binds = {}
+
+    inn = _safe_str(inn)
+    fio_norm = _normalize_fio_for_compare(full_name)
+
+    if inn and HAS("INN"):
+        where_parts.append("TRIM(s.inn) = :b_inn")
+        binds["b_inn"] = inn
+
+    fio_expr = _smstaff_fio_expr("s", cols_set)
+    if fio_norm:
+        where_parts.append(
+            f"UPPER(REPLACE(REPLACE({fio_expr}, 'Ё', 'Е'), 'ё', 'е')) = :b_fio"
+        )
+        binds["b_fio"] = fio_norm
+
+    if not where_parts:
+        return []
+
+    sql = f"""
+        SELECT {", ".join(select_parts)}
+        FROM smstaff s
+        WHERE {" OR ".join(where_parts)}
+        ORDER BY s.id
+    """
+
+    cur.execute(sql, binds)
+    return _oracle_rows_to_jsonable(cur)
+
+
+def _pick_smstaff_candidate(rows: list[dict], *, inn: str, fio_1c: str) -> tuple[Optional[dict], str]:
+    """
+    Выбирает одного кандидата.
+    Возвращает:
+      (row, "")
+      (None, "not_found" | "ambiguous_inn" | "ambiguous_fio" | "ambiguous")
+    """
+    if not rows:
+        return None, "not_found"
+
+    def uniq_logins(items: list[dict]) -> set[str]:
+        return {
+            _safe_str(x.get("serverlogin")).lower()
+            for x in items
+            if _safe_str(x.get("serverlogin"))
+        }
+
+    inn = _safe_str(inn)
+    fio_norm = _normalize_fio_for_compare(fio_1c)
+
+    if inn:
+        by_inn = [r for r in rows if _safe_str(r.get("inn")) == inn]
+        if by_inn:
+            if len(uniq_logins(by_inn)) == 1:
+                return by_inn[0], ""
+            return None, "ambiguous_inn"
+
+    if fio_norm:
+        by_fio = [
+            r for r in rows
+            if _normalize_fio_for_compare(r.get("afio")) == fio_norm
+        ]
+        if by_fio:
+            if len(uniq_logins(by_fio)) == 1:
+                return by_fio[0], ""
+            return None, "ambiguous_fio"
+
+    if len(uniq_logins(rows)) == 1:
+        return rows[0], ""
+
+    return None, "ambiguous"
+
+
+def _call_bin_createuser2_for_existing_employee(
+    cur,
+    *,
+    login: str,
+    inn: str,
+    afio: Optional[str],
+    adol: str,
+    store_id: int,
+):
+    """
+    Вызывает SUPERMAG.bin_createuser2 в режиме:
+      APASS = NULL
+      ACHECK = -1
+      AUSERENABLED = -1
+    """
+    proc_name = os.getenv("SM_BIN_CREATEUSER2_PROC", "SUPERMAG.bin_createuser2").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+        raise ValueError("Некорректное имя процедуры в SM_BIN_CREATEUSER2_PROC.")
+
+    cur.execute(
+        f"""
+        BEGIN
+            {proc_name}(
+                AUSER => :p_auser,
+                APASS => :p_apass,
+                ADOL => :p_adol,
+                ACHECK => :p_acheck,
+                AUSERENABLED => :p_auserenabled,
+                AINN => :p_ainn,
+                AFIO => :p_afio,
+                ASTOREID => :p_astoreid
+            );
+        END;
+        """,
+        p_auser=_safe_str(login),
+        p_apass=None,  # SQL NULL
+        p_adol=_safe_str(adol) or None,
+        p_acheck=-1,
+        p_auserenabled=-1,
+        p_ainn=_safe_str(inn) or None,
+        p_afio=_safe_str(afio) or None,
+        p_astoreid=store_id,
+    )
+
+
+def _build_smstaff_batch_excel(result_rows: list[dict], log_rows: list[dict]) -> io.BytesIO:
+    wb = Workbook()
+
+    ws1 = wb.active
+    ws1.title = "Результаты"
+
+    headers1 = [
+        "ИД магазина",
+        "Название магазина",
+        "База",
+        "ИНН",
+        "ФИО из 1С",
+        "Должность из 1С",
+        "Логин из SMSTAFF",
+        "ФИО из SMSTAFF",
+        "Статус",
+        "Действие",
+        "Сообщение",
+    ]
+    ws1.append(headers1)
+
+    for row in result_rows:
+        ws1.append([
+            row.get("store_id", ""),
+            row.get("store_name", ""),
+            row.get("dbname", ""),
+            row.get("inn", ""),
+            row.get("fio_1c", ""),
+            row.get("position_1c", ""),
+            row.get("login", ""),
+            row.get("smstaff_fio", ""),
+            row.get("status", ""),
+            row.get("action", ""),
+            row.get("message", ""),
+        ])
+
+    ws2 = wb.create_sheet("Логи")
+    headers2 = [
+        "Уровень",
+        "Шаг",
+        "ИД магазина",
+        "Название магазина",
+        "База",
+        "ИНН",
+        "ФИО из 1С",
+        "Логин",
+        "Сообщение",
+    ]
+    ws2.append(headers2)
+
+    for row in log_rows:
+        ws2.append([
+            row.get("level", ""),
+            row.get("step", ""),
+            row.get("store_id", ""),
+            row.get("store_name", ""),
+            row.get("dbname", ""),
+            row.get("inn", ""),
+            row.get("fio_1c", ""),
+            row.get("login", ""),
+            row.get("message", ""),
+        ])
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin = Side(border_style="thin", color="D9D9D9")
+
+    for ws in (ws1, ws2):
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{max(ws.max_row, 1)}"
+
+    widths1 = {
+        "A": 12, "B": 40, "C": 16, "D": 18, "E": 34,
+        "F": 26, "G": 24, "H": 34, "I": 16, "J": 20, "K": 60,
+    }
+    for col, width in widths1.items():
+        ws1.column_dimensions[col].width = width
+
+    widths2 = {
+        "A": 12, "B": 22, "C": 12, "D": 34, "E": 16,
+        "F": 18, "G": 34, "H": 24, "I": 70,
+    }
+    for col, width in widths2.items():
+        ws2.column_dimensions[col].width = width
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+##
+
+
 def _normalize_bin_createuser2_adol(value: str) -> str:
     value = (value or "").replace("Ё", "Е").replace("ё", "е")
     value = re.sub(r"\s+", " ", value).strip().upper()
@@ -14356,6 +14681,533 @@ def sm_staff_ui_create2(request):
         "success_message": success_message,
         "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
     })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##Это для прогона новой функции
+
+@require_http_methods(["GET", "POST"])
+@csrf_protect
+def sm_staff_ui_batch_by_store(request):
+    """
+    Массовая обработка магазинов:
+    - ввод одного или нескольких store_id
+    - поиск сотрудников в 1С
+    - поиск их в SMSTAFF по inn или fio
+    - вызов bin_createuser2 только для найденных
+    - пароль уходит как SQL NULL
+    - все логи отображаются на странице
+    """
+    form = {
+        "store_ids": "",
+    }
+
+    error = ""
+    success_message = ""
+    summary = {}
+    result_rows: list[dict] = []
+    log_rows: list[dict] = []
+    export_token = ""
+
+    if request.method == "POST":
+        form["store_ids"] = _safe_str(request.POST.get("store_ids"))
+
+        requested_store_ids = _parse_smstore_ids_input(form["store_ids"])
+        if not requested_store_ids:
+            error = "Укажи хотя бы один корректный id магазина."
+        else:
+            try:
+                stores_info = _fetch_sm_database_items()
+                stores_map = {
+                    _to_int_or_none(x.get("smstore")): x
+                    for x in stores_info
+                    if _to_int_or_none(x.get("smstore")) is not None
+                }
+
+                raw_employees = _fetch_working_employees_from_1c()
+
+                normalized_employees = []
+                for raw_item in raw_employees:
+                    item = _normalize_working_employee(raw_item)
+                    if not item:
+                        continue
+
+                    pos_key = _normalize_position(item.get("position"))
+                    if pos_key not in _SM2_BATCH_ALLOWED_POSITION_MAP:
+                        continue
+
+                    if item.get("store_id") not in requested_store_ids:
+                        continue
+
+                    item["adol_to_send"] = _SM2_BATCH_ALLOWED_POSITION_MAP[pos_key]
+                    normalized_employees.append(item)
+
+                employees_by_store: dict[int, list[dict]] = defaultdict(list)
+                for emp in normalized_employees:
+                    sid = _to_int_or_none(emp.get("store_id"))
+                    if sid is None:
+                        continue
+                    employees_by_store[sid].append(emp)
+
+                summary = {
+                    "stores_requested": len(requested_store_ids),
+                    "employees_from_1c_filtered": len(normalized_employees),
+                    "success_count": 0,
+                    "warning_count": 0,
+                    "error_count": 0,
+                    "skipped_count": 0,
+                }
+
+                for store_id in requested_store_ids:
+                    store_info = stores_map.get(store_id) or {}
+                    store_name = _safe_str(store_info.get("name"))
+                    dbname = _safe_str(store_info.get("dbname")).upper()
+
+                    if not dbname:
+                        try:
+                            dbname = _safe_str(get_dbname_for_smstore(store_id)).upper()
+                        except Exception:
+                            dbname = ""
+
+                    employees = employees_by_store.get(store_id, [])
+
+                    _append_smstaff_batch_log(
+                        log_rows,
+                        level="INFO",
+                        step="STORE_START",
+                        store_id=store_id,
+                        store_name=store_name,
+                        dbname=dbname,
+                        message=f"Начата обработка магазина {store_id}. Сотрудников после фильтра 1С: {len(employees)}.",
+                    )
+
+                    if not employees:
+                        summary["skipped_count"] += 1
+                        result_rows.append({
+                            "store_id": store_id,
+                            "store_name": store_name,
+                            "dbname": dbname,
+                            "inn": "",
+                            "fio_1c": "",
+                            "position_1c": "",
+                            "login": "",
+                            "smstaff_fio": "",
+                            "status": "Пропуск",
+                            "action": "Нет сотрудников",
+                            "message": "В 1С не найдено сотрудников с подходящей должностью для этого магазина.",
+                        })
+                        _append_smstaff_batch_log(
+                            log_rows,
+                            level="WARNING",
+                            step="STORE_EMPLOYEES",
+                            store_id=store_id,
+                            store_name=store_name,
+                            dbname=dbname,
+                            message="В 1С нет сотрудников для обработки по этому магазину.",
+                        )
+                        continue
+
+                    if not dbname:
+                        summary["error_count"] += len(employees)
+                        for emp in employees:
+                            result_rows.append({
+                                "store_id": store_id,
+                                "store_name": store_name,
+                                "dbname": "",
+                                "inn": emp.get("inn", ""),
+                                "fio_1c": emp.get("full_name", ""),
+                                "position_1c": emp.get("position", ""),
+                                "login": "",
+                                "smstaff_fio": "",
+                                "status": "Ошибка",
+                                "action": "Поиск базы",
+                                "message": "Не найден REP.DBNAME для магазина.",
+                            })
+                            _append_smstaff_batch_log(
+                                log_rows,
+                                level="ERROR",
+                                step="DBNAME",
+                                store_id=store_id,
+                                store_name=store_name,
+                                inn=emp.get("inn", ""),
+                                fio_1c=emp.get("full_name", ""),
+                                message="Не найден REP.DBNAME для магазина.",
+                            )
+                        continue
+
+                    if not _is_allowed_service(dbname) or dbname not in ORACLE_TNS_MAP:
+                        summary["error_count"] += len(employees)
+                        for emp in employees:
+                            result_rows.append({
+                                "store_id": store_id,
+                                "store_name": store_name,
+                                "dbname": dbname,
+                                "inn": emp.get("inn", ""),
+                                "fio_1c": emp.get("full_name", ""),
+                                "position_1c": emp.get("position", ""),
+                                "login": "",
+                                "smstaff_fio": "",
+                                "status": "Ошибка",
+                                "action": "Проверка базы",
+                                "message": f"База {dbname} не описана в ORACLE_TNS_MAP.",
+                            })
+                            _append_smstaff_batch_log(
+                                log_rows,
+                                level="ERROR",
+                                step="DB_CHECK",
+                                store_id=store_id,
+                                store_name=store_name,
+                                dbname=dbname,
+                                inn=emp.get("inn", ""),
+                                fio_1c=emp.get("full_name", ""),
+                                message=f"База {dbname} не описана в ORACLE_TNS_MAP.",
+                            )
+                        continue
+
+                    conn = cur = None
+                    try:
+                        conn = _connect_oracle_service(dbname)
+                        cur = conn.cursor()
+
+                        for emp in employees:
+                            inn = _safe_str(emp.get("inn"))
+                            fio_1c = _safe_str(emp.get("full_name"))
+                            position_1c = _safe_str(emp.get("position"))
+                            adol_to_send = _safe_str(emp.get("adol_to_send"))
+
+                            result_item = {
+                                "store_id": store_id,
+                                "store_name": store_name,
+                                "dbname": dbname,
+                                "inn": inn,
+                                "fio_1c": fio_1c,
+                                "position_1c": position_1c,
+                                "login": "",
+                                "smstaff_fio": "",
+                                "status": "",
+                                "action": "",
+                                "message": "",
+                            }
+
+                            if not inn and not fio_1c:
+                                summary["skipped_count"] += 1
+                                result_item["status"] = "Пропуск"
+                                result_item["action"] = "Поиск в SMSTAFF"
+                                result_item["message"] = "Нельзя искать сотрудника: пустые и ИНН, и ФИО."
+                                result_rows.append(result_item)
+
+                                _append_smstaff_batch_log(
+                                    log_rows,
+                                    level="WARNING",
+                                    step="SEARCH_SMSTAFF",
+                                    store_id=store_id,
+                                    store_name=store_name,
+                                    dbname=dbname,
+                                    message="Пропуск сотрудника: пустые ИНН и ФИО.",
+                                )
+                                continue
+
+                            candidates = _oracle_fetch_smstaff_candidates_for_employee(
+                                cur,
+                                inn=inn,
+                                full_name=fio_1c,
+                            )
+
+                            chosen_row, pick_error = _pick_smstaff_candidate(
+                                candidates,
+                                inn=inn,
+                                fio_1c=fio_1c,
+                            )
+
+                            if not chosen_row:
+                                summary["warning_count"] += 1
+                                result_item["status"] = "Не найден"
+                                result_item["action"] = "Поиск в SMSTAFF"
+
+                                if pick_error == "not_found":
+                                    result_item["message"] = "Пользователь не найден в SMSTAFF по INN или FIO."
+                                elif pick_error == "ambiguous_inn":
+                                    result_item["message"] = "Найдено несколько пользователей в SMSTAFF по одному ИНН."
+                                elif pick_error == "ambiguous_fio":
+                                    result_item["message"] = "Найдено несколько пользователей в SMSTAFF по одному ФИО."
+                                else:
+                                    result_item["message"] = "Найдено несколько кандидатов в SMSTAFF, нельзя однозначно выбрать логин."
+
+                                result_rows.append(result_item)
+
+                                _append_smstaff_batch_log(
+                                    log_rows,
+                                    level="WARNING",
+                                    step="SEARCH_SMSTAFF",
+                                    store_id=store_id,
+                                    store_name=store_name,
+                                    dbname=dbname,
+                                    inn=inn,
+                                    fio_1c=fio_1c,
+                                    message=result_item["message"],
+                                )
+                                continue
+
+                            login = _safe_str(chosen_row.get("serverlogin"))
+                            smstaff_fio = _safe_str(chosen_row.get("afio"))
+
+                            result_item["login"] = login
+                            result_item["smstaff_fio"] = smstaff_fio
+
+                            fio_compare_1c = _normalize_fio_for_compare(fio_1c)
+                            fio_compare_sm = _normalize_fio_for_compare(smstaff_fio)
+
+                            if not smstaff_fio:
+                                _append_smstaff_batch_log(
+                                    log_rows,
+                                    level="WARNING",
+                                    step="FIO_CHECK",
+                                    store_id=store_id,
+                                    store_name=store_name,
+                                    dbname=dbname,
+                                    inn=inn,
+                                    fio_1c=fio_1c,
+                                    login=login,
+                                    message="В SMSTAFF у сотрудника не заполнено AFIO.",
+                                )
+                            elif fio_compare_1c and fio_compare_sm != fio_compare_1c:
+                                _append_smstaff_batch_log(
+                                    log_rows,
+                                    level="WARNING",
+                                    step="FIO_CHECK",
+                                    store_id=store_id,
+                                    store_name=store_name,
+                                    dbname=dbname,
+                                    inn=inn,
+                                    fio_1c=fio_1c,
+                                    login=login,
+                                    message=f"ФИО в SMSTAFF не совпадает с 1С. SMSTAFF='{smstaff_fio}', 1C='{fio_1c}'.",
+                                )
+
+                            try:
+                                _append_smstaff_batch_log(
+                                    log_rows,
+                                    level="INFO",
+                                    step="CALL_PROC",
+                                    store_id=store_id,
+                                    store_name=store_name,
+                                    dbname=dbname,
+                                    inn=inn,
+                                    fio_1c=fio_1c,
+                                    login=login,
+                                    message=f"Вызов bin_createuser2: APASS=NULL, ACHECK=-1, AUSERENABLED=-1, ADOL='{adol_to_send}', ASTOREID={store_id}.",
+                                )
+
+                                _call_bin_createuser2_for_existing_employee(
+                                    cur,
+                                    login=login,
+                                    inn=inn,
+                                    afio=(smstaff_fio or None),  # берём ФИО из SMSTAFF
+                                    adol=adol_to_send,            # берём должность из 1С
+                                    store_id=store_id,           # ИдМагазина
+                                )
+                                conn.commit()
+
+                                summary["success_count"] += 1
+                                result_item["status"] = "Успешно"
+                                result_item["action"] = "bin_createuser2"
+                                result_item["message"] = (
+                                    f"Процедура выполнена. APASS=NULL, ACHECK=-1, "
+                                    f"AUSERENABLED=-1, ADOL='{adol_to_send}', ASTOREID={store_id}."
+                                )
+                                result_rows.append(result_item)
+
+                                _append_smstaff_batch_log(
+                                    log_rows,
+                                    level="INFO",
+                                    step="CALL_PROC",
+                                    store_id=store_id,
+                                    store_name=store_name,
+                                    dbname=dbname,
+                                    inn=inn,
+                                    fio_1c=fio_1c,
+                                    login=login,
+                                    message="Процедура выполнена успешно.",
+                                )
+
+                            except Exception as e:
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+
+                                summary["error_count"] += 1
+                                result_item["status"] = "Ошибка"
+                                result_item["action"] = "bin_createuser2"
+                                result_item["message"] = str(e)
+                                result_rows.append(result_item)
+
+                                _append_smstaff_batch_log(
+                                    log_rows,
+                                    level="ERROR",
+                                    step="CALL_PROC",
+                                    store_id=store_id,
+                                    store_name=store_name,
+                                    dbname=dbname,
+                                    inn=inn,
+                                    fio_1c=fio_1c,
+                                    login=login,
+                                    message=f"Ошибка вызова процедуры: {e}",
+                                )
+
+                    except Exception as e:
+                        logger.exception(f"[UI/SMSTAFF_BATCH] store={store_id} db={dbname} error: {e}")
+                        summary["error_count"] += len(employees)
+
+                        for emp in employees:
+                            result_rows.append({
+                                "store_id": store_id,
+                                "store_name": store_name,
+                                "dbname": dbname,
+                                "inn": emp.get("inn", ""),
+                                "fio_1c": emp.get("full_name", ""),
+                                "position_1c": emp.get("position", ""),
+                                "login": "",
+                                "smstaff_fio": "",
+                                "status": "Ошибка",
+                                "action": "Обработка магазина",
+                                "message": str(e),
+                            })
+
+                        _append_smstaff_batch_log(
+                            log_rows,
+                            level="ERROR",
+                            step="STORE_PROCESS",
+                            store_id=store_id,
+                            store_name=store_name,
+                            dbname=dbname,
+                            message=f"Ошибка при обработке магазина: {e}",
+                        )
+                    finally:
+                        try:
+                            if cur:
+                                cur.close()
+                            if conn:
+                                conn.close()
+                        except Exception:
+                            pass
+
+                success_message = (
+                    f"Обработано магазинов: {summary.get('stores_requested', 0)}. "
+                    f"Успешно: {summary.get('success_count', 0)}. "
+                    f"Предупреждений: {summary.get('warning_count', 0)}. "
+                    f"Ошибок: {summary.get('error_count', 0)}. "
+                    f"Пропусков: {summary.get('skipped_count', 0)}."
+                )
+
+                export_token = uuid.uuid4().hex
+                session_payload = request.session.get("smstaff_batch_runs", {})
+                session_payload[export_token] = {
+                    "result_rows": result_rows,
+                    "log_rows": log_rows,
+                    "created_at": timezone.now().isoformat(),
+                }
+
+                # оставим только последние 5 запусков
+                if len(session_payload) > 5:
+                    keys_sorted = sorted(
+                        session_payload.keys(),
+                        key=lambda k: session_payload[k].get("created_at", ""),
+                        reverse=True,
+                    )
+                    session_payload = {k: session_payload[k] for k in keys_sorted[:5]}
+
+                request.session["smstaff_batch_runs"] = session_payload
+                request.session.modified = True
+
+            except Exception as e:
+                logger.exception("[UI/SMSTAFF_BATCH] unexpected error: %s", e)
+                error = str(e)
+
+    return render(request, "frostapp/smstaff_batch_by_store.html", {
+        "form": form,
+        "error": error,
+        "success_message": success_message,
+        "summary": summary,
+        "result_rows": result_rows,
+        "log_rows": log_rows,
+        "export_token": export_token,
+        "back_url": reverse("sm_staff_ui_list"),
+    })
+
+
+
+
+
+@require_http_methods(["GET"])
+def sm_staff_ui_batch_by_store_download(request):
+    token = _safe_str(request.GET.get("token"))
+    if not token:
+        return HttpResponse("Не передан token.", status=400)
+
+    runs = request.session.get("smstaff_batch_runs", {})
+    payload = runs.get(token)
+    if not payload:
+        return HttpResponse("Результат не найден или устарел.", status=404)
+
+    result_rows = payload.get("result_rows") or []
+    log_rows = payload.get("log_rows") or []
+
+    output = _build_smstaff_batch_excel(result_rows, log_rows)
+
+    filename = f"smstaff_batch_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return FileResponse(
+        output,
+        as_attachment=True,
+        filename=filename,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
