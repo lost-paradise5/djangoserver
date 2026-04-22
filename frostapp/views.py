@@ -12300,6 +12300,76 @@ _SM_USERENABLED_CHOICES = [
     {"value": "0",  "label": "0 — заблокировать пользователя"},
 ]
 
+
+## это для новой функции bincreateuser2
+
+_SM2_ALLOWED_ADOL_VALUES = [
+    "АДМИНИСТРАТОР",
+    "АДМИНИСТРАТОР МАГАЗИНА",
+    "ПРИЕМЩИК",
+    "ПРИЕМЩИК ТОВАРА",
+    "РЕВИЗОР",
+    "ПОМОЩНИК РЕВИЗОРА",
+]
+
+_SM2_ALLOWED_ADOL_SET = {x.upper() for x in _SM2_ALLOWED_ADOL_VALUES}
+
+_SM2_ACHECK_CHOICES = [
+    {"value": "-1", "label": "-1 — нового не создавать, работать только с существующим"},
+    {"value": "0",  "label": "0 — если пользователь уже существует, ничего не менять"},
+    {"value": "1",  "label": "1 — если пользователь уже существует, менять пароль/должность"},
+    {"value": "2",  "label": "2 — удалить пользователя"},
+]
+
+_SM2_USERENABLED_CHOICES = [
+    {"value": "-1", "label": "-1 — не менять статус"},
+    {"value": "1",  "label": "1 — активировать пользователя"},
+    {"value": "0",  "label": "0 — заблокировать пользователя"},
+]
+
+
+def _normalize_bin_createuser2_adol(value: str) -> str:
+    value = (value or "").replace("Ё", "Е").replace("ё", "е")
+    value = re.sub(r"\s+", " ", value).strip().upper()
+    return value
+
+
+def _build_smstaff2_success_message(
+    *,
+    db: str,
+    auser: str,
+    adol: str | None,
+    astoreid: int | None,
+    acheck: int,
+    auserenabled: int,
+    used_password: str,
+) -> str:
+    parts = [f"Процедура bin_createuser2 успешно выполнена в базе {db} для логина {auser}."]
+
+    if acheck == 2:
+        parts.append("Режим: удаление пользователя.")
+    elif acheck == 0 and auserenabled == 0:
+        parts.append("Режим: блокировка пользователя.")
+    else:
+        parts.append("Режим: создание/обновление пользователя.")
+
+    if adol:
+        parts.append(f"Должность: {adol}.")
+    if astoreid is not None:
+        parts.append(f"Магазин (ASTOREID): {astoreid}.")
+    if used_password:
+        parts.append(f"Пароль, переданный в процедуру: {used_password}.")
+
+    return " ".join(parts)
+
+
+
+
+
+
+
+
+###
 def _oracle_update_smstaff_after_create(cur, login: str, inn: str, afio: str, offindex: int | None) -> int:
     """
     Принудительно обновляет AFIO и OFFINDEX в SMSTAFF после вызова bin_createuser.
@@ -14019,7 +14089,261 @@ def sm_staff_ui_create(request):
 
 
 
+@require_http_methods(["GET", "POST"])
+@csrf_protect
+def sm_staff_ui_create2(request):
+    """
+    UI для вызова SUPERMAG.bin_createuser2.
 
+    Все параметры вводятся вручную:
+    - AUSER
+    - APASS
+    - ADOL
+    - ACHECK
+    - AUSERENABLED
+    - AINN
+    - AFIO
+    - ASTOREID
+
+    Можно выбрать несколько баз и выполнить процедуру сразу по всем.
+    """
+    services = _ui_services_list()
+
+    if request.method == "POST":
+        raw_selected_dbs = request.POST.getlist("dbs")
+        fallback_db = (request.POST.get("db") or "").strip().upper()
+    else:
+        raw_selected_dbs = request.GET.getlist("dbs")
+        fallback_db = (request.GET.get("db") or "").strip().upper()
+
+    selected_dbs = _normalize_selected_services(raw_selected_dbs)
+
+    if not selected_dbs and fallback_db:
+        selected_dbs = _normalize_selected_services([fallback_db])
+
+    if not selected_dbs:
+        selected_dbs = [services[0]] if services else ["BINUU00"]
+
+    db = selected_dbs[0]
+
+    form = {
+        "auser": "",
+        "apass": "",
+        "ainn": "",
+        "afio": "",
+        "adol": "",
+        "acheck": "1",
+        "auserenabled": "1",
+        "astoreid": "",
+    }
+
+    db_results = []
+    created_password = ""
+    success_message = ""
+    error = ""
+
+    if request.method == "POST":
+        form["auser"] = (request.POST.get("auser") or "").strip().lower()
+        form["apass"] = (request.POST.get("apass") or "").strip()
+        form["ainn"] = (request.POST.get("ainn") or "").strip()
+        form["afio"] = (request.POST.get("afio") or "").strip()
+        form["adol"] = (request.POST.get("adol") or "").strip()
+        form["acheck"] = (request.POST.get("acheck") or "1").strip()
+        form["auserenabled"] = (request.POST.get("auserenabled") or "1").strip()
+        form["astoreid"] = (request.POST.get("astoreid") or "").strip()
+
+        auser = form["auser"]
+        manual_password = form["apass"]
+        ainn = form["ainn"]
+        afio = form["afio"]
+        raw_adol = form["adol"]
+        acheck_raw = form["acheck"]
+        auserenabled_raw = form["auserenabled"]
+        astoreid_raw = form["astoreid"]
+
+        allowed_acheck_values = {x["value"] for x in _SM2_ACHECK_CHOICES}
+        allowed_auserenabled_values = {x["value"] for x in _SM2_USERENABLED_CHOICES}
+
+        normalized_adol = _normalize_bin_createuser2_adol(raw_adol)
+
+        is_delete_mode = (acheck_raw == "2")
+        is_block_mode = (acheck_raw == "0" and auserenabled_raw == "0")
+
+        # Для обычного создания/обновления должность и astoreid лучше требовать.
+        needs_position_data = not is_delete_mode and not is_block_mode and acheck_raw in {"0", "1"}
+
+        astoreid = None
+
+        if not selected_dbs:
+            error = "Выбери хотя бы одну базу."
+
+        elif not auser:
+            error = "Заполни логин (AUSER)."
+
+        elif not _is_valid_sm_login(auser):
+            error = (
+                "Логин может содержать только латинские буквы, цифры, "
+                "точку, дефис и нижнее подчёркивание."
+            )
+
+        elif manual_password and len(manual_password) > 128:
+            error = "Пароль слишком длинный. Максимум 128 символов."
+
+        elif acheck_raw not in allowed_acheck_values:
+            error = "Некорректное значение ACHECK."
+
+        elif auserenabled_raw not in allowed_auserenabled_values:
+            error = "Некорректное значение AUSERENABLED."
+
+        elif ainn and not _is_valid_inn_digits(ainn):
+            error = "ИНН должен состоять из 10 или 12 цифр."
+
+        elif afio and len(afio) > 255:
+            error = "ФИО (AFIO) слишком длинное. Максимум 255 символов."
+
+        elif raw_adol and normalized_adol not in _SM2_ALLOWED_ADOL_SET:
+            error = (
+                "ADOL должен быть одним из значений: "
+                + ", ".join(_SM2_ALLOWED_ADOL_VALUES)
+            )
+
+        else:
+            if astoreid_raw:
+                try:
+                    astoreid = int(astoreid_raw)
+                    if astoreid <= 0:
+                        raise ValueError()
+                except Exception:
+                    error = "ASTOREID должен быть положительным целым числом."
+            elif needs_position_data:
+                error = "Для обычного создания/обновления укажи ASTOREID."
+
+            if not error and needs_position_data and not normalized_adol:
+                error = "Для обычного создания/обновления укажи ADOL."
+
+        if not error:
+            acheck = int(acheck_raw)
+            auserenabled = int(auserenabled_raw)
+
+            used_password = manual_password if manual_password else _generate_sm_password(4)
+            created_password = used_password
+
+            proc_name = os.getenv("SM_BIN_CREATEUSER2_PROC", "SUPERMAG.bin_createuser2").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+                error = "Некорректное имя процедуры в SM_BIN_CREATEUSER2_PROC."
+
+        if not error:
+            for target_db in selected_dbs:
+                result_item = {
+                    "db": target_db,
+                    "error": "",
+                    "success_message": "",
+                    "conflicts": [],
+                    "created_rows": [],
+                    "used_password": created_password,
+                }
+
+                conn = cur = None
+                try:
+                    conn = _connect_oracle_service(target_db)
+                    cur = conn.cursor()
+
+                    # Покажем, что уже есть до вызова процедуры
+                    result_item["conflicts"] = _oracle_fetch_smstaff_conflicts(cur, auser, ainn)
+
+                    logger.info(
+                        f"[UI/SMSTAFF_CREATE2] start db={target_db} login={auser} "
+                        f"inn={ainn!r} afio={afio!r} adol={normalized_adol!r} "
+                        f"acheck={acheck} auserenabled={auserenabled} astoreid={astoreid} "
+                        f"password_mode={'manual' if manual_password else 'auto'}"
+                    )
+
+                    cur.execute(
+                        f"""
+                        BEGIN
+                            {proc_name}(
+                                AUSER => :p_auser,
+                                APASS => :p_apass,
+                                ADOL => :p_adol,
+                                ACHECK => :p_acheck,
+                                AUSERENABLED => :p_auserenabled,
+                                AINN => :p_ainn,
+                                AFIO => :p_afio,
+                                ASTOREID => :p_astoreid
+                            );
+                        END;
+                        """,
+                        p_auser=auser,
+                        p_apass=created_password,
+                        p_adol=(normalized_adol or None),
+                        p_acheck=acheck,
+                        p_auserenabled=auserenabled,
+                        p_ainn=(ainn or None),
+                        p_afio=(afio or None),
+                        p_astoreid=astoreid,
+                    )
+
+                    conn.commit()
+
+                    result_item["created_rows"] = _oracle_fetch_smstaff_by_login(cur, auser)
+                    result_item["success_message"] = _build_smstaff2_success_message(
+                        db=target_db,
+                        auser=auser,
+                        adol=(normalized_adol or None),
+                        astoreid=astoreid,
+                        acheck=acheck,
+                        auserenabled=auserenabled,
+                        used_password=created_password,
+                    )
+
+                    logger.info(
+                        f"[UI/SMSTAFF_CREATE2] success db={target_db} login={auser} "
+                        f"created_rows={len(result_item['created_rows'])} "
+                        f"adol={normalized_adol!r} astoreid={astoreid}"
+                    )
+
+                except Exception as e:
+                    logger.exception(f"[UI/SMSTAFF_CREATE2] error db={target_db}: {e}")
+                    result_item["error"] = str(e)
+                    try:
+                        if conn:
+                            conn.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        if cur:
+                            cur.close()
+                        if conn:
+                            conn.close()
+                    except Exception:
+                        pass
+
+                db_results.append(result_item)
+
+            ok_count = sum(1 for x in db_results if not x["error"])
+            err_count = sum(1 for x in db_results if x["error"])
+
+            success_message = (
+                f"Обработано баз: {len(db_results)}. "
+                f"Успешно: {ok_count}. "
+                f"С ошибкой: {err_count}."
+            )
+
+    return render(request, "frostapp/smstaff_create2.html", {
+        "services": services,
+        "db": db,
+        "selected_dbs": selected_dbs,
+        "form": form,
+        "acheck_choices": _SM2_ACHECK_CHOICES,
+        "auserenabled_choices": _SM2_USERENABLED_CHOICES,
+        "adol_choices": _SM2_ALLOWED_ADOL_VALUES,
+        "error": error,
+        "db_results": db_results,
+        "created_password": created_password,
+        "success_message": success_message,
+        "back_url": f"{reverse('sm_staff_ui_list')}?{urlencode({'db': db})}",
+    })
 
 
 
