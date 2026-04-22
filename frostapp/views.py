@@ -14153,7 +14153,9 @@ def sm_staff_ui_create2(request):
         form["astoreid"] = (request.POST.get("astoreid") or "").strip()
 
         auser = form["auser"]
-        manual_password = form["apass"]
+        raw_apass = form["apass"]
+        apass_is_explicit_null = raw_apass.lower() == "null"
+        manual_password = "" if apass_is_explicit_null else raw_apass
         ainn = form["ainn"]
         afio = form["afio"]
         raw_adol = form["adol"]
@@ -14224,10 +14226,20 @@ def sm_staff_ui_create2(request):
         if not error:
             acheck = int(acheck_raw)
             auserenabled = int(auserenabled_raw)
-
-            used_password = manual_password if manual_password else _generate_sm_password(4)
-            created_password = used_password
-
+        
+            if apass_is_explicit_null:
+                proc_password = None          # в Oracle уйдёт SQL NULL
+                created_password = "NULL"     # только для отображения в UI
+                password_mode = "null"
+            elif manual_password:
+                proc_password = manual_password
+                created_password = manual_password
+                password_mode = "manual"
+            else:
+                proc_password = _generate_sm_password(4)
+                created_password = proc_password
+                password_mode = "auto"
+        
             proc_name = os.getenv("SM_BIN_CREATEUSER2_PROC", "SUPERMAG.bin_createuser2").strip()
             if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
                 error = "Некорректное имя процедуры в SM_BIN_CREATEUSER2_PROC."
@@ -14255,7 +14267,7 @@ def sm_staff_ui_create2(request):
                         f"[UI/SMSTAFF_CREATE2] start db={target_db} login={auser} "
                         f"inn={ainn!r} afio={afio!r} adol={normalized_adol!r} "
                         f"acheck={acheck} auserenabled={auserenabled} astoreid={astoreid} "
-                        f"password_mode={'manual' if manual_password else 'auto'}"
+                        f"password_mode={password_mode}"
                     )
 
                     cur.execute(
@@ -14274,7 +14286,7 @@ def sm_staff_ui_create2(request):
                         END;
                         """,
                         p_auser=auser,
-                        p_apass=created_password,
+                        p_apass=proc_password,
                         p_adol=(normalized_adol or None),
                         p_acheck=acheck,
                         p_auserenabled=auserenabled,
