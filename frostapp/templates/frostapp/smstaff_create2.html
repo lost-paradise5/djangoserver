@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Создание пользователя через bin_createuser2</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="{% url 'sm_staff_ui_list' %}">SMSTAFF</a>
+    <div class="d-flex gap-2">
+      <a class="btn btn-outline-light btn-sm" href="{{ back_url }}">К списку</a>
+      <a class="btn btn-outline-light btn-sm" href="/admin/">Admin</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 class="mb-0">Создание / обновление пользователя через bin_createuser2</h3>
+    <a class="btn btn-outline-secondary" href="{{ back_url }}">← Назад к списку</a>
+  </div>
+
+  {% if error %}
+    <div class="alert alert-danger">
+      <div>{{ error }}</div>
+      {% if created_password %}
+        <hr>
+        <div><b>Пароль, переданный в процедуру:</b> <code style="font-size: 1.1rem;">{{ created_password }}</code></div>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% if success_message %}
+    <div class="alert alert-info">
+      <div>{{ success_message }}</div>
+      {% if created_password %}
+        <hr>
+        <div><b>Пароль, переданный в процедуру:</b> <code style="font-size: 1.1rem;">{{ created_password }}</code></div>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  <form method="get" class="card card-body mb-3">
+    <div class="row g-3 align-items-end">
+      <div class="col-md-10">
+        <label class="form-label">Базы</label>
+        <select class="form-select" name="dbs" multiple size="12">
+          {% for s in services %}
+            <option value="{{ s }}" {% if s in selected_dbs %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+        <div class="form-text">
+          Можно выбрать сразу несколько баз. Для множественного выбора используй Ctrl / Cmd.
+        </div>
+      </div>
+
+      <div class="col-md-2">
+        <button class="btn btn-outline-primary w-100">Применить</button>
+      </div>
+    </div>
+  </form>
+
+  <form method="post" class="card shadow-sm">
+    {% csrf_token %}
+
+    {% for s in selected_dbs %}
+      <input type="hidden" name="dbs" value="{{ s }}">
+    {% endfor %}
+    <input type="hidden" name="db" value="{{ db }}">
+
+    <div class="card-header">
+      <b>Параметры процедуры SUPERMAG.bin_createuser2</b>
+    </div>
+
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-12">
+          <label class="form-label">Выбранные базы</label>
+          <div class="border rounded p-3 bg-light">
+            {% for s in selected_dbs %}
+              <span class="badge text-bg-secondary me-1 mb-1">{{ s }}</span>
+            {% empty %}
+              <span class="text-muted">Базы не выбраны</span>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="col-md-4">
+          <label class="form-label">AUSER (логин)</label>
+          <input class="form-control" name="auser" value="{{ form.auser }}" placeholder="например t_test" required>
+          <div class="form-text">Обязательное поле. Латиница, цифры, точка, дефис, нижнее подчёркивание.</div>
+        </div>
+
+        <div class="col-md-4">
+          <label class="form-label">APASS (пароль)</label>
+          <input class="form-control" name="apass" value="{{ form.apass }}" placeholder="если пусто — будет сгенерирован">
+          <div class="form-text">Если не заполнить — пароль сгенерируется автоматически.</div>
+        </div>
+
+        <div class="col-md-4">
+          <label class="form-label">ASTOREID (ИД магазина)</label>
+          <input class="form-control" type="number" min="1" step="1" name="astoreid" value="{{ form.astoreid }}" placeholder="например 114">
+          <div class="form-text">Обычно сюда идёт <b>ИдМагазина</b> из 1С.</div>
+        </div>
+
+        <div class="col-md-4">
+          <label class="form-label">AINN (ИНН)</label>
+          <input id="id_ainn" class="form-control" name="ainn" value="{{ form.ainn }}" placeholder="10 или 12 цифр">
+        </div>
+
+        <div class="col-md-8">
+          <label class="form-label">AFIO (ФИО)</label>
+          <input id="id_afio" class="form-control" name="afio" value="{{ form.afio }}" placeholder="например Иванов Иван Иванович">
+          <div class="form-text">Обычно это: Фамилия + Имя + Отчество.</div>
+        </div>
+
+        <div class="col-md-6">
+          <label class="form-label">ADOL (должность)</label>
+          <input class="form-control" name="adol" id="id_adol" value="{{ form.adol }}"
+                 list="adol_list" placeholder="например Администратор магазина">
+          <datalist id="adol_list">
+            {% for x in adol_choices %}
+              <option value="{{ x }}"></option>
+            {% endfor %}
+          </datalist>
+          <div class="form-text">
+            Допустимые значения:
+            {% for x in adol_choices %}
+              <span class="badge text-bg-light border me-1 mb-1">{{ x }}</span>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="col-md-3">
+          <label class="form-label">ACHECK</label>
+          <select class="form-select" name="acheck" id="id_acheck">
+            {% for x in acheck_choices %}
+              <option value="{{ x.value }}" {% if form.acheck == x.value %}selected{% endif %}>{{ x.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="col-md-3">
+          <label class="form-label">AUSERENABLED</label>
+          <select class="form-select" name="auserenabled" id="id_auserenabled">
+            {% for x in auserenabled_choices %}
+              <option value="{{ x.value }}" {% if form.auserenabled == x.value %}selected{% endif %}>{{ x.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="col-12">
+          <div class="alert alert-secondary mb-0" id="modeHint">
+            <b>Ручной режим заполнения.</b><br>
+            Обычно значения берутся так:<br>
+            <b>AINN</b> = ИНН из 1С<br>
+            <b>AFIO</b> = Фамилия + Имя + Отчество<br>
+            <b>ADOL</b> = Должность<br>
+            <b>ASTOREID</b> = ИдМагазина<br>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-footer d-flex gap-2">
+      <button class="btn btn-primary">Выполнить</button>
+      <a class="btn btn-outline-secondary" href="{{ back_url }}">Отмена</a>
+    </div>
+  </form>
+
+  {% if db_results %}
+    {% for result in db_results %}
+      <div class="card mt-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <b>Результат по базе {{ result.db }}</b>
+          {% if result.error %}
+            <span class="badge text-bg-danger">Ошибка</span>
+          {% else %}
+            <span class="badge text-bg-success">Успешно</span>
+          {% endif %}
+        </div>
+
+        <div class="card-body">
+          {% if result.error %}
+            <div class="alert alert-danger mb-3">
+              <div>{{ result.error }}</div>
+              {% if result.used_password %}
+                <hr>
+                <div><b>Пароль, переданный в процедуру:</b> <code>{{ result.used_password }}</code></div>
+              {% endif %}
+            </div>
+          {% endif %}
+
+          {% if result.success_message %}
+            <div class="alert alert-success mb-3">
+              <div>{{ result.success_message }}</div>
+              {% if result.used_password %}
+                <hr>
+                <div><b>Пароль, переданный в процедуру:</b> <code>{{ result.used_password }}</code></div>
+              {% endif %}
+            </div>
+          {% endif %}
+
+          {% if result.conflicts %}
+            <div class="card mb-3">
+              <div class="card-header">
+                <b>Найдены существующие записи с таким логином и/или ИНН</b>
+              </div>
+              <div class="card-body p-0">
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped mb-0">
+                    <thead class="table-light">
+                      <tr>
+                        <th>ID</th>
+                        <th>ФИО</th>
+                        <th>Логин</th>
+                        <th>ИНН</th>
+                        <th>Должность</th>
+                        <th>Enabled</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for r in result.conflicts %}
+                        <tr>
+                          <td>{{ r.id }}</td>
+                          <td>{{ r.afio|default:"—" }}</td>
+                          <td><code>{{ r.serverlogin }}</code></td>
+                          <td><code>{{ r.inn }}</code></td>
+                          <td>
+                            {{ r.off_title|default:"—" }}
+                            {% if r.offindex %}
+                              <div class="text-muted small">OFFINDEX: {{ r.offindex }}</div>
+                            {% endif %}
+                          </td>
+                          <td>{{ r.userenabled }}</td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          {% endif %}
+
+          {% if result.created_rows %}
+            <div class="card">
+              <div class="card-header">
+                <b>Текущие записи пользователя после выполнения процедуры</b>
+              </div>
+              <div class="card-body p-0">
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped mb-0">
+                    <thead class="table-light">
+                      <tr>
+                        <th>ID</th>
+                        <th>ФИО</th>
+                        <th>Логин</th>
+                        <th>ИНН</th>
+                        <th>Должность</th>
+                        <th>Enabled</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for r in result.created_rows %}
+                        <tr>
+                          <td>{{ r.id }}</td>
+                          <td>{{ r.afio|default:"—" }}</td>
+                          <td><code>{{ r.serverlogin }}</code></td>
+                          <td><code>{{ r.inn }}</code></td>
+                          <td>
+                            {{ r.off_title|default:"—" }}
+                            {% if r.offindex %}
+                              <div class="text-muted small">OFFINDEX: {{ r.offindex }}</div>
+                            {% endif %}
+                          </td>
+                          <td>{{ r.userenabled }}</td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  {% endif %}
+</div>
+
+<script>
+(function () {
+  const acheck = document.getElementById('id_acheck');
+  const auserenabled = document.getElementById('id_auserenabled');
+  const modeHint = document.getElementById('modeHint');
+
+  function updateHint() {
+    const acheckVal = (acheck?.value || '').trim();
+    const auserenabledVal = (auserenabled?.value || '').trim();
+
+    if (acheckVal === '2') {
+      modeHint.innerHTML =
+        '<b>Режим удаления.</b><br>' +
+        'Обычно достаточно поля <b>AUSER</b>.<br>' +
+        '<b>APASS</b>, <b>AINN</b>, <b>AFIO</b>, <b>ADOL</b>, <b>ASTOREID</b> можно не заполнять.';
+      return;
+    }
+
+    if (acheckVal === '0' && auserenabledVal === '0') {
+      modeHint.innerHTML =
+        '<b>Режим блокировки.</b><br>' +
+        'Обычно достаточно поля <b>AUSER</b>.<br>' +
+        '<b>ADOL</b> и <b>ASTOREID</b> можно не заполнять.';
+      return;
+    }
+
+    modeHint.innerHTML =
+      '<b>Режим создания / обновления.</b><br>' +
+      '<b>AUSER</b> обязателен.<br>' +
+      '<b>APASS</b> можно не указывать — тогда он будет сгенерирован.<br>' +
+      'Для обычного создания лучше указывать <b>AINN</b>, <b>AFIO</b>, <b>ADOL</b>, <b>ASTOREID</b>.<br>' +
+      'Из 1С обычно берут: ИНН → AINN, ФИО → AFIO, Должность → ADOL, ИдМагазина → ASTOREID.';
+  }
+
+  if (acheck) acheck.addEventListener('change', updateHint);
+  if (auserenabled) auserenabled.addEventListener('change', updateHint);
+  updateHint();
+})();
+</script>
+
+</body>
+</html>
