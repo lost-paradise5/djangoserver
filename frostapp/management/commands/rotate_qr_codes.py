@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from datetime import timezone as dt_tz
 import logging
 import os
+import time
 
 logger = logging.getLogger("ukm_logger")
 
@@ -42,25 +43,7 @@ def batched(qs, size):
 
 class Command(BaseCommand):
     """
-    Ежедневная ротация QR/пароля (PostgreSQL + UKM4 + UKM5 + конвертер import4staffbonus)
-    для всех пользователей, у которых:
-
-      • есть tg_id (users.tg_id не NULL)
-      • есть хотя бы одна запись в ukm_users с storeid из UKM5_FULL_XML_STORE_IDS
-
-    Для КАЖДОГО такого пользователя:
-
-      1) employee_id проверяется как ИНН (10/12 цифр) через ensure_plain_inn().
-      2) В trm_in_users ищется кассир (ИНН + ФИО):
-         - если найден → используем этот id (единый для всех магазинов);
-         - если нет   → берём MAX(id)+1 как базовый id.
-      3) Генерируется новый пароль через build_user_password(ИНН).
-      4) В PostgreSQL обновляется QRCode + OpenInSystem (system_id=9) через _set_password_pg().
-      5) Для КАЖДОГО магазина из ukm_users:
-         - UKM4 + XML UKM5 обновляются через _update_store_mysql_and_xml_for_single_store();
-         - конвертер import4staffbonus.users + signal обновляется через
-           _write_converter_user_and_signal() с тем же cashier_id, что и в trm_in_users.
-      6) В конце отправляется один сводный лог в MAX администратору.
+    Ежедневная ротация QR/пароля для пользователей с tg_id и доступами в целевые магазины.
     """
 
     help = "Ежедневное обновление QR/пароля для пользователей с доступом к магазину УКМ и tg_id."
@@ -85,19 +68,21 @@ class Command(BaseCommand):
         parser.add_argument(
             '--user-id',
             type=int,
-            help='Ограничить обработку одним user_id (но при этом всё равно требуется tg_id и подходящий storeid)'
+            help='Ограничить обработку одним user_id'
         )
         parser.add_argument('--tz', type=str, default=os.getenv('ROTATION_TZ', 'Europe/Stockholm'))
         parser.add_argument(
             '--idempotent',
             action='store_true',
-            help='Пропускать пользователя, если сегодня уже есть свежий QR (по локальной дате)'
+            help='Пропускать пользователя, если сегодня уже есть свежий QR'
         )
 
     def handle(self, *args, **opts):
         if not self._acquire_lock():
             self.stdout.write(self.style.WARNING("Другой запуск уже идёт — выхожу."))
             return
+
+        started_at = time.monotonic()
 
         try:
             bs = opts['batch_size']
@@ -123,16 +108,20 @@ class Command(BaseCommand):
             qs = qs.order_by('id')
 
             total = qs.count()
+
             self.stdout.write(
-                f"candidates={total}, batch={bs}, tz={opts['tz']}, "
-                f"dry={opts['dry_run']}, idempotent={opts['idempotent']}"
+                f"START rotate_qr_codes | date={today_local.isoformat()} | tz={opts['tz']} | "
+                f"candidates={total} | batch={bs} | dry={opts['dry_run']} | idempotent={opts['idempotent']}"
             )
 
-            rotated = skipped = failed = 0
-            details = []  # для MAX-лога
+            rotated = partial = skipped = failed = 0
+            details = []
+            processed = 0
 
             for chunk in batched(qs, bs):
                 for user in chunk:
+                    processed += 1
+
                     status, info = self._rotate_one_user(
                         user=user,
                         today_local=today_local,
@@ -144,14 +133,21 @@ class Command(BaseCommand):
 
                     if status == 'rotated':
                         rotated += 1
+                    elif status == 'partial':
+                        partial += 1
                     elif status == 'skipped':
                         skipped += 1
                     else:
                         failed += 1
 
+                    self.stdout.write(self._format_user_run_line(processed, total, info))
+
+            elapsed = time.monotonic() - started_at
+
             self.stdout.write(
                 self.style.SUCCESS(
-                    f"Готово: rotated={rotated}, skipped={skipped}, failed={failed}"
+                    f"FINISH rotate_qr_codes | ok={rotated} | partial={partial} | "
+                    f"skipped={skipped} | failed={failed} | elapsed={elapsed:.1f}s"
                 )
             )
 
@@ -160,16 +156,20 @@ class Command(BaseCommand):
                 tz_name=opts['tz'],
                 total=total,
                 rotated=rotated,
+                partial=partial,
                 skipped=skipped,
                 failed=failed,
                 details=details,
                 dry_run=opts['dry_run'],
+                elapsed_sec=elapsed,
             )
 
         finally:
             self._release_lock()
 
     def _rotate_one_user(self, user, today_local, tz, idempotent: bool, dry_run: bool):
+        started_at = time.monotonic()
+
         info = {
             "user_id": user.id,
             "fio": (user.full_name or "").strip(),
@@ -180,6 +180,8 @@ class Command(BaseCommand):
             "stores": [],
             "cashier_id": None,
             "store_results": [],
+            "store_stats": {"ok": 0, "warning": 0, "error": 0},
+            "duration_sec": 0.0,
         }
 
         try:
@@ -191,8 +193,9 @@ class Command(BaseCommand):
                         dt = timezone.make_aware(dt, dt_tz.utc)
                     if dt.astimezone(tz).date() == today_local:
                         info["status"] = "already_rotated_today"
-                        info["error"] = "QR уже обновлён сегодня (idempotent)"
-                        logger.info(f"[ROTATE] user_id={user.id} пропущен: уже есть QR на {today_local}")
+                        info["error"] = "QR уже обновлён сегодня"
+                        info["duration_sec"] = round(time.monotonic() - started_at, 2)
+                        logger.info(f"[ROTATE][USER] user_id={user.id} status=skipped reason=already_rotated_today")
                         return "skipped", info
 
             fio = info["fio"]
@@ -201,7 +204,8 @@ class Command(BaseCommand):
             if not fio or not inn_raw:
                 info["status"] = "skipped_no_fio_or_inn"
                 info["error"] = "full_name или employee_id пусты"
-                logger.warning(f"[ROTATE] user_id={user.id} пропуск: fio/inn пусты")
+                info["duration_sec"] = round(time.monotonic() - started_at, 2)
+                logger.warning(f"[ROTATE][USER] user_id={user.id} status=skipped reason=empty_fio_or_inn")
                 return "skipped", info
 
             try:
@@ -209,21 +213,30 @@ class Command(BaseCommand):
             except Exception as e:
                 info["status"] = "skipped_bad_inn"
                 info["error"] = f"Некорректный ИНН: {e}"
-                logger.warning(f"[ROTATE] user_id={user.id} пропуск: {info['error']}")
+                info["duration_sec"] = round(time.monotonic() - started_at, 2)
+                logger.warning(f"[ROTATE][USER] user_id={user.id} status=skipped reason=bad_inn error={e}")
                 return "skipped", info
 
-            ukm_links = list(UKMUser.objects.filter(user_id=user.id).values('storeid', 'roleid'))
+            ukm_links = list(
+                UKMUser.objects
+                .filter(user_id=user.id)
+                .values('storeid', 'roleid')
+                .order_by('storeid')
+            )
             info["stores"] = ukm_links
+
             if not ukm_links:
                 info["status"] = "skipped_no_ukm_users"
                 info["error"] = "Нет записей в ukm_users"
-                logger.warning(f"[ROTATE] user_id={user.id} пропуск: нет ukm_users")
+                info["duration_sec"] = round(time.monotonic() - started_at, 2)
+                logger.warning(f"[ROTATE][USER] user_id={user.id} status=skipped reason=no_ukm_users")
                 return "skipped", info
 
             if dry_run:
                 info["status"] = "dry_run"
                 info["error"] = "Запуск с --dry-run, изменения не вносились"
-                logger.info(f"[ROTATE] [DRY] user_id={user.id}, inn={plain_inn}, stores={ukm_links!r}")
+                info["duration_sec"] = round(time.monotonic() - started_at, 2)
+                logger.info(f"[ROTATE][USER] user_id={user.id} status=dry_run stores={len(ukm_links)}")
                 return "skipped", info
 
             if not hasattr(self, "_trm_alloc"):
@@ -272,7 +285,7 @@ class Command(BaseCommand):
 
             new_password = build_user_password(plain_inn)
             masked = new_password[:6] + "..." + new_password[-4:]
-            logger.info(f"[ROTATE] user_id={user.id} новый пароль (masked)={masked}, len={len(new_password)}")
+            logger.info(f"[ROTATE][USER] user_id={user.id} new_password={masked} len={len(new_password)}")
 
             _set_password_pg(user, new_password)
 
@@ -287,7 +300,7 @@ class Command(BaseCommand):
                     existing_id = get_trm_employee_id(plain_inn, fio, store_id=sid, host=None)
                 except Exception as e:
                     logger.error(
-                        f"[ROTATE] get_trm_employee_id error user_id={user.id} storeid={sid}: {e}",
+                        f"[ROTATE][TRM] user_id={user.id} storeid={sid} get_trm_employee_id error: {e}",
                         exc_info=True
                     )
 
@@ -301,11 +314,6 @@ class Command(BaseCommand):
                 if converter_cashier_id is None:
                     converter_cashier_id = cashier_id_for_store
 
-                logger.info(
-                    f"[ROTATE] user_id={user.id} storeid={sid}, roleId={role_id}, "
-                    f"cashier_id_for_store={cashier_id_for_store}, found_in_trm={found}"
-                )
-
                 sync_result = _update_store_mysql_and_xml_for_single_store(
                     store_id=sid,
                     cashier_id=cashier_id_for_store,
@@ -315,13 +323,25 @@ class Command(BaseCommand):
                     password_plain=new_password,
                 )
 
+                store_status, store_summary = self._classify_store_sync(sync_result)
+
                 info["store_results"].append({
                     "storeid": sid,
                     "roleid": role_id,
                     "cashier_id": int(cashier_id_for_store),
                     "found_in_trm": bool(found),
+                    "store_status": store_status,
+                    "store_summary": store_summary,
                     "sync": sync_result,
                 })
+
+                info["store_stats"][store_status] += 1
+
+                logger.info(
+                    f"[ROTATE][STORE] user_id={user.id} storeid={sid} role_id={role_id} "
+                    f"cashier_id={cashier_id_for_store} found_in_trm={found} "
+                    f"status={store_status} summary={store_summary}"
+                )
 
                 _write_converter_user_and_signal(
                     cashier_id=int(converter_cashier_id),
@@ -332,28 +352,134 @@ class Command(BaseCommand):
                     role_id=role_id,
                 )
 
-            info["status"] = "rotated"
+            ok_cnt = info["store_stats"]["ok"]
+            warn_cnt = info["store_stats"]["warning"]
+            err_cnt = info["store_stats"]["error"]
+
+            if err_cnt > 0 and ok_cnt == 0 and warn_cnt == 0:
+                final_status = "failed"
+            elif err_cnt > 0 or warn_cnt > 0:
+                final_status = "partial"
+            else:
+                final_status = "rotated"
+
+            info["status"] = final_status
             info["cashier_id"] = int(converter_cashier_id) if converter_cashier_id is not None else None
-            info["new_password"] = new_password
-            return "rotated", info
+            info["duration_sec"] = round(time.monotonic() - started_at, 2)
+
+            logger.info(
+                f"[ROTATE][USER] user_id={user.id} status={final_status} "
+                f"stores_ok={ok_cnt} stores_warn={warn_cnt} stores_err={err_cnt} "
+                f"duration={info['duration_sec']}s"
+            )
+
+            return final_status, info
 
         except Exception as e:
-            logger.exception(f"[ROTATE] Сбой ротации для user_id={user.id}: {e}")
+            logger.exception(f"[ROTATE][USER] user_id={user.id} failed: {e}")
             info["status"] = "failed"
             info["error"] = str(e)
+            info["duration_sec"] = round(time.monotonic() - started_at, 2)
             return "failed", info
+
+    def _classify_store_sync(self, sync: dict) -> tuple[str, str]:
+        sync = sync or {}
+        ukm4 = sync.get("ukm4") or {}
+        ukm5 = sync.get("ukm5") or {}
+
+        issues = []
+        severity = "ok"
+
+        ukm4_status = ukm4.get("status")
+        ukm5_status = ukm5.get("status")
+
+        if ukm4_status in {"error", "skipped_no_ukm4ip"}:
+            severity = "error"
+            err = (ukm4.get("error") or ukm4_status or "").strip()
+            issues.append(f"UKM4: {self._shorten(err, 90)}")
+
+        if ukm5_status == "error":
+            severity = "error"
+            err = (ukm5.get("error") or "UKM5 error").strip()
+            issues.append(f"UKM5: {self._shorten(err, 90)}")
+        elif ukm5_status == "warning":
+            if severity != "error":
+                severity = "warning"
+            verification = ukm5.get("verification") or {}
+            active_count = int(verification.get("active_count") or 0)
+            stale_left = int(verification.get("stale_active_left_count") or 0)
+            issues.append(f"UKM5: active={active_count}, stale_left={stale_left}")
+
+        if not issues:
+            return "ok", "OK"
+
+        return severity, "; ".join(issues)
+
+    def _shorten(self, text: str, limit: int) -> str:
+        text = (text or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def _format_user_run_line(self, idx: int, total: int, info: dict) -> str:
+        fio = self._shorten((info.get("fio") or "ФИО не указано"), 36)
+        status_label = (info.get("status") or "").upper()
+        duration = float(info.get("duration_sec") or 0.0)
+
+        stats = info.get("store_stats") or {}
+        ok_cnt = int(stats.get("ok") or 0)
+        warn_cnt = int(stats.get("warning") or 0)
+        err_cnt = int(stats.get("error") or 0)
+
+        stores_brief = []
+        for sr in info.get("store_results") or []:
+            code = {
+                "ok": "OK",
+                "warning": "WARN",
+                "error": "ERR",
+            }.get(sr.get("store_status"), "?")
+            stores_brief.append(f"{sr.get('storeid')}:{code}")
+
+        stores_part = ", ".join(stores_brief) if stores_brief else "—"
+
+        tail = ""
+        if info.get("error"):
+            tail = f" | note={self._shorten(info['error'], 120)}"
+
+        return (
+            f"[{idx}/{total}] user_id={info.get('user_id')} | {status_label} | "
+            f"stores ok={ok_cnt} warn={warn_cnt} err={err_cnt} | "
+            f"{duration:.1f}s | {stores_part} | {fio}{tail}"
+        )
 
     def _human_status(self, status: str) -> str:
         mapping = {
             "rotated": "обновлено",
-            "dry_run": "проверено без изменений (dry-run)",
-            "already_rotated_today": "пропущено — уже обновлялся сегодня",
-            "skipped_no_fio_or_inn": "пропущено — не заполнены ФИО или ИНН",
+            "partial": "частично",
+            "dry_run": "проверено без изменений",
+            "already_rotated_today": "пропущено — уже было сегодня",
+            "skipped_no_fio_or_inn": "пропущено — нет ФИО/ИНН",
             "skipped_bad_inn": "пропущено — некорректный ИНН",
-            "skipped_no_ukm_users": "пропущено — нет доступов в ukm_users",
+            "skipped_no_ukm_users": "пропущено — нет ukm_users",
             "failed": "ошибка",
         }
         return mapping.get(status or "", status or "неизвестно")
+
+    def _make_problem_line(self, info: dict) -> str:
+        fio = self._shorten((info.get("fio") or f"user_id={info.get('user_id')}"), 24)
+
+        problems = []
+        for sr in info.get("store_results") or []:
+            if sr.get("store_status") != "ok":
+                problems.append(f"{sr.get('storeid')}: {sr.get('store_summary')}")
+
+        if not problems and info.get("error"):
+            problems.append(self._shorten(info["error"], 120))
+
+        if not problems:
+            return ""
+
+        return f"• {info.get('user_id')} {fio} — " + self._shorten("; ".join(problems[:2]), 220)
 
     def _send_max_summary(
         self,
@@ -361,74 +487,79 @@ class Command(BaseCommand):
         tz_name: str,
         total: int,
         rotated: int,
+        partial: int,
         skipped: int,
         failed: int,
         details: list,
         dry_run: bool,
+        elapsed_sec: float,
     ) -> None:
-        """
-        Формирует и отправляет один сводный лог в MAX.
-        Отправка идёт асинхронно.
-        """
         try:
             header = (
-                "🧪 [DRY-RUN] Плановое обновление QR-кодов и паролей"
+                "🧪 DRY-RUN ротации QR/паролей"
                 if dry_run else
-                "✅ Обновление паролей"
+                "✅ Ротация QR/паролей"
             )
+
+            ukm4_ok = ukm4_err = 0
+            ukm5_ok = ukm5_warn = ukm5_err = 0
+
+            for info in details:
+                for sr in info.get("store_results") or []:
+                    sync = sr.get("sync") or {}
+                    ukm4_status = ((sync.get("ukm4") or {}).get("status") or "")
+                    ukm5_status = ((sync.get("ukm5") or {}).get("status") or "")
+
+                    if ukm4_status == "ok":
+                        ukm4_ok += 1
+                    elif ukm4_status in {"error", "skipped_no_ukm4ip"}:
+                        ukm4_err += 1
+
+                    if ukm5_status == "ok":
+                        ukm5_ok += 1
+                    elif ukm5_status == "warning":
+                        ukm5_warn += 1
+                    elif ukm5_status == "error":
+                        ukm5_err += 1
 
             lines = [
                 header,
-                "",
-                f"1. Дата: {today_local.isoformat()} (TZ={tz_name})",
-                f"2. Всего сотрудников: {total}",
-                f"3. Обновлено: {rotated}",
-                f"4. Пропущено: {skipped}",
-                f"5. Ошибок: {failed}",
-                "",
-                "6. Сотрудники:",
+                f"Дата: {today_local.isoformat()} ({tz_name})",
+                f"Всего: {total} | OK: {rotated} | Частично: {partial} | Пропущено: {skipped} | Ошибок: {failed}",
+                f"UKM4: ok={ukm4_ok} err={ukm4_err}",
+                f"UKM5: ok={ukm5_ok} warn={ukm5_warn} err={ukm5_err}",
+                f"Время: {elapsed_sec:.1f}s",
             ]
 
-            if not details:
-                lines.append("1. Нет записей")
+            problem_lines = []
+            for info in details:
+                if info.get("status") in {"partial", "failed"}:
+                    line = self._make_problem_line(info)
+                    if line:
+                        problem_lines.append(line)
+
+            if problem_lines:
+                lines.append("")
+                lines.append("Проблемные сотрудники:")
+                max_len = 3900
+                for idx, line in enumerate(problem_lines, start=1):
+                    candidate = "\n".join(lines + [line])
+                    if len(candidate) > max_len:
+                        rest = len(problem_lines) - idx + 1
+                        lines.append(f"…ещё: {rest}")
+                        break
+                    lines.append(line)
             else:
-                for idx, info in enumerate(details, start=1):
-                    fio = (info.get("fio") or "").strip() or "ФИО не указано"
-                    stores_count = len(info.get("stores") or [])
-                    status_label = self._human_status(info.get("status"))
+                lines.append("")
+                lines.append("Проблем по магазинам не обнаружено.")
 
-                    lines.append(f"{idx}. {fio}")
-                    lines.append(f"   Статус: {status_label}")
-                    lines.append(f"   Доступов в УКМ: {stores_count}")
-
-                    for sr in info.get("store_results") or []:
-                        sync = sr.get("sync") or {}
-                        ukm5 = sync.get("ukm5") or {}
-                        verification = ukm5.get("verification") or {}
-
-                        lines.append(
-                            f"   • storeid={sr.get('storeid')} "
-                            f"cashier_id={sr.get('cashier_id')} "
-                            f"UKM5={ukm5.get('status', '—')} "
-                            f"user_found={verification.get('user_found', '—')} "
-                            f"password_matches={verification.get('password_matches', '—')} "
-                            f"active_count={verification.get('active_count', '—')} "
-                            f"old_disabled={ukm5.get('deactivated_count', '—')} "
-                            f"stale_left={verification.get('stale_active_left_count', '—')}"
-                        )
-
-                    if info.get("error"):
-                        lines.append(f"   Примечание: {info['error']}")
-
-            _send_max_log_async("\n".join(lines))
+            msg = "\n".join(lines)
+            _send_max_log_async(msg)
 
         except Exception as e:
             logger.error(f"[ROTATE] Не удалось поставить сводный лог в очередь MAX: {e}", exc_info=True)
 
     def _acquire_lock(self):
-        """
-        Advisory lock в PostgreSQL для избежания параллельных запусков.
-        """
         with connection.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(987654321012345678)")
             return bool(cur.fetchone()[0])
