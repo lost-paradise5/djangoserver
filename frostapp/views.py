@@ -4288,6 +4288,478 @@ def connect_store_mysql(host: str):
     )
 
 
+
+### Это для API УКМ-5
+
+UKM5_API_HOST = os.getenv("UKM5_API_HOST", "192.168.17.38")
+UKM5_API_PORT = int(os.getenv("UKM5_API_PORT", "29017"))
+
+UKM5_DB_HOST = os.getenv("UKM5_DB_HOST", "192.168.17.38")
+UKM5_DB_PORT = int(os.getenv("UKM5_DB_PORT", "3306"))
+UKM5_DB_NAME = os.getenv("UKM5_DB_NAME", "srvdata")
+UKM5_DB_USER = os.getenv("UKM5_DB_USER", "ukminfo")
+UKM5_DB_PASSWORD = os.getenv("UKM5_DB_PASSWORD", "CtHDbCGK.C")
+
+UKM5_HTTP_TIMEOUT = int(os.getenv("UKM5_HTTP_TIMEOUT", "20"))
+UKM5_VERIFY_TIMEOUT = int(os.getenv("UKM5_VERIFY_TIMEOUT", "20"))
+UKM5_VERIFY_SLEEP = float(os.getenv("UKM5_VERIFY_SLEEP", "1.0"))
+UKM5_CARD_TZ = os.getenv("UKM5_CARD_TZ", os.getenv("ROTATION_TZ", "Asia/Irkutsk"))
+
+_UKM5_HTTP = requests.Session()
+_UKM5_HTTP.headers.update({"Content-Type": "application/json"})
+
+
+def _mask_secret(value: str, left: int = 6, right: int = 4) -> str:
+    s = str(value or "")
+    if not s:
+        return ""
+    if len(s) <= left + right:
+        return "*" * len(s)
+    return f"{s[:left]}...{s[-right:]}"
+
+
+def connect_ukm5_srvdata():
+    return pymysql.connect(
+        host=UKM5_DB_HOST,
+        port=UKM5_DB_PORT,
+        user=UKM5_DB_USER,
+        password=UKM5_DB_PASSWORD,
+        database=UKM5_DB_NAME,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=5,
+        read_timeout=10,
+        write_timeout=10,
+    )
+
+
+def _map_pg_role_to_ukm5(role_id: int) -> int:
+    """
+    mapping:
+      1  -> 10002
+      13 -> 10001
+    """
+    role_id = int(role_id)
+    if role_id == 13:
+        return 10001
+    if role_id == 1:
+        return 10002
+
+    logger.warning(f"[UKM5] Неожиданный role_id={role_id}, ставлю fallback=10002")
+    return 10002
+
+
+def _resolve_pg_smstore_by_ukm4store(store_id: int) -> int:
+    row = (
+        Store.objects
+        .filter(ukm4store=int(store_id))
+        .values("smstore", "ukm4store", "name")
+        .first()
+    )
+    if not row or row["smstore"] in (None, ""):
+        raise ValueError(f"Не найден smstore в PostgreSQL stores для ukm4store={store_id}")
+    return int(row["smstore"])
+
+
+def _resolve_ukm5_store_binding(store_id: int) -> dict:
+    """
+    store_id (из ukm_users.storeid / stores.ukm4store)
+      -> PG stores.smstore
+      -> srvdata.store_external_params.external_id
+      -> srvdata.store_external_params.id == srvdata.store.id == internal store_id
+    """
+    external_store_id = _resolve_pg_smstore_by_ukm4store(store_id)
+
+    conn = cur = None
+    try:
+        conn = connect_ukm5_srvdata()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                sep.id AS store_id,
+                sep.external_id,
+                s.name AS store_name
+            FROM store_external_params sep
+            LEFT JOIN store s ON s.id = sep.id
+            WHERE sep.external_id = %s
+            LIMIT 1
+        """, (str(external_store_id),))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(
+                f"В UKM5 srvdata.store_external_params не найден external_id={external_store_id}"
+            )
+
+        return {
+            "internal_store_id": int(row["store_id"]),
+            "external_store_id": int(row["external_id"]),
+            "store_name": row.get("store_name") or "",
+        }
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _make_ukm5_card_dates() -> tuple[str, str]:
+    """
+    dateFrom  = текущий локальный день 00:00:00
+    dateTill  = следующий день 23:59:59
+    """
+    tz = ZoneInfo(UKM5_CARD_TZ)
+    now_local = timezone.now().astimezone(tz)
+
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = (start_local + datetime.timedelta(days=1)).replace(
+        hour=23, minute=59, second=59, microsecond=0
+    )
+
+    return (
+        start_local.strftime("%Y-%m-%dT%H:%M:%S"),
+        end_local.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+
+
+def _build_ukm5_user_payload(
+    *,
+    cashier_id: int,
+    fio: str,
+    plain_inn: str,
+    password_plain: str,
+    role_id: int,
+    card_number: str,
+    card_active: bool,
+    date_from: str,
+    date_till: str,
+) -> dict:
+    return {
+        "elements": [
+            {
+                "id": int(cashier_id),
+                "name": fio,
+                "roleId": _map_pg_role_to_ukm5(role_id),
+                "password": password_plain,
+                "inn": plain_inn,
+                "cards": [
+                    {
+                        "number": card_number,
+                        "active": bool(card_active),
+                        "dateFrom": date_from,
+                        "dateTill": date_till,
+                    }
+                ],
+                "delete": False,
+            }
+        ]
+    }
+
+
+def _import_user_to_ukm5(*, external_store_id: int, payload: dict) -> dict:
+    url = f"http://{UKM5_API_HOST}:{UKM5_API_PORT}/api/v1/import/store/{external_store_id}/users"
+
+    resp = _UKM5_HTTP.post(url, json=payload, timeout=UKM5_HTTP_TIMEOUT)
+    body_text = (resp.text or "").strip()
+
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"UKM5 import error: status={resp.status_code}, body={body_text[:1000]}"
+        )
+
+    try:
+        parsed = resp.json() if body_text else None
+    except Exception:
+        parsed = body_text
+
+    return {
+        "status_code": resp.status_code,
+        "body": parsed,
+    }
+
+
+def _fetch_ukm5_user_and_cards(
+    *,
+    internal_store_id: int,
+    plain_inn: str,
+    cashier_id: int | None = None,
+) -> dict:
+    conn = cur = None
+    try:
+        conn = connect_ukm5_srvdata()
+        cur = conn.cursor()
+
+        params = [int(internal_store_id), plain_inn]
+        sql = """
+            SELECT
+                `store_id`,
+                `id`,
+                `name`,
+                `password`,
+                `role_id`,
+                `inn`,
+                `version`,
+                `deleted`
+            FROM `user`
+            WHERE `store_id` = %s
+              AND `inn` = %s
+        """
+        if cashier_id is not None:
+            sql += " AND `id` = %s"
+            params.append(int(cashier_id))
+        sql += " ORDER BY `id` DESC LIMIT 1"
+
+        cur.execute(sql, tuple(params))
+        user_row = cur.fetchone()
+
+        cards = []
+        if user_row:
+            cur.execute("""
+                SELECT
+                    `store_id`,
+                    `number`,
+                    `user_id`,
+                    `date_from`,
+                    `date_till`,
+                    `active`
+                FROM `user_card`
+                WHERE `store_id` = %s
+                  AND `user_id` = %s
+                ORDER BY `number`
+            """, (int(user_row["store_id"]), int(user_row["id"])))
+            cards = cur.fetchall() or []
+
+        return {
+            "user": user_row,
+            "cards": cards,
+        }
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _poll_ukm5_user_state(
+    *,
+    internal_store_id: int,
+    plain_inn: str,
+    cashier_id: int | None = None,
+    expected_password: str | None = None,
+    expected_active_number: str | None = None,
+    forbidden_active_numbers: set[str] | None = None,
+) -> tuple[dict, bool]:
+    deadline = time.monotonic() + UKM5_VERIFY_TIMEOUT
+    last_state = {"user": None, "cards": []}
+    forbidden_active_numbers = {str(x).strip() for x in (forbidden_active_numbers or set()) if str(x).strip()}
+
+    while True:
+        state = _fetch_ukm5_user_and_cards(
+            internal_store_id=internal_store_id,
+            plain_inn=plain_inn,
+            cashier_id=cashier_id,
+        )
+        last_state = state
+
+        user_row = state.get("user") or {}
+        cards = state.get("cards") or []
+
+        active_numbers = {
+            str(c.get("number") or "").strip()
+            for c in cards
+            if bool(c.get("active"))
+        }
+
+        user_found = bool(user_row)
+        password_ok = (expected_password is None) or (
+            user_found and (str(user_row.get("password") or "") == str(expected_password))
+        )
+        expected_card_ok = (expected_active_number is None) or (str(expected_active_number) in active_numbers)
+        forbidden_ok = not bool(active_numbers.intersection(forbidden_active_numbers))
+
+        if user_found and password_ok and expected_card_ok and forbidden_ok:
+            return state, True
+
+        if time.monotonic() >= deadline:
+            return last_state, False
+
+        time.sleep(UKM5_VERIFY_SLEEP)
+
+
+def _sync_user_to_ukm5(
+    *,
+    store_id: int,
+    cashier_id: int,
+    role_id: int,
+    plain_inn: str,
+    fio: str,
+    password_plain: str,
+) -> dict:
+    """
+    1) POST активной карты number=password_plain
+    2) ждём, пока user/password/card появятся в srvdata
+    3) находим старые active user_card != new number
+    4) отправляем POST по каждой старой карте с active=false
+    5) снова poll и проверяем финальное состояние
+    """
+    binding = _resolve_ukm5_store_binding(store_id)
+    internal_store_id = int(binding["internal_store_id"])
+    external_store_id = int(binding["external_store_id"])
+
+    date_from, date_till = _make_ukm5_card_dates()
+
+    active_payload = _build_ukm5_user_payload(
+        cashier_id=int(cashier_id),
+        fio=fio,
+        plain_inn=plain_inn,
+        password_plain=password_plain,
+        role_id=int(role_id),
+        card_number=password_plain,
+        card_active=True,
+        date_from=date_from,
+        date_till=date_till,
+    )
+
+    active_api = _import_user_to_ukm5(
+        external_store_id=external_store_id,
+        payload=active_payload,
+    )
+
+    state_after_create, create_ready = _poll_ukm5_user_state(
+        internal_store_id=internal_store_id,
+        plain_inn=plain_inn,
+        cashier_id=int(cashier_id),
+        expected_password=password_plain,
+        expected_active_number=password_plain,
+    )
+
+    user_row = state_after_create.get("user") or {}
+    cards_after_create = state_after_create.get("cards") or []
+
+    actual_user_id = int(user_row["id"]) if user_row and user_row.get("id") is not None else int(cashier_id)
+
+    stale_active_numbers = [
+        str(c.get("number") or "").strip()
+        for c in cards_after_create
+        if str(c.get("number") or "").strip() != str(password_plain)
+        and bool(c.get("active"))
+    ]
+
+    deactivated = []
+    for old_number in stale_active_numbers:
+        deactivate_payload = _build_ukm5_user_payload(
+            cashier_id=actual_user_id,
+            fio=fio,
+            plain_inn=plain_inn,
+            password_plain=password_plain,
+            role_id=int(role_id),
+            card_number=old_number,
+            card_active=False,
+            date_from=date_from,
+            date_till=date_till,
+        )
+
+        api_res = _import_user_to_ukm5(
+            external_store_id=external_store_id,
+            payload=deactivate_payload,
+        )
+
+        deactivated.append({
+            "number_masked": _mask_secret(old_number),
+            "api_status_code": api_res.get("status_code"),
+        })
+
+    final_state, final_ready = _poll_ukm5_user_state(
+        internal_store_id=internal_store_id,
+        plain_inn=plain_inn,
+        cashier_id=actual_user_id,
+        expected_password=password_plain,
+        expected_active_number=password_plain,
+        forbidden_active_numbers=set(stale_active_numbers),
+    )
+
+    final_user = final_state.get("user") or {}
+    final_cards = final_state.get("cards") or []
+
+    final_active_numbers = [
+        str(c.get("number") or "").strip()
+        for c in final_cards
+        if bool(c.get("active"))
+    ]
+    final_active_numbers_masked = [_mask_secret(x) for x in final_active_numbers]
+
+    password_matches = bool(final_user) and str(final_user.get("password") or "") == str(password_plain)
+    stale_active_left = [
+        x for x in final_active_numbers
+        if x != str(password_plain)
+    ]
+
+    return {
+        "binding": {
+            "internal_store_id": internal_store_id,
+            "external_store_id": external_store_id,
+            "store_name": binding.get("store_name") or "",
+        },
+        "active_import_status_code": active_api.get("status_code"),
+        "create_ready": create_ready,
+        "deactivated_count": len(deactivated),
+        "deactivated_cards": deactivated,
+        "verification": {
+            "final_ready": final_ready,
+            "user_found": bool(final_user),
+            "user_id": int(final_user["id"]) if final_user and final_user.get("id") is not None else None,
+            "password_matches": password_matches,
+            "active_numbers_masked": final_active_numbers_masked,
+            "active_count": len(final_active_numbers),
+            "stale_active_left_masked": [_mask_secret(x) for x in stale_active_left],
+            "stale_active_left_count": len(stale_active_left),
+        },
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###
 def _update_store_mysql_and_xml_for_single_store(
     store_id: int,
     cashier_id: int,
@@ -4295,29 +4767,41 @@ def _update_store_mysql_and_xml_for_single_store(
     plain_inn: str,
     fio: str,
     password_plain: str
-) -> None:
+) -> dict:
     """
-    Обновляет кассира по ОДНОМУ магазину:
-      • UKM4 (MySQL import4.users + import4.signal)
-      • UKM5 (XML storeCashiers_... если магазин UKM5)
+    Обновляет кассира по одному магазину:
+      • UKM4 (MySQL import4.users + import4.signal) — как и раньше
+      • UKM5 — вместо XML делает POST в importUsers API и затем проверяет user/user_card
 
-    ВАЖНО:
-      • Для магазинов из UKM5_FULL_XML_STORE_IDS делаем ПОЛНУЮ пересборку XML,
-        а не точечный upsert одного кассира.
+    Возвращает подробный результат для логов.
     """
     logger.info(
         f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
         f"cashier_id={cashier_id}, role_id={role_id}"
     )
 
+    result = {
+        "store_id": int(store_id),
+        "cashier_id": int(cashier_id),
+        "role_id": int(role_id),
+        "ukm4": {
+            "status": "skipped",
+            "host": None,
+            "version": None,
+            "error": "",
+        },
+        "ukm5": {
+            "status": "skipped_not_ukm5",
+            "error": "",
+        },
+    }
+
     info = get_store_info(store_id)
     ukm4ip = info.get("ukm4ip")
     is_ukm5 = info.get("is_ukm5", False)
     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
 
-    
-    # UKM4 / MySQL import4
-    
+    # ---- UKM4 / MySQL import4 ----
     if ukm4ip:
         conv = cur = None
         try:
@@ -4325,16 +4809,11 @@ def _update_store_mysql_and_xml_for_single_store(
             cur = conv.cursor()
 
             base_version = _calc_next_signal_version(cur)
-            logger.info(
-                f"[QR/EMP] Store {store_id} ({ukm4ip}): next version={base_version} "
-                f"(по MAX(signal.version))"
-            )
-
             ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
+
             if ttl_supported:
-                now = timezone.now()
-                # start_date = now.date()
-                end_date = (now + datetime.timedelta(days=1)).date()
+                now_dt = timezone.now()
+                end_date = (now_dt + datetime.timedelta(days=1)).date()
                 start_date = end_date
 
                 cur.execute("""
@@ -4353,7 +4832,6 @@ def _update_store_mysql_and_xml_for_single_store(
                         role_id    = VALUES(role_id),
                         version    = VALUES(version),
                         deleted    = 0,
-                        # start_date = VALUES(start_date),
                         start_date = VALUES(end_date),
                         end_date   = VALUES(end_date)
                 """, (
@@ -4367,7 +4845,6 @@ def _update_store_mysql_and_xml_for_single_store(
                     start_date,
                     end_date
                 ))
-                logger.info(f"[QR/EMP] Store {store_id} ({ukm4ip}): users TTL cols detected, set {start_date}..{end_date}")
             else:
                 cur.execute("""
                     INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
@@ -4388,7 +4865,6 @@ def _update_store_mysql_and_xml_for_single_store(
                     role_id,
                     base_version
                 ))
-                logger.info(f"[QR/EMP] Store {store_id} ({ukm4ip}): users TTL cols NOT found, wrote without dates")
 
             cur.execute(
                 "INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)",
@@ -4396,10 +4872,19 @@ def _update_store_mysql_and_xml_for_single_store(
             )
 
             conv.commit()
+
+            result["ukm4"] = {
+                "status": "ok",
+                "host": str(ukm4ip),
+                "version": int(base_version),
+                "error": "",
+            }
+
             logger.info(
                 f"[QR/EMP] Store {store_id} ({ukm4ip}): OK users+signal "
                 f"(id={cashier_id}, role_id={role_id}, version={base_version})"
             )
+
         except Exception as e:
             logger.error(f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}", exc_info=True)
             if conv:
@@ -4407,6 +4892,14 @@ def _update_store_mysql_and_xml_for_single_store(
                     conv.rollback()
                 except Exception:
                     pass
+
+            result["ukm4"] = {
+                "status": "error",
+                "host": str(ukm4ip) if ukm4ip else None,
+                "version": None,
+                "error": str(e),
+            }
+
         finally:
             try:
                 if cur:
@@ -4417,49 +4910,234 @@ def _update_store_mysql_and_xml_for_single_store(
                 pass
     else:
         logger.error(f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal")
+        result["ukm4"] = {
+            "status": "skipped_no_ukm4ip",
+            "host": None,
+            "version": None,
+            "error": "ukm4ip not found",
+        }
 
-    
-    # UKM5 / XML
-    
+    # ---- UKM5 / API вместо XML ----
     if not is_ukm5:
-        return
+        return result
 
-    # Полная пересборка XML для “спец” магазинов
-    if int(store_id) in UKM5_FULL_XML_STORE_IDS:
-        try:
-            xml_path = build_full_ukm5_xml_for_store(store_id)
-            logger.info(f"[QR/EMP] Store {store_id}: полный XML пересобран: {xml_path}")
-        except Exception as e:
-            logger.error(
-                f"[QR/EMP] Store {store_id}: ошибка полной пересборки XML/UKM5: {e}",
-                exc_info=True
-            )
-        return
-
-    # Остальные UKM5 — точечное обновление одного кассира
     try:
-        xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
+        ukm5_res = _sync_user_to_ukm5(
+            store_id=int(store_id),
+            cashier_id=int(cashier_id),
+            role_id=int(role_id),
+            plain_inn=plain_inn,
+            fio=fio,
+            password_plain=password_plain,
+        )
 
-        # удаляем старые записи этого INN
-        changed = False
-        for cash_el in list(root.findall("cashier")):
-            if (cash_el.findtext("INN") or "").strip() == plain_inn:
-                root.remove(cash_el)
-                changed = True
-        if changed:
-            logger.info(f"[QR/EMP] Store {store_id}: удалены старые cashier с INN={plain_inn} из {xml_path}")
+        verification = ukm5_res.get("verification") or {}
+        ok = (
+            verification.get("user_found") is True
+            and verification.get("password_matches") is True
+            and int(verification.get("stale_active_left_count") or 0) == 0
+        )
 
-        cash_el = ET.SubElement(root, "cashier")
-        ET.SubElement(cash_el, "roleId").text = str(role_id)
-        ET.SubElement(cash_el, "id").text = str(cashier_id)
-        ET.SubElement(cash_el, "name").text = fio
-        ET.SubElement(cash_el, "INN").text = plain_inn
-        ET.SubElement(cash_el, "password").text = password_plain
+        result["ukm5"] = {
+            "status": "ok" if ok else "warning",
+            "error": "",
+            **ukm5_res,
+        }
 
-        _write_xml_with_declaration(xml_path, root, ensure_base=True)
-        logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
+        logger.info(
+            f"[UKM5] storeid={store_id} external_store_id={ukm5_res['binding']['external_store_id']} "
+            f"user_found={verification.get('user_found')} "
+            f"password_matches={verification.get('password_matches')} "
+            f"active_count={verification.get('active_count')} "
+            f"stale_active_left_count={verification.get('stale_active_left_count')} "
+            f"deactivated_count={ukm5_res.get('deactivated_count')}"
+        )
+
     except Exception as e:
-        logger.error(f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}", exc_info=True)
+        logger.error(
+            f"[UKM5] Store {store_id}: ошибка API/verify вместо XML: {e}",
+            exc_info=True
+        )
+        result["ukm5"] = {
+            "status": "error",
+            "error": str(e),
+        }
+
+    return result
+
+
+# def _update_store_mysql_and_xml_for_single_store(
+#     store_id: int,
+#     cashier_id: int,
+#     role_id: int,
+#     plain_inn: str,
+#     fio: str,
+#     password_plain: str
+# ) -> None:
+#     """
+#     Обновляет кассира по ОДНОМУ магазину:
+#       • UKM4 (MySQL import4.users + import4.signal)
+#       • UKM5 (XML storeCashiers_... если магазин UKM5)
+
+#     ВАЖНО:
+#       • Для магазинов из UKM5_FULL_XML_STORE_IDS делаем ПОЛНУЮ пересборку XML,
+#         а не точечный upsert одного кассира.
+#     """
+#     logger.info(
+#         f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
+#         f"cashier_id={cashier_id}, role_id={role_id}"
+#     )
+
+#     info = get_store_info(store_id)
+#     ukm4ip = info.get("ukm4ip")
+#     is_ukm5 = info.get("is_ukm5", False)
+#     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
+
+    
+#     # UKM4 / MySQL import4
+    
+#     if ukm4ip:
+#         conv = cur = None
+#         try:
+#             conv = connect_store_mysql(ukm4ip)
+#             cur = conv.cursor()
+
+#             base_version = _calc_next_signal_version(cur)
+#             logger.info(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): next version={base_version} "
+#                 f"(по MAX(signal.version))"
+#             )
+
+#             ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
+#             if ttl_supported:
+#                 now = timezone.now()
+#                 # start_date = now.date()
+#                 end_date = (now + datetime.timedelta(days=1)).date()
+#                 start_date = end_date
+
+#                 cur.execute("""
+#                     INSERT INTO users (
+#                         store, id, name, inn, password, role_id, version, deleted,
+#                         start_date, end_date
+#                     )
+#                     VALUES (
+#                         %s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0,
+#                         %s, %s
+#                     )
+#                     ON DUPLICATE KEY UPDATE
+#                         name       = VALUES(name),
+#                         inn        = VALUES(inn),
+#                         password   = VALUES(password),
+#                         role_id    = VALUES(role_id),
+#                         version    = VALUES(version),
+#                         deleted    = 0,
+#                         # start_date = VALUES(start_date),
+#                         start_date = VALUES(end_date),
+#                         end_date   = VALUES(end_date)
+#                 """, (
+#                     store_id,
+#                     cashier_id,
+#                     fio,
+#                     plain_inn,
+#                     mysql_pwd(password_plain),
+#                     role_id,
+#                     base_version,
+#                     start_date,
+#                     end_date
+#                 ))
+#                 logger.info(f"[QR/EMP] Store {store_id} ({ukm4ip}): users TTL cols detected, set {start_date}..{end_date}")
+#             else:
+#                 cur.execute("""
+#                     INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
+#                     VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+#                     ON DUPLICATE KEY UPDATE
+#                         name     = VALUES(name),
+#                         inn      = VALUES(inn),
+#                         password = VALUES(password),
+#                         role_id  = VALUES(role_id),
+#                         version  = VALUES(version),
+#                         deleted  = 0
+#                 """, (
+#                     store_id,
+#                     cashier_id,
+#                     fio,
+#                     plain_inn,
+#                     mysql_pwd(password_plain),
+#                     role_id,
+#                     base_version
+#                 ))
+#                 logger.info(f"[QR/EMP] Store {store_id} ({ukm4ip}): users TTL cols NOT found, wrote without dates")
+
+#             cur.execute(
+#                 "INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)",
+#                 (base_version,)
+#             )
+
+#             conv.commit()
+#             logger.info(
+#                 f"[QR/EMP] Store {store_id} ({ukm4ip}): OK users+signal "
+#                 f"(id={cashier_id}, role_id={role_id}, version={base_version})"
+#             )
+#         except Exception as e:
+#             logger.error(f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}", exc_info=True)
+#             if conv:
+#                 try:
+#                     conv.rollback()
+#                 except Exception:
+#                     pass
+#         finally:
+#             try:
+#                 if cur:
+#                     cur.close()
+#                 if conv:
+#                     conv.close()
+#             except Exception:
+#                 pass
+#     else:
+#         logger.error(f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal")
+
+    
+#     # UKM5 / XML
+    
+#     if not is_ukm5:
+#         return
+
+#     # Полная пересборка XML для “спец” магазинов
+#     if int(store_id) in UKM5_FULL_XML_STORE_IDS:
+#         try:
+#             xml_path = build_full_ukm5_xml_for_store(store_id)
+#             logger.info(f"[QR/EMP] Store {store_id}: полный XML пересобран: {xml_path}")
+#         except Exception as e:
+#             logger.error(
+#                 f"[QR/EMP] Store {store_id}: ошибка полной пересборки XML/UKM5: {e}",
+#                 exc_info=True
+#             )
+#         return
+
+#     # Остальные UKM5 — точечное обновление одного кассира
+#     try:
+#         xml_path, tree, root = _get_or_create_storecashiers_tree(store_id)
+
+#         # удаляем старые записи этого INN
+#         changed = False
+#         for cash_el in list(root.findall("cashier")):
+#             if (cash_el.findtext("INN") or "").strip() == plain_inn:
+#                 root.remove(cash_el)
+#                 changed = True
+#         if changed:
+#             logger.info(f"[QR/EMP] Store {store_id}: удалены старые cashier с INN={plain_inn} из {xml_path}")
+
+#         cash_el = ET.SubElement(root, "cashier")
+#         ET.SubElement(cash_el, "roleId").text = str(role_id)
+#         ET.SubElement(cash_el, "id").text = str(cashier_id)
+#         ET.SubElement(cash_el, "name").text = fio
+#         ET.SubElement(cash_el, "INN").text = plain_inn
+#         ET.SubElement(cash_el, "password").text = password_plain
+
+#         _write_xml_with_declaration(xml_path, root, ensure_base=True)
+#         logger.info(f"[QR/EMP] Store {store_id}: XML обновлён {xml_path}")
+#     except Exception as e:
+#         logger.error(f"[QR/EMP] Store {store_id}: ошибка при работе с XML/UKM5: {e}", exc_info=True)
         
 
             
@@ -9824,7 +10502,7 @@ def update_cashier(request):
                     cashier_id, resolved_host = _alloc_new_trm_id_for_store(sid)
                     found_in_trm = False
 
-                _update_store_mysql_and_xml_for_single_store(
+                sync_result = _update_store_mysql_and_xml_for_single_store(
                     store_id=sid,
                     cashier_id=int(cashier_id),
                     role_id=int(role_id),
@@ -9850,6 +10528,7 @@ def update_cashier(request):
                     "ukm_host": str(resolved_host or ""),
                     "status": "ok",
                     "error": "",
+                    "sync": sync_result,
                 })
 
             except Exception as e:
