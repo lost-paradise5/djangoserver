@@ -72,7 +72,7 @@ from ldap.controls.libldap import SimplePagedResultsControl
 from django.core.exceptions import FieldError
 import base64
 from urllib.parse import urlencode
-from functools import wraps
+from functools import wraps, lru_cache
 import io
 import mimetypes
 from openpyxl import Workbook, load_workbook
@@ -176,6 +176,41 @@ def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
 
             pass
     return out
+
+
+@lru_cache(maxsize=512)
+def _get_store_info_cached_tuple(store_id_key: str):
+    """
+    Кэшируем только нужные поля, чтобы не таскать лишнее и не дёргать Oracle
+    много раз на один и тот же магазин в пределах процесса.
+    """
+    info = get_store_info(int(store_id_key))
+
+    smstore_raw = info.get("smstore")
+    try:
+        smstore_val = int(smstore_raw) if smstore_raw not in (None, "") else None
+    except Exception:
+        smstore_val = None
+
+    ukm4ip_raw = info.get("ukm4ip")
+    ukm4ip_val = str(ukm4ip_raw).strip() if ukm4ip_raw else None
+
+    return (
+        bool(info.get("is_ukm5", False)),
+        ukm4ip_val,
+        smstore_val,
+    )
+
+
+def _get_store_info_cached(store_id: int | str) -> dict:
+    is_ukm5, ukm4ip, smstore = _get_store_info_cached_tuple(str(store_id).strip())
+    return {
+        "is_ukm5": is_ukm5,
+        "ukm4ip": ukm4ip,
+        "smstore": smstore,
+    }
+
+
 
 
 def _oracle_connect(*, user: str, password: str, dsn: str, **kwargs):
@@ -3174,6 +3209,8 @@ UKM5_SRV_USER = os.getenv("UKM5_SRV_USER", "ukminfo")
 UKM5_SRV_PASSWORD = os.getenv("UKM5_SRV_PASSWORD", "CtHDbCGK.C")  
 UKM5_SRV_DB = os.getenv("UKM5_SRV_DB", "srvdata")
 
+UKM5_VERIFY_MAX_SAME_POLLS = int(os.getenv("UKM5_VERIFY_MAX_SAME_POLLS", "2"))
+
 SSH_UKM4_ROOT_PASSWORD = os.getenv("SSH_UKM4_ROOT_PASSWORD", "xxxxxx") 
 SSH_UKM4_KSO_PASSWORD  = os.getenv("SSH_UKM4_KSO_PASSWORD", "xxxxxx") 
 SSH_UKM5_PASSWORD      = os.getenv("SSH_UKM5_PASSWORD", "xxxxxx")   
@@ -3916,7 +3953,7 @@ def _resolve_ukmserver_host(host: Optional[str] = None, store_id: Optional[int |
 
     if store_id is not None:
         try:
-            info = get_store_info(store_id)
+            info = _get_store_info_cached(store_id)
             ip = info.get("ukm4ip")
             if ip:
                 return str(ip).strip(), "oracle"
@@ -4203,12 +4240,8 @@ def resolve_cashier_id_for_store(store_id: int, plain_inn: str, fio: str) -> tup
     """
     Возвращает:
       (cashier_id, resolved_ukm_host, found_in_trm, trm_debug)
-
-    cashier_id:
-      - если найден в trm_in_users -> found_id_final
-      - иначе -> next_id_all (MAX(id)+1 глобально по этой таблице на этом ukmserver)
     """
-    info = get_store_info(store_id)
+    info = _get_store_info_cached(store_id)
     ukm_host_from_oracle = info.get("ukm4ip")
 
     trm_dbg = inspect_trm_in_users(
@@ -4264,8 +4297,8 @@ def connect_oracle():
     return _oracle_connect(user="supermag_user", password="supermag_pass", dsn=dsn)
 
 def is_ukm5_store(storeid: int) -> bool:
-    """Сохранена стар. сигнатура: True если магазин UKM5, иначе False."""
-    info = get_store_info(storeid)
+    """Сохранена старая сигнатура: True если магазин UKM5, иначе False."""
+    info = _get_store_info_cached(storeid)
     return info.get("is_ukm5", False)
 
 
@@ -4361,13 +4394,10 @@ def _resolve_pg_smstore_by_ukm4store(store_id: int) -> int:
     return int(row["smstore"])
 
 
-def _resolve_ukm5_store_binding(store_id: int) -> dict:
-    """
-    store_id (из ukm_users.storeid / stores.ukm4store)
-      -> PG stores.smstore
-      -> srvdata.store_external_params.external_id
-      -> srvdata.store_external_params.id == srvdata.store.id == internal store_id
-    """
+
+@lru_cache(maxsize=256)
+def _resolve_ukm5_store_binding_cached(store_id_key: str):
+    store_id = int(store_id_key)
     external_store_id = _resolve_pg_smstore_by_ukm4store(store_id)
 
     conn = cur = None
@@ -4390,11 +4420,11 @@ def _resolve_ukm5_store_binding(store_id: int) -> dict:
                 f"В UKM5 srvdata.store_external_params не найден external_id={external_store_id}"
             )
 
-        return {
-            "internal_store_id": int(row["store_id"]),
-            "external_store_id": int(row["external_id"]),
-            "store_name": row.get("store_name") or "",
-        }
+        return (
+            int(row["store_id"]),
+            int(row["external_id"]),
+            row.get("store_name") or "",
+        )
     finally:
         try:
             if cur:
@@ -4403,6 +4433,16 @@ def _resolve_ukm5_store_binding(store_id: int) -> dict:
                 conn.close()
         except Exception:
             pass
+
+
+
+def _resolve_ukm5_store_binding(store_id: int) -> dict:
+    internal_store_id, external_store_id, store_name = _resolve_ukm5_store_binding_cached(str(int(store_id)))
+    return {
+        "internal_store_id": internal_store_id,
+        "external_store_id": external_store_id,
+        "store_name": store_name,
+    }
 
 
 def _make_ukm5_card_dates() -> tuple[str, str]:
@@ -4556,7 +4596,14 @@ def _poll_ukm5_user_state(
 ) -> tuple[dict, bool]:
     deadline = time.monotonic() + UKM5_VERIFY_TIMEOUT
     last_state = {"user": None, "cards": []}
-    forbidden_active_numbers = {str(x).strip() for x in (forbidden_active_numbers or set()) if str(x).strip()}
+    forbidden_active_numbers = {
+        str(x).strip()
+        for x in (forbidden_active_numbers or set())
+        if str(x).strip()
+    }
+
+    last_signature = None
+    same_signature_count = 0
 
     while True:
         state = _fetch_ukm5_user_and_cards(
@@ -4584,6 +4631,26 @@ def _poll_ukm5_user_state(
 
         if user_found and password_ok and expected_card_ok and forbidden_ok:
             return state, True
+
+        signature = (
+            int(user_row["id"]) if user_found and user_row.get("id") is not None else None,
+            str(user_row.get("password") or ""),
+            tuple(sorted(
+                (str(c.get("number") or "").strip(), int(bool(c.get("active"))))
+                for c in cards
+            )),
+        )
+
+        if signature == last_signature:
+            same_signature_count += 1
+        else:
+            last_signature = signature
+            same_signature_count = 0
+
+        # Если пользователь уже появился, но состояние не меняется несколько опросов подряд,
+        # дальше ждать обычно бессмысленно.
+        if user_found and same_signature_count >= UKM5_VERIFY_MAX_SAME_POLLS:
+            return last_state, False
 
         if time.monotonic() >= deadline:
             return last_state, False
@@ -4796,7 +4863,7 @@ def _update_store_mysql_and_xml_for_single_store(
         },
     }
 
-    info = get_store_info(store_id)
+    info = _get_store_info_cached(store_id)
     ukm4ip = info.get("ukm4ip")
     is_ukm5 = info.get("is_ukm5", False)
     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
@@ -4932,10 +4999,19 @@ def _update_store_mysql_and_xml_for_single_store(
         )
 
         verification = ukm5_res.get("verification") or {}
+
+        user_found = verification.get("user_found") is True
+        password_matches = verification.get("password_matches") is True
+        active_count = int(verification.get("active_count") or 0)
+        stale_left_count = int(verification.get("stale_active_left_count") or 0)
+        final_ready = verification.get("final_ready") is True
+
         ok = (
-            verification.get("user_found") is True
-            and verification.get("password_matches") is True
-            and int(verification.get("stale_active_left_count") or 0) == 0
+            user_found
+            and password_matches
+            and active_count == 1
+            and stale_left_count == 0
+            and final_ready
         )
 
         result["ukm5"] = {
@@ -4946,11 +5022,12 @@ def _update_store_mysql_and_xml_for_single_store(
 
         logger.info(
             f"[UKM5] storeid={store_id} external_store_id={ukm5_res['binding']['external_store_id']} "
-            f"user_found={verification.get('user_found')} "
-            f"password_matches={verification.get('password_matches')} "
-            f"active_count={verification.get('active_count')} "
-            f"stale_active_left_count={verification.get('stale_active_left_count')} "
-            f"deactivated_count={ukm5_res.get('deactivated_count')}"
+            f"user_found={user_found} "
+            f"password_matches={password_matches} "
+            f"active_count={active_count} "
+            f"stale_active_left_count={stale_left_count} "
+            f"deactivated_count={ukm5_res.get('deactivated_count')} "
+            f"final_ready={final_ready}"
         )
 
     except Exception as e:
