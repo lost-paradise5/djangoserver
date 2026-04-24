@@ -179,6 +179,7 @@ class Command(BaseCommand):
             "error": "",
             "stores": [],
             "cashier_id": None,
+            "store_results": [],
         }
 
         try:
@@ -305,7 +306,7 @@ class Command(BaseCommand):
                     f"cashier_id_for_store={cashier_id_for_store}, found_in_trm={found}"
                 )
 
-                _update_store_mysql_and_xml_for_single_store(
+                sync_result = _update_store_mysql_and_xml_for_single_store(
                     store_id=sid,
                     cashier_id=cashier_id_for_store,
                     role_id=role_id,
@@ -313,6 +314,14 @@ class Command(BaseCommand):
                     fio=fio,
                     password_plain=new_password,
                 )
+
+                info["store_results"].append({
+                    "storeid": sid,
+                    "roleid": role_id,
+                    "cashier_id": int(cashier_id_for_store),
+                    "found_in_trm": bool(found),
+                    "sync": sync_result,
+                })
 
                 _write_converter_user_and_signal(
                     cashier_id=int(converter_cashier_id),
@@ -391,6 +400,22 @@ class Command(BaseCommand):
                     lines.append(f"{idx}. {fio}")
                     lines.append(f"   Статус: {status_label}")
                     lines.append(f"   Доступов в УКМ: {stores_count}")
+
+                    for sr in info.get("store_results") or []:
+                        sync = sr.get("sync") or {}
+                        ukm5 = sync.get("ukm5") or {}
+                        verification = ukm5.get("verification") or {}
+
+                        lines.append(
+                            f"   • storeid={sr.get('storeid')} "
+                            f"cashier_id={sr.get('cashier_id')} "
+                            f"UKM5={ukm5.get('status', '—')} "
+                            f"user_found={verification.get('user_found', '—')} "
+                            f"password_matches={verification.get('password_matches', '—')} "
+                            f"active_count={verification.get('active_count', '—')} "
+                            f"old_disabled={ukm5.get('deactivated_count', '—')} "
+                            f"stale_left={verification.get('stale_active_left_count', '—')}"
+                        )
 
                     if info.get("error"):
                         lines.append(f"   Примечание: {info['error']}")
