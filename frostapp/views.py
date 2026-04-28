@@ -75,6 +75,7 @@ from urllib.parse import urlencode
 from functools import wraps, lru_cache
 import io
 import mimetypes
+import shutil
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
@@ -363,6 +364,9 @@ MAXBOT_CHECKLIST_REPORT_TEMPLATE = os.getenv(
     "MAXBOT_CHECKLIST_REPORT_TEMPLATE",
     "/app/media/ТЗ на чат-бот.xlsx"
 )
+
+MAXBOT_CHECKLIST_SHARED_REPORTS_DIR = os.getenv("MAXBOT_CHECKLIST_SHARED_REPORTS_DIR", "").strip()
+
 MAXBOT_LOCAL_TZ = ZoneInfo(os.getenv("MAXBOT_LOCAL_TZ", "Asia/Irkutsk"))
 CHECKLIST_STEP_META = {
     "sorting": (1, "Сортировка"),
@@ -23737,6 +23741,26 @@ def _photo_saved_name(session, answer, seq_no: int, ext: str) -> str:
         f"__{question_stub}"
         f"__Фото-{seq_no:02d}{ext}"
     )
+
+
+def _mirror_file_to_shared(abs_path: str | Path):
+    if not MAXBOT_CHECKLIST_SHARED_REPORTS_DIR:
+        return
+
+    try:
+        abs_path = Path(abs_path)
+        primary_root = Path(MAXBOT_CHECKLIST_REPORTS_DIR)
+        shared_root = Path(MAXBOT_CHECKLIST_SHARED_REPORTS_DIR)
+
+        rel_path = abs_path.relative_to(primary_root)
+        dst_path = shared_root / rel_path
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(abs_path, dst_path)
+    except Exception:
+        logger.exception("Не удалось скопировать файл в общую папку: %s", abs_path)
+
+
     
 def generate_checklist_session_no() -> str:
     return f"MAX7S-{_local_now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
@@ -24110,6 +24134,8 @@ def _download_and_save_checklist_photo(
         with open(full_path, "wb") as fh:
             fh.write(resp.content)
 
+        _mirror_file_to_shared(full_path)
+
         photo_obj.photo_file = str(full_path)
         photo_obj.saved_name = saved_name
         photo_obj.original_name = saved_name
@@ -24262,6 +24288,7 @@ def generate_checklist_excel_report(session: MaxBotChecklistSession) -> str:
     ws.print_area = "A1:H42"
 
     wb.save(str(report_path))
+    _mirror_file_to_shared(report_path)
     return str(report_path)
 
 
