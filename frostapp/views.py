@@ -11569,6 +11569,37 @@ def employee_identification(request):
 #     )
 
 
+def _get_store_name_from_pg_by_smstore(smstore) -> str:
+    """
+    Возвращает название магазина из PostgreSQL stores по stores.smstore.
+    """
+    if smstore is None:
+        return ""
+
+    try:
+        smstore_int = int(smstore)
+    except Exception:
+        return ""
+
+    try:
+        store = (
+            Store.objects
+            .filter(smstore=smstore_int)
+            .only("name")
+            .first()
+        )
+
+        if not store:
+            return ""
+
+        return str(store.name or "").strip()
+
+    except Exception as e:
+        logger.exception(f"[POS] Не удалось получить name из stores по smstore={smstore}: {e}")
+        return ""
+
+
+
 
 
 
@@ -11579,42 +11610,63 @@ def get_devices_for_user(user: User) -> tuple[Optional[User], list[dict]]:
     ukm_links = list(
         UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid")
     )
+
     if not ukm_links:
         return user, []
 
-    # storeid -> roleid (берём первый ненулевой, если есть)
+    # storeid -> roleid
     roles_by_store: dict[int, int | None] = {}
     store_ids: list[int] = []
+
     for x in ukm_links:
         sid_raw = x.get("storeid")
         rid_raw = x.get("roleid")
+
         if str(sid_raw).isdigit():
             sid = int(sid_raw)
             store_ids.append(sid)
+
             if sid not in roles_by_store:
                 roles_by_store[sid] = int(rid_raw) if str(rid_raw).isdigit() else None
 
     store_ids = sorted(set(store_ids))
+
     if not store_ids:
         return user, []
 
-    # ukm4store -> Store из Postgres (если есть)
-    store_map = {
-        int(s.ukm4store): s
-        for s in Store.objects.filter(ukm4store__in=store_ids)
-        if s.ukm4store is not None
-    }
+    # ukm4store -> Store из PostgreSQL
+    store_map = {}
+
+    try:
+        qs = (
+            Store.objects
+            .filter(ukm4store__in=store_ids)
+            .only("ukm4store", "smstore", "name")
+        )
+
+        for s in qs:
+            try:
+                if s.ukm4store is not None:
+                    store_map[int(s.ukm4store)] = s
+            except Exception:
+                continue
+
+    except Exception as e:
+        logger.exception(f"[POS] Ошибка загрузки stores по ukm4store: {e}")
+        store_map = {}
 
     devices: list[dict] = []
 
     for ukm4_storeid in store_ids:
         role_id = roles_by_store.get(ukm4_storeid)
 
-        # 1) smstore пытаемся взять из таблицы Store
+        # 1. Пытаемся взять магазин из PostgreSQL stores по ukm4store
         s_obj = store_map.get(int(ukm4_storeid))
-        smstore = getattr(s_obj, "smstore", None)
 
-        # 2) если нет — пробуем достать smstore через Oracle по ukm4_storeid
+        smstore = getattr(s_obj, "smstore", None) if s_obj else None
+        store_name = str(getattr(s_obj, "name", "") or "").strip() if s_obj else ""
+
+        # 2. Если smstore не нашли в PostgreSQL — пробуем достать через Oracle
         if smstore is None:
             try:
                 info_by_ukm = get_store_info(ukm4_storeid)
@@ -11626,33 +11678,130 @@ def get_devices_for_user(user: User) -> tuple[Optional[User], list[dict]]:
             logger.warning(f"[POS] smstore not resolved for ukm4store={ukm4_storeid}")
             continue
 
-        # 1) UKM4 кассы
+        # 3. Главное исправление:
+        # если имя магазина ещё не нашли, берём его из PostgreSQL stores по smstore
+        if not store_name:
+            store_name = _get_store_name_from_pg_by_smstore(smstore)
+
+        # 4. UKM4 кассы
         try:
             devices.extend(
                 fetch_ukm4_pos_list(
                     ukm4_storeid=int(ukm4_storeid),
                     smstore=int(smstore),
                     role_id=role_id,
+                    store_name=store_name,
                 )
             )
         except Exception as e:
-            logger.exception(f"[POS] UKM4 list error ukm4store={ukm4_storeid}, smstore={smstore}: {e}")
+            logger.exception(
+                f"[POS] UKM4 list error ukm4store={ukm4_storeid}, "
+                f"smstore={smstore}, store_name={store_name!r}: {e}"
+            )
 
-        # 2) UKM5 кассы — только если Oracle магазин помечен как UKM5
+        # 5. UKM5 кассы — только если Oracle магазин помечен как UKM5
         try:
             info = get_store_info(int(smstore))
+
             if info.get("is_ukm5", False):
                 devices.extend(
                     fetch_ukm5_pos_list(
                         smstore=int(smstore),
                         ukm4_storeid=int(ukm4_storeid),
                         role_id=role_id,
+                        store_name=store_name,
                     )
                 )
+
         except Exception as e:
-            logger.exception(f"[POS] UKM5 list error smstore={smstore}: {e}")
+            logger.exception(
+                f"[POS] UKM5 list error smstore={smstore}, "
+                f"store_name={store_name!r}: {e}"
+            )
 
     return user, devices
+    
+# def get_devices_for_user(user: User) -> tuple[Optional[User], list[dict]]:
+#     if not user:
+#         return None, []
+
+#     ukm_links = list(
+#         UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid")
+#     )
+#     if not ukm_links:
+#         return user, []
+
+#     # storeid -> roleid (берём первый ненулевой, если есть)
+#     roles_by_store: dict[int, int | None] = {}
+#     store_ids: list[int] = []
+#     for x in ukm_links:
+#         sid_raw = x.get("storeid")
+#         rid_raw = x.get("roleid")
+#         if str(sid_raw).isdigit():
+#             sid = int(sid_raw)
+#             store_ids.append(sid)
+#             if sid not in roles_by_store:
+#                 roles_by_store[sid] = int(rid_raw) if str(rid_raw).isdigit() else None
+
+#     store_ids = sorted(set(store_ids))
+#     if not store_ids:
+#         return user, []
+
+#     # ukm4store -> Store из Postgres (если есть)
+#     store_map = {
+#         int(s.ukm4store): s
+#         for s in Store.objects.filter(ukm4store__in=store_ids)
+#         if s.ukm4store is not None
+#     }
+
+#     devices: list[dict] = []
+
+#     for ukm4_storeid in store_ids:
+#         role_id = roles_by_store.get(ukm4_storeid)
+
+#         # 1) smstore пытаемся взять из таблицы Store
+#         s_obj = store_map.get(int(ukm4_storeid))
+#         smstore = getattr(s_obj, "smstore", None)
+
+#         # 2) если нет — пробуем достать smstore через Oracle по ukm4_storeid
+#         if smstore is None:
+#             try:
+#                 info_by_ukm = get_store_info(ukm4_storeid)
+#                 smstore = info_by_ukm.get("smstore")
+#             except Exception:
+#                 smstore = None
+
+#         if smstore is None:
+#             logger.warning(f"[POS] smstore not resolved for ukm4store={ukm4_storeid}")
+#             continue
+
+#         # 1) UKM4 кассы
+#         try:
+#             devices.extend(
+#                 fetch_ukm4_pos_list(
+#                     ukm4_storeid=int(ukm4_storeid),
+#                     smstore=int(smstore),
+#                     role_id=role_id,
+#                 )
+#             )
+#         except Exception as e:
+#             logger.exception(f"[POS] UKM4 list error ukm4store={ukm4_storeid}, smstore={smstore}: {e}")
+
+#         # 2) UKM5 кассы — только если Oracle магазин помечен как UKM5
+#         try:
+#             info = get_store_info(int(smstore))
+#             if info.get("is_ukm5", False):
+#                 devices.extend(
+#                     fetch_ukm5_pos_list(
+#                         smstore=int(smstore),
+#                         ukm4_storeid=int(ukm4_storeid),
+#                         role_id=role_id,
+#                     )
+#                 )
+#         except Exception as e:
+#             logger.exception(f"[POS] UKM5 list error smstore={smstore}: {e}")
+
+#     return user, devices
 
 
 
@@ -11740,7 +11889,13 @@ def _ip_allowed(ip: str) -> bool:
     return any(ip_obj in net for net in _ALLOWED_NETS)
 
 
-def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int, role_id: int | None = None) -> list[dict]:
+def fetch_ukm4_pos_list(
+    *,
+    ukm4_storeid: int,
+    smstore: int,
+    role_id: int | None = None,
+    store_name: str = "",
+) -> list[dict]:
     info = get_store_info(smstore)
     ukm_host = info.get("ukm4ip")
 
@@ -11793,6 +11948,7 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int, role_id: int | None 
                 "ssh_user": "ukmclient" if is_kso else "root",
                 "ukm_store_id": int(ukm4_storeid),   
                 "sm_store_id": int(smstore),        
+                "store_name": str(store_name or "").strip(),
                 "role_id": int(role_id) if role_id is not None else None,
             })
 
@@ -11805,7 +11961,13 @@ def fetch_ukm4_pos_list(*, ukm4_storeid: int, smstore: int, role_id: int | None 
             pass
 
 
-def fetch_ukm5_pos_list(*, smstore: int, ukm4_storeid: int, role_id: int | None = None) -> list[dict]:
+def fetch_ukm5_pos_list(
+    *,
+    smstore: int,
+    ukm4_storeid: int,
+    role_id: int | None = None,
+    store_name: str = "",
+) -> list[dict]:
     conn = cur = None
     items: list[dict] = []
     try:
@@ -11855,7 +12017,8 @@ def fetch_ukm5_pos_list(*, smstore: int, ukm4_storeid: int, role_id: int | None 
                 "is_kso": True,
                 "ssh_user": "ukm5",
                 "ukm_store_id": int(ukm4_storeid),  
-                "sm_store_id": int(smstore),       
+                "sm_store_id": int(smstore),     
+                "store_name": str(store_name or "").strip(),
                 "role_id": int(role_id) if role_id is not None else None,
             })
 
