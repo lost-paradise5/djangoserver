@@ -8905,7 +8905,7 @@ def agent_auth_start(request):
         users = list(
             User.objects
             .filter(phone__in=list(phone_candidates))
-            .only('id', 'full_name', 'tg_id', 'max_id', 'mail')
+            .only('id', 'full_name', 'tg_id', 'max_id', 'mail', 'employee_id')
             .order_by('id')[:2]
         )
 
@@ -8999,10 +8999,13 @@ def agent_auth_start(request):
                 ])
             )
 
+            user_inn = str(getattr(user, 'employee_id', '') or '').strip()
+            
             response_payload = {
                 'user': {
                     'id': user.id,
                     'fio': user.full_name,
+                    'user_inn': user_inn,
                 },
                 'stores': stores_response,
                 'isnot2fa': True,
@@ -9529,10 +9532,13 @@ def agent_auth_verify_pin(request):
             ])
         )
 
+        user_inn = str(getattr(sess.user, 'employee_id', '') or '').strip()
+
         response = {
             'user': {
                 'id': sess.user.id,
                 'fio': sess.user.full_name,
+                'user_inn': user_inn,
             },
             'stores': stores_response,
         }
