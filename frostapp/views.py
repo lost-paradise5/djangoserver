@@ -21,6 +21,7 @@ from django.core.mail import EmailMultiAlternatives
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError
 import threading
+from django.db import close_old_connections
 from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -3296,7 +3297,7 @@ def send_telegram_log(message: str) -> None:
 _TELEGRAM_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 _MAX_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
-
+_QR_DB_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 def send_max_admin_log(message: str) -> None:
     """
@@ -3345,12 +3346,12 @@ def _send_telegram_log_async(message: str) -> None:
 
 
 
-def log_qr_issue(
+def _log_qr_issue_sync(
     *,
     endpoint: str,
     method: str,
     status: str,
-    user: Optional[User] = None,
+    user_id: Optional[int] = None,
     employee_inn: str = "",
     employee_fio: str = "",
     tg_id: str = "",
@@ -3362,18 +3363,19 @@ def log_qr_issue(
     qr_data: str = "",
     error_message: str = "",
     raw_request: Optional[dict] = None,
-    latitude: Optional[float] = None,  
+    latitude: Optional[float] = None,
     longitude: Optional[float] = None,
 ) -> None:
     """
-    Запись отдельной строки в qr_issue_logs.
-    Никакие ошибки наружу не выкидывает.
+    Реальная синхронная запись в qr_issue_logs.
+    Вызывается из фонового executor-а.
     """
+    close_old_connections()
+
     try:
-        # приведение к строке всего, что может оказаться int/None
-        endpoint_str = str(endpoint or "")
-        method_str = str(method or "")
-        status_str = str(status or "")
+        endpoint_str = str(endpoint or "")[:64]
+        method_str = str(method or "")[:32]
+        status_str = str(status or "")[:16]
 
         employee_inn_str = str(employee_inn or "")
         employee_fio_str = str(employee_fio or "")
@@ -3384,13 +3386,14 @@ def log_qr_issue(
 
         qr_data_str = "" if qr_data is None else str(qr_data)
         error_message_str = "" if error_message is None else str(error_message)
-        
-        lat_val = _to_float_or_none(latitude) 
-        lon_val = _to_float_or_none(longitude)   
 
-        # raw_request в JSONField/текст
+        lat_val = _to_float_or_none(latitude)
+        lon_val = _to_float_or_none(longitude)
+
         if isinstance(raw_request, dict):
             raw_request_value = raw_request
+        elif raw_request is not None:
+            raw_request_value = {"value": str(raw_request)[:4000]}
         else:
             raw_request_value = None
 
@@ -3398,7 +3401,7 @@ def log_qr_issue(
             endpoint=endpoint_str,
             method=method_str,
             status=status_str,
-            user=user,
+            user_id=user_id,
             employee_inn=employee_inn_str or "",
             employee_fio=employee_fio_str or "",
             tg_id=tg_id_str[:32],
@@ -3410,11 +3413,68 @@ def log_qr_issue(
             qr_data=qr_data_str or "",
             error_message=error_message_str or "",
             raw_request=raw_request_value,
-            latitude=lat_val, 
-            longitude=lon_val, 
+            latitude=lat_val,
+            longitude=lon_val,
         )
+
     except Exception as e:
         logger.error(f"[QR/DBLOG] Ошибка записи в qr_issue_logs: {e}", exc_info=True)
+    finally:
+        close_old_connections()
+
+
+def log_qr_issue(
+    *,
+    endpoint: str,
+    method: str,
+    status: str,
+    user: Optional[User] = None,
+    user_id: Optional[int] = None,
+    employee_inn: str = "",
+    employee_fio: str = "",
+    tg_id: str = "",
+    phone_raw: str = "",
+    phone_normalized: str = "",
+    sm_store_id: Optional[int] = None,
+    ukm_store_id: Optional[int] = None,
+    role_id: Optional[int] = None,
+    qr_data: str = "",
+    error_message: str = "",
+    raw_request: Optional[dict] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+) -> None:
+    """
+    Публичная функция логирования.
+    Ставит запись в qr_issue_logs в фон, чтобы не тормозить основной HTTP-ответ.
+    """
+    try:
+        resolved_user_id = user_id
+        if resolved_user_id is None and user is not None:
+            resolved_user_id = getattr(user, "id", None)
+
+        _QR_DB_LOG_EXECUTOR.submit(
+            _log_qr_issue_sync,
+            endpoint=endpoint,
+            method=method,
+            status=status,
+            user_id=resolved_user_id,
+            employee_inn=employee_inn,
+            employee_fio=employee_fio,
+            tg_id=tg_id,
+            phone_raw=phone_raw,
+            phone_normalized=phone_normalized,
+            sm_store_id=sm_store_id,
+            ukm_store_id=ukm_store_id,
+            role_id=role_id,
+            qr_data=qr_data,
+            error_message=error_message,
+            raw_request=raw_request,
+            latitude=latitude,
+            longitude=longitude,
+        )
+    except Exception as e:
+        logger.error(f"[QR/DBLOG] Не удалось поставить запись в очередь: {e}", exc_info=True)
         
 def send_telegram_to_user(user, message: str) -> bool:
     """
@@ -8198,8 +8258,10 @@ def _build_agent_auth_requester(user=None, **extra):
         payload.update({
             "user_id": user.id,
             "full_name": getattr(user, "full_name", "") or "",
+            "employee_inn": getattr(user, "employee_id", "") or "",
             "phone": getattr(user, "phone", "") or "",
             "mail": getattr(user, "mail", "") or "",
+            "tg_id": getattr(user, "tg_id", "") or "",
             "max_id": getattr(user, "max_id", "") or "",
         })
 
@@ -8299,6 +8361,17 @@ def _agent_audit_json_response(
         extra=extra,
     )
 
+    _log_agent_auth_to_qr_table(
+        event=event,
+        request=request,
+        request_payload=request_payload,
+        response_payload=payload,
+        status_code=status,
+        requester=requester,
+        stores=stores,
+        extra=extra,
+    )
+
     if json_dumps_params:
         return JsonResponse(payload, status=status, json_dumps_params=json_dumps_params)
 
@@ -8328,7 +8401,126 @@ def _agent_audit_error(
     )
 
 
+def _log_agent_auth_to_qr_table(
+    *,
+    event: str,
+    request=None,
+    request_payload=None,
+    response_payload=None,
+    status_code=None,
+    requester=None,
+    stores=None,
+    extra=None,
+):
+    """
+    Дублирует важные agent_auth события в qr_issue_logs.
+    Текстовый audit-файл остаётся как был.
+    """
+    try:
+        if event not in {"agent_auth_start", "agent_auth_verify_pin"}:
+            return
 
+        requester = requester or {}
+        response_payload = response_payload or {}
+        extra = extra or {}
+
+        try:
+            code_int = int(status_code or 500)
+        except Exception:
+            code_int = 500
+
+        status_str = "ok" if 200 <= code_int < 400 else "error"
+
+        if event == "agent_auth_start":
+            if extra.get("auth_mode") == "direct" or extra.get("isnot2fa") is True:
+                method = "AGENT_DIRECT"
+            else:
+                method = "AGENT_START"
+        else:
+            method = "AGENT_VERIFY_PIN"
+
+        response_user = response_payload.get("user") if isinstance(response_payload, dict) else {}
+        if not isinstance(response_user, dict):
+            response_user = {}
+
+        user_id_raw = requester.get("user_id") or response_user.get("id")
+        try:
+            user_id_val = int(user_id_raw) if user_id_raw not in (None, "") else None
+        except Exception:
+            user_id_val = None
+
+        employee_inn = (
+            requester.get("employee_inn")
+            or response_user.get("user_inn")
+            or ""
+        )
+
+        employee_fio = (
+            requester.get("full_name")
+            or response_user.get("fio")
+            or ""
+        )
+
+        tg_id = requester.get("tg_id") or ""
+        phone_raw = requester.get("phone") or ""
+        phone_norm = normalize_phone_ru(phone_raw) if phone_raw else ""
+
+        raw_for_table = {
+            "agent_auth_event": event,
+            "request": _sanitize_for_agent_audit(request_payload or {}),
+            "response": _sanitize_for_agent_audit(response_payload or {}),
+            "extra": _sanitize_for_agent_audit(extra or {}),
+            "ip": _get_request_ip(request) if request else "",
+            "user_agent": (request.META.get("HTTP_USER_AGENT") or "")[:1000] if request else "",
+        }
+
+        store_rows = stores if isinstance(stores, list) and stores else [None]
+
+        for store in store_rows:
+            store = store or {}
+
+            sm_store_id = None
+            ukm_store_id = None
+            role_id = None
+
+            try:
+                if store.get("smstore") is not None:
+                    sm_store_id = int(store.get("smstore"))
+            except Exception:
+                sm_store_id = None
+
+            try:
+                if store.get("ukm_storeid") is not None:
+                    ukm_store_id = int(store.get("ukm_storeid"))
+            except Exception:
+                ukm_store_id = None
+
+            try:
+                if store.get("roleid") is not None:
+                    role_id = int(store.get("roleid"))
+            except Exception:
+                role_id = None
+
+            log_qr_issue(
+                endpoint=event,
+                method=method,
+                status=status_str,
+                user_id=user_id_val,
+                employee_inn=employee_inn,
+                employee_fio=employee_fio,
+                tg_id=tg_id,
+                phone_raw=phone_raw,
+                phone_normalized=phone_norm or "",
+                sm_store_id=sm_store_id,
+                ukm_store_id=ukm_store_id,
+                role_id=role_id,
+                qr_data="",
+                error_message="" if status_str == "ok" else str(response_payload.get("error") or ""),
+                raw_request=raw_for_table,
+            )
+
+    except Exception as e:
+        logger.exception(f"[AGENT_AUTH_QR_LOG] Ошибка записи agent_auth в qr_issue_logs: {e}")
 
 
 
@@ -8984,7 +9176,7 @@ def get_qr_code_by_tg(request):
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_ID",
+                method="BY_MAX",
                 status="error",
                 user=None,
                 tg_id="",
@@ -9008,7 +9200,7 @@ def get_qr_code_by_tg(request):
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_ID",
+                method="BY_MAX",
                 status="error",
                 user=None,
                 tg_id="",
@@ -9031,7 +9223,7 @@ def get_qr_code_by_tg(request):
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_ID",
+                method="BY_MAX",
                 status="error",
                 user=None,
                 tg_id=tg_id,
@@ -9061,7 +9253,7 @@ def get_qr_code_by_tg(request):
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_ID",
+                method="BY_MAX",
                 status="error",
                 user=user,
                 tg_id=tg_id_user,
@@ -9086,7 +9278,7 @@ def get_qr_code_by_tg(request):
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_ID",
+                method="BY_MAX",
                 status="error",
                 user=user,
                 tg_id=tg_id_user,
@@ -9111,7 +9303,7 @@ def get_qr_code_by_tg(request):
             )
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_ID",
+                method="BY_MAX",
                 status="error",
                 user=user,
                 tg_id=tg_id_user,
@@ -9183,7 +9375,7 @@ def get_qr_code_by_tg(request):
         for r in per_store_results:
             log_qr_issue(
                 endpoint="get_qr_code_by_tg",
-                method="BY_ID",
+                method="BY_MAX",
                 status="ok",
                 user=user,
                 employee_inn=plain_inn,
@@ -10960,12 +11152,101 @@ def _ssh_reboot(ip: str, *, username: str, password: str, use_sudo: bool) -> dic
 
 @csrf_exempt
 def pos_reboot(request):
+    endpoint_name = "pos_reboot"
+    method_name = "POS_REBOOT"
+
+    raw_body = request.body.decode("utf-8", errors="replace") if request.body else "{}"
+    body = {}
+
+    def _safe_int_or_none(value):
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    def _user_inn(user_obj):
+        if not user_obj:
+            return ""
+        raw = str(getattr(user_obj, "employee_id", "") or "").strip()
+        if not raw:
+            return ""
+        try:
+            return ensure_plain_inn(raw)
+        except Exception:
+            return raw
+
+    def _user_fio(user_obj):
+        if not user_obj:
+            return ""
+        return " ".join(str(getattr(user_obj, "full_name", "") or "").split()).strip()
+
+    def _user_phone(user_obj):
+        if not user_obj:
+            return ""
+        return str(getattr(user_obj, "phone", "") or "").strip()
+
+    def _write_pos_log(
+        *,
+        status: str,
+        error_message: str = "",
+        user_obj: Optional[User] = None,
+        device: Optional[dict] = None,
+        extra: Optional[dict] = None,
+    ):
+        """
+        Единая запись pos_reboot в qr_issue_logs.
+        Работает и для ранних ошибок, и для результата SSH.
+        """
+        device = device or {}
+        extra = extra or {}
+
+        phone_raw = _user_phone(user_obj)
+        tg_id_user = str(getattr(user_obj, "tg_id", "") or "").strip() if user_obj else ""
+
+        sm_store_id = _safe_int_or_none(device.get("sm_store_id") or body.get("sm_store_id") or body.get("smstore"))
+        ukm_store_id = _safe_int_or_none(device.get("ukm_store_id") or body.get("ukm_store_id") or body.get("storeid"))
+        role_id = _safe_int_or_none(device.get("role_id") or body.get("role_id") or body.get("roleid"))
+
+        log_qr_issue(
+            endpoint=endpoint_name,
+            method=method_name,
+            status=status,
+            user=user_obj,
+            employee_inn=_user_inn(user_obj),
+            employee_fio=_user_fio(user_obj),
+            tg_id=tg_id_user,
+            phone_raw=phone_raw,
+            phone_normalized=normalize_phone_ru(phone_raw) if phone_raw else "",
+            sm_store_id=sm_store_id,
+            ukm_store_id=ukm_store_id,
+            role_id=role_id,
+            qr_data="",
+            error_message=error_message or "",
+            raw_request={
+                "request": body if body else {"raw_body": raw_body},
+                "device": device,
+                "extra": extra,
+            },
+        )
+
     if request.method != "POST":
+        _write_pos_log(
+            status="error",
+            error_message="Только POST",
+            extra={"stage": "method_check", "request_method": request.method},
+        )
         return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
 
     try:
-        body = json.loads(request.body.decode("utf-8") if request.body else "{}")
-    except Exception:
+        body = json.loads(raw_body if raw_body else "{}")
+    except Exception as e:
+        _write_pos_log(
+            status="error",
+            error_message=f"Некорректный JSON: {e}",
+            extra={"stage": "json_parse"},
+        )
         return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
 
     tg_id = str(body.get("tg_id") or "").strip()
@@ -10977,19 +11258,60 @@ def pos_reboot(request):
     req_is_kso = body.get("is_kso", None)
 
     if (not tg_id and not max_id) or not ip:
+        _write_pos_log(
+            status="error",
+            error_message="Нужны tg_id/max_id и ip",
+            extra={
+                "stage": "validation",
+                "tg_id": tg_id,
+                "max_id": max_id,
+                "ip": ip,
+            },
+        )
         return JsonResponse({"status": "error", "message": "Нужны tg_id/max_id и ip"}, status=400)
 
     if not _ip_allowed(ip):
+        _write_pos_log(
+            status="error",
+            error_message=f"IP {ip} запрещён (allowlist)",
+            extra={
+                "stage": "ip_allowlist",
+                "ip": ip,
+                "allowed_nets": POS_REBOOT_ALLOWED_NETS_RAW,
+            },
+        )
         return JsonResponse({"status": "error", "message": f"IP {ip} запрещён (allowlist)"}, status=403)
 
     user, devices, err = get_devices_for_ids(tg_id=tg_id, max_id=max_id)
+
     if not user:
+        _write_pos_log(
+            status="error",
+            error_message=err or "Пользователь не найден",
+            extra={
+                "stage": "resolve_user",
+                "tg_id": tg_id,
+                "max_id": max_id,
+            },
+        )
         return JsonResponse({"status": "error", "message": err or "Пользователь не найден"}, status=404)
 
     tg_id_user = str(getattr(user, "tg_id", "") or "").strip()
 
     dev = next((d for d in devices if str(d.get("ip") or "").strip() == ip), None)
+
     if not dev:
+        _write_pos_log(
+            status="error",
+            error_message="Этот IP не найден среди касс пользователя (запрещено)",
+            user_obj=user,
+            extra={
+                "stage": "device_access_check",
+                "requested_ip": ip,
+                "available_devices_count": len(devices),
+                "available_ips": [str(d.get("ip") or "").strip() for d in devices],
+            },
+        )
         return JsonResponse({"status": "error", "message": "Этот IP не найден среди касс пользователя (запрещено)"}, status=403)
 
     ukm4 = bool(dev.get("ukm4"))
@@ -10997,15 +11319,53 @@ def pos_reboot(request):
     is_kso = bool(dev.get("is_kso"))
 
     if req_ukm4 is not None and bool(req_ukm4) != ukm4:
+        _write_pos_log(
+            status="error",
+            error_message="ukm4 не совпадает с типом кассы пользователя",
+            user_obj=user,
+            device=dev,
+            extra={"stage": "device_type_check", "requested_ukm4": req_ukm4, "actual_ukm4": ukm4},
+        )
         return JsonResponse({"status": "error", "message": "ukm4 не совпадает с типом кассы пользователя"}, status=400)
+
     if req_ukm5 is not None and bool(req_ukm5) != ukm5:
+        _write_pos_log(
+            status="error",
+            error_message="ukm5 не совпадает с типом кассы пользователя",
+            user_obj=user,
+            device=dev,
+            extra={"stage": "device_type_check", "requested_ukm5": req_ukm5, "actual_ukm5": ukm5},
+        )
         return JsonResponse({"status": "error", "message": "ukm5 не совпадает с типом кассы пользователя"}, status=400)
+
     if req_is_kso is not None and bool(req_is_kso) != is_kso:
+        _write_pos_log(
+            status="error",
+            error_message="is_kso не совпадает с типом кассы пользователя",
+            user_obj=user,
+            device=dev,
+            extra={"stage": "device_type_check", "requested_is_kso": req_is_kso, "actual_is_kso": is_kso},
+        )
         return JsonResponse({"status": "error", "message": "is_kso не совпадает с типом кассы пользователя"}, status=400)
 
     if ukm4 and ukm5:
+        _write_pos_log(
+            status="error",
+            error_message="Некорректное устройство: ukm4 и ukm5 одновременно",
+            user_obj=user,
+            device=dev,
+            extra={"stage": "device_flags_check"},
+        )
         return JsonResponse({"status": "error", "message": "Некорректное устройство: ukm4 и ukm5 одновременно"}, status=500)
+
     if not (ukm4 or ukm5):
+        _write_pos_log(
+            status="error",
+            error_message="Некорректное устройство: не ukm4 и не ukm5",
+            user_obj=user,
+            device=dev,
+            extra={"stage": "device_flags_check"},
+        )
         return JsonResponse({"status": "error", "message": "Некорректное устройство: не ukm4 и не ukm5"}, status=500)
 
     cash_id = dev.get("cash_id")
@@ -11032,6 +11392,17 @@ def pos_reboot(request):
             use_sudo = False
 
     if not password:
+        _write_pos_log(
+            status="error",
+            error_message=f"Не задан пароль SSH для {username} (env)",
+            user_obj=user,
+            device=dev,
+            extra={
+                "stage": "ssh_password_check",
+                "ssh_user": username,
+                "kind": kind,
+            },
+        )
         return JsonResponse({"status": "error", "message": f"Не задан пароль SSH для {username} (env)"}, status=500)
 
     initiator_name = _human_user_name(user)
@@ -11046,25 +11417,17 @@ def pos_reboot(request):
     try:
         res = _ssh_reboot(ip, username=username, password=password, use_sudo=use_sudo)
 
-        log_qr_issue(
-            endpoint="pos_reboot",
-            method="POS_REBOOT",
+        _write_pos_log(
             status="ok",
-            user=user,
-            tg_id=tg_id_user,
-            sm_store_id=int(sm_store_id) if str(sm_store_id).isdigit() else sm_store_id,
-            ukm_store_id=int(ukm_store_id) if str(ukm_store_id).isdigit() else ukm_store_id,
-            role_id=int(role_id) if str(role_id).isdigit() else role_id,
-            employee_inn="",
-            employee_fio="",
-            phone_raw="",
-            phone_normalized="",
-            qr_data="",
-            error_message="",
-            raw_request={
-                "request": body,
-                "resolved": {"tg_id": tg_id_user, "max_id": getattr(user, "max_id", None), "user_id": user.id},
-                "device": dev,
+            user_obj=user,
+            device=dev,
+            extra={
+                "stage": "ssh_reboot",
+                "resolved": {
+                    "tg_id": tg_id_user,
+                    "max_id": getattr(user, "max_id", None),
+                    "user_id": user.id,
+                },
                 "ssh_user": username,
                 "ssh_port": POS_SSH_PORT,
                 "cmd": cmd_hint,
@@ -11104,33 +11467,23 @@ def pos_reboot(request):
     except Exception as e:
         logger.exception(f"[POS/REBOOT] error: {e}")
 
-        try:
-            log_qr_issue(
-                endpoint="pos_reboot",
-                method="POS_REBOOT",
-                status="error",
-                user=user,
-                tg_id=tg_id_user,
-                sm_store_id=int(sm_store_id) if str(sm_store_id).isdigit() else sm_store_id,
-                ukm_store_id=int(ukm_store_id) if str(ukm_store_id).isdigit() else ukm_store_id,
-                role_id=int(role_id) if str(role_id).isdigit() else role_id,
-                employee_inn="",
-                employee_fio="",
-                phone_raw="",
-                phone_normalized="",
-                qr_data="",
-                error_message=str(e),
-                raw_request={
-                    "request": body,
-                    "resolved": {"tg_id": tg_id_user, "max_id": getattr(user, "max_id", None), "user_id": user.id},
-                    "device": dev,
-                    "ssh_user": username,
-                    "ssh_port": POS_SSH_PORT,
-                    "cmd": cmd_hint,
+        _write_pos_log(
+            status="error",
+            error_message=str(e),
+            user_obj=user,
+            device=dev,
+            extra={
+                "stage": "ssh_reboot",
+                "resolved": {
+                    "tg_id": tg_id_user,
+                    "max_id": getattr(user, "max_id", None),
+                    "user_id": user.id,
                 },
-            )
-        except Exception:
-            logger.exception("[POS/REBOOT] failed to write QRIssueLog")
+                "ssh_user": username,
+                "ssh_port": POS_SSH_PORT,
+                "cmd": cmd_hint,
+            },
+        )
 
         msg_lines = [
             "❌ Ошибка перезагрузки кассы",
@@ -11140,6 +11493,11 @@ def pos_reboot(request):
             f"  • user_id: {user.id}",
             f"  • tg_id: {tg_id_user or '—'}",
             f"  • max_id: {getattr(user,'max_id','') or '—'}",
+            "",
+            "🏬 Магазин:",
+            f"  • ukm_store_id: {ukm_store_id if ukm_store_id is not None else '—'}",
+            f"  • sm_store_id: {sm_store_id if sm_store_id is not None else '—'}",
+            f"  • role_id: {role_id if role_id is not None else '—'}",
             "",
             "💻 Касса:",
             f"  • Тип: {kind}",
@@ -11152,7 +11510,6 @@ def pos_reboot(request):
         _send_telegram_log_async("\n".join(msg_lines))
 
         return JsonResponse({"status": "error", "message": str(e)}, status=500, json_dumps_params={"ensure_ascii": False})
-
 
 
 
