@@ -146,11 +146,6 @@ urlpatterns = [
     path("api/reports/inactive-users/send/", inactive_users_report_send_to_bitrix, name="inactive_users_report_send_to_bitrix"),
 
 
-    path("sm/sync-staff/", sm_sync_staff_ui, name="sm_sync_staff_ui"),
-    path("sm/sync-staff/stream/", sm_sync_staff_stream, name="sm_sync_staff_stream"),
-
-    # скриптовый запуск (API)
-    path("api/sm/sync-staff/run/", sm_sync_staff_run, name="sm_sync_staff_run"),
     path('ui/smstaff/create/', sm_staff_ui_create, name='sm_staff_ui_create'),
 
     path("api/maxbot/process/", maxbot_process_update, name="maxbot_process_update"),
