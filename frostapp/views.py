@@ -19567,19 +19567,29 @@ def _build_short_sm_afio(first_name: str, last_name: str) -> str:
     return " ".join([x for x in [last_name, first_name] if x]).strip()
 
 
-def _choose_sm_afio_for_create(last_name: str, first_name: str, middle_name: str) -> tuple[str, str]:
+def _choose_sm_afio_for_create(last_name: str, first_name: str, middle_name: str) -> tuple[str, str, bool]:
     """
     Возвращает AFIO для создания в Супермаге.
 
-    Правила:
-    1) Если 'Фамилия Имя Отчество' <= 28 символов — отправляем полное.
-    2) Если полное ФИО > 28 символов — отправляем 'Фамилия Имя'.
-    3) Если 'Фамилия Имя' > 29 символов — жёстко режем до 29 символов,
-       чтобы не словить ORA-12899 повторно.
+    Новые правила:
+    1) Собираем полное ФИО: 'Фамилия Имя Отчество'.
+    2) Если полное ФИО <= 30 символов — отправляем полное.
+    3) Если полное ФИО > 30 символов — НЕ отправляем его вообще,
+       сразу сокращаем до 'Фамилия Имя'.
+    4) Если 'Фамилия Имя' тоже > 30 символов — обрезаем до 30 символов.
 
     Возврат:
-      (afio, mode)
-      mode: full / short / short_trimmed / empty
+      (afio, mode, full_afio_too_long)
+
+      mode:
+        full          — отправляем полное ФИО
+        short         — отправляем 'Фамилия Имя'
+        short_trimmed — отправляем 'Фамилия Имя', обрезанное до 30 символов
+        empty         — ФИО пустое
+
+      full_afio_too_long:
+        True  — полное ФИО было длиннее 30 символов
+        False — полное ФИО было нормальной длины
     """
     last_name = _safe_text(last_name)
     first_name = _safe_text(first_name)
@@ -19588,18 +19598,23 @@ def _choose_sm_afio_for_create(last_name: str, first_name: str, middle_name: str
     full_afio = " ".join([x for x in [last_name, first_name, middle_name] if x]).strip()
     short_afio = _build_short_sm_afio(first_name=first_name, last_name=last_name)
 
-    if full_afio and len(full_afio) <= SM_AFIO_FULL_MAX:
-        return full_afio, "full"
+    full_afio_too_long = bool(full_afio and len(full_afio) > SM_AFIO_FULL_MAX)
 
+    if full_afio and not full_afio_too_long:
+        return full_afio, "full", False
+
+    # Если полное ФИО длиннее 30 — сразу используем Фамилия + Имя.
+    # Полное ФИО в Oracle-процедуру уже не отправляем.
     if short_afio:
         if len(short_afio) <= SM_AFIO_SHORT_MAX:
-            return short_afio, "short"
-        return short_afio[:SM_AFIO_SHORT_MAX].rstrip(), "short_trimmed"
+            return short_afio, "short", full_afio_too_long
+
+        return short_afio[:SM_AFIO_SHORT_MAX].rstrip(), "short_trimmed", full_afio_too_long
 
     if full_afio:
-        return full_afio[:SM_AFIO_SHORT_MAX].rstrip(), "short_trimmed"
+        return full_afio[:SM_AFIO_SHORT_MAX].rstrip(), "short_trimmed", full_afio_too_long
 
-    return "", "empty"
+    return "", "empty", full_afio_too_long
 
 
 def _is_smstaff_surname_too_long_error(exc: Exception) -> bool:
@@ -19672,8 +19687,9 @@ SUPERMAG_OFFINDEX_ADMIN = 118
 SUPERMAG_ORAROLE_ADMIN = "OPERATOR_ADMIN"
 WORKING_EMPLOYEES_EXPORT_SUBDIR = "working_employees_sync_exports"
 
-SM_AFIO_FULL_MAX = 28
-SM_AFIO_SHORT_MAX = 29
+SM_AFIO_MAX = 30
+SM_AFIO_FULL_MAX = SM_AFIO_MAX
+SM_AFIO_SHORT_MAX = SM_AFIO_MAX
 
 def _chunked(seq, size: int):
     seq = list(seq)
@@ -19700,7 +19716,26 @@ def _translit_to_login_part(text: str) -> str:
     return s
 
 
-def _build_sm_login_base(first_name: str, last_name: str, inn: str) -> str:
+def _build_sm_login_base(
+    first_name: str,
+    last_name: str,
+    inn: str,
+    middle_name: str = "",
+    add_middle_initial: bool = False,
+) -> str:
+    """
+    Строит базовый логин для Супермага.
+
+    Обычный вариант:
+      Имя_Фамилия
+
+    Если add_middle_initial=True:
+      Имя_Фамилия_ПерваяБукваОтчества
+
+    Например:
+      Иван Петров Сергеевич -> ivan_petrov_s
+      Юлия Иванова Юрьевна -> yuliya_ivanova_yu
+    """
     first_part = _translit_to_login_part(first_name)
     last_part = _translit_to_login_part(last_name)
 
@@ -19712,6 +19747,28 @@ def _build_sm_login_base(first_name: str, last_name: str, inn: str) -> str:
         base = last_part
     else:
         base = f"user_{(inn or '')[-4:]}" if inn else "user"
+
+    base = re.sub(r"_+", "_", base).strip("._-")
+    if not base:
+        base = f"user_{(inn or '')[-4:]}" if inn else "user"
+
+    if add_middle_initial:
+        middle_name = _safe_text(middle_name)
+        middle_initial = ""
+
+        if middle_name:
+            # Берём первую букву отчества и транслитерируем её.
+            # Для букв типа Ю/Я/Ж может получиться yu/ya/zh — это нормально для логина.
+            middle_initial = _translit_to_login_part(middle_name[0])
+
+            # На всякий случай, если первый символ не дал результата.
+            if not middle_initial:
+                middle_translit = _translit_to_login_part(middle_name)
+                middle_initial = middle_translit[:1]
+
+        if middle_initial:
+            suffix = f"_{middle_initial}"
+            base = f"{base[:64 - len(suffix)]}{suffix}"
 
     base = re.sub(r"_+", "_", base).strip("._-")
     if not base:
@@ -20879,15 +20936,7 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                     processed_inn_in_run.add(inn)
                     continue
 
-                login_base = _build_sm_login_base(
-                    first_name=item["first_name"],
-                    last_name=item["last_name"],
-                    inn=inn,
-                )
-                login_new = _resolve_available_sm_login(cur, login_base, reserved_logins)
-                pin_code = _generate_pin_code()
-                
-                chosen_afio, afio_mode = _choose_sm_afio_for_create(
+                chosen_afio, afio_mode, full_afio_too_long = _choose_sm_afio_for_create(
                     last_name=item["last_name"],
                     first_name=item["first_name"],
                     middle_name=item.get("middle_name", ""),
@@ -20896,13 +20945,30 @@ def _run_working_employees_supermag(dry_run: bool) -> dict:
                 if not chosen_afio:
                     chosen_afio = full_name
                 
+                login_base = _build_sm_login_base(
+                    first_name=item["first_name"],
+                    last_name=item["last_name"],
+                    inn=inn,
+                    middle_name=item.get("middle_name", ""),
+                    add_middle_initial=full_afio_too_long,
+                )
+                
+                login_new = _resolve_available_sm_login(cur, login_base, reserved_logins)
+                pin_code = _generate_pin_code()
+                
                 actions.append(f"логин: {login_new}")
                 actions.append(f"пароль: {pin_code}")
                 actions.append(f"AFIO: {chosen_afio}")
+                
+                if full_afio_too_long:
+                    actions.append("полное ФИО длиннее 30 символов: в Супермаг сразу отправлен AFIO в формате 'Фамилия Имя'")
+                    actions.append("к логину добавлена первая буква отчества")
+                
                 if afio_mode == "short":
-                    actions.append("AFIO сокращён до 'Фамилия Имя', потому что полное ФИО длиннее 28 символов")
+                    actions.append("AFIO сокращён до 'Фамилия Имя'")
                 elif afio_mode == "short_trimmed":
-                    actions.append("AFIO сокращён и обрезан до 29 символов")
+                    actions.append("AFIO сокращён до 'Фамилия Имя' и обрезан до 30 символов")
+                
                 actions.append(f"ADOL: {SUPERMAG_ORAROLE_ADMIN}")
                 actions.append(f"OFFINDEX: {SUPERMAG_OFFINDEX_ADMIN}")
 
