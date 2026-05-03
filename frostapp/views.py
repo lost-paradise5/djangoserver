@@ -3391,9 +3391,9 @@ def _log_qr_issue_sync(
         lon_val = _to_float_or_none(longitude)
 
         if isinstance(raw_request, dict):
-            raw_request_value = raw_request
+            raw_request_value = _json_safe(raw_request)
         elif raw_request is not None:
-            raw_request_value = {"value": str(raw_request)[:4000]}
+            raw_request_value = _json_safe({"value": raw_request})
         else:
             raw_request_value = None
 
@@ -3475,7 +3475,55 @@ def log_qr_issue(
         )
     except Exception as e:
         logger.error(f"[QR/DBLOG] Не удалось поставить запись в очередь: {e}", exc_info=True)
-        
+
+
+
+
+def _json_safe(value):
+    """
+    Рекурсивно приводит значение к виду, который можно сохранить в JSONField.
+    Исправляет datetime/date/time/Decimal/UUID/bytes/set и прочие нестандартные типы.
+    """
+    import datetime as _dt
+    from decimal import Decimal
+    from uuid import UUID
+
+    if value is None:
+        return None
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+        return value.isoformat()
+
+    if isinstance(value, Decimal):
+        return str(value)
+
+    if isinstance(value, UUID):
+        return str(value)
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+
+    if isinstance(value, dict):
+        return {
+            str(k): _json_safe(v)
+            for k, v in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
+
+
+
+
 def send_telegram_to_user(user, message: str) -> bool:
     """
     Отправка сообщения сотруднику по user.tg_id.
@@ -8465,14 +8513,14 @@ def _log_agent_auth_to_qr_table(
         phone_raw = requester.get("phone") or ""
         phone_norm = normalize_phone_ru(phone_raw) if phone_raw else ""
 
-        raw_for_table = {
+        raw_for_table = _json_safe({
             "agent_auth_event": event,
             "request": _sanitize_for_agent_audit(request_payload or {}),
             "response": _sanitize_for_agent_audit(response_payload or {}),
             "extra": _sanitize_for_agent_audit(extra or {}),
             "ip": _get_request_ip(request) if request else "",
             "user_agent": (request.META.get("HTTP_USER_AGENT") or "")[:1000] if request else "",
-        }
+        })
 
         store_rows = stores if isinstance(stores, list) and stores else [None]
 
