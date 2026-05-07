@@ -466,16 +466,35 @@ LDAP_EXPORT_MAX_TOTAL = int(os.getenv("LDAP_EXPORT_MAX_TOTAL", "20000"))
 
 # Helpers: hashing/pin/session
 
-# Время жизни PIN для agent_auth: до 23:59 текущего дня
+# Время жизни персонального PIN для agent_auth: до 23:59:59 текущего дня
 AGENT_PIN_TZ = ZoneInfo(os.getenv("AGENT_PIN_TZ", "Asia/Irkutsk"))
+
+# Постоянный секрет для генерации персонального дневного PIN.
+# ВАЖНО: не менять это значение, иначе PIN у пользователей изменится.
+AGENT_DAILY_PIN_SECRET = "BIN_AGENT_PIN_7f9c2e41a6b34d9f8c0a55e12d4a9b63_2026_FIXED"
+
+
+def _get_agent_pin_local_now():
+    """
+    Текущее время в локальной зоне PIN.
+    """
+    return timezone.localtime(timezone.now(), AGENT_PIN_TZ)
+
+
+def _get_agent_pin_local_date():
+    """
+    Текущая дата в локальной зоне PIN.
+    Именно от этой даты зависит дневной персональный PIN.
+    """
+    return _get_agent_pin_local_now().date()
 
 
 def _get_agent_pin_expires_at():
     """
     Возвращает expires_at для PIN: сегодня в 23:59:59
-    в локальной зоне AGENT_PIN_TZ.
+    по локальной зоне AGENT_PIN_TZ.
     """
-    now_local = timezone.now().astimezone(AGENT_PIN_TZ)
+    now_local = _get_agent_pin_local_now()
 
     expires_local = now_local.replace(
         hour=23,
@@ -484,7 +503,7 @@ def _get_agent_pin_expires_at():
         microsecond=0,
     )
 
-    return expires_local
+    return expires_local.astimezone(datetime.timezone.utc)
 
 
 def _format_agent_pin_expires_text(expires_at=None) -> str:
@@ -494,9 +513,39 @@ def _format_agent_pin_expires_text(expires_at=None) -> str:
     if expires_at is None:
         expires_at = _get_agent_pin_expires_at()
 
-    expires_local = expires_at.astimezone(AGENT_PIN_TZ)
+    expires_local = timezone.localtime(expires_at, AGENT_PIN_TZ)
 
-    return f"до {expires_local.strftime('%H:%M')} сегодняшнего дня"
+    return f"до {expires_local.strftime('%H:%M:%S')} сегодняшнего дня"
+
+
+def _generate_agent_daily_pin_for_user(user) -> str:
+    """
+    Один пользователь в один день получает один и тот же PIN.
+    На следующий день PIN автоматически будет другим.
+    """
+    local_date = _get_agent_pin_local_date().isoformat()
+
+    user_id = str(getattr(user, "id", "") or "")
+    employee_id = str(getattr(user, "employee_id", "") or "").strip()
+
+    payload = f"agent-auth-pin:{user_id}:{employee_id}:{local_date}"
+
+    digest = hmac.new(
+        AGENT_DAILY_PIN_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    pin_number = int(digest[:12], 16) % 10000
+
+    return f"{pin_number:04d}"
+
+
+def _hash_agent_pin(pin: str) -> str:
+    """
+    Хэш PIN для сохранения в auth_sessions.
+    """
+    return hashlib.sha256(str(pin).encode("utf-8")).hexdigest()
 
 
 
@@ -8806,11 +8855,13 @@ def agent_auth_start(request):
 
         session_uuid = uuid.uuid4()
         session_id = str(session_uuid)
-
-        pin = _generate_pin_code()
+        
+        # Персональный дневной PIN пользователя.
+        # В течение текущего дня для этого пользователя он всегда одинаковый.
+        pin = _generate_agent_daily_pin_for_user(user)
         expires_at = _get_agent_pin_expires_at()
-        pin_hash = hashlib.sha256(pin.encode('utf-8')).hexdigest()
-
+        pin_hash = _hash_agent_pin(pin)
+        
         AuthSession.objects.create(
             session_id=session_uuid,
             user=user,
@@ -8865,7 +8916,8 @@ def agent_auth_start(request):
             extra={
                 "delivery": delivery,
                 "expires_at": expires_at,
-                "pin_expires_mode": "today_23_59",
+                "pin_expires_mode": "daily_personal_until_23_59_59",
+                "pin_date": _get_agent_pin_local_date().isoformat(),
                 "pin_timezone": str(AGENT_PIN_TZ),
                 "auth_mode": "pin",
                 "isnot2fa": False,
@@ -8981,7 +9033,7 @@ def agent_auth_verify_pin(request):
                 },
             )
 
-        if sess.status != 'pin_sent':
+        if sess.status not in ('pin_sent', 'success'):
             return _agent_audit_error(
                 request,
                 event=event,
@@ -9007,7 +9059,7 @@ def agent_auth_verify_pin(request):
                 extra={"attempts": sess.attempts},
             )
 
-        pin_hash_input = hashlib.sha256(pin_input.encode('utf-8')).hexdigest()
+        pin_hash_input = _hash_agent_pin(pin_input)
         if pin_hash_input != (sess.pin_hash or ""):
             sess.attempts = sess.attempts + 1
             if sess.attempts >= MAX_PIN_ATTEMPTS:
@@ -9046,8 +9098,9 @@ def agent_auth_verify_pin(request):
                 },
             )
 
-        sess.status = 'success'
-        sess.save(update_fields=['status', 'updated_at'])
+        if sess.status != 'success':
+            sess.status = 'success'
+            sess.save(update_fields=['status', 'updated_at'])
 
         stores_payload, cred, stores_response = _build_agent_stores_response(sess.user)
 
