@@ -466,6 +466,41 @@ LDAP_EXPORT_MAX_TOTAL = int(os.getenv("LDAP_EXPORT_MAX_TOTAL", "20000"))
 
 # Helpers: hashing/pin/session
 
+# Время жизни PIN для agent_auth: до 23:59 текущего дня
+AGENT_PIN_TZ = ZoneInfo(os.getenv("AGENT_PIN_TZ", "Asia/Irkutsk"))
+
+
+def _get_agent_pin_expires_at():
+    """
+    Возвращает expires_at для PIN: сегодня в 23:59:59
+    в локальной зоне AGENT_PIN_TZ.
+    """
+    now_local = timezone.now().astimezone(AGENT_PIN_TZ)
+
+    expires_local = now_local.replace(
+        hour=23,
+        minute=59,
+        second=59,
+        microsecond=0,
+    )
+
+    return expires_local
+
+
+def _format_agent_pin_expires_text(expires_at=None) -> str:
+    """
+    Текст для сообщения пользователю.
+    """
+    if expires_at is None:
+        expires_at = _get_agent_pin_expires_at()
+
+    expires_local = expires_at.astimezone(AGENT_PIN_TZ)
+
+    return f"до {expires_local.strftime('%H:%M')} сегодняшнего дня"
+
+
+
+
 
 def _rand_pin_4() -> str:
     return f"{random.randint(0, 9999):04d}"
@@ -7919,7 +7954,7 @@ def send_email_to_user(user, subject: str, message: str) -> bool:
 
 
 
-def send_pin_to_user_channels(user, pin: str) -> dict:
+def send_pin_to_user_channels(user, pin: str, expires_at=None) -> dict:
     """
     Отправляет PIN по приоритету каналов:
 
@@ -7931,7 +7966,7 @@ def send_pin_to_user_channels(user, pin: str) -> dict:
     - Telegram для PIN сейчас НЕ используется
     - fallback с MAX на email НЕ выполняется, если max_id есть
     """
-    ttl_text = f"{PIN_TTL_MINUTES} минут"
+    ttl_text = _format_agent_pin_expires_text(expires_at)
     pin_message = f"Ваш код авторизации: {pin}\nОн действителен {ttl_text}."
 
     max_sent = False
@@ -8773,7 +8808,7 @@ def agent_auth_start(request):
         session_id = str(session_uuid)
 
         pin = _generate_pin_code()
-        expires_at = timezone.now() + datetime.timedelta(minutes=PIN_TTL_MINUTES)
+        expires_at = _get_agent_pin_expires_at()
         pin_hash = hashlib.sha256(pin.encode('utf-8')).hexdigest()
 
         AuthSession.objects.create(
@@ -8786,7 +8821,7 @@ def agent_auth_start(request):
             expires_at=expires_at,
         )
 
-        delivery = send_pin_to_user_channels(user, pin)
+        delivery = send_pin_to_user_channels(user, pin, expires_at=expires_at)
 
         if not delivery["ok"]:
             logger.error(
@@ -8830,7 +8865,8 @@ def agent_auth_start(request):
             extra={
                 "delivery": delivery,
                 "expires_at": expires_at,
-                "pin_ttl_minutes": PIN_TTL_MINUTES,
+                "pin_expires_mode": "today_23_59",
+                "pin_timezone": str(AGENT_PIN_TZ),
                 "auth_mode": "pin",
                 "isnot2fa": False,
             },
