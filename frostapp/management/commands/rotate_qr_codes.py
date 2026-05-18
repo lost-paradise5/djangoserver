@@ -13,7 +13,7 @@ from frostapp.views import (
     get_next_trm_employee_id,
     connect_ukm,
     _send_max_log_async,
-    UKM5_FULL_XML_STORE_IDS,
+    get_ukm5_full_xml_store_ids,
     TRM_SMALL_MAX,
 )
 
@@ -89,7 +89,7 @@ class Command(BaseCommand):
             tz = ZoneInfo(opts['tz'])
             today_local = timezone.now().astimezone(tz).date()
 
-            anchor_store_ids = sorted(int(x) for x in (UKM5_FULL_XML_STORE_IDS or {2013}))
+            anchor_store_ids = sorted(int(x) for x in (get_ukm5_full_xml_store_ids() or {2013}))
             allowed_store_ids = set(anchor_store_ids)
 
             qs = User.objects.filter(
