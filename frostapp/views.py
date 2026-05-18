@@ -165,19 +165,135 @@ ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_PA
 
 SYNC_DEFAULT_PAGE_SIZE = 100
 
-def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
-    raw = os.getenv(name, default_csv) or ""
+# def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
+#     raw = os.getenv(name, default_csv) or ""
+#     out: set[int] = set()
+#     for part in raw.split(","):
+#         part = part.strip()
+#         if not part:
+#             continue
+#         try:
+#             out.add(int(part))
+#         except Exception:
+
+#             pass
+#     return out
+
+
+
+
+
+def _parse_int_set(raw: str) -> set[int]:
     out: set[int] = set()
+
+    raw = raw or ""
     for part in raw.split(","):
         part = part.strip()
         if not part:
             continue
+
         try:
             out.add(int(part))
         except Exception:
+            logger.warning(f"[ENV] Некорректный storeid в списке UKM5_FULL_XML_STORE_IDS: {part!r}")
 
-            pass
     return out
+
+
+def _parse_int_set_env(name: str, default_csv: str) -> set[int]:
+    return _parse_int_set(os.getenv(name, default_csv) or "")
+
+
+def _read_simple_env_file_value(name: str, env_path: str = "/app/.env") -> str | None:
+    """
+    Простое чтение .env без python-dotenv.
+
+    Поддерживает строки вида:
+      KEY=value
+      export KEY=value
+      KEY="value"
+      KEY='value'
+
+    Комментарии и пустые строки пропускаются.
+    """
+    try:
+        if not os.path.exists(env_path):
+            return None
+
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = (line or "").strip()
+
+                if not line or line.startswith("#"):
+                    continue
+
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if key != name:
+                    continue
+
+                if (
+                    len(value) >= 2
+                    and (
+                        (value[0] == value[-1] == '"')
+                        or (value[0] == value[-1] == "'")
+                    )
+                ):
+                    value = value[1:-1]
+
+                return value
+
+    except Exception as e:
+        logger.error(f"[ENV] Ошибка чтения {env_path}: {e}", exc_info=True)
+
+    return None
+
+
+def get_ukm5_full_xml_store_ids() -> set[int]:
+    """
+    Динамически читает список магазинов для ночной ротации.
+
+    Приоритет:
+      1. /app/.env
+      2. переменная окружения UKM5_FULL_XML_STORE_IDS
+      3. дефолт 2013,9016,1003
+    """
+    default_csv = "2013,9016,1003"
+
+    raw_from_file = _read_simple_env_file_value("UKM5_FULL_XML_STORE_IDS", "/app/.env")
+    if raw_from_file is not None:
+        result = _parse_int_set(raw_from_file)
+        if result:
+            return result
+
+        logger.warning(
+            "[ENV] UKM5_FULL_XML_STORE_IDS найден в /app/.env, но список пустой/некорректный. "
+            "Использую fallback."
+        )
+
+    return _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", default_csv)
+
+
+# Оставляем старую переменную для совместимости со старым кодом.
+# Но в rotate_qr_codes.py лучше использовать get_ukm5_full_xml_store_ids().
+UKM5_FULL_XML_STORE_IDS: set[int] = get_ukm5_full_xml_store_ids()
+
+
+
+
+
+
+
+
+
 
 
 @lru_cache(maxsize=512)
