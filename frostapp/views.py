@@ -7869,22 +7869,54 @@ def _normalize_oracle_value(value):
     return value if value else None
 
 
-
-def _get_supermag_store_meta_map(smstore_ids):
+def _get_postgres_store_meta_map(smstore_ids):
     """
-    Возвращает словарь:
-    {
-        smstore_id: {
-            "name": ...,
-            "address": ...,
-            "inn": ...,
-            "kpp": ...,          # ВАЖНО: теперь из supermag.smclientinfo
-            "fsrar_id": ...,
-            "ukm_server_ip": ...,
-            "dbname": ...,
-            "market": ...
+    Fallback-источник по магазинам из PostgreSQL stores.
+
+    Используется, если Supermag/BINUU00 недоступна
+    или не вернула REP.DBNAME, затем если BINUU12 тоже не помогла.
+    """
+    prepared_ids = []
+    for sid in smstore_ids or []:
+        try:
+            prepared_ids.append(int(sid))
+        except Exception:
+            continue
+
+    prepared_ids = list(dict.fromkeys(prepared_ids))
+    if not prepared_ids:
+        return {}
+
+    result = {}
+
+    qs = (
+        Store.objects
+        .filter(smstore__in=prepared_ids)
+        .only("smstore", "name", "address", "ukm4ip", "dbname")
+    )
+
+    for store in qs:
+        if store.smstore is None:
+            continue
+
+        result[int(store.smstore)] = {
+            "name": _normalize_oracle_value(store.name),
+            "address": _normalize_oracle_value(store.address),
+            "inn": None,
+            "kpp": None,
+            "fsrar_id": None,
+            "ukm_server_ip": str(store.ukm4ip).strip() if store.ukm4ip else None,
+            "dbname": _normalize_oracle_value(getattr(store, "dbname", None)),
+            "market": None,
+            "dbname_source": "postgres_stores",
         }
-    }
+
+    return result
+
+def _get_supermag_store_meta_map_from_service(smstore_ids, service_name: str):
+    """
+    Читает расширенные данные магазинов из конкретной базы Supermag:
+    BINUU00, BINUU12 и т.д.
     """
     prepared_ids = []
     for sid in smstore_ids or []:
@@ -7971,8 +8003,9 @@ def _get_supermag_store_meta_map(smstore_ids):
 
     conn = cur = None
     result = {}
+
     try:
-        conn = connect_oracle_supermag()
+        conn = _connect_oracle_service(service_name)
         cur = conn.cursor()
         cur.execute(sql, binds)
 
@@ -7992,13 +8025,11 @@ def _get_supermag_store_meta_map(smstore_ids):
                 "ukm_server_ip": _normalize_oracle_value(item.get("ukm_server_ip")),
                 "dbname": _normalize_oracle_value(item.get("dbname")),
                 "market": _normalize_oracle_value(item.get("subformat2")),
+                "dbname_source": service_name,
             }
 
         return result
 
-    except Exception as e:
-        logger.exception(f"[AGENT_AUTH] Ошибка получения расширенных данных магазинов из Supermag: {e}")
-        return {}
     finally:
         try:
             if cur:
@@ -8007,6 +8038,135 @@ def _get_supermag_store_meta_map(smstore_ids):
                 conn.close()
         except Exception:
             pass
+
+
+
+
+
+
+def _get_supermag_store_meta_map(smstore_ids):
+    """
+    Возвращает словарь:
+    {
+        smstore_id: {
+            "name": ...,
+            "address": ...,
+            "inn": ...,
+            "kpp": ...,
+            "fsrar_id": ...,
+            "ukm_server_ip": ...,
+            "dbname": ...,
+            "market": ...
+        }
+    }
+
+    Новая логика получения dbname:
+    1. BINUU00
+    2. BINUU12
+    3. PostgreSQL stores.dbname
+    """
+    prepared_ids = []
+    for sid in smstore_ids or []:
+        if sid is None:
+            continue
+        try:
+            prepared_ids.append(int(sid))
+        except Exception:
+            continue
+
+    prepared_ids = list(dict.fromkeys(prepared_ids))
+    if not prepared_ids:
+        return {}
+
+    result = {}
+
+    def merge_meta(source_map: dict, source_name: str):
+        for smstore, item in (source_map or {}).items():
+            try:
+                smstore_int = int(smstore)
+            except Exception:
+                continue
+
+            current = result.setdefault(smstore_int, {})
+
+            for key in [
+                "name",
+                "address",
+                "inn",
+                "kpp",
+                "fsrar_id",
+                "ukm_server_ip",
+                "dbname",
+                "market",
+            ]:
+                if not current.get(key) and item.get(key):
+                    current[key] = item.get(key)
+
+            if item.get("dbname") and not current.get("dbname_source"):
+                current["dbname_source"] = item.get("dbname_source") or source_name
+
+    # 1. Основной источник — BINUU00
+    try:
+        data_00 = _get_supermag_store_meta_map_from_service(prepared_ids, "BINUU00")
+        merge_meta(data_00, "BINUU00")
+    except Exception as e:
+        logger.exception(
+            f"[AGENT_AUTH] Не удалось получить данные магазинов из BINUU00: {e}"
+        )
+
+    missing_dbname_after_00 = [
+        sid for sid in prepared_ids
+        if not result.get(sid, {}).get("dbname")
+    ]
+
+    # 2. Если по каким-то магазинам dbname не получили — пробуем BINUU12
+    if missing_dbname_after_00:
+        try:
+            data_12 = _get_supermag_store_meta_map_from_service(
+                missing_dbname_after_00,
+                "BINUU12",
+            )
+            merge_meta(data_12, "BINUU12")
+        except Exception as e:
+            logger.exception(
+                f"[AGENT_AUTH] Не удалось получить данные магазинов из BINUU12: {e}"
+            )
+
+    missing_dbname_after_12 = [
+        sid for sid in prepared_ids
+        if not result.get(sid, {}).get("dbname")
+    ]
+
+    # 3. Последний fallback — PostgreSQL stores.dbname
+    if missing_dbname_after_12:
+        try:
+            pg_data = _get_postgres_store_meta_map(missing_dbname_after_12)
+            merge_meta(pg_data, "postgres_stores")
+        except Exception as e:
+            logger.exception(
+                f"[AGENT_AUTH] Не удалось получить dbname из PostgreSQL stores: {e}"
+            )
+
+    # Чтобы структура всегда была одинаковая
+    for sid in prepared_ids:
+        result.setdefault(sid, {
+            "name": None,
+            "address": None,
+            "inn": None,
+            "kpp": None,
+            "fsrar_id": None,
+            "ukm_server_ip": None,
+            "dbname": None,
+            "market": None,
+            "dbname_source": None,
+        })
+
+        if not result[sid].get("dbname"):
+            logger.warning(
+                f"[AGENT_AUTH] DBNAME не найден ни в BINUU00, ни в BINUU12, ни в stores.dbname для smstore={sid}"
+            )
+
+    return result
 
 
 
@@ -8252,6 +8412,10 @@ def _get_agent_user_stores(user):
         meta = supermag_meta_map.get(int(smstore), {}) if smstore is not None else {}
 
         dbname = meta.get('dbname')
+
+        if not dbname and store_obj and getattr(store_obj, "dbname", None):
+            dbname = _safe_text(store_obj.dbname)
+        
         if not dbname and smstore is not None:
             try:
                 dbname = get_dbname_for_smstore(smstore)
@@ -8269,6 +8433,7 @@ def _get_agent_user_stores(user):
             'address': meta.get('address') or (store_obj.address if store_obj else '') or '',
             'roleid': row.get('roleid'),
             'dbname': dbname,
+            'dbname_source': meta.get('dbname_source'),
             'ukm_server_ip': meta.get('ukm_server_ip') or (str(store_obj.ukm4ip) if store_obj and store_obj.ukm4ip else None),
             'inn': meta.get('inn'),
             'kpp': meta.get('kpp'),
@@ -8374,6 +8539,7 @@ def _build_agent_stores_response(user, include_password=True):
             'address': store['address'],
             'roleid': store['roleid'],
             'dbname': store['dbname'],
+            'dbname_source': store.get('dbname_source'),
             'ukm_server_ip': store['ukm_server_ip'],
             'inn': store['inn'],
             'kpp': store['kpp'],
