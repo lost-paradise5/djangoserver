@@ -162,6 +162,8 @@ class Store(models.Model):
     ukm4ip = models.GenericIPAddressField(null=True, blank=True)
     ukm5store = models.IntegerField(null=True, blank=True)
 
+    dbname = models.TextField(null=True, blank=True)
+
     latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
 
