@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.db import connection
-from django.db.models import Q
+
 
 from frostapp.models import User, QRCode, UKMUser
 from frostapp.views import (
@@ -93,12 +93,9 @@ class Command(BaseCommand):
             anchor_store_ids = sorted(int(x) for x in (get_ukm5_full_xml_store_ids() or {2013}))
             allowed_store_ids = set(anchor_store_ids)
             
-            has_contact_id = (
-                Q(tg_id__isnull=False) & ~Q(tg_id__exact="")
-            ) | Q(max_id__isnull=False)
             
             qs = User.objects.filter(
-                has_contact_id,
+                tg_id__isnull=False,
                 id__in=UKMUser.objects.filter(storeid__in=anchor_store_ids).values('user_id'),
             ).distinct()
 
@@ -193,7 +190,6 @@ class Command(BaseCommand):
             "inn": (user.employee_id or "").strip(),
             "phone": (getattr(user, "phone", None) or "").strip(),
             "tg_id": getattr(user, "tg_id", None),
-            "max_id": getattr(user, "max_id", None),
             "status": "",
             "error": "",
             "stores": [],
