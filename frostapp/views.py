@@ -22824,3 +22824,798 @@ def handle_checklist_message_event(user: User, text: str, max_user_id: int, max_
         )
 
     return build_main_menu(user)
+
+
+
+
+
+
+### формирует реестр сотрудников по магазинам
+
+def _store_report_safe_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _store_report_norm_name(value: str) -> str:
+    """
+    Нормализация ФИО для сопоставления:
+    - нижний регистр
+    - убираем лишние пробелы
+    """
+    value = _store_report_safe_text(value).lower()
+    return " ".join(value.split())
+
+
+def _store_report_norm_phone(value: str) -> str:
+    """
+    Оставляем только цифры.
+    8XXXXXXXXXX приводим к 7XXXXXXXXXX.
+    """
+    digits = re.sub(r"\D+", "", _store_report_safe_text(value))
+
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+
+    return digits
+
+
+def _store_report_phone_last10(value: str) -> str:
+    digits = _store_report_norm_phone(value)
+    if len(digits) >= 10:
+        return digits[-10:]
+    return ""
+
+
+def _store_report_full_name_from_onec(emp: dict) -> str:
+    """
+    Собираем ФИО из ответа 1С.
+    Если вдруг в ответе уже будет поле ФИО — используем его.
+    """
+    fio = _store_report_safe_text(
+        emp.get("ФИО")
+        or emp.get("Фио")
+        or emp.get("fio")
+        or emp.get("full_name")
+    )
+
+    if fio:
+        return " ".join(fio.split())
+
+    last_name = _store_report_safe_text(emp.get("Фамилия"))
+    first_name = _store_report_safe_text(emp.get("Имя"))
+    middle_name = _store_report_safe_text(emp.get("Отчество"))
+
+    return " ".join(x for x in [last_name, first_name, middle_name] if x).strip()
+
+
+def _store_report_parse_smstores(raw: str) -> list[int]:
+    """
+    Парсим stores=412,2013,9016
+    """
+    raw = _store_report_safe_text(raw)
+    if not raw:
+        return []
+
+    result = []
+    seen = set()
+
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        try:
+            sid = int(part)
+        except Exception:
+            continue
+
+        if sid not in seen:
+            result.append(sid)
+            seen.add(sid)
+
+    return result
+
+
+def _store_report_extract_onec_list(payload):
+    """
+    Ответ 1С может быть:
+    - списком
+    - словарём с ключом data/result/items/employees
+    Поэтому делаем универсально.
+    """
+    if isinstance(payload, list):
+        return payload
+
+    if isinstance(payload, dict):
+        for key in ("data", "result", "items", "employees", "Сотрудники"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+
+        # Если вдруг 1С вернула словарь вида {"0": {...}, "1": {...}}
+        values = list(payload.values())
+        if values and all(isinstance(x, dict) for x in values):
+            return values
+
+    return []
+
+
+def _store_report_fetch_onec_working_employees() -> list[dict]:
+    """
+    Получаем всех работающих сотрудников из 1С.
+    Фильтрация по магазинам будет уже внутри Django.
+    """
+    auth = None
+    if ONEC_WORKING_EMPLOYEES_AUTH_USER or ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD:
+        auth = (
+            ONEC_WORKING_EMPLOYEES_AUTH_USER,
+            ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD,
+        )
+
+    response = requests.get(
+        ONEC_WORKING_EMPLOYEES_URL,
+        auth=auth,
+        timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    employees = _store_report_extract_onec_list(payload)
+
+    clean = []
+    for item in employees:
+        if isinstance(item, dict):
+            clean.append(item)
+
+    return clean
+
+
+def _store_report_find_users_for_employees(employees: list[dict]) -> dict[str, list[dict]]:
+    """
+    Возвращает словарь:
+      employee_key -> список найденных пользователей из users
+
+    Ищем по:
+    1. ФИО
+    2. employee_id = ИНН
+    3. последние 10 цифр телефона
+
+    Если записей несколько — вернутся все.
+    """
+    names_norm = set()
+    inns = set()
+    phone_last10_set = set()
+
+    employee_keys = []
+
+    for emp in employees:
+        fio = _store_report_full_name_from_onec(emp)
+        inn = _store_report_safe_text(emp.get("ИНН"))
+        phone = _store_report_safe_text(emp.get("НомерТелефона"))
+
+        name_norm = _store_report_norm_name(fio)
+        phone_last10 = _store_report_phone_last10(phone)
+
+        if name_norm:
+            names_norm.add(name_norm)
+        if inn:
+            inns.add(inn)
+        if phone_last10:
+            phone_last10_set.add(phone_last10)
+
+        employee_keys.append((name_norm, inn, phone_last10))
+
+    result_by_employee_key = defaultdict(list)
+
+    if not names_norm and not inns and not phone_last10_set:
+        return result_by_employee_key
+
+    # Чтобы ANY(%s) не падал на пустых массивах
+    names_arg = list(names_norm) or ["__none__"]
+    inns_arg = list(inns) or ["__none__"]
+    phones_arg = list(phone_last10_set) or ["__none__"]
+
+    sql = """
+        SELECT
+            id,
+            employee_id,
+            full_name,
+            phone,
+            tg_id,
+            max_id
+        FROM users
+        WHERE lower(btrim(coalesce(full_name, ''))) = ANY(%s)
+           OR coalesce(employee_id, '') = ANY(%s)
+           OR right(regexp_replace(coalesce(phone, ''), '\\D', '', 'g'), 10) = ANY(%s)
+        ORDER BY full_name, id
+    """
+
+    users_rows = []
+
+    with connection.cursor() as cur:
+        cur.execute(sql, [names_arg, inns_arg, phones_arg])
+        cols = [c[0] for c in cur.description]
+        for row in cur.fetchall():
+            users_rows.append(dict(zip(cols, row)))
+
+    by_name = defaultdict(list)
+    by_inn = defaultdict(list)
+    by_phone = defaultdict(list)
+
+    for user_row in users_rows:
+        user_name_norm = _store_report_norm_name(user_row.get("full_name"))
+        user_inn = _store_report_safe_text(user_row.get("employee_id"))
+        user_phone_last10 = _store_report_phone_last10(user_row.get("phone"))
+
+        if user_name_norm:
+            by_name[user_name_norm].append(user_row)
+        if user_inn:
+            by_inn[user_inn].append(user_row)
+        if user_phone_last10:
+            by_phone[user_phone_last10].append(user_row)
+
+    for name_norm, inn, phone_last10 in employee_keys:
+        employee_key = f"{name_norm}|{inn}|{phone_last10}"
+
+        found = []
+        seen_user_ids = set()
+
+        for source_list in (
+            by_inn.get(inn, []),
+            by_phone.get(phone_last10, []),
+            by_name.get(name_norm, []),
+        ):
+            for user_row in source_list:
+                user_id = user_row.get("id")
+                if user_id in seen_user_ids:
+                    continue
+
+                found.append(user_row)
+                seen_user_ids.add(user_id)
+
+        result_by_employee_key[employee_key] = found
+
+    return result_by_employee_key
+
+
+def _store_report_position_sort_key(position: str):
+    """
+    Чтобы должности были не просто по алфавиту, а примерно в нормальном порядке.
+    Всё неизвестное уйдёт ниже.
+    """
+    p = _store_report_norm_name(position)
+
+    order = [
+        "директор",
+        "директор магазина",
+        "администратор",
+        "администратор магазина",
+        "администратор мобильного подразделения",
+        "приемщик",
+        "приемщик товара",
+        "приемщик магазина",
+        "контролер торгового зала",
+        "контролер торгового зала 1 категории",
+        "контролер торгового зала 2 категории",
+        "контролер торгового зала 3 категории",
+        "старший специалист торгового зала",
+        "специалист торгового зала",
+        "специалист торгового зала 1 категории",
+        "специалист торгового зала 2 категории",
+        "специалист торгового зала 3 категории",
+    ]
+
+    try:
+        idx = order.index(p)
+    except ValueError:
+        idx = 999
+
+    return idx, p
+
+
+def _store_report_add_borders(ws, cell_range: str):
+    thin = Side(style="thin", color="D9E2F3")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for row in ws[cell_range]:
+        for cell in row:
+            cell.border = border
+
+
+def _store_report_autofit(ws, min_width=10, max_width=38):
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        best = min_width
+
+        for row_idx in range(1, ws.max_row + 1):
+            value = ws.cell(row=row_idx, column=col_idx).value
+            if value is None:
+                continue
+
+            value_len = len(str(value))
+            if value_len > best:
+                best = value_len
+
+        ws.column_dimensions[letter].width = min(best + 2, max_width)
+
+
+def _store_report_build_excel(
+    store_ids: list[int],
+    stores_map: dict[int, dict],
+    employees_by_store: dict[int, list[dict]],
+    users_by_employee_key: dict[str, list[dict]],
+) -> bytes:
+    wb = Workbook()
+
+    ws_summary = wb.active
+    ws_summary.title = "Свод"
+
+    ws_grouped = wb.create_sheet("По должностям")
+
+    title_fill = PatternFill("solid", fgColor="1F4E78")
+    section_fill = PatternFill("solid", fgColor="D9EAF7")
+    header_fill = PatternFill("solid", fgColor="BDD7EE")
+    subheader_fill = PatternFill("solid", fgColor="EAF3F8")
+    not_found_fill = PatternFill("solid", fgColor="FCE4D6")
+
+    white_font = Font(color="FFFFFF", bold=True)
+    bold_font = Font(bold=True)
+
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # -------------------------
+    # Лист 1: Свод
+    # -------------------------
+    summary_headers = [
+        "SMSTORE",
+        "Название магазина",
+        "Должность",
+        "ФИО из 1С",
+        "Телефон из 1С",
+        "ИНН из 1С",
+        "Дата приёма",
+        "Подразделение",
+        "users.id",
+        "ФИО в users",
+        "Телефон в users",
+        "tg_id",
+        "max_id",
+        "Статус поиска",
+    ]
+
+    ws_summary.append(summary_headers)
+
+    for col in range(1, len(summary_headers) + 1):
+        cell = ws_summary.cell(row=1, column=col)
+        cell.fill = title_fill
+        cell.font = white_font
+        cell.alignment = center
+
+    row_num = 2
+
+    for store_id in store_ids:
+        store_info = stores_map.get(store_id, {})
+        store_name = store_info.get("name") or "Магазин не найден в таблице stores"
+
+        employees = employees_by_store.get(store_id, [])
+        employees = sorted(
+            employees,
+            key=lambda e: (
+                _store_report_position_sort_key(_store_report_safe_text(e.get("Должность"))),
+                _store_report_norm_name(_store_report_full_name_from_onec(e)),
+            )
+        )
+
+        if not employees:
+            ws_summary.append([
+                store_id,
+                store_name,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "В ответе 1С нет сотрудников по этому ИдМагазина",
+            ])
+
+            for col in range(1, len(summary_headers) + 1):
+                ws_summary.cell(row=row_num, column=col).fill = not_found_fill
+
+            row_num += 1
+            continue
+
+        for emp in employees:
+            fio = _store_report_full_name_from_onec(emp)
+            inn = _store_report_safe_text(emp.get("ИНН"))
+            phone = _store_report_safe_text(emp.get("НомерТелефона"))
+            position = _store_report_safe_text(emp.get("Должность"))
+            hire_date = _store_report_safe_text(emp.get("ДатаПриема"))
+            subdivision = _store_report_safe_text(emp.get("Подразделение"))
+
+            emp_key = (
+                f"{_store_report_norm_name(fio)}|"
+                f"{inn}|"
+                f"{_store_report_phone_last10(phone)}"
+            )
+
+            matched_users = users_by_employee_key.get(emp_key, [])
+
+            if not matched_users:
+                ws_summary.append([
+                    store_id,
+                    store_name,
+                    position,
+                    fio,
+                    phone,
+                    inn,
+                    hire_date,
+                    subdivision,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "Не найден в users",
+                ])
+                row_num += 1
+                continue
+
+            for user_row in matched_users:
+                ws_summary.append([
+                    store_id,
+                    store_name,
+                    position,
+                    fio,
+                    phone,
+                    inn,
+                    hire_date,
+                    subdivision,
+                    user_row.get("id") or "",
+                    user_row.get("full_name") or "",
+                    user_row.get("phone") or "",
+                    user_row.get("tg_id") or "",
+                    user_row.get("max_id") or "",
+                    "Найден",
+                ])
+                row_num += 1
+
+    _store_report_add_borders(ws_summary, f"A1:N{ws_summary.max_row}")
+    _store_report_autofit(ws_summary, max_width=42)
+    ws_summary.freeze_panes = "A2"
+    ws_summary.auto_filter.ref = f"A1:N{ws_summary.max_row}"
+
+    for row in ws_summary.iter_rows(min_row=2, max_row=ws_summary.max_row):
+        for cell in row:
+            cell.alignment = left
+
+    # -------------------------
+    # Лист 2: По должностям
+    # -------------------------
+    current_row = 1
+
+    for store_id in store_ids:
+        store_info = stores_map.get(store_id, {})
+        store_name = store_info.get("name") or "Магазин не найден в таблице stores"
+
+        employees = employees_by_store.get(store_id, [])
+
+        positions = sorted(
+            {
+                _store_report_safe_text(emp.get("Должность")) or "Без должности"
+                for emp in employees
+            },
+            key=_store_report_position_sort_key,
+        )
+
+        if not positions:
+            positions = ["Нет сотрудников в ответе 1С"]
+
+        # Каждая должность = 4 колонки
+        total_cols = max(len(positions) * 4, 4)
+
+        ws_grouped.merge_cells(
+            start_row=current_row,
+            start_column=1,
+            end_row=current_row,
+            end_column=total_cols,
+        )
+
+        title_cell = ws_grouped.cell(row=current_row, column=1)
+        title_cell.value = f"Магазин {store_id} — {store_name}"
+        title_cell.fill = title_fill
+        title_cell.font = white_font
+        title_cell.alignment = center
+
+        current_row += 1
+
+        # Строка должностей
+        for pos_idx, position in enumerate(positions):
+            start_col = pos_idx * 4 + 1
+            end_col = start_col + 3
+
+            ws_grouped.merge_cells(
+                start_row=current_row,
+                start_column=start_col,
+                end_row=current_row,
+                end_column=end_col,
+            )
+
+            cell = ws_grouped.cell(row=current_row, column=start_col)
+            cell.value = position
+            cell.fill = section_fill
+            cell.font = bold_font
+            cell.alignment = center
+
+        current_row += 1
+
+        # Подзаголовки
+        subheaders = ["ФИО", "Телефон", "tg_id", "max_id"]
+
+        for pos_idx, position in enumerate(positions):
+            start_col = pos_idx * 4 + 1
+
+            for offset, header in enumerate(subheaders):
+                cell = ws_grouped.cell(row=current_row, column=start_col + offset)
+                cell.value = header
+                cell.fill = header_fill
+                cell.font = bold_font
+                cell.alignment = center
+
+        current_row += 1
+
+        position_rows = defaultdict(list)
+
+        for emp in employees:
+            position = _store_report_safe_text(emp.get("Должность")) or "Без должности"
+
+            fio = _store_report_full_name_from_onec(emp)
+            inn = _store_report_safe_text(emp.get("ИНН"))
+            phone = _store_report_safe_text(emp.get("НомерТелефона"))
+
+            emp_key = (
+                f"{_store_report_norm_name(fio)}|"
+                f"{inn}|"
+                f"{_store_report_phone_last10(phone)}"
+            )
+
+            matched_users = users_by_employee_key.get(emp_key, [])
+
+            if not matched_users:
+                position_rows[position].append({
+                    "fio": fio,
+                    "phone": phone,
+                    "tg_id": "",
+                    "max_id": "",
+                })
+            else:
+                for user_row in matched_users:
+                    position_rows[position].append({
+                        "fio": fio,
+                        "phone": phone,
+                        "tg_id": user_row.get("tg_id") or "",
+                        "max_id": user_row.get("max_id") or "",
+                    })
+
+        max_rows = 1
+        if employees:
+            max_rows = max(len(position_rows.get(position, [])) for position in positions)
+
+        data_start_row = current_row
+
+        for i in range(max_rows):
+            for pos_idx, position in enumerate(positions):
+                start_col = pos_idx * 4 + 1
+                rows_for_position = position_rows.get(position, [])
+
+                if i >= len(rows_for_position):
+                    continue
+
+                item = rows_for_position[i]
+
+                values = [
+                    item.get("fio") or "",
+                    item.get("phone") or "",
+                    item.get("tg_id") or "",
+                    item.get("max_id") or "",
+                ]
+
+                for offset, value in enumerate(values):
+                    cell = ws_grouped.cell(
+                        row=current_row + i,
+                        column=start_col + offset,
+                    )
+                    cell.value = value
+                    cell.alignment = left
+
+        data_end_row = current_row + max_rows - 1
+
+        if data_end_row >= data_start_row:
+            _store_report_add_borders(
+                ws_grouped,
+                f"A{current_row - 2}:{get_column_letter(total_cols)}{data_end_row}",
+            )
+
+        current_row = data_end_row + 3
+
+    _store_report_autofit(ws_grouped, max_width=34)
+
+    for ws in [ws_summary, ws_grouped]:
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(
+                    horizontal=cell.alignment.horizontal or "left",
+                    vertical=cell.alignment.vertical or "top",
+                    wrap_text=True,
+                )
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    return output.getvalue()
+
+
+@require_GET
+def working_employees_by_stores_excel(request):
+    """
+    GET /working-employees-by-stores-excel/?stores=412,2013&token=wc3wow
+
+    stores — один или несколько smstore через запятую.
+    """
+    # Защита отчёта, потому что внутри телефоны, tg_id и max_id.
+    # Если хочешь отключить токен — задай WORKING_EMPLOYEE_REPORT_TOKEN пустым.
+    report_token = os.getenv("WORKING_EMPLOYEE_REPORT_TOKEN", INACTIVE_REPORT_TOKEN).strip()
+
+    if report_token:
+        request_token = _store_report_safe_text(request.GET.get("token"))
+        if request_token != report_token:
+            return HttpResponseForbidden("Invalid token")
+
+    raw_stores = (
+        request.GET.get("stores")
+        or request.GET.get("store")
+        or request.GET.get("smstores")
+        or ""
+    )
+
+    store_ids = _store_report_parse_smstores(raw_stores)
+
+    if not store_ids:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Передай id магазина через параметр stores, например: ?stores=412 или ?stores=412,2013",
+            },
+            status=400,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+    try:
+        logger.info(f"[WORKING_EMPLOYEES_XLSX] Запрос отчёта по smstore={store_ids}")
+
+        stores_rows = (
+            Store.objects
+            .filter(smstore__in=store_ids)
+            .values("smstore", "name", "address")
+        )
+
+        stores_map = {}
+        for row in stores_rows:
+            try:
+                smstore = int(row.get("smstore"))
+            except Exception:
+                continue
+
+            stores_map[smstore] = {
+                "name": row.get("name") or "",
+                "address": row.get("address") or "",
+            }
+
+        onec_employees = _store_report_fetch_onec_working_employees()
+
+        employees_by_store = defaultdict(list)
+
+        wanted = set(store_ids)
+
+        for emp in onec_employees:
+            raw_store_id = _store_report_safe_text(emp.get("ИдМагазина"))
+            if not raw_store_id:
+                continue
+
+            try:
+                emp_store_id = int(raw_store_id)
+            except Exception:
+                continue
+
+            if emp_store_id not in wanted:
+                continue
+
+            employees_by_store[emp_store_id].append(emp)
+
+        all_selected_employees = []
+        for sid in store_ids:
+            all_selected_employees.extend(employees_by_store.get(sid, []))
+
+        users_by_employee_key = _store_report_find_users_for_employees(all_selected_employees)
+
+        xlsx_bytes = _store_report_build_excel(
+            store_ids=store_ids,
+            stores_map=stores_map,
+            employees_by_store=employees_by_store,
+            users_by_employee_key=users_by_employee_key,
+        )
+
+        now_str = timezone.now().strftime("%Y%m%d_%H%M%S")
+        stores_part = "_".join(str(x) for x in store_ids[:10])
+        if len(store_ids) > 10:
+            stores_part += "_etc"
+
+        filename = f"working_employees_stores_{stores_part}_{now_str}.xlsx"
+
+        response = HttpResponse(
+            xlsx_bytes,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+        logger.info(
+            "[WORKING_EMPLOYEES_XLSX] Отчёт сформирован: "
+            f"stores={store_ids}, employees={len(all_selected_employees)}, file={filename}"
+        )
+
+        return response
+
+    except RequestException as e:
+        logger.error(f"[WORKING_EMPLOYEES_XLSX] Ошибка запроса к 1С: {e}", exc_info=True)
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": f"Ошибка запроса к 1С: {e}",
+            },
+            status=502,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+    except Exception as e:
+        logger.error(f"[WORKING_EMPLOYEES_XLSX] Ошибка формирования отчёта: {e}", exc_info=True)
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": f"Ошибка формирования отчёта: {e}",
+            },
+            status=500,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
