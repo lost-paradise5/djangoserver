@@ -218,6 +218,14 @@ urlpatterns = [
         views.working_employees_sync_supermag_test_run,
         name="working_employees_sync_supermag_test_run",
     ),
+
+
+    path(
+        "working-employees-by-stores-excel/",
+        views.working_employees_by_stores_excel,
+        name="working_employees_by_stores_excel",
+    ),
+    
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
     path('sync/stores/', sync_stores_postgres, name='sync_stores_postgres'),
