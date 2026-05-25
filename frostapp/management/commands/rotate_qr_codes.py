@@ -47,7 +47,7 @@ class Command(BaseCommand):
     в целевые магазины из UKM5_FULL_XML_STORE_IDS.
     """
 
-    help = "Ежедневное обновление QR для пользователей с доступом к магазину УКМ и tg_id/max_id"
+    help = "Ежедневное обновление QR для всех пользователей с доступом к целевым магазинам УКМ."
 
     def add_arguments(self, parser):
         parser.add_argument('--batch-size', type=int, default=100)
@@ -102,13 +102,7 @@ class Command(BaseCommand):
             anchor_store_ids = sorted(int(x) for x in (get_ukm5_full_xml_store_ids() or {2013}))
             allowed_store_ids = set(anchor_store_ids)
             
-            has_contact_id = (
-                Q(tg_id__isnull=False)
-                | (Q(max_id__isnull=False) & Q(max_id__gt=0))
-            )
-            
             qs = User.objects.filter(
-                has_contact_id,
                 id__in=UKMUser.objects.filter(storeid__in=anchor_store_ids).values('user_id'),
             ).distinct()
 
@@ -505,29 +499,80 @@ class Command(BaseCommand):
         }
         return mapping.get(status or "", status or "неизвестно")
 
-    def _fit_max_message(self, lines: list[str], limit: int = 3900) -> str:
+
+    def _contact_note(self, info: dict) -> str:
+        """
+        Возвращает пометку по отсутствующим tg_id/max_id.
+        Нужно для отчёта MAX: сотрудник обновлён, но видно,
+        что у него нет tg_id, max_id или обоих.
+        """
+        tg_id = info.get("tg_id")
+        max_id = info.get("max_id")
+
+        has_tg = tg_id not in (None, "")
+        has_max = max_id not in (None, "", 0)
+
+        if not has_tg and not has_max:
+            return "нет tg_id и max_id"
+
+        if not has_tg:
+            return "нет tg_id"
+
+        if not has_max:
+            return "нет max_id"
+
+        return ""
+
+    def _split_max_messages(self, lines: list[str], limit: int = 3900) -> list[str]:
+        """
+        Делит большой MAX-отчёт на несколько сообщений.
+        Ничего не обрезает.
+
+        limit делаем 3900, чтобы не упираться в лимиты MAX.
+        """
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+
+        safe_limit = max(1000, int(limit) - 250)
+
+        for line in lines:
+            line = str(line)
+
+            # Если вдруг одна строка слишком длинная — режем её кусками.
+            if len(line) > safe_limit:
+                parts = [
+                    line[i:i + safe_limit]
+                    for i in range(0, len(line), safe_limit)
+                ]
+            else:
+                parts = [line]
+
+            for part in parts:
+                add_len = len(part) + 1
+
+                if current and current_len + add_len > safe_limit:
+                    chunks.append("\n".join(current))
+                    current = []
+                    current_len = 0
+
+                current.append(part)
+                current_len += add_len
+
+        if current:
+            chunks.append("\n".join(current))
+
+        if len(chunks) <= 1:
+            return chunks
+
+        total = len(chunks)
         result = []
-        cur_len = 0
 
-        for idx, line in enumerate(lines):
-            chunk = line if not result else "\n" + line
-            if cur_len + len(chunk) > limit:
-                remaining = len(lines) - idx
-                tail = f"… сообщение сокращено, ещё строк: {remaining}"
-                if result:
-                    extra_chunk = "\n" + tail
-                    if cur_len + len(extra_chunk) <= limit:
-                        result.append(tail)
-                    else:
-                        result[-1] = "… сообщение сокращено"
-                else:
-                    result.append("… сообщение сокращено")
-                break
+        for idx, chunk in enumerate(chunks, start=1):
+            prefix = f"🌙 Ночная ротация QR/паролей — часть {idx}/{total}\n\n"
+            result.append(prefix + chunk)
 
-            result.append(line)
-            cur_len += len(chunk)
-
-        return "\n".join(result)
+        return result
 
     def _send_max_summary(
         self,
@@ -553,11 +598,32 @@ class Command(BaseCommand):
             ukm4_ok = ukm4_err = 0
             ukm5_ok = ukm5_warn = ukm5_err = 0
 
+            no_tg = 0
+            no_max = 0
+            no_tg_and_no_max = 0
+
             store_groups = defaultdict(list)
 
             for info in details:
                 fio = (info.get("fio") or "").strip() or "ФИО не указано"
                 phone = (info.get("phone") or "").strip() or "—"
+
+                tg_id = info.get("tg_id")
+                max_id = info.get("max_id")
+
+                has_tg = tg_id not in (None, "")
+                has_max = max_id not in (None, "", 0)
+
+                if not has_tg:
+                    no_tg += 1
+
+                if not has_max:
+                    no_max += 1
+
+                if not has_tg and not has_max:
+                    no_tg_and_no_max += 1
+
+                contact_note = self._contact_note(info)
 
                 for sr in info.get("store_results") or []:
                     sync = sr.get("sync") or {}
@@ -577,9 +643,13 @@ class Command(BaseCommand):
                         ukm5_err += 1
 
                     store_groups[int(sr["storeid"])].append({
+                        "user_id": info.get("user_id"),
                         "fio": fio,
                         "roleid": sr.get("roleid"),
                         "phone": phone,
+                        "tg_id": tg_id,
+                        "max_id": max_id,
+                        "contact_note": contact_note,
                         "store_status": sr.get("store_status") or "ok",
                     })
 
@@ -596,6 +666,9 @@ class Command(BaseCommand):
                 f"Ошибок: {failed}",
                 f"UKM4: ok={ukm4_ok} err={ukm4_err}",
                 f"UKM5: ok={ukm5_ok} warn={ukm5_warn} err={ukm5_err}",
+                f"Без tg_id: {no_tg}",
+                f"Без max_id: {no_max}",
+                f"Без tg_id и max_id: {no_tg_and_no_max}",
                 f"Время: {elapsed_sec:.1f}s",
                 "",
                 "По магазинам:",
@@ -624,12 +697,25 @@ class Command(BaseCommand):
                     )
 
                     for u in users:
+                        note = ""
+                        if u.get("contact_note"):
+                            note = f" | ⚠️ {u['contact_note']}"
+
+                        phone = u.get("phone") or "—"
+
                         lines.append(
-                            f"• {u['fio']} | roleid={u['roleid']} | {u['phone']}"
+                            f"• {u['fio']} | {phone} | roleid={u['roleid']}{note}"
                         )
 
-            msg = self._fit_max_message(lines, limit=3900)
-            _send_max_log_async(msg)
+            messages = self._split_max_messages(lines, limit=3900)
+
+            for msg in messages:
+                _send_max_log_async(msg)
+
+            logger.info(
+                f"[ROTATE][MAX] summary queued: messages={len(messages)}, "
+                f"stores={len(store_groups)}, users={total}"
+            )
 
         except Exception as e:
             logger.error(f"[ROTATE] Не удалось поставить сводный лог в очередь MAX: {e}", exc_info=True)
