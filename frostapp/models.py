@@ -173,6 +173,48 @@ class Store(models.Model):
 
 
 
+
+
+
+class ShiftMarkQueue(models.Model):
+    id = models.BigAutoField(primary_key=True)
+
+    idem_key = models.CharField(max_length=128, unique=True)
+
+    status = models.CharField(max_length=20, default='pending')
+    payload = models.JSONField()
+
+    inn = models.CharField(max_length=20, null=True, blank=True)
+    fio = models.TextField(null=True, blank=True)
+    sm_store_id = models.IntegerField(null=True, blank=True)
+    ukm_store_id = models.IntegerField(null=True, blank=True)
+    event_datetime = models.CharField(max_length=32, null=True, blank=True)
+    direction = models.CharField(max_length=32, null=True, blank=True)
+
+    attempts = models.IntegerField(default=0)
+
+    last_http_status = models.IntegerField(null=True, blank=True)
+    last_response = models.TextField(null=True, blank=True)
+    last_error = models.TextField(null=True, blank=True)
+
+    next_attempt_at = models.DateTimeField()
+    locked_at = models.DateTimeField(null=True, blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'shift_mark_queue'
+        managed = False
+
+
+
+
+
+
+
+
 class AuthSession(models.Model):
     STATUS_CHOICES = [
         ('pending',   'Pending'),   # телефон подтверждён, магазин ещё не выбран
