@@ -95,6 +95,7 @@ from .models import (
     Department, 
     Position, 
     Store, 
+    ShiftMarkQueue,
     AuthSession,
     QRIssueLog, 
     VpnAccessSession, 
@@ -162,6 +163,22 @@ _AGENT_AUTH_SENSITIVE_KEYS = {
 
 ONEC_WORKING_EMPLOYEES_AUTH_USER = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_USER", "")
 ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD", "")
+
+
+
+SHIFT_QUEUE_RETRY_AFTER_MINUTES = int(
+    os.getenv("SHIFT_QUEUE_RETRY_AFTER_MINUTES", "60")
+)
+
+SHIFT_QUEUE_BATCH_SIZE = int(
+    os.getenv("SHIFT_QUEUE_BATCH_SIZE", "100")
+)
+
+SHIFT_QUEUE_LOCK_STALE_MINUTES = int(
+    os.getenv("SHIFT_QUEUE_LOCK_STALE_MINUTES", "30")
+)
+
+
 
 SYNC_DEFAULT_PAGE_SIZE = 100
 
@@ -5393,6 +5410,219 @@ def _post_to_onec(payload: dict, idem_key: str, timeout=(3, 7), retries=2) -> Tu
             if attempt < retries:
                 time.sleep(0.3 * (2 ** attempt)) 
     raise RuntimeError(f"Ошибка запроса в 1С: {last_exc}")
+
+
+
+
+def _clip_text(value: str, limit: int = 4000) -> str:
+    s = "" if value is None else str(value)
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def enqueue_shift_mark_for_retry(
+    *,
+    idem_key: str,
+    onec_payload: dict,
+    plain_inn: str,
+    fio: str,
+    sm_store_id_int: Optional[int],
+    ukm_store_id: Optional[int],
+    event_dt_str: str,
+    direction: str,
+    last_http_status: Optional[int] = None,
+    last_response: str = "",
+    last_error: str = "",
+) -> ShiftMarkQueue:
+    """
+    Сохраняет отметку смены в очередь для повторной отправки в 1С.
+    Если такая отметка уже есть по idem_key — не создаёт дубль.
+    """
+    close_old_connections()
+
+    now_dt = timezone.now()
+    next_attempt = now_dt + datetime.timedelta(minutes=SHIFT_QUEUE_RETRY_AFTER_MINUTES)
+
+    defaults = {
+        "status": "pending",
+        "payload": _json_safe(onec_payload),
+        "inn": str(plain_inn or ""),
+        "fio": str(fio or ""),
+        "sm_store_id": sm_store_id_int,
+        "ukm_store_id": ukm_store_id,
+        "event_datetime": str(event_dt_str or ""),
+        "direction": str(direction or ""),
+        "last_http_status": last_http_status,
+        "last_response": _clip_text(last_response),
+        "last_error": _clip_text(last_error),
+        "next_attempt_at": next_attempt,
+        "locked_at": None,
+        "updated_at": now_dt,
+    }
+
+    obj, created = ShiftMarkQueue.objects.get_or_create(
+        idem_key=idem_key,
+        defaults={
+            **defaults,
+            "attempts": 0,
+            "created_at": now_dt,
+        }
+    )
+
+    if not created and obj.status != "sent":
+        for key, value in defaults.items():
+            setattr(obj, key, value)
+        obj.save(update_fields=list(defaults.keys()))
+
+    return obj
+
+
+def _claim_shift_queue_item() -> Optional[ShiftMarkQueue]:
+    """
+    Забирает одну запись из очереди.
+    skip_locked нужен, чтобы два параллельных запуска команды не взяли одну и ту же отметку.
+    """
+    close_old_connections()
+
+    now_dt = timezone.now()
+    stale_locked_before = now_dt - datetime.timedelta(minutes=SHIFT_QUEUE_LOCK_STALE_MINUTES)
+
+    with transaction.atomic():
+        item = (
+            ShiftMarkQueue.objects
+            .select_for_update(skip_locked=True)
+            .filter(next_attempt_at__lte=now_dt)
+            .filter(
+                Q(status__in=["pending", "failed"]) |
+                Q(status="processing", locked_at__lt=stale_locked_before)
+            )
+            .order_by("created_at")
+            .first()
+        )
+
+        if not item:
+            return None
+
+        item.status = "processing"
+        item.locked_at = now_dt
+        item.updated_at = now_dt
+        item.save(update_fields=["status", "locked_at", "updated_at"])
+
+        return item
+
+
+def process_shift_mark_queue_once(limit: int = None) -> dict:
+    """
+    Обрабатывает очередь отметок смены.
+    Возвращает статистику для лога/management command.
+    """
+    limit = int(limit or SHIFT_QUEUE_BATCH_SIZE)
+
+    stats = {
+        "taken": 0,
+        "sent": 0,
+        "retry": 0,
+        "errors": 0,
+    }
+
+    for _ in range(limit):
+        item = _claim_shift_queue_item()
+
+        if not item:
+            break
+
+        stats["taken"] += 1
+
+        try:
+            status_1c, text_1c = _post_to_onec(
+                item.payload,
+                idem_key=item.idem_key,
+            )
+
+            now_dt = timezone.now()
+
+            if 200 <= status_1c < 300:
+                item.status = "sent"
+                item.attempts = int(item.attempts or 0) + 1
+                item.last_http_status = status_1c
+                item.last_response = _clip_text(text_1c)
+                item.last_error = ""
+                item.sent_at = now_dt
+                item.locked_at = None
+                item.updated_at = now_dt
+                item.save(update_fields=[
+                    "status",
+                    "attempts",
+                    "last_http_status",
+                    "last_response",
+                    "last_error",
+                    "sent_at",
+                    "locked_at",
+                    "updated_at",
+                ])
+
+                stats["sent"] += 1
+
+                _send_admin_log_async(
+                    "✅ Отметка смены из очереди доставлена в 1С\n"
+                    f"ID очереди: {item.id}\n"
+                    f"ИНН: {item.inn or '—'}\n"
+                    f"ФИО: {item.fio or '—'}\n"
+                    f"Магазин: {item.sm_store_id or '—'}\n"
+                    f"Время отметки: {item.event_datetime or '—'}\n"
+                    f"HTTP 1С: {status_1c}"
+                )
+
+            else:
+                item.status = "pending"
+                item.attempts = int(item.attempts or 0) + 1
+                item.last_http_status = status_1c
+                item.last_response = _clip_text(text_1c)
+                item.last_error = f"1С вернула HTTP {status_1c}"
+                item.next_attempt_at = now_dt + datetime.timedelta(minutes=SHIFT_QUEUE_RETRY_AFTER_MINUTES)
+                item.locked_at = None
+                item.updated_at = now_dt
+                item.save(update_fields=[
+                    "status",
+                    "attempts",
+                    "last_http_status",
+                    "last_response",
+                    "last_error",
+                    "next_attempt_at",
+                    "locked_at",
+                    "updated_at",
+                ])
+
+                stats["retry"] += 1
+
+        except Exception as e:
+            now_dt = timezone.now()
+
+            item.status = "pending"
+            item.attempts = int(item.attempts or 0) + 1
+            item.last_error = _clip_text(str(e))
+            item.next_attempt_at = now_dt + datetime.timedelta(minutes=SHIFT_QUEUE_RETRY_AFTER_MINUTES)
+            item.locked_at = None
+            item.updated_at = now_dt
+            item.save(update_fields=[
+                "status",
+                "attempts",
+                "last_error",
+                "next_attempt_at",
+                "locked_at",
+                "updated_at",
+            ])
+
+            stats["errors"] += 1
+
+            logger.exception(f"[SHIFT_QUEUE] Ошибка отправки item_id={item.id} в 1С: {e}")
+
+    return stats
+
+
+
+
+
+
 
 
 def encrypt_inn_full(inn: str) -> str:
@@ -10982,16 +11212,69 @@ def employee_identification(request):
     try:
         status_1c, text_1c = _post_to_onec(onec_payload, idem_key=idem_key)
     except Exception as e:
-        logger.exception(f"[EMP_IDENT] Ошибка запроса в 1С: {e}")
-        return _log_and_return_error(
-            500,
-            "Запрос в 1С",
-            f"Ошибка запроса в 1С: {e}",
-            inn_raw=plain_inn,
-            fio_raw=fio,
-            smstore_raw=smstore_raw,
+        logger.exception(f"[EMP_IDENT] Ошибка запроса в 1С, сохраняю в очередь: {e}")
+    
+        queue_obj = enqueue_shift_mark_for_retry(
+            idem_key=idem_key,
+            onec_payload=onec_payload,
+            plain_inn=plain_inn,
+            fio=fio,
+            sm_store_id_int=sm_store_id_int,
             ukm_store_id=ukm_store_id,
-            phone_raw=phone_raw,
+            event_dt_str=event_dt_str,
+            direction=direction or "EMP_IDENT",
+            last_http_status=None,
+            last_response="",
+            last_error=f"Ошибка запроса в 1С: {e}",
+        )
+    
+        _send_admin_log_async(
+            "⏳ Отметка смены сохранена в очередь\n"
+            "Причина: 1С недоступна или ошибка сети\n"
+            f"ID очереди: {queue_obj.id}\n"
+            f"ИНН: {plain_inn}\n"
+            f"ФИО: {fio}\n"
+            f"Магазин: {smstore_raw}\n"
+            f"Время отметки: {event_dt_str}\n"
+            f"Ошибка: {e}"
+        )
+    
+        try:
+            log_qr_issue(
+                endpoint='employee_identification',
+                method=direction or 'EMP_IDENT',
+                status='queued',
+                user=user_obj,
+                employee_inn=plain_inn,
+                employee_fio=fio,
+                tg_id=getattr(user_obj, "tg_id", "") if user_obj else "",
+                phone_raw=phone_raw or "",
+                phone_normalized=phone_norm or "",
+                sm_store_id=sm_store_id_int,
+                ukm_store_id=ukm_store_id,
+                role_id=None,
+                qr_data="",
+                error_message=f"Поставлено в очередь: {e}",
+                raw_request={
+                    "request": data,
+                    "onec_payload": onec_payload,
+                    "queue_id": queue_obj.id,
+                    "queue_status": queue_obj.status,
+                },
+                latitude=lat_val,
+                longitude=lon_val,
+            )
+        except Exception:
+            logger.exception("[EMP_IDENT] Ошибка записи queued в qr_issue_logs")
+    
+        return JsonResponse(
+            {
+                'status': 'ok',
+                'queued': True,
+                'message': 'Отметка сохранена. 1С временно недоступна, отправим автоматически.',
+                'queue_id': queue_obj.id,
+            },
+            status=200
         )
 
     # 6. Анализ ответа 1С и логирование
@@ -11002,23 +11285,15 @@ def employee_identification(request):
         "📡 Отметка смены",
         "",
         "👤 Сотрудник:",
-        f"  • ФИО: {fio}",
-        f"  • ИНН: {plain_inn}",
-        f"  • user_id (PostgreSQL): {user_obj.id if user_obj else '—'}",
+        f"  ФИО: {fio}",
         "",
         "🏬 Магазин:",
         f"  • MX (из запроса): {smstore_raw}",
-        f"  • storeId (SMSTORE int): {sm_store_id_int if sm_store_id_int is not None else '—'}",
-        f"  • ukm4store: {ukm_store_id if ukm_store_id is not None else '—'}",
         f"  • Name: {store_obj.name if store_obj else '—'}",
         "",
-        "⚙️ Параметры события:",
+        "⚙️ Время отметки:",
         f"  • direction: {direction or '—'}",
         f"  • datetime: {event_dt_str or dt_raw or '—'}",
-        "",
-        "📲 Телефон:",
-        f"  • raw: {phone_raw or '—'}",
-        f"  • normalized: {phone_norm or '—'}",
         "",
         "🔗 1С:",
         f"  • HTTP статус: {status_1c}",
@@ -11057,14 +11332,41 @@ def employee_identification(request):
 
     # 7. Ответ клиенту
     if not ok_1c:
+        queue_obj = enqueue_shift_mark_for_retry(
+            idem_key=idem_key,
+            onec_payload=onec_payload,
+            plain_inn=plain_inn,
+            fio=fio,
+            sm_store_id_int=sm_store_id_int,
+            ukm_store_id=ukm_store_id,
+            event_dt_str=event_dt_str,
+            direction=direction or "EMP_IDENT",
+            last_http_status=status_1c,
+            last_response=text_1c,
+            last_error=f"1С вернула HTTP {status_1c}",
+        )
+    
+        _send_admin_log_async(
+            "⏳ Отметка смены сохранена в очередь\n"
+            "Причина: 1С вернула ошибочный HTTP-статус\n"
+            f"ID очереди: {queue_obj.id}\n"
+            f"ИНН: {plain_inn}\n"
+            f"ФИО: {fio}\n"
+            f"Магазин: {smstore_raw}\n"
+            f"Время отметки: {event_dt_str}\n"
+            f"HTTP 1С: {status_1c}\n"
+            f"Ответ 1С: {resp_short}"
+        )
+    
         return JsonResponse(
             {
-                'status': 'error',
-                'message': f'1С ответила со статусом {status_1c}',
+                'status': 'ok',
+                'queued': True,
+                'message': 'Отметка сохранена. 1С временно недоступна, отправим автоматически.',
+                'queue_id': queue_obj.id,
                 'onec_status': status_1c,
-                'onec_body': text_1c,
             },
-            status=500
+            status=200
         )
 
     return JsonResponse(
