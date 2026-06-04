@@ -5135,9 +5135,11 @@ def _update_store_mysql_and_xml_for_single_store(
             ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
 
             if ttl_supported:
-                now_dt = timezone.now()
-                end_date = (now_dt + datetime.timedelta(days=1)).date()
-                start_date = end_date
+                local_tz = ZoneInfo(os.getenv("ROTATION_TZ", "Asia/Irkutsk"))
+                today_local = timezone.now().astimezone(local_tz).date()
+                
+                start_date = today_local
+                end_date = today_local
 
                 cur.execute("""
                     INSERT INTO users (
@@ -5155,7 +5157,7 @@ def _update_store_mysql_and_xml_for_single_store(
                         role_id    = VALUES(role_id),
                         version    = VALUES(version),
                         deleted    = 0,
-                        start_date = VALUES(end_date),
+                        start_date = VALUES(start_date),
                         end_date   = VALUES(end_date)
                 """, (
                     store_id,
