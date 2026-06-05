@@ -160,6 +160,10 @@ _AGENT_AUTH_SENSITIVE_KEYS = {
     "authorization",
 }
 
+_AGENT_PIN_DELIVERY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("AGENT_PIN_DELIVERY_WORKERS", "4"))
+)
+
 
 ONEC_WORKING_EMPLOYEES_AUTH_USER = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_USER", "")
 ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD = os.getenv("ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD", "")
@@ -8601,6 +8605,301 @@ def send_pin_to_user_channels(user, pin: str, expires_at=None) -> dict:
 
 
 
+
+
+
+#Для асинхронности в Агенте Супермаг и МАХ
+
+def _get_agent_pin_day_bounds():
+    """
+    Возвращает границы текущего PIN-дня в timezone AGENT_PIN_TZ.
+
+    Нужно, чтобы "первый раз за день" считался не по UTC,
+    а по локальной зоне PIN, например Asia/Irkutsk.
+    """
+    now_local = _get_agent_pin_local_now()
+
+    start_local = now_local.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    next_start_local = start_local + datetime.timedelta(days=1)
+
+    return {
+        "pin_date": start_local.date(),
+        "start_utc": start_local.astimezone(datetime.timezone.utc),
+        "next_start_utc": next_start_local.astimezone(datetime.timezone.utc),
+    }
+
+
+def _agent_pin_delivery_lock_keys(user_id: int, pin_date) -> tuple[int, int]:
+    """
+    Делаем стабильный advisory-lock ключ для пары:
+      user_id + локальная дата PIN.
+
+    Используем 2 int32-ключа для pg_advisory_xact_lock(key1, key2).
+    """
+    raw = f"agent_pin_delivery:{int(user_id)}:{pin_date.isoformat()}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+
+    key1 = int.from_bytes(digest[:4], byteorder="big", signed=True)
+    key2 = int.from_bytes(digest[4:8], byteorder="big", signed=True)
+
+    return key1, key2
+
+
+def _acquire_agent_pin_delivery_xact_lock(user_id: int, pin_date) -> None:
+    """
+    Блокировка на время transaction.atomic().
+
+    Защищает от ситуации, когда два параллельных запроса пользователя
+    одновременно решили, что они первые за день.
+    """
+    if connection.vendor != "postgresql":
+        logger.warning(
+            "[AGENT_AUTH/PIN_DELIVERY] connection.vendor != postgresql, "
+            "advisory-lock пропущен"
+        )
+        return
+
+    key1, key2 = _agent_pin_delivery_lock_keys(user_id, pin_date)
+
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", [key1, key2])
+
+
+def _agent_pin_delivery_channel(user) -> str:
+    """
+    Определяет фактический канал отправки PIN по текущей логике:
+      1. MAX
+      2. email
+      3. none
+    """
+    max_id = getattr(user, "max_id", None)
+    email = str(getattr(user, "mail", "") or "").strip()
+
+    if max_id:
+        return "max"
+
+    if email:
+        return "email"
+
+    return "none"
+
+
+def _has_pin_session_for_user_today(user) -> bool:
+    """
+    Проверяет, была ли уже сегодня успешная/актуальная PIN-сессия.
+
+    Важно:
+    - считаем только status pin_sent/success;
+    - expired/blocked не считаем как успешную первую отправку;
+    - дата считается по AGENT_PIN_TZ.
+    """
+    bounds = _get_agent_pin_day_bounds()
+
+    return AuthSession.objects.filter(
+        user=user,
+        created_at__gte=bounds["start_utc"],
+        created_at__lt=bounds["next_start_utc"],
+        status__in=["pin_sent", "success"],
+    ).exists()
+
+
+def _send_pin_to_user_channels_async_worker(user_id: int, pin: str, expires_at=None, context=None) -> None:
+    """
+    Реальная фоновая отправка PIN.
+
+    В поток лучше передавать user_id, а не Django model object,
+    поэтому здесь перечитываем пользователя и закрываем старые соединения.
+    """
+    close_old_connections()
+
+    context = context or {}
+
+    try:
+        user = (
+            User.objects
+            .only("id", "full_name", "max_id", "mail")
+            .get(id=int(user_id))
+        )
+
+        delivery = send_pin_to_user_channels(
+            user,
+            pin,
+            expires_at=expires_at,
+        )
+
+        if delivery.get("ok"):
+            logger.info(
+                f"[AGENT_AUTH/PIN_DELIVERY_ASYNC] PIN отправлен в фоне "
+                f"user_id={user_id} channel={context.get('channel')} "
+                f"delivery={delivery}"
+            )
+        else:
+            logger.error(
+                f"[AGENT_AUTH/PIN_DELIVERY_ASYNC] Не удалось отправить PIN в фоне "
+                f"user_id={user_id} channel={context.get('channel')} "
+                f"delivery={delivery}"
+            )
+
+    except Exception as e:
+        logger.exception(
+            f"[AGENT_AUTH/PIN_DELIVERY_ASYNC] Ошибка фоновой отправки PIN "
+            f"user_id={user_id}: {e}"
+        )
+
+    finally:
+        close_old_connections()
+
+
+def _send_pin_to_user_channels_async(user, pin: str, expires_at=None, context=None) -> bool:
+    """
+    Ставит отправку PIN в фон и сразу возвращает управление.
+    """
+    try:
+        _AGENT_PIN_DELIVERY_EXECUTOR.submit(
+            _send_pin_to_user_channels_async_worker,
+            int(user.id),
+            pin,
+            expires_at,
+            context or {},
+        )
+        return True
+
+    except Exception as e:
+        logger.exception(
+            f"[AGENT_AUTH/PIN_DELIVERY_ASYNC] Не удалось поставить PIN в очередь "
+            f"user_id={getattr(user, 'id', None)}: {e}"
+        )
+        return False
+
+
+def _create_auth_session_and_deliver_pin(user, pin: str, expires_at):
+    """
+    Создаёт AuthSession и отправляет PIN по правилу:
+
+      - первый раз за текущий PIN-день: синхронно;
+      - повторные запросы этого же пользователя за этот же день: асинхронно.
+
+    Возвращает:
+      (session, delivery_dict)
+
+    ВАЖНО:
+    Первый синхронный запрос держит advisory-lock до завершения отправки.
+    Это нужно, чтобы при двух параллельных запросах только один реально был "первым".
+    """
+    bounds = _get_agent_pin_day_bounds()
+    pin_date = bounds["pin_date"]
+
+    channel = _agent_pin_delivery_channel(user)
+
+    session_uuid = uuid.uuid4()
+    pin_hash = _hash_agent_pin(pin)
+
+    with transaction.atomic():
+        _acquire_agent_pin_delivery_xact_lock(user.id, pin_date)
+
+        already_sent_today = _has_pin_session_for_user_today(user)
+
+        sess = AuthSession.objects.create(
+            session_id=session_uuid,
+            user=user,
+            storeid=None,
+            pin_hash=pin_hash,
+            status="pin_sent",
+            attempts=0,
+            expires_at=expires_at,
+        )
+
+        # Первый раз за день — отправляем синхронно и ждём результата.
+        if not already_sent_today:
+            delivery = send_pin_to_user_channels(
+                user,
+                pin,
+                expires_at=expires_at,
+            )
+
+            delivery.update({
+                "delivery_mode": "sync",
+                "queued": False,
+                "first_delivery_today": True,
+                "pin_date": pin_date.isoformat(),
+                "pin_timezone": str(AGENT_PIN_TZ),
+                "channel": channel,
+                "max_queued": False,
+                "email_queued": False,
+            })
+
+            # Если первая синхронная отправка не удалась,
+            # не считаем эту сессию успешной первой отправкой за день.
+            if not delivery.get("ok"):
+                sess.status = "expired"
+                sess.save(update_fields=["status", "updated_at"])
+
+            return sess, delivery
+
+        # Повторные запросы за день — отправляем в фоне.
+        queued = _send_pin_to_user_channels_async(
+            user,
+            pin,
+            expires_at=expires_at,
+            context={
+                "channel": channel,
+                "pin_date": pin_date.isoformat(),
+                "pin_timezone": str(AGENT_PIN_TZ),
+                "reason": "repeat_request_same_day",
+                "session_id": str(session_uuid),
+            },
+        )
+
+        delivery = {
+            "ok": bool(queued),
+            "queued": bool(queued),
+            "delivery_mode": "async",
+            "first_delivery_today": False,
+            "pin_date": pin_date.isoformat(),
+            "pin_timezone": str(AGENT_PIN_TZ),
+            "channel": channel,
+
+            # Для совместимости со старым кодом:
+            "telegram_sent": False,
+            "max_sent": False,
+            "email_sent": False,
+
+            # Новые понятные поля:
+            "max_queued": bool(queued and channel == "max"),
+            "email_queued": bool(queued and channel == "email"),
+        }
+
+        if not queued:
+            sess.status = "expired"
+            sess.save(update_fields=["status", "updated_at"])
+
+        return sess, delivery
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def _get_agent_user_stores(user):
     """
     Возвращает уникальные магазины пользователя из ukm_users
@@ -9367,32 +9666,25 @@ def agent_auth_start(request):
                 stores=stores_for_log,
             )
 
-        session_uuid = uuid.uuid4()
-        session_id = str(session_uuid)
-        
         # Персональный дневной PIN пользователя.
         # В течение текущего дня для этого пользователя он всегда одинаковый.
         pin = _generate_agent_daily_pin_for_user(user)
         expires_at = _get_agent_pin_expires_at()
-        pin_hash = _hash_agent_pin(pin)
         
-        AuthSession.objects.create(
-            session_id=session_uuid,
+        sess, delivery = _create_auth_session_and_deliver_pin(
             user=user,
-            storeid=None,
-            pin_hash=pin_hash,
-            status='pin_sent',
-            attempts=0,
+            pin=pin,
             expires_at=expires_at,
         )
+        
+        session_id = str(sess.session_id)
 
-        delivery = send_pin_to_user_channels(user, pin, expires_at=expires_at)
-
-        if not delivery["ok"]:
+        if not delivery.get("ok"):
             logger.error(
-                f"[AGENT_AUTH/START] Не удалось отправить PIN user_id={user.id} "
-                f"(telegram_sent={delivery['telegram_sent']}, max_sent={delivery['max_sent']})"
+                f"[AGENT_AUTH/START] Не удалось отправить/поставить в очередь PIN "
+                f"user_id={user.id} delivery={delivery}"
             )
+        
             return _agent_audit_error(
                 request,
                 event=event,
@@ -9404,14 +9696,25 @@ def agent_auth_start(request):
                 extra={"delivery": delivery},
             )
 
+        if delivery.get("delivery_mode") == "sync":
+            delivery_mode_text = "синхронно, первый раз за день"
+        elif delivery.get("delivery_mode") == "async":
+            delivery_mode_text = "асинхронно, повторный запрос за день"
+        else:
+            delivery_mode_text = str(delivery.get("delivery_mode") or "неизвестно")
+        
         _send_admin_log_async(
             "\n".join([
                 "🔐 Агент. Запрос",
                 f"{user.full_name}",
                 f"Телефон: {_mask_phone(phone_raw)}",
-                f"Email: {_mask_email(getattr(user, 'mail', '')) if getattr(user, 'mail', None) else 'нет'}",
-                f"Email: {'да' if delivery.get('email_sent') else 'нет'}",
-                f"MAX: {'да' if delivery.get('max_sent') else 'нет'}",
+                f"Email пользователя: {_mask_email(getattr(user, 'mail', '')) if getattr(user, 'mail', None) else 'нет'}",
+                f"Канал PIN: {delivery.get('channel') or '—'}",
+                f"Режим отправки PIN: {delivery_mode_text}",
+                f"MAX отправлен: {'да' if delivery.get('max_sent') else 'нет'}",
+                f"MAX в фоне: {'да' if delivery.get('max_queued') else 'нет'}",
+                f"Email отправлен: {'да' if delivery.get('email_sent') else 'нет'}",
+                f"Email в фоне: {'да' if delivery.get('email_queued') else 'нет'}",
             ])
         )
 
