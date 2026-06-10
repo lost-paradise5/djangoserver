@@ -23748,6 +23748,14 @@ def _store_report_autofit(ws, min_width=10, max_width=38):
         ws.column_dimensions[letter].width = min(best + 2, max_width)
 
 
+def _store_report_has_max_id(value) -> bool:
+    """
+    Сотрудник считается подключившимся к MAX,
+    если в users.max_id есть непустое значение.
+    """
+    return bool(_store_report_safe_text(value))
+
+
 def _store_report_build_excel(
     store_ids: list[int],
     stores_map: dict[int, dict],
@@ -23759,13 +23767,15 @@ def _store_report_build_excel(
     ws_summary = wb.active
     ws_summary.title = "Свод"
 
-    ws_grouped = wb.create_sheet("По должностям")
+    # Вместо старого листа "По должностям"
+    ws_stats = wb.create_sheet("Статистика по магазинам")
 
     title_fill = PatternFill("solid", fgColor="1F4E78")
-    section_fill = PatternFill("solid", fgColor="D9EAF7")
     header_fill = PatternFill("solid", fgColor="BDD7EE")
-    subheader_fill = PatternFill("solid", fgColor="EAF3F8")
     not_found_fill = PatternFill("solid", fgColor="FCE4D6")
+    total_fill = PatternFill("solid", fgColor="D9EAF7")
+    good_fill = PatternFill("solid", fgColor="E2F0D9")
+    bad_fill = PatternFill("solid", fgColor="FCE4D6")
 
     white_font = Font(color="FFFFFF", bold=True)
     bold_font = Font(bold=True)
@@ -23773,9 +23783,7 @@ def _store_report_build_excel(
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
-    # -------------------------
     # Лист 1: Свод
-    # -------------------------
     summary_headers = [
         "SMSTORE",
         "Название магазина",
@@ -23904,10 +23912,34 @@ def _store_report_build_excel(
         for cell in row:
             cell.alignment = left
 
-    # -------------------------
-    # Лист 2: По должностям
-    # -------------------------
-    current_row = 1
+    # Лист 2: Статистика по магазинам
+    stats_headers = [
+        "SMSTORE",
+        "Название магазина",
+        "Всего сотрудников из 1С",
+        "Подключились, max_id есть",
+        "Не подключились",
+        "Найдены в users без max_id",
+        "Не найдены в users",
+        "Процент подключившихся",
+        "Комментарий",
+    ]
+
+    ws_stats.append(stats_headers)
+
+    for col in range(1, len(stats_headers) + 1):
+        cell = ws_stats.cell(row=1, column=col)
+        cell.fill = title_fill
+        cell.font = white_font
+        cell.alignment = center
+
+    total_employees_all = 0
+    connected_all = 0
+    not_connected_all = 0
+    found_without_max_all = 0
+    not_found_all = 0
+
+    stats_row = 2
 
     for store_id in store_ids:
         store_info = stores_map.get(store_id, {})
@@ -23915,75 +23947,12 @@ def _store_report_build_excel(
 
         employees = employees_by_store.get(store_id, [])
 
-        positions = sorted(
-            {
-                _store_report_safe_text(emp.get("Должность")) or "Без должности"
-                for emp in employees
-            },
-            key=_store_report_position_sort_key,
-        )
-
-        if not positions:
-            positions = ["Нет сотрудников в ответе 1С"]
-
-        # Каждая должность = 4 колонки
-        total_cols = max(len(positions) * 4, 4)
-
-        ws_grouped.merge_cells(
-            start_row=current_row,
-            start_column=1,
-            end_row=current_row,
-            end_column=total_cols,
-        )
-
-        title_cell = ws_grouped.cell(row=current_row, column=1)
-        title_cell.value = f"Магазин {store_id} — {store_name}"
-        title_cell.fill = title_fill
-        title_cell.font = white_font
-        title_cell.alignment = center
-
-        current_row += 1
-
-        # Строка должностей
-        for pos_idx, position in enumerate(positions):
-            start_col = pos_idx * 4 + 1
-            end_col = start_col + 3
-
-            ws_grouped.merge_cells(
-                start_row=current_row,
-                start_column=start_col,
-                end_row=current_row,
-                end_column=end_col,
-            )
-
-            cell = ws_grouped.cell(row=current_row, column=start_col)
-            cell.value = position
-            cell.fill = section_fill
-            cell.font = bold_font
-            cell.alignment = center
-
-        current_row += 1
-
-        # Подзаголовки
-        subheaders = ["ФИО", "Телефон", "tg_id", "max_id"]
-
-        for pos_idx, position in enumerate(positions):
-            start_col = pos_idx * 4 + 1
-
-            for offset, header in enumerate(subheaders):
-                cell = ws_grouped.cell(row=current_row, column=start_col + offset)
-                cell.value = header
-                cell.fill = header_fill
-                cell.font = bold_font
-                cell.alignment = center
-
-        current_row += 1
-
-        position_rows = defaultdict(list)
+        total_employees = len(employees)
+        connected_count = 0
+        found_without_max_count = 0
+        not_found_count = 0
 
         for emp in employees:
-            position = _store_report_safe_text(emp.get("Должность")) or "Без должности"
-
             fio = _store_report_full_name_from_onec(emp)
             inn = _store_report_safe_text(emp.get("ИНН"))
             phone = _store_report_safe_text(emp.get("НомерТелефона"))
@@ -23997,65 +23966,103 @@ def _store_report_build_excel(
             matched_users = users_by_employee_key.get(emp_key, [])
 
             if not matched_users:
-                position_rows[position].append({
-                    "fio": fio,
-                    "phone": phone,
-                    "tg_id": "",
-                    "max_id": "",
-                })
-            else:
-                for user_row in matched_users:
-                    position_rows[position].append({
-                        "fio": fio,
-                        "phone": phone,
-                        "tg_id": user_row.get("tg_id") or "",
-                        "max_id": user_row.get("max_id") or "",
-                    })
+                not_found_count += 1
+                continue
 
-        max_rows = 1
-        if employees:
-            max_rows = max(len(position_rows.get(position, [])) for position in positions)
-
-        data_start_row = current_row
-
-        for i in range(max_rows):
-            for pos_idx, position in enumerate(positions):
-                start_col = pos_idx * 4 + 1
-                rows_for_position = position_rows.get(position, [])
-
-                if i >= len(rows_for_position):
-                    continue
-
-                item = rows_for_position[i]
-
-                values = [
-                    item.get("fio") or "",
-                    item.get("phone") or "",
-                    item.get("tg_id") or "",
-                    item.get("max_id") or "",
-                ]
-
-                for offset, value in enumerate(values):
-                    cell = ws_grouped.cell(
-                        row=current_row + i,
-                        column=start_col + offset,
-                    )
-                    cell.value = value
-                    cell.alignment = left
-
-        data_end_row = current_row + max_rows - 1
-
-        if data_end_row >= data_start_row:
-            _store_report_add_borders(
-                ws_grouped,
-                f"A{current_row - 2}:{get_column_letter(total_cols)}{data_end_row}",
+            # Сотрудника считаем подключившимся один раз,
+            # даже если по нему нашлось несколько записей в users.
+            has_max_id = any(
+                _store_report_has_max_id(user_row.get("max_id"))
+                for user_row in matched_users
             )
 
-        current_row = data_end_row + 3
+            if has_max_id:
+                connected_count += 1
+            else:
+                found_without_max_count += 1
 
-    _store_report_autofit(ws_grouped, max_width=34)
+        not_connected_count = total_employees - connected_count
 
-    for ws in [ws_summary, ws_grouped]:
+        if total_employees > 0:
+            connected_percent = connected_count / total_employees
+            comment = ""
+        else:
+            connected_percent = 0
+            comment = "В ответе 1С нет сотрудников по этому ИдМагазина"
+
+        ws_stats.append([
+            store_id,
+            store_name,
+            total_employees,
+            connected_count,
+            not_connected_count,
+            found_without_max_count,
+            not_found_count,
+            connected_percent,
+            comment,
+        ])
+
+        # Подсветка строки по проценту подключения
+        percent_cell = ws_stats.cell(row=stats_row, column=8)
+        percent_cell.number_format = "0.00%"
+
+        if total_employees == 0:
+            fill = not_found_fill
+        elif connected_percent >= 0.8:
+            fill = good_fill
+        elif connected_percent < 0.5:
+            fill = bad_fill
+        else:
+            fill = None
+
+        if fill:
+            for col in range(1, len(stats_headers) + 1):
+                ws_stats.cell(row=stats_row, column=col).fill = fill
+
+        total_employees_all += total_employees
+        connected_all += connected_count
+        not_connected_all += not_connected_count
+        found_without_max_all += found_without_max_count
+        not_found_all += not_found_count
+
+        stats_row += 1
+
+    # Итоговая строка
+    total_percent = connected_all / total_employees_all if total_employees_all else 0
+
+    ws_stats.append([
+        "ИТОГО",
+        "",
+        total_employees_all,
+        connected_all,
+        not_connected_all,
+        found_without_max_all,
+        not_found_all,
+        total_percent,
+        "",
+    ])
+
+    total_row = ws_stats.max_row
+
+    for col in range(1, len(stats_headers) + 1):
+        cell = ws_stats.cell(row=total_row, column=col)
+        cell.fill = total_fill
+        cell.font = bold_font
+        cell.alignment = center
+
+    ws_stats.cell(row=total_row, column=8).number_format = "0.00%"
+
+    _store_report_add_borders(ws_stats, f"A1:I{ws_stats.max_row}")
+    _store_report_autofit(ws_stats, max_width=42)
+    ws_stats.freeze_panes = "A2"
+    ws_stats.auto_filter.ref = f"A1:I{ws_stats.max_row}"
+
+    for row in ws_stats.iter_rows(min_row=2, max_row=ws_stats.max_row):
+        for cell in row:
+            cell.alignment = left
+
+    # Финальная нормализация выравнивания
+    for ws in [ws_summary, ws_stats]:
         for row in ws.iter_rows():
             for cell in row:
                 cell.alignment = Alignment(
