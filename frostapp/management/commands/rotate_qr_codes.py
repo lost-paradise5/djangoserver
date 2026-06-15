@@ -420,33 +420,60 @@ class Command(BaseCommand):
         sync = sync or {}
         ukm4 = sync.get("ukm4") or {}
         ukm5 = sync.get("ukm5") or {}
-
+    
         issues = []
         severity = "ok"
-
+    
         ukm4_status = ukm4.get("status")
         ukm5_status = ukm5.get("status")
-
+    
         if ukm4_status in {"error", "skipped_no_ukm4ip"}:
             severity = "error"
             err = (ukm4.get("error") or ukm4_status or "").strip()
-            issues.append(f"UKM4: {self._shorten(err, 90)}")
-
+            issues.append(f"UKM4: {self._shorten(err, 120)}")
+    
         if ukm5_status == "error":
             severity = "error"
             err = (ukm5.get("error") or "UKM5 error").strip()
-            issues.append(f"UKM5: {self._shorten(err, 90)}")
+            issues.append(f"UKM5: {self._shorten(err, 120)}")
+    
         elif ukm5_status == "warning":
             if severity != "error":
                 severity = "warning"
+    
             verification = ukm5.get("verification") or {}
+    
+            user_found = verification.get("user_found")
+            password_matches = verification.get("password_matches")
             active_count = int(verification.get("active_count") or 0)
             stale_left = int(verification.get("stale_active_left_count") or 0)
-            issues.append(f"UKM5: active={active_count}, stale_left={stale_left}")
-
+            final_ready = verification.get("final_ready")
+    
+            warn_reasons = []
+    
+            if user_found is not True:
+                warn_reasons.append("user_found=False")
+    
+            if password_matches is not True:
+                warn_reasons.append("password_matches=False")
+    
+            if active_count != 1:
+                warn_reasons.append(f"active_count={active_count}")
+    
+            if stale_left != 0:
+                warn_reasons.append(f"stale_left={stale_left}")
+    
+            if final_ready is not True:
+                warn_reasons.append("final_ready=False")
+    
+            if not warn_reasons:
+                warn_reasons.append("verification не прошла без явной причины")
+    
+            issues.append("UKM5 WARN: " + ", ".join(warn_reasons))
+    
         if not issues:
             return "ok", "OK"
-
+    
         return severity, "; ".join(issues)
 
     def _shorten(self, text: str, limit: int) -> str:
@@ -501,26 +528,26 @@ class Command(BaseCommand):
 
 
     def _contact_note(self, info: dict) -> str:
-        """
-        Возвращает пометку по отсутствующим tg_id/max_id.
-        Нужно для отчёта MAX: сотрудник обновлён, но видно,
-        что у него нет tg_id, max_id или обоих.
-        """
         tg_id = info.get("tg_id")
         max_id = info.get("max_id")
-
-        has_tg = tg_id not in (None, "")
-        has_max = max_id not in (None, "", 0)
-
+    
+        tg_text = str(tg_id).strip() if tg_id is not None else ""
+        has_tg = bool(tg_text)
+    
+        try:
+            has_max = max_id is not None and int(max_id) > 0
+        except Exception:
+            has_max = bool(str(max_id or "").strip())
+    
         if not has_tg and not has_max:
             return "нет tg_id и max_id"
-
+    
         if not has_tg:
             return "нет tg_id"
-
+    
         if not has_max:
             return "нет max_id"
-
+    
         return ""
 
     def _split_max_messages(self, lines: list[str], limit: int = 3900) -> list[str]:
@@ -611,8 +638,13 @@ class Command(BaseCommand):
                 tg_id = info.get("tg_id")
                 max_id = info.get("max_id")
 
-                has_tg = tg_id not in (None, "")
-                has_max = max_id not in (None, "", 0)
+                tg_text = str(tg_id).strip() if tg_id is not None else ""
+                has_tg = bool(tg_text)
+                
+                try:
+                    has_max = max_id is not None and int(max_id) > 0
+                except Exception:
+                    has_max = bool(str(max_id or "").strip())
 
                 if not has_tg:
                     no_tg += 1
@@ -651,6 +683,7 @@ class Command(BaseCommand):
                         "max_id": max_id,
                         "contact_note": contact_note,
                         "store_status": sr.get("store_status") or "ok",
+                        "store_summary": sr.get("store_summary") or "",
                     })
 
             lines = [
@@ -703,8 +736,12 @@ class Command(BaseCommand):
 
                         phone = u.get("phone") or "—"
 
+                        summary_note = ""
+                        if u.get("store_status") in {"warning", "error"} and u.get("store_summary"):
+                            summary_note = f" | {u['store_status'].upper()}: {u['store_summary']}"
+
                         lines.append(
-                            f"• {u['fio']} | {phone} | roleid={u['roleid']}{note}"
+                            f"• {u['fio']} | {phone} | roleid={u['roleid']}{note}{summary_note}"
                         )
 
             messages = self._split_max_messages(lines, limit=3900)
