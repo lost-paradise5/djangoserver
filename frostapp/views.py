@@ -8129,7 +8129,7 @@ def _send_admin_log_async(message: str) -> None:
     отправляет админ-лог в Telegram и в MAX асинхронно,
     не блокируя HTTP-ответ.
     """
-    _send_telegram_log_async(message)
+    # _send_telegram_log_async(message)
     _send_max_log_async(message)
 
 
