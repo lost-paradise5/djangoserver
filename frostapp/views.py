@@ -3551,6 +3551,41 @@ def _send_max_log_async(message: str) -> None:
         logger.exception(f"[MAX/ASYNC] Не удалось поставить лог в очередь: {e}")
 
 
+
+def _send_qr_employee_max_log_async(message: str) -> None:
+    """
+    Асинхронный админ-лог в MAX для get_qr_code_by_employee_id.
+
+    Использует:
+      • MAX_BOT_TOKEN
+      • MAX_ADMIN_LOG_USER_ID
+
+    Фактическая отправка идёт через _send_max_log_async(),
+    поэтому HTTP-ответ не блокируется.
+    """
+    text = (message or "").strip()
+    if not text:
+        return
+
+    _send_max_log_async(text)
+
+
+def _drop_qr_tg_admin_log(*args, **kwargs) -> None:
+    """
+    Заглушка для отключения внешних админ-логов в get_qr_code_by_tg.
+
+    Ничего не отправляет:
+      • ни в Telegram
+      • ни в MAX
+
+    QRIssueLog при этом остаётся и продолжает писаться отдельно.
+    """
+    return
+
+
+
+
+
 def _send_telegram_log_async(message: str) -> None:
     """
     Отправляет админ-лог в Telegram в фоне и не блокирует HTTP-ответ.
@@ -10124,7 +10159,7 @@ def get_qr_code_by_tg(request):
             data = json.loads(raw_body)
         except Exception as e:
             logger.error(f"[QR/RO] JSON parse error: {e}; body={raw_body!r}")
-            _send_telegram_log_async(
+            _drop_qr_tg_admin_log(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Парсинг JSON\nПричина: {e}\n\n"
                 f"Сырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
@@ -10150,7 +10185,7 @@ def get_qr_code_by_tg(request):
 
         if not tg_id and not max_id:
             msg = "Не указан tg_id или max_id"
-            _send_telegram_log_async(
+            _drop_qr_tg_admin_log(
                 f"❌ Ошибка (READ-ONLY) при выдаче QR\nЭтап: Валидация\nПричина: {msg}"
             )
             log_qr_issue(
@@ -10172,7 +10207,7 @@ def get_qr_code_by_tg(request):
         user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
         if not user:
             msg = f"Пользователь не найден: {err} (tg_id={tg_id!r}, max_id={max_id!r})"
-            _send_telegram_log_async(
+            _drop_qr_tg_admin_log(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Поиск пользователя\nПричина: {msg}"
             )
@@ -10200,7 +10235,7 @@ def get_qr_code_by_tg(request):
             plain_inn = ensure_plain_inn(employee_id_raw)
         except Exception as e:
             msg = f"Некорректный employee_id (ИНН) у user_id={user.id}: {e}"
-            _send_telegram_log_async(
+            _drop_qr_tg_admin_log(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Валидация ИНН\nПричина: {msg}\n\n"
                 f"tg_id={tg_id_user or '—'}\nmax_id={getattr(user,'max_id','') or '—'}\n"
@@ -10225,7 +10260,7 @@ def get_qr_code_by_tg(request):
         ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
         if not ukm_links:
             msg = f"Нет записей ukm_users для user_id={user.id}"
-            _send_telegram_log_async(
+            _drop_qr_tg_admin_log(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n\n"
                 f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\n"
@@ -10250,7 +10285,7 @@ def get_qr_code_by_tg(request):
         password, open_username, open_row_id = _get_existing_open_password(user_id=user.id, system_id=9)
         if not password:
             msg = f"Нет password в open_in_system (system_id=9) для user_id={user.id}"
-            _send_telegram_log_async(
+            _drop_qr_tg_admin_log(
                 "❌ Ошибка (READ-ONLY) при выдаче QR\n"
                 f"Этап: Чтение open_in_system\nПричина: {msg}\n\n"
                 f"user_id={user.id}\nФИО={fio or '—'}\nИНН={plain_inn}\n"
@@ -10313,7 +10348,7 @@ def get_qr_code_by_tg(request):
             password,
             f"open_in_system.id={open_row_id}, username={open_username or '—'}",
         ]
-        _send_telegram_log_async("\n".join(lines))
+        _drop_qr_tg_admin_log("\n".join(lines))
 
         phone_norm = normalize_phone_ru(user.phone or "") or ""
         try:
@@ -10357,7 +10392,7 @@ def get_qr_code_by_tg(request):
 
     except Exception as e:
         logger.exception("[QR/RO] Unexpected error")
-        _send_telegram_log_async(
+        _drop_qr_tg_admin_log(
             "💥 Критическая ошибка (READ-ONLY) при выдаче QR\n"
             f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
         )
@@ -10389,7 +10424,7 @@ def get_qr_code_by_employee_id(request):
             data = json.loads(raw_body)
         except Exception as e:
             logger.error(f"[QR/EMP/RO] JSON parse error: {e}; body={raw_body!r}")
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Парсинг JSON\nПричина: {e}\n\n"
                 f"Сырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
@@ -10421,7 +10456,7 @@ def get_qr_code_by_employee_id(request):
 
         if not inn_raw:
             msg = "Не указан inn"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 f"❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\nЭтап: Валидация\nПричина: {msg}"
             )
             log_qr_issue(
@@ -10447,7 +10482,7 @@ def get_qr_code_by_employee_id(request):
             plain_inn = ensure_plain_inn(inn_raw)
         except Exception as e:
             msg = f"Некорректный ИНН: {e}"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация ИНН\nПричина: {msg}\ninn={inn_raw!r}"
             )
@@ -10472,7 +10507,7 @@ def get_qr_code_by_employee_id(request):
 
         if not fio_raw:
             msg = "Не указано fio"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация\nПричина: {msg}\ninn={plain_inn}"
             )
@@ -10498,7 +10533,7 @@ def get_qr_code_by_employee_id(request):
 
         if not store_raw or not store_raw.isdigit():
             msg = "Некорректный storeId (smstore)"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация\nПричина: {msg}\nstoreId={store_raw!r}"
             )
@@ -10524,7 +10559,7 @@ def get_qr_code_by_employee_id(request):
 
         if not role_raw or not role_raw.isdigit():
             msg = "Некорректный roleId"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Валидация\nПричина: {msg}\nroleId={role_raw!r}"
             )
@@ -10553,7 +10588,7 @@ def get_qr_code_by_employee_id(request):
         store_obj = Store.objects.filter(smstore=sm_store_id).first()
         if not store_obj or store_obj.ukm4store is None:
             msg = "Магазин не найден в stores или не указан ukm4store"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Маппинг smstore→ukm4store\nПричина: {msg}\nsmstore={sm_store_id}"
             )
@@ -10580,7 +10615,7 @@ def get_qr_code_by_employee_id(request):
             ukm_store_id_req = int(str(store_obj.ukm4store).strip())
         except Exception:
             msg = "Некорректное значение ukm4store"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Маппинг smstore→ukm4store\nПричина: {msg}\nsmstore={sm_store_id}"
             )
@@ -10598,7 +10633,7 @@ def get_qr_code_by_employee_id(request):
         )
         if not user:
             msg = f"Пользователь с INN={plain_inn} не найден в PostgreSQL"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Поиск пользователя\nПричина: {msg}\n"
                 f"inn={plain_inn}\nfio={fio}\nsmstore={sm_store_id} (ukm4store={ukm_store_id_req})"
@@ -10625,7 +10660,7 @@ def get_qr_code_by_employee_id(request):
         ukm_links = list(UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid"))
         if not ukm_links:
             msg = f"Нет записей ukm_users для user_id={user.id}"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n"
                 f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}\nsmstore={sm_store_id} (ukm4store={ukm_store_id_req})"
@@ -10652,7 +10687,7 @@ def get_qr_code_by_employee_id(request):
         has_requested_store = any(int(x["storeid"]) == int(ukm_store_id_req) for x in ukm_links if str(x.get("storeid", "")).isdigit())
         if not has_requested_store:
             msg = f"У пользователя нет доступа к ukm4store={ukm_store_id_req} (запрошен smstore={sm_store_id})"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Проверка доступов\nПричина: {msg}\n"
                 f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}"
@@ -10679,7 +10714,7 @@ def get_qr_code_by_employee_id(request):
         password, open_username, open_row_id = _get_existing_open_password(user_id=user.id, system_id=9)
         if not password:
             msg = f"Нет password в open_in_system (system_id=9) для user_id={user.id}"
-            _send_telegram_log_async(
+            _send_qr_employee_max_log_async(
                 "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
                 f"Этап: Чтение open_in_system\nПричина: {msg}\n\n"
                 f"user_id={user.id}\nФИО={fio}\nИНН={plain_inn}"
@@ -10762,7 +10797,7 @@ def get_qr_code_by_employee_id(request):
             password,
             f"open_in_system.id={open_row_id}, username={open_username or '—'}",
         ]
-        _send_telegram_log_async("\n".join(lines))
+        _send_qr_employee_max_log_async("\n".join(lines))
 
         try:
             raw_req = json.loads(raw_body) if raw_body else None
@@ -10802,7 +10837,7 @@ def get_qr_code_by_employee_id(request):
 
     except Exception as e:
         logger.exception("[QR/EMP/RO] Unexpected error")
-        _send_telegram_log_async(
+        _send_qr_employee_max_log_async(
             "💥 Критическая ошибка (READ-ONLY) при выдаче QR по ИНН\n"
             f"{e}\n\nСырой запрос:\n{raw_body[:1000]}{'…' if len(raw_body) > 1000 else ''}"
         )
