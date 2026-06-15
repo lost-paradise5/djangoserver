@@ -5143,7 +5143,8 @@ def _update_store_mysql_and_xml_for_single_store(
                 today_local = timezone.now().astimezone(local_tz).date()
                 
                 start_date = today_local
-                end_date = today_local
+        
+                end_date = today_local + datetime.timedelta(days=1)
 
                 cur.execute("""
                     INSERT INTO users (
