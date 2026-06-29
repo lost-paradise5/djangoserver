@@ -16482,6 +16482,240 @@ def _tg_send_message(chat_id: str, text: str, reply_markup: dict | None = None) 
 
 
 
+
+
+
+
+# Admin Badge -> Bitrix24
+
+BADGE_REPORT_TIMEZONE = os.getenv(
+    "BADGE_REPORT_TIMEZONE",
+    os.getenv("SHIFT_TIMEZONE", "Asia/Irkutsk")
+).strip() or "Asia/Irkutsk"
+
+
+_BITRIX_BADGE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("BITRIX_BADGE_WORKERS", "2"))
+)
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+
+def _bitrix_method_url(method: str) -> str:
+    """
+    Поддерживает такие варианты BITRIX_WEBHOOK_URL:
+
+    1) https://domain.bitrix24.ru/rest/1/secret/
+       -> https://domain.bitrix24.ru/rest/1/secret/im.message.add.json
+
+    2) https://domain.bitrix24.ru/rest/1/secret/im.message.add.json
+       -> оставит как есть
+    """
+    base = (os.getenv("BITRIX_WEBHOOK_URL") or "").strip()
+    if not base:
+        return ""
+
+    base = base.rstrip("/")
+    method = method.strip().strip("/")
+
+    if base.endswith(f"/{method}") or base.endswith(f"/{method}.json"):
+        return base
+
+    return f"{base}/{method}.json"
+
+
+def _badge_local_dt(dt=None):
+    if not dt:
+        dt = timezone.now()
+
+    try:
+        tz = ZoneInfo(BADGE_REPORT_TIMEZONE)
+        return timezone.localtime(dt, tz)
+    except Exception:
+        return timezone.localtime(dt)
+
+
+def _badge_date_time_parts(dt=None) -> tuple[str, str]:
+    local_dt = _badge_local_dt(dt)
+    return local_dt.strftime("%d.%m.%Y"), local_dt.strftime("%H:%M:%S")
+
+
+def _get_badge_store_name(storeid) -> str:
+    if not storeid:
+        return "—"
+
+    try:
+        store = (
+            Store.objects
+            .filter(ukm4store=storeid)
+            .only("name", "ukm4store", "smstore")
+            .first()
+        )
+
+        if store and store.name:
+            return str(store.name).strip()
+
+    except Exception as e:
+        logger.error("[BADGE BITRIX] Ошибка получения магазина: %s", e, exc_info=True)
+
+    return f"Магазин {storeid}"
+
+
+def _build_badge_bitrix_message(
+    *,
+    store_name: str,
+    decided_at,
+    cashier_name: str,
+    admin_name: str,
+) -> str:
+    date_text, time_text = _badge_date_time_parts(decided_at)
+
+    return "\n".join([
+        "🪪 Передача бейджа администратора",
+        "",
+        f"Магазин: {store_name or '—'}",
+        f"Дата: {date_text}",
+        f"Время: {time_text}",
+        f"Кассир: {cashier_name or '—'}",
+        f"Администратор: {admin_name or '—'}",
+    ])
+
+
+def _send_admin_badge_to_bitrix_sync(
+    *,
+    store_name: str,
+    decided_at,
+    cashier_name: str,
+    admin_name: str,
+) -> None:
+    if not _env_truthy("BITRIX_BADGE_NOTIFY_ENABLED", "0"):
+        return
+
+    url = _bitrix_method_url("im.message.add")
+    dialog_id = (os.getenv("BITRIX_BADGE_DIALOG_ID") or "").strip()
+
+    if not url or not dialog_id:
+        logger.warning(
+            "[BADGE BITRIX] Не настроены BITRIX_WEBHOOK_URL или BITRIX_BADGE_DIALOG_ID"
+        )
+        return
+
+    message = _build_badge_bitrix_message(
+        store_name=store_name,
+        decided_at=decided_at,
+        cashier_name=cashier_name,
+        admin_name=admin_name,
+    )
+
+    timeout_sec = int(os.getenv("BITRIX_BADGE_TIMEOUT_SEC", "8"))
+
+    try:
+        response = requests.post(
+            url,
+            data={
+                "DIALOG_ID": dialog_id,
+                "MESSAGE": message,
+                "SYSTEM": "N",
+                "URL_PREVIEW": "N",
+            },
+            timeout=timeout_sec,
+        )
+
+        text = response.text[:1500] if response.text else ""
+
+        if not response.ok:
+            logger.error(
+                "[BADGE BITRIX] HTTP ошибка: status=%s body=%s",
+                response.status_code,
+                text,
+            )
+            return
+
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+
+        if isinstance(body, dict) and body.get("error"):
+            logger.error(
+                "[BADGE BITRIX] REST ошибка: error=%s description=%s",
+                body.get("error"),
+                body.get("error_description"),
+            )
+            return
+
+        logger.info("[BADGE BITRIX] Сообщение отправлено в Bitrix24")
+
+    except Exception as e:
+        logger.error("[BADGE BITRIX] Ошибка отправки: %s", e, exc_info=True)
+
+
+def send_admin_badge_to_bitrix_async(
+    *,
+    storeid,
+    cashier_name: str,
+    admin_name: str,
+    decided_at,
+) -> None:
+    """
+    Асинхронная отправка в Bitrix24.
+    В поток передаём уже простые значения, а не Django model instance.
+    """
+    store_name = _get_badge_store_name(storeid)
+
+    _BITRIX_BADGE_EXECUTOR.submit(
+        _send_admin_badge_to_bitrix_sync,
+        store_name=store_name,
+        decided_at=decided_at,
+        cashier_name=cashier_name,
+        admin_name=admin_name,
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def tg_admin_badge_start(request):
@@ -16810,6 +17044,90 @@ def tg_admin_badge_request(request):
 
 
 
+# @csrf_exempt
+# @require_http_methods(["POST"])
+# def tg_admin_badge_decision(request):
+#     """
+#     DECISION: { guid, decision, admin_id, (admin_tg_id?), (admin_max_id?) }
+#     Возвращает send_to_tg_id (если есть) и send_to_max_id (если MAX-сессия).
+#     """
+#     if not _require_bot_token(request):
+#         return JsonResponse({"status": "error", "message": "FORBIDDEN"}, status=403)
+
+#     _expire_old_badge_requests()
+
+#     data, err = _json_body_or_400(request)
+#     if err:
+#         return err
+
+#     guid = str(data.get("guid") or "").strip()
+#     decision = str(data.get("decision") or "").strip().lower()
+#     admin_id_raw = data.get("admin_id")
+#     admin_tg_id = str(data.get("admin_tg_id") or "").strip()
+#     admin_max_id = str(data.get("admin_max_id") or "").strip()
+
+#     if not guid or decision not in ("accept", "reject") or admin_id_raw is None:
+#         return JsonResponse({"status": "error", "message": "guid, decision(accept/reject), admin_id required"}, status=400)
+
+#     try:
+#         admin_id = int(str(admin_id_raw).strip())
+#     except Exception:
+#         return JsonResponse({"status": "error", "message": "BAD_ADMIN_ID"}, status=400)
+
+#     try:
+#         req = AdminBadgeRequest.objects.get(id=guid)
+#     except Exception:
+#         return JsonResponse({"status": "error", "message": "GUID_NOT_FOUND"}, status=404)
+
+#     if req.status == "EXPIRED" or req.expires_at < timezone.now():
+#         return JsonResponse({"status": "error", "message": "EXPIRED"}, status=410)
+
+#     if not req.admin_user_id or int(req.admin_user_id) != int(admin_id):
+#         return JsonResponse({"status": "error", "message": "ADMIN_MISMATCH"}, status=403)
+
+#     # сверка tg_id (для TG-канала)
+#     if admin_tg_id and req.admin_tg_id and str(req.admin_tg_id) != admin_tg_id:
+#         return JsonResponse({"status": "error", "message": "ADMIN_TG_MISMATCH"}, status=403)
+
+#     # сверка max_id (для MAX-канала)
+#     meta = req.meta or {}
+#     if admin_max_id and meta.get("admin_max_id") and str(meta.get("admin_max_id")) != admin_max_id:
+#         return JsonResponse({"status": "error", "message": "ADMIN_MAX_MISMATCH"}, status=403)
+
+#     now = timezone.now()
+#     req.decision = decision
+#     req.decided_at = now
+#     req.status = "ACCEPTED" if decision == "accept" else "REJECTED"
+#     req.meta = {**meta, "decision_payload": data}
+#     req.save(update_fields=["decision", "decided_at", "status", "meta"])
+
+#     send_to_tg_id = str(req.cashier_tg_id or "").strip()
+#     send_to_max_id = str(meta.get("cashier_max_id") or "").strip()
+
+#     if decision == "reject":
+#         return JsonResponse({
+#             "status": "ok",
+#             "guid": str(req.id),
+#             "decision": "reject",
+#             "send_to_tg_id": send_to_tg_id,
+#             "send_to_max_id": send_to_max_id,
+#             "message_to_cashier": "Администратор отклонил запрос бейджа.",
+#         })
+
+#     password, open_username, open_row_id = _get_existing_open_password(user_id=admin_id, system_id=9)
+#     if not password:
+#         return JsonResponse({"status": "error", "message": "ADMIN_PASSWORD_NOT_FOUND"}, status=404)
+
+#     return JsonResponse({
+#         "status": "ok",
+#         "guid": str(req.id),
+#         "decision": "accept",
+#         "send_to_tg_id": send_to_tg_id,
+#         "send_to_max_id": send_to_max_id,
+#         "password": password,
+#         "admin_open_in_system": {"id": open_row_id, "username": open_username, "system_id": 9},
+#     })
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def tg_admin_badge_decision(request):
@@ -16833,7 +17151,10 @@ def tg_admin_badge_decision(request):
     admin_max_id = str(data.get("admin_max_id") or "").strip()
 
     if not guid or decision not in ("accept", "reject") or admin_id_raw is None:
-        return JsonResponse({"status": "error", "message": "guid, decision(accept/reject), admin_id required"}, status=400)
+        return JsonResponse({
+            "status": "error",
+            "message": "guid, decision(accept/reject), admin_id required"
+        }, status=400)
 
     try:
         admin_id = int(str(admin_id_raw).strip())
@@ -16851,25 +17172,28 @@ def tg_admin_badge_decision(request):
     if not req.admin_user_id or int(req.admin_user_id) != int(admin_id):
         return JsonResponse({"status": "error", "message": "ADMIN_MISMATCH"}, status=403)
 
-    # сверка tg_id (для TG-канала)
+    # сверка tg_id для TG-канала
     if admin_tg_id and req.admin_tg_id and str(req.admin_tg_id) != admin_tg_id:
         return JsonResponse({"status": "error", "message": "ADMIN_TG_MISMATCH"}, status=403)
 
-    # сверка max_id (для MAX-канала)
+    # сверка max_id для MAX-канала
     meta = req.meta or {}
     if admin_max_id and meta.get("admin_max_id") and str(meta.get("admin_max_id")) != admin_max_id:
         return JsonResponse({"status": "error", "message": "ADMIN_MAX_MISMATCH"}, status=403)
 
     now = timezone.now()
+
     req.decision = decision
     req.decided_at = now
     req.status = "ACCEPTED" if decision == "accept" else "REJECTED"
     req.meta = {**meta, "decision_payload": data}
+
     req.save(update_fields=["decision", "decided_at", "status", "meta"])
 
     send_to_tg_id = str(req.cashier_tg_id or "").strip()
     send_to_max_id = str(meta.get("cashier_max_id") or "").strip()
 
+    # Если отклонили — в Bitrix24 не отправляем, просто возвращаем отказ
     if decision == "reject":
         return JsonResponse({
             "status": "ok",
@@ -16880,9 +17204,34 @@ def tg_admin_badge_decision(request):
             "message_to_cashier": "Администратор отклонил запрос бейджа.",
         })
 
-    password, open_username, open_row_id = _get_existing_open_password(user_id=admin_id, system_id=9)
+    # Если подтвердили — получаем пароль бейджа админа
+    password, open_username, open_row_id = _get_existing_open_password(
+        user_id=admin_id,
+        system_id=9,
+    )
+
     if not password:
-        return JsonResponse({"status": "error", "message": "ADMIN_PASSWORD_NOT_FOUND"}, status=404)
+        return JsonResponse({
+            "status": "error",
+            "message": "ADMIN_PASSWORD_NOT_FOUND"
+        }, status=404)
+
+    # После подтверждения отправляем лог в Bitrix24 асинхронно.
+    # MAX-бот не будет ждать Bitrix24.
+    try:
+        cashier_name_for_bitrix = req.cashier_full_name or "—"
+        admin_name_for_bitrix = req.admin_full_name or "—"
+        storeid_for_bitrix = req.storeid
+        decided_at_for_bitrix = req.decided_at
+
+        transaction.on_commit(lambda: send_admin_badge_to_bitrix_async(
+            storeid=storeid_for_bitrix,
+            cashier_name=cashier_name_for_bitrix,
+            admin_name=admin_name_for_bitrix,
+            decided_at=decided_at_for_bitrix,
+        ))
+    except Exception as e:
+        logger.error("[BADGE BITRIX] Не удалось поставить отправку в очередь: %s", e, exc_info=True)
 
     return JsonResponse({
         "status": "ok",
@@ -16891,7 +17240,11 @@ def tg_admin_badge_decision(request):
         "send_to_tg_id": send_to_tg_id,
         "send_to_max_id": send_to_max_id,
         "password": password,
-        "admin_open_in_system": {"id": open_row_id, "username": open_username, "system_id": 9},
+        "admin_open_in_system": {
+            "id": open_row_id,
+            "username": open_username,
+            "system_id": 9,
+        },
     })
 
 
@@ -16913,7 +17266,152 @@ def tg_admin_badge_decision(request):
 
 
 
+@require_GET
+def admin_badge_transfer_report_excel(request, period: str):
+    """
+    Excel-отчёт по подтверждённым передачам бейджа администратора.
 
+    Периоды:
+      /reports/admin-badge-transfer-excel/week/
+      /reports/admin-badge-transfer-excel/month/
+      /reports/admin-badge-transfer-excel/halfyear/
+    """
+
+    expected_token = (
+        os.getenv("BADGE_REPORT_TOKEN")
+        or os.getenv("MAX_BOT_INTERNAL_TOKEN")
+        or ""
+    ).strip()
+
+    got_token = (
+        request.GET.get("token")
+        or request.headers.get("X-Report-Token")
+        or ""
+    ).strip()
+
+    if expected_token and got_token != expected_token:
+        return HttpResponseForbidden("Forbidden")
+
+    period = (period or "").strip().lower()
+
+    period_days = {
+        "week": 7,
+        "month": 30,
+        "halfyear": 183,
+        "half-year": 183,
+        "6months": 183,
+        "sixmonths": 183,
+    }
+
+    if period not in period_days:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Некорректный период. Используй: week, month, halfyear",
+            },
+            status=400,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+    start_dt = timezone.now() - datetime.timedelta(days=period_days[period])
+
+    qs = (
+        AdminBadgeRequest.objects
+        .filter(
+            Q(status="ACCEPTED") | Q(decision__iexact="accept"),
+            decided_at__isnull=False,
+            decided_at__gte=start_dt,
+        )
+        .order_by("decided_at")
+    )
+
+    # Чтобы не делать запрос к stores на каждую строку
+    store_ids = sorted({
+        int(x.storeid)
+        for x in qs
+        if x.storeid is not None
+    })
+
+    stores_map = {}
+
+    if store_ids:
+        stores_qs = Store.objects.filter(ukm4store__in=store_ids).only("ukm4store", "name")
+
+        for store in stores_qs:
+            if store.ukm4store is not None:
+                stores_map[int(store.ukm4store)] = (
+                    str(store.name).strip()
+                    if store.name
+                    else f"Магазин {store.ukm4store}"
+                )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Передача бейджа"
+
+    headers = ["Магазин", "Дата", "Время", "Кассир", "Администратор"]
+    ws.append(headers)
+
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    thin = Side(style="thin", color="B7B7B7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for col_num, title in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_num)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    for item in qs:
+        if item.storeid is not None:
+            store_name = stores_map.get(int(item.storeid), f"Магазин {item.storeid}")
+        else:
+            store_name = "—"
+
+        date_text, time_text = _badge_date_time_parts(item.decided_at)
+
+        ws.append([
+            store_name,
+            date_text,
+            time_text,
+            item.cashier_full_name or "—",
+            item.admin_full_name or "—",
+        ])
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.border = border
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+    widths = {
+        "A": 35,
+        "B": 14,
+        "C": 12,
+        "D": 35,
+        "E": 35,
+    }
+
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    local_today = _badge_local_dt(timezone.now()).strftime("%Y-%m-%d")
+    filename = f"admin_badge_transfer_{period}_{local_today}.xlsx"
+
+    response = HttpResponse(
+        output.getvalue(),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+    return response
 
 
 
