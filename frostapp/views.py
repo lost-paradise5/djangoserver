@@ -10451,7 +10451,10 @@ def get_qr_code_by_employee_id(request):
         inn_raw = str(data.get("inn") or data.get("employee_id") or "").strip()
         fio_raw = str(data.get("fio") or "").strip()
         store_raw = str(data.get("storeId") or data.get("storeid") or "").strip()
-        role_raw = str(data.get("roleId") or data.get("roleid") or "").strip()
+        
+        role_value = data.get("roleId", data.get("roleid", None))
+        role_raw = "" if role_value is None else str(role_value).strip()
+        
         phone_raw = str(data.get("phone") or "").strip()
 
         if not inn_raw:
@@ -10557,31 +10560,35 @@ def get_qr_code_by_employee_id(request):
             return JsonResponse({"status": "error", "message": msg}, status=400)
         sm_store_id = int(store_raw)
 
-        if not role_raw or not role_raw.isdigit():
-            msg = "Некорректный roleId"
-            _send_qr_employee_max_log_async(
-                "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
-                f"Этап: Валидация\nПричина: {msg}\nroleId={role_raw!r}"
-            )
-            log_qr_issue(
-                endpoint="get_qr_code_by_employee_id",
-                method="BY_INN",
-                status="error",
-                user=None,
-                employee_inn=plain_inn,
-                employee_fio=fio,
-                tg_id="",
-                phone_raw=phone_raw,
-                phone_normalized=normalize_phone_ru(phone_raw) or "",
-                sm_store_id=sm_store_id,
-                ukm_store_id=None,
-                role_id=None,
-                qr_data="",
-                error_message=f"Валидация: {msg}",
-                raw_request={"raw_body": raw_body} if raw_body else None,
-            )
-            return JsonResponse({"status": "error", "message": msg}, status=400)
-        role_id_req = int(role_raw)
+        role_id_req = None
+
+        if role_raw:
+            if not role_raw.isdigit():
+                msg = "Некорректный roleId"
+                _send_qr_employee_max_log_async(
+                    "❌ Ошибка (READ-ONLY) при выдаче QR по ИНН\n"
+                    f"Этап: Валидация\nПричина: {msg}\nroleId={role_raw!r}"
+                )
+                log_qr_issue(
+                    endpoint="get_qr_code_by_employee_id",
+                    method="BY_INN",
+                    status="error",
+                    user=None,
+                    employee_inn=plain_inn,
+                    employee_fio=fio,
+                    tg_id="",
+                    phone_raw=phone_raw,
+                    phone_normalized=normalize_phone_ru(phone_raw) or "",
+                    sm_store_id=sm_store_id,
+                    ukm_store_id=None,
+                    role_id=None,
+                    qr_data="",
+                    error_message=f"Валидация: {msg}",
+                    raw_request={"raw_body": raw_body} if raw_body else None,
+                )
+                return JsonResponse({"status": "error", "message": msg}, status=400)
+        
+            role_id_req = int(role_raw)
 
         phone_norm = normalize_phone_ru(phone_raw) or ""
 
@@ -10748,12 +10755,24 @@ def get_qr_code_by_employee_id(request):
         role_mismatch_notes = []
         for l in ukm_links:
             sid = int(l["storeid"])
-            role_id_db = int(l["roleid"])
+        
+            role_id_db = None
+            try:
+                role_id_db = int(l["roleid"]) if l.get("roleid") is not None else None
+            except Exception:
+                role_id_db = None
+        
             s_obj = store_map.get(str(sid))
-
-            if sid == int(ukm_store_id_req) and role_id_db != int(role_id_req):
-                role_mismatch_notes.append(f"requested_role={role_id_req} != ukm_users.roleid={role_id_db} (ukm_storeid={sid})")
-
+        
+            if (
+                role_id_req is not None
+                and sid == int(ukm_store_id_req)
+                and role_id_db != role_id_req
+            ):
+                role_mismatch_notes.append(
+                    f"requested_role={role_id_req} != ukm_users.roleid={role_id_db} (ukm_storeid={sid})"
+                )
+        
             per_store_results.append({
                 "ukm_storeid": sid,
                 "smstore": getattr(s_obj, "smstore", None),
@@ -10779,7 +10798,7 @@ def get_qr_code_by_employee_id(request):
             f"  • phone_raw: {phone_raw or '—'}",
             f"  • phone_norm: {phone_norm or '—'}",
             "",
-            f"🏬 Запрошенный магазин: smstore={sm_store_id} → ukm4store={ukm_store_id_req}, roleId={role_id_req}",
+            f"🏬 Запрошенный магазин: smstore={sm_store_id} → ukm4store={ukm_store_id_req}, roleId={role_id_req if role_id_req is not None else 'не передан'}",
         ]
         if role_mismatch_notes:
             lines += ["", "⚠️ Несовпадение roleId:", *[f"  • {x}" for x in role_mismatch_notes]]
