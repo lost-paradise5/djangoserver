@@ -74,6 +74,7 @@ from frostapp.views import (
     working_employees_excel_generate,
     export_stores_excel,
     sync_stores_postgres,
+    admin_badge_transfer_report_excel,
 )
 
 urlpatterns = [
@@ -225,9 +226,17 @@ urlpatterns = [
         views.working_employees_by_stores_excel,
         name="working_employees_by_stores_excel",
     ),
+
+    path(
+        "reports/admin-badge-transfer-excel/<str:period>/",
+        admin_badge_transfer_report_excel,
+        name="admin_badge_transfer_report_excel",
+    ),
     
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
+
+    
     path('sync/stores/', sync_stores_postgres, name='sync_stores_postgres'),
     path("ui/smstaff/create2/", views.sm_staff_ui_create2, name="sm_staff_ui_create2"),
 
