@@ -278,6 +278,41 @@ def _read_simple_env_file_value(name: str, env_path: str = "/app/.env") -> str |
     return None
 
 
+
+
+def _env_value(name: str, default: str = "", env_path: str = "/app/.env") -> str:
+    """
+    Читает значение сначала из настоящего окружения Docker,
+    потом из файла /app/.env.
+    """
+    value = os.getenv(name)
+
+    if value is not None and str(value).strip() != "":
+        return str(value).strip()
+
+    value_from_file = _read_simple_env_file_value(name, env_path)
+
+    if value_from_file is not None and str(value_from_file).strip() != "":
+        return str(value_from_file).strip()
+
+    return default
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def get_ukm5_full_xml_store_ids() -> set[int]:
     """
     Динамически читает список магазинов для ночной ротации.
@@ -16488,10 +16523,14 @@ def _tg_send_message(chat_id: str, text: str, reply_markup: dict | None = None) 
 
 # Admin Badge -> Bitrix24
 
-BADGE_REPORT_TIMEZONE = os.getenv(
-    "BADGE_REPORT_TIMEZONE",
-    os.getenv("SHIFT_TIMEZONE", "Asia/Irkutsk")
-).strip() or "Asia/Irkutsk"
+def _badge_report_timezone() -> str:
+    return (
+        _env_value(
+            "BADGE_REPORT_TIMEZONE",
+            _env_value("SHIFT_TIMEZONE", "Asia/Irkutsk")
+        ).strip()
+        or "Asia/Irkutsk"
+    )
 
 
 _BITRIX_BADGE_EXECUTOR = ThreadPoolExecutor(
@@ -16500,7 +16539,7 @@ _BITRIX_BADGE_EXECUTOR = ThreadPoolExecutor(
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
-    return str(os.getenv(name, default)).strip().lower() in {
+    return str(_env_value(name, default)).strip().lower() in {
         "1", "true", "yes", "y", "on"
     }
 
@@ -16515,7 +16554,8 @@ def _bitrix_method_url(method: str) -> str:
     2) https://domain.bitrix24.ru/rest/1/secret/im.message.add.json
        -> оставит как есть
     """
-    base = (os.getenv("BITRIX_WEBHOOK_URL") or "").strip()
+    base = _env_value("BITRIX_WEBHOOK_URL", "").strip()
+
     if not base:
         return ""
 
@@ -16533,7 +16573,7 @@ def _badge_local_dt(dt=None):
         dt = timezone.now()
 
     try:
-        tz = ZoneInfo(BADGE_REPORT_TIMEZONE)
+        tz = ZoneInfo(_badge_report_timezone())
         return timezone.localtime(dt, tz)
     except Exception:
         return timezone.localtime(dt)
@@ -16592,16 +16632,39 @@ def _send_admin_badge_to_bitrix_sync(
     cashier_name: str,
     admin_name: str,
 ) -> None:
-    if not _env_truthy("BITRIX_BADGE_NOTIFY_ENABLED", "0"):
-        return
+    enabled_raw = _env_value("BITRIX_BADGE_NOTIFY_ENABLED", "0")
+    enabled = _env_truthy("BITRIX_BADGE_NOTIFY_ENABLED", "0")
 
     url = _bitrix_method_url("im.message.add")
-    dialog_id = (os.getenv("BITRIX_BADGE_DIALOG_ID") or "").strip()
+    dialog_id = _env_value("BITRIX_BADGE_DIALOG_ID", "").strip()
 
-    if not url or not dialog_id:
-        logger.warning(
-            "[BADGE BITRIX] Не настроены BITRIX_WEBHOOK_URL или BITRIX_BADGE_DIALOG_ID"
-        )
+    print(
+        f"[BADGE BITRIX] start enabled_raw={enabled_raw!r} "
+        f"enabled={enabled} url_set={bool(url)} dialog_id={dialog_id!r}",
+        flush=True,
+    )
+
+    logger.warning(
+        "[BADGE BITRIX] start enabled_raw=%r enabled=%s url_set=%s dialog_id=%r",
+        enabled_raw,
+        enabled,
+        bool(url),
+        dialog_id,
+    )
+
+    if not enabled:
+        print("[BADGE BITRIX] Отправка выключена. Нужно BITRIX_BADGE_NOTIFY_ENABLED=1", flush=True)
+        logger.warning("[BADGE BITRIX] Отправка выключена. Нужно BITRIX_BADGE_NOTIFY_ENABLED=1")
+        return
+
+    if not url:
+        print("[BADGE BITRIX] Не задан BITRIX_WEBHOOK_URL", flush=True)
+        logger.error("[BADGE BITRIX] Не задан BITRIX_WEBHOOK_URL")
+        return
+
+    if not dialog_id:
+        print("[BADGE BITRIX] Не задан BITRIX_BADGE_DIALOG_ID", flush=True)
+        logger.error("[BADGE BITRIX] Не задан BITRIX_BADGE_DIALOG_ID")
         return
 
     message = _build_badge_bitrix_message(
@@ -16611,7 +16674,23 @@ def _send_admin_badge_to_bitrix_sync(
         admin_name=admin_name,
     )
 
-    timeout_sec = int(os.getenv("BITRIX_BADGE_TIMEOUT_SEC", "8"))
+    try:
+        timeout_sec = int(_env_value("BITRIX_BADGE_TIMEOUT_SEC", "8"))
+    except Exception:
+        timeout_sec = 8
+
+    print(
+        f"[BADGE BITRIX] sending url={url} dialog_id={dialog_id} "
+        f"message={message.replace(chr(10), ' | ')}",
+        flush=True,
+    )
+
+    logger.warning(
+        "[BADGE BITRIX] sending url=%s dialog_id=%s message=%s",
+        url,
+        dialog_id,
+        message.replace("\n", " | "),
+    )
 
     try:
         response = requests.post(
@@ -16625,7 +16704,18 @@ def _send_admin_badge_to_bitrix_sync(
             timeout=timeout_sec,
         )
 
-        text = response.text[:1500] if response.text else ""
+        text = response.text[:3000] if response.text else ""
+
+        print(
+            f"[BADGE BITRIX] response status={response.status_code} body={text}",
+            flush=True,
+        )
+
+        logger.warning(
+            "[BADGE BITRIX] response status=%s body=%s",
+            response.status_code,
+            text,
+        )
 
         if not response.ok:
             logger.error(
@@ -16648,9 +16738,11 @@ def _send_admin_badge_to_bitrix_sync(
             )
             return
 
-        logger.info("[BADGE BITRIX] Сообщение отправлено в Bitrix24")
+        print("[BADGE BITRIX] Сообщение успешно отправлено в Bitrix24", flush=True)
+        logger.warning("[BADGE BITRIX] Сообщение успешно отправлено в Bitrix24")
 
     except Exception as e:
+        print(f"[BADGE BITRIX] Ошибка отправки: {e}", flush=True)
         logger.error("[BADGE BITRIX] Ошибка отправки: %s", e, exc_info=True)
 
 
@@ -16666,6 +16758,20 @@ def send_admin_badge_to_bitrix_async(
     В поток передаём уже простые значения, а не Django model instance.
     """
     store_name = _get_badge_store_name(storeid)
+
+    print(
+        f"[BADGE BITRIX] async submit storeid={storeid} store_name={store_name!r} "
+        f"cashier={cashier_name!r} admin={admin_name!r}",
+        flush=True,
+    )
+
+    logger.warning(
+        "[BADGE BITRIX] async submit storeid=%s store_name=%r cashier=%r admin=%r",
+        storeid,
+        store_name,
+        cashier_name,
+        admin_name,
+    )
 
     _BITRIX_BADGE_EXECUTOR.submit(
         _send_admin_badge_to_bitrix_sync,
@@ -17190,6 +17296,25 @@ def tg_admin_badge_decision(request):
 
     req.save(update_fields=["decision", "decided_at", "status", "meta"])
 
+    print(
+        f"[BADGE DECISION] saved guid={req.id} decision={decision} "
+        f"status={req.status} storeid={req.storeid} "
+        f"cashier={req.cashier_full_name!r} admin={req.admin_full_name!r}",
+        flush=True,
+    )
+    
+    logger.warning(
+        "[BADGE DECISION] saved guid=%s decision=%s status=%s storeid=%s cashier=%r admin=%r",
+        req.id,
+        decision,
+        req.status,
+        req.storeid,
+        req.cashier_full_name,
+        req.admin_full_name,
+    )
+
+    
+
     send_to_tg_id = str(req.cashier_tg_id or "").strip()
     send_to_max_id = str(meta.get("cashier_max_id") or "").strip()
 
@@ -17223,6 +17348,22 @@ def tg_admin_badge_decision(request):
         admin_name_for_bitrix = req.admin_full_name or "—"
         storeid_for_bitrix = req.storeid
         decided_at_for_bitrix = req.decided_at
+
+        print(
+            f"[BADGE BITRIX] schedule send guid={req.id} "
+            f"storeid={storeid_for_bitrix} cashier={cashier_name_for_bitrix!r} "
+            f"admin={admin_name_for_bitrix!r} decided_at={decided_at_for_bitrix}",
+            flush=True,
+        )
+        
+        logger.warning(
+            "[BADGE BITRIX] schedule send guid=%s storeid=%s cashier=%r admin=%r decided_at=%s",
+            req.id,
+            storeid_for_bitrix,
+            cashier_name_for_bitrix,
+            admin_name_for_bitrix,
+            decided_at_for_bitrix,
+        )
 
         transaction.on_commit(lambda: send_admin_badge_to_bitrix_async(
             storeid=storeid_for_bitrix,
@@ -17278,8 +17419,8 @@ def admin_badge_transfer_report_excel(request, period: str):
     """
 
     expected_token = (
-        os.getenv("BADGE_REPORT_TOKEN")
-        or os.getenv("MAX_BOT_INTERNAL_TOKEN")
+        _env_value("BADGE_REPORT_TOKEN")
+        or _env_value("MAX_BOT_INTERNAL_TOKEN")
         or ""
     ).strip()
 
