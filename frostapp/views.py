@@ -5204,18 +5204,31 @@ def _update_store_mysql_and_xml_for_single_store(
         try:
             conv = connect_store_mysql(ukm4ip)
             cur = conv.cursor()
-
+    
             base_version = _calc_next_signal_version(cur)
-            ttl_supported = _mysql_users_supports_ttl_cols(cur, cache_key=str(ukm4ip))
-
+            ttl_supported = _mysql_users_supports_ttl_cols(
+                cur,
+                cache_key=str(ukm4ip)
+            )
+    
             if ttl_supported:
-                local_tz = ZoneInfo(os.getenv("ROTATION_TZ", "Asia/Irkutsk"))
+                local_tz = ZoneInfo(
+                    os.getenv("ROTATION_TZ", "Asia/Irkutsk")
+                )
                 today_local = timezone.now().astimezone(local_tz).date()
-                
+    
                 start_date = today_local
-        
-                end_date = today_local + datetime.timedelta(days=1)
-
+    
+                if int(store_id) == 1003:
+                    end_date = start_date + datetime.timedelta(days=1)
+                else:
+                    end_date = start_date
+    
+                logger.info(
+                    f"[QR/EMP][DATES] storeid={store_id}, "
+                    f"start_date={start_date}, end_date={end_date}"
+                )
+    
                 cur.execute("""
                     INSERT INTO users (
                         store, id, name, inn, password, role_id, version, deleted,
@@ -5245,10 +5258,17 @@ def _update_store_mysql_and_xml_for_single_store(
                     start_date,
                     end_date
                 ))
+    
             else:
                 cur.execute("""
-                    INSERT INTO users (store, id, name, inn, password, role_id, version, deleted)
-                    VALUES (%s, %s, %s, %s, OLD_PASSWORD(%s), %s, %s, 0)
+                    INSERT INTO users (
+                        store, id, name, inn, password,
+                        role_id, version, deleted
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, OLD_PASSWORD(%s),
+                        %s, %s, 0
+                    )
                     ON DUPLICATE KEY UPDATE
                         name     = VALUES(name),
                         inn      = VALUES(inn),
@@ -5265,41 +5285,47 @@ def _update_store_mysql_and_xml_for_single_store(
                     role_id,
                     base_version
                 ))
-
+    
             cur.execute(
-                "INSERT INTO `signal`(`signal`,`version`) VALUES ('incr', %s)",
+                "INSERT INTO `signal`(`signal`,`version`) "
+                "VALUES ('incr', %s)",
                 (base_version,)
             )
-
+    
             conv.commit()
-
+    
             result["ukm4"] = {
                 "status": "ok",
                 "host": str(ukm4ip),
                 "version": int(base_version),
                 "error": "",
             }
-
+    
             logger.info(
                 f"[QR/EMP] Store {store_id} ({ukm4ip}): OK users+signal "
-                f"(id={cashier_id}, role_id={role_id}, version={base_version})"
+                f"(id={cashier_id}, role_id={role_id}, "
+                f"version={base_version})"
             )
-
+    
         except Exception as e:
-            logger.error(f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}", exc_info=True)
+            logger.error(
+                f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}",
+                exc_info=True
+            )
+    
             if conv:
                 try:
                     conv.rollback()
                 except Exception:
                     pass
-
+    
             result["ukm4"] = {
                 "status": "error",
                 "host": str(ukm4ip) if ukm4ip else None,
                 "version": None,
                 "error": str(e),
             }
-
+    
         finally:
             try:
                 if cur:
