@@ -319,7 +319,7 @@ def _fill_1c_admin_badge_print_sheet(wb: Workbook, start_dt, end_exclusive_dt, t
     get_qr_code_by_employee_id сейчас пишет несколько строк по магазинам пользователя.
     Поэтому берём только строку, где sm_store_id совпадает с storeId из raw_request.
     """
-    ws = wb.create_sheet("Печать бейджа администратора из 1С")
+    ws = wb.create_sheet("Печать бейджа из 1С")
 
     headers = ["Магазин", "Дата", "Время", "Администратор"]
     ws.append(headers)
