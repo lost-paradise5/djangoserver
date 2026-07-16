@@ -14477,6 +14477,7 @@ def _mobile_prepare_employees(
             "oracle_test_rows": [],
 
             "generated_password": "",
+            "password_source": "",
 
             "postgres_result": {},
             "supermag_result": {},
@@ -15633,6 +15634,81 @@ def _mobile_sync_postgres_employee(
     }
 
 
+
+
+def _mobile_select_employee_pin(
+    user_id: int,
+) -> tuple[str, str]:
+    """
+    Возвращает единый четырёхзначный PIN сотрудника.
+
+    Логика:
+    1. Если в open_in_system уже есть один корректный PIN
+       для system_id=4 — используем его повторно.
+    2. Если записей нет, PIN некорректный или в дублях
+       находятся разные PIN — генерируем новый.
+    3. После успешной обработки хотя бы одной базы
+       _mobile_upsert_open_in_system() приведёт все записи
+       system_id=4 к одному логину и одному PIN.
+    """
+    rows = list(
+        OpenInSystem.objects
+        .filter(
+            user_id=user_id,
+            system_id=4,
+        )
+        .order_by("id")
+        .values(
+            "id",
+            "password",
+        )
+    )
+
+    valid_pins = sorted({
+        str(row.get("password") or "").strip()
+        for row in rows
+        if (
+            str(row.get("password") or "").strip().isdigit()
+            and len(
+                str(row.get("password") or "").strip()
+            ) == 4
+        )
+    })
+
+    if len(valid_pins) == 1:
+        return (
+            valid_pins[0],
+            "Существующий PIN из open_in_system",
+        )
+
+    new_pin = _generate_sm_password(4)
+
+    if len(valid_pins) > 1:
+        source = (
+            "Новый PIN: в open_in_system "
+            "найдены разные четырёхзначные PIN"
+        )
+    elif rows:
+        source = (
+            "Новый PIN: существующий пароль "
+            "в open_in_system имеет неверный формат"
+        )
+    else:
+        source = (
+            "Новый PIN: записи open_in_system "
+            "ещё не было"
+        )
+
+    return new_pin, source
+
+
+
+
+
+
+
+
+
 def _mobile_apply_supermag(
     employees: list[dict],
     services: list[str],
@@ -15893,6 +15969,10 @@ def _mobile_apply_supermag(
             )
             and item["error_count"] == 0
         )
+        item["partial_success"] = (
+            item["success_count"] > 0
+            and not item["all_success"]
+        )
 
     return result
 
@@ -16108,7 +16188,31 @@ def mobile_employees_sync_ui(request):
                 services,
             )
         )
-
+        
+        # Базы, полностью прошедшие предварительную проверку:
+        # - соединение установлено;
+        # - таблицы доступны;
+        # - нужные должности найдены.
+        available_services = [
+            db
+            for db in services
+            if db not in inventory["db_errors"]
+        ]
+        
+        # Недоступные базы или базы с ошибкой структуры/должности.
+        skipped_services = [
+            db
+            for db in services
+            if db in inventory["db_errors"]
+        ]
+        
+        logger.info(
+            "[MOBILE_SYNC][PREFLIGHT] "
+            "available=%s skipped=%s",
+            available_services,
+            skipped_services,
+        )
+        
         _mobile_plan_logins(
             employees,
             inventory,
@@ -16142,6 +16246,20 @@ def mobile_employees_sync_ui(request):
             "oracle_services_count": len(
                 services
             ),
+            
+            "available_oracle_services": (
+                available_services
+            ),
+            "available_oracle_services_count": len(
+                available_services
+            ),
+            
+            "skipped_oracle_services": (
+                skipped_services
+            ),
+            "skipped_oracle_services_count": len(
+                skipped_services
+            ),
         })
 
         # Тестовый запуск заканчивается здесь.
@@ -16169,31 +16287,6 @@ def mobile_employees_sync_ui(request):
                 "Oracle-базы для Supermag."
             )
 
-        # КЛЮЧЕВОЕ ПОВЕДЕНИЕ:
-        #
-        # если хотя бы одна база недоступна,
-        # в ней нет нужной таблицы или должности,
-        # реальный запуск прекращается
-        # ДО изменения PostgreSQL и Oracle.
-        if (
-            supermag_employees
-            and inventory["db_errors"]
-        ):
-            failed = ", ".join(
-                sorted(
-                    inventory[
-                        "db_errors"
-                    ]
-                )
-            )
-
-            raise RuntimeError(
-                "Запуск остановлен до "
-                "изменения данных: "
-                "не пройдена проверка "
-                "всех Supermag-баз. "
-                f"Проблемные базы: {failed}."
-            )
 
         # users + ukm_users.
         for employee in employees:
@@ -16235,99 +16328,211 @@ def mobile_employees_sync_ui(request):
         for employee in employees:
             if not employee["needs_supermag"]:
                 continue
-
-            if employee[
-                "postgres_result"
-            ].get("error"):
-                continue
-
-            if employee["login_plan_error"]:
-                employee[
-                    "supermag_result"
-                ] = {
-                    "success_count": 0,
-                    "target_count": len(
-                        services
+        
+            # Если users или ukm_users не удалось обработать,
+            # Supermag для этого сотрудника пропускаем.
+            if employee["postgres_result"].get("error"):
+                employee["open_result"] = {
+                    "skipped": True,
+                    "message": (
+                        "Не обработано из-за ошибки "
+                        "users или ukm_users."
                     ),
-                    "all_success": False,
-                    "errors": [{
-                        "db": "Планирование",
-                        "message": (
-                            employee[
-                                "login_plan_error"
-                            ]
-                        ),
-                    }],
                 }
                 continue
-
-            # Один PIN на сотрудника.
-            # Этот же PIN отправляется
-            # во все базы и open_in_system.
-            employee[
-                "generated_password"
-            ] = _generate_sm_password(4)
-
-            ready_for_supermag.append(
-                employee
+        
+            # Конфликт ИНН или логина, обнаруженный
+            # при предварительной проверке доступных баз.
+            if employee["login_plan_error"]:
+                employee["supermag_result"] = {
+                    "success_dbs": [],
+                    "success_count": 0,
+                    "target_count": len(
+                        available_services
+                    ),
+                    "error_count": 1,
+                    "all_success": False,
+                    "partial_success": False,
+        
+                    "skipped_dbs": list(
+                        skipped_services
+                    ),
+                    "skipped_count": len(
+                        skipped_services
+                    ),
+        
+                    "errors": [{
+                        "db": "Планирование",
+                        "message": employee[
+                            "login_plan_error"
+                        ],
+                    }],
+                }
+        
+                employee["open_result"] = {
+                    "skipped": True,
+                    "message": (
+                        "Не обновлено из-за конфликта "
+                        "ИНН или логина."
+                    ),
+                }
+                continue
+        
+            # Если ни одна база не прошла предварительную
+            # проверку, users и ukm_users уже обработаны,
+            # но Supermag и open_in_system не меняем.
+            if not available_services:
+                employee["supermag_result"] = {
+                    "success_dbs": [],
+                    "success_count": 0,
+                    "target_count": 0,
+                    "error_count": 0,
+                    "all_success": False,
+                    "partial_success": False,
+        
+                    "skipped_dbs": list(
+                        skipped_services
+                    ),
+                    "skipped_count": len(
+                        skipped_services
+                    ),
+        
+                    "errors": [],
+                    "message": (
+                        "Supermag не обрабатывался: "
+                        "нет доступных Oracle-баз."
+                    ),
+                }
+        
+                employee["open_result"] = {
+                    "skipped": True,
+                    "message": (
+                        "Не обновлено: ни одна база "
+                        "Supermag не была доступна."
+                    ),
+                }
+                continue
+        
+            # Выбираем PIN только один раз для сотрудника.
+            # При повторном запуске используется PIN,
+            # уже сохранённый в open_in_system.
+            (
+                employee["generated_password"],
+                employee["password_source"],
+            ) = _mobile_select_employee_pin(
+                employee["user_id"]
             )
-
+        
+            logger.info(
+                "[MOBILE_SYNC][PIN] "
+                "inn=%s user_id=%s login=%s "
+                "pin=%s source=%s",
+                employee["inn"],
+                employee["user_id"],
+                employee["planned_login"],
+                employee["generated_password"],
+                employee["password_source"],
+            )
+        
+            ready_for_supermag.append(employee)
+        
+        
         if ready_for_supermag:
-            sm_results = (
-                _mobile_apply_supermag(
-                    ready_for_supermag,
-                    services,
-                    inventory[
-                        "positions_by_db"
-                    ],
-                )
+            # В процедуру передаём только базы,
+            # прошедшие предварительную проверку.
+            sm_results = _mobile_apply_supermag(
+                ready_for_supermag,
+                available_services,
+                inventory["positions_by_db"],
             )
-
-            for employee in (
-                ready_for_supermag
-            ):
+        
+            for employee in ready_for_supermag:
+                employee["supermag_result"] = (
+                    sm_results[employee["inn"]]
+                )
+        
+                # Добавляем в результат базы,
+                # пропущенные ещё на этапе проверки.
                 employee[
                     "supermag_result"
-                ] = sm_results[
-                    employee["inn"]
-                ]
-
-                # open_in_system меняем
-                # только после успеха
-                # во всех Supermag-базах.
-                if employee[
+                ]["skipped_dbs"] = list(
+                    skipped_services
+                )
+        
+                employee[
                     "supermag_result"
-                ]["all_success"]:
+                ]["skipped_count"] = len(
+                    skipped_services
+                )
+        
+                employee[
+                    "supermag_result"
+                ]["partial_success"] = (
+                    employee[
+                        "supermag_result"
+                    ]["success_count"] > 0
+                    and not employee[
+                        "supermag_result"
+                    ]["all_success"]
+                )
+        
+                # open_in_system обновляем, если удалось
+                # создать или обновить сотрудника хотя бы
+                # в одной базе Supermag.
+                #
+                # Это важно для повторного запуска:
+                # сохранённый PIN будет повторно отправлен
+                # в базы, которые сейчас недоступны.
+                if (
+                    employee[
+                        "supermag_result"
+                    ]["success_count"] > 0
+                ):
                     try:
-                        employee[
-                            "open_result"
-                        ] = (
+                        open_result = (
                             _mobile_upsert_open_in_system(
-                                user_id=(
-                                    employee[
-                                        "user_id"
-                                    ]
-                                ),
-                                login=(
-                                    employee[
-                                        "planned_login"
-                                    ]
-                                ),
-                                password=(
-                                    employee[
-                                        "generated_password"
-                                    ]
-                                ),
+                                user_id=employee[
+                                    "user_id"
+                                ],
+                                login=employee[
+                                    "planned_login"
+                                ],
+                                password=employee[
+                                    "generated_password"
+                                ],
                             )
                         )
-
-                    except Exception as exc:
+        
+                        open_result[
+                            "password_source"
+                        ] = employee[
+                            "password_source"
+                        ]
+        
+                        if employee[
+                            "supermag_result"
+                        ]["all_success"]:
+                            open_result["message"] = (
+                                "PIN записан в open_in_system "
+                                "и во все доступные базы."
+                            )
+                        else:
+                            open_result["message"] = (
+                                "PIN записан в open_in_system "
+                                "и в успешно обработанные базы. "
+                                "Остальные базы будут повторно "
+                                "обработаны следующим запуском."
+                            )
+        
                         employee[
                             "open_result"
-                        ] = {
+                        ] = open_result
+        
+                    except Exception as exc:
+                        employee["open_result"] = {
                             "error": str(exc)
                         }
-
+        
                         logger.exception(
                             "[MOBILE_SYNC]"
                             "[OPEN_IN_SYSTEM] "
@@ -16337,16 +16542,15 @@ def mobile_employees_sync_ui(request):
                             employee["user_id"],
                             exc,
                         )
+        
                 else:
-                    employee[
-                        "open_result"
-                    ] = {
+                    employee["open_result"] = {
                         "skipped": True,
                         "message": (
-                            "Не обновлено: "
-                            "сотрудник обработан "
-                            "не во всех "
-                            "Supermag-базах."
+                            "Не обновлено: сотрудника "
+                            "не удалось обработать ни "
+                            "в одной доступной базе "
+                            "Supermag."
                         ),
                     }
 
