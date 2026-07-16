@@ -232,6 +232,11 @@ urlpatterns = [
         admin_badge_transfer_report_excel,
         name="admin_badge_transfer_report_excel",
     ),
+    path(
+        "ui/mobile-employees-sync/",
+        views.mobile_employees_sync_ui,
+        name="mobile_employees_sync_ui",
+    ),
     
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
