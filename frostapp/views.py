@@ -14145,6 +14145,2283 @@ def _oracle_fetch_smstaff_by_login(cur, login: str) -> list[dict]:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================================
+# Мобильное подразделение: users + ukm_users + Supermag + open_in_system
+# ============================================================================
+
+MOBILE_EMPLOYEE_STORE_IDS_RAW = r"""
+11013 11014 11011 7015 11012 14020 2012 9018 14019 11016 6016
+7003 4010 4002 8007 7014 7002 2010 5007 9016 8003 3002 7012 5008
+5001 2006 8005 1004 3003 1006 8002 9001 5006 2007 6012 11008 6014
+9006 2001 1005 9004 7013 2011 14005 14006 9008 9010 4004 9014 11006
+11004 6010 6011 14015 8010 2013 6015 5009 3011 11015 3013 3012 8012
+12005 12008 12007 6017 14021 4011 12009 1003 112005 112004 115008
+110003 117004 114007 121007 118005 104002 114005 109003 109002 1234003
+112006 117005 109004 1234002 112007 102005 104001 115005 105005 108004
+111003 118006 102001 114006 105001 110006 104010 111004 115006 110005
+104008 110008 121005 103009 106006 105004 113006 111002 104009 117003
+109007 107001 113003 108003 1234006 120003 106008 121001 113004 102009
+115007 115009 1010 1234005 103008 103013 109008 106005 103005 103011
+103012 110007 106009 121004 116002 119003 119004 120002 7016 11017 7018
+7019 7020 114008 116004 105006 114009 108005 1234007 111005 108006
+108007 116005 104011 105007 102010 117006 1234008 114003 114004 103010
+7021 4015
+"""
+
+
+def _mobile_parse_store_ids(raw_value: str) -> tuple[int, ...]:
+    result = []
+    seen = set()
+
+    for token in re.findall(r"\d+", raw_value or ""):
+        value = int(token)
+
+        if value <= 0 or value in seen:
+            continue
+
+        seen.add(value)
+        result.append(value)
+
+    return tuple(result)
+
+
+MOBILE_EMPLOYEE_STORE_IDS = _mobile_parse_store_ids(
+    os.getenv(
+        "MOBILE_EMPLOYEE_STORE_IDS",
+        MOBILE_EMPLOYEE_STORE_IDS_RAW,
+    )
+)
+
+# Версия для новых строк ukm_users.
+MOBILE_UKM_VERSION = int(
+    os.getenv("MOBILE_UKM_VERSION", "1")
+)
+
+# Используется, чтобы два реальных запуска не выполнялись одновременно.
+MOBILE_SYNC_DB_LOCK_KEY = int(
+    os.getenv("MOBILE_SYNC_DB_LOCK_KEY", "2026071601")
+)
+
+_MOBILE_SYNC_LOCAL_LOCK = threading.Lock()
+
+
+MOBILE_SM_POSITION_CONFIG = {
+    "admin": {
+        "id": 624,
+        "title": "Админ_УУ_Николаевский_Мобил",
+        "orarole": "ADMIN_UU_NIKOLAEVSKIY_MOBIL",
+    },
+    "receiver": {
+        "id": 625,
+        "title": "Прием_УУ_Николаевский_Мобил",
+        "orarole": "PRIEM_UU_NIKOLAEVSKIY_MOBIL",
+    },
+}
+
+
+def _mobile_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _mobile_normalize(value: Any) -> str:
+    value = _mobile_text(value)
+    value = value.replace("Ё", "Е").replace("ё", "е")
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def _mobile_false(value: Any) -> bool:
+    if value is False:
+        return True
+
+    return _mobile_normalize(value) in {
+        "false",
+        "0",
+        "нет",
+        "no",
+    }
+
+
+def _mobile_classify_position(
+    position_name: str,
+) -> tuple[str, str, int, bool]:
+    """
+    Возвращает:
+
+    kind
+    подпись типа сотрудника
+    roleid для ukm_users
+    нужно ли создавать Supermag
+    """
+    normalized = _mobile_normalize(position_name)
+
+    if "администратор" in normalized:
+        return (
+            "admin",
+            "Администратор",
+            13,
+            True,
+        )
+
+    if "приемщик" in normalized:
+        return (
+            "receiver",
+            "Приемщик",
+            1,
+            True,
+        )
+
+    if "торгового зала" in normalized:
+        return (
+            "sales_floor",
+            "Сотрудник торгового зала",
+            1,
+            False,
+        )
+
+    # Из мобильного подразделения берём всех.
+    # Для остальных должностей:
+    # - создаём users;
+    # - создаём ukm_users с roleid=1;
+    # - Supermag не создаём.
+    return (
+        "other",
+        "Другая должность мобильного подразделения",
+        1,
+        False,
+    )
+
+
+def _mobile_prepare_employees(
+    raw_employees: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    employees = []
+    rejected = []
+    duplicates = []
+    by_inn = {}
+
+    for source_index, raw in enumerate(
+        raw_employees,
+        start=1,
+    ):
+        if not isinstance(raw, dict):
+            rejected.append({
+                "source_index": source_index,
+                "reason": (
+                    "Элемент ответа 1С "
+                    "не является объектом."
+                ),
+            })
+            continue
+
+        department_name = _mobile_text(
+            raw.get("Подразделение")
+        )
+
+        if (
+            "мобильное подразделение"
+            not in _mobile_normalize(department_name)
+        ):
+            continue
+
+        inn = _mobile_text(raw.get("ИНН"))
+        lastname = _mobile_text(raw.get("Фамилия"))
+        firstname = _mobile_text(raw.get("Имя"))
+        patronymic = _mobile_text(raw.get("Отчество"))
+
+        full_name = re.sub(
+            r"\s+",
+            " ",
+            " ".join(
+                value
+                for value in (
+                    lastname,
+                    firstname,
+                    patronymic,
+                )
+                if value
+            ),
+        ).strip()
+
+        if _mobile_false(
+            raw.get("ОформленПоТрудовомуДоговору")
+        ):
+            rejected.append({
+                "source_index": source_index,
+                "inn": inn,
+                "fio": full_name,
+                "reason": (
+                    "Сотрудник не оформлен "
+                    "по трудовому договору."
+                ),
+            })
+            continue
+
+        if not _is_valid_inn_digits(inn):
+            rejected.append({
+                "source_index": source_index,
+                "inn": inn,
+                "fio": full_name,
+                "reason": (
+                    "Некорректный ИНН: "
+                    "ожидается 10 или 12 цифр."
+                ),
+            })
+            continue
+
+        if not full_name:
+            rejected.append({
+                "source_index": source_index,
+                "inn": inn,
+                "fio": "",
+                "reason": "В 1С не заполнено ФИО.",
+            })
+            continue
+
+        position_name = (
+            _mobile_text(raw.get("Должность"))
+            or "Не указана"
+        )
+
+        (
+            kind,
+            kind_label,
+            roleid,
+            needs_supermag,
+        ) = _mobile_classify_position(
+            position_name
+        )
+
+        employee = {
+            "source_index": source_index,
+            "inn": inn,
+            "lastname": lastname,
+            "firstname": firstname,
+            "patronymic": patronymic,
+            "full_name": full_name,
+            "mail": _mobile_text(
+                raw.get("Почта")
+            ),
+            "phone": _mobile_text(
+                raw.get("НомерТелефона")
+            ),
+            "department_name": (
+                department_name
+                or "Мобильное подразделение"
+            ),
+            "department_guid": _mobile_text(
+                raw.get("ПодразделениеGuid")
+            ),
+            "position_name": position_name,
+            "kind": kind,
+            "kind_label": kind_label,
+            "roleid": roleid,
+            "needs_supermag": needs_supermag,
+
+            "source_duplicates": [],
+
+            "planned_login": "",
+            "login_source": "",
+            "login_plan_error": "",
+
+            "oracle_existing_logins": [],
+            "oracle_test_rows": [],
+
+            "generated_password": "",
+
+            "postgres_result": {},
+            "supermag_result": {},
+            "open_result": {},
+        }
+
+        previous = by_inn.get(inn)
+
+        if previous:
+            duplicate = {
+                "inn": inn,
+                "first_source_index": (
+                    previous["source_index"]
+                ),
+                "duplicate_source_index": (
+                    source_index
+                ),
+                "first_fio": (
+                    previous["full_name"]
+                ),
+                "duplicate_fio": full_name,
+                "first_position": (
+                    previous["position_name"]
+                ),
+                "duplicate_position": (
+                    position_name
+                ),
+            }
+
+            duplicates.append(duplicate)
+            previous["source_duplicates"].append(
+                duplicate
+            )
+            continue
+
+        by_inn[inn] = employee
+        employees.append(employee)
+
+    return employees, rejected, duplicates
+
+
+def _mobile_shorten_fio(
+    employee: dict,
+    max_length: int = 30,
+) -> str:
+    """
+    Если ФИО длиннее 30 символов:
+
+    Фамилия Имя О.
+
+    Если и это длиннее:
+
+    Фамилия И.О.
+    """
+    full_name = re.sub(
+        r"\s+",
+        " ",
+        employee["full_name"],
+    ).strip()
+
+    if len(full_name) <= max_length:
+        return full_name
+
+    lastname = employee["lastname"]
+    firstname = employee["firstname"]
+    patronymic = employee["patronymic"]
+
+    variant = " ".join(
+        filter(
+            None,
+            [
+                lastname,
+                firstname,
+                (
+                    f"{patronymic[0]}."
+                    if patronymic
+                    else ""
+                ),
+            ],
+        )
+    ).strip()
+
+    if len(variant) <= max_length:
+        return variant
+
+    variant = " ".join(
+        filter(
+            None,
+            [
+                lastname,
+                (
+                    f"{firstname[0]}."
+                    if firstname
+                    else ""
+                ),
+                (
+                    f"{patronymic[0]}."
+                    if patronymic
+                    else ""
+                ),
+            ],
+        )
+    ).strip()
+
+    if len(variant) <= max_length:
+        return variant
+
+    return variant[:max_length].rstrip(" .")
+
+
+def _mobile_fit_login(
+    base: str,
+    suffix: str = "",
+) -> str:
+    max_base_length = max(
+        1,
+        64 - len(suffix),
+    )
+
+    return (
+        f"{base[:max_base_length].rstrip('_')}"
+        f"{suffix}"
+    )[:64].rstrip("_")
+
+
+def _mobile_login_candidates(
+    employee: dict,
+) -> list[str]:
+    """
+    Иванов Сидор Петрович:
+
+    sidor_ivanov
+    sidor_ivanov_p
+    sidor_ivanov_p2
+    sidor_ivanov_p3
+    ...
+    """
+    firstname = _normalize_login_piece(
+        employee["firstname"]
+    )
+    lastname = _normalize_login_piece(
+        employee["lastname"]
+    )
+    patronymic = _normalize_login_piece(
+        employee["patronymic"]
+    )
+
+    if not firstname or not lastname:
+        return []
+
+    base = f"{firstname}_{lastname}"
+
+    candidates = [
+        _mobile_fit_login(base)
+    ]
+
+    if patronymic:
+        candidates.append(
+            _mobile_fit_login(
+                base,
+                f"_{patronymic[0]}",
+            )
+        )
+
+        for number in range(2, 100):
+            candidates.append(
+                _mobile_fit_login(
+                    base,
+                    f"_{patronymic[0]}{number}",
+                )
+            )
+    else:
+        for number in range(2, 101):
+            candidates.append(
+                _mobile_fit_login(
+                    base,
+                    f"_{number}",
+                )
+            )
+
+    result = []
+    seen = set()
+
+    for login in candidates:
+        login = login.lower()
+
+        if login in seen:
+            continue
+
+        if not _is_valid_sm_login(login):
+            continue
+
+        seen.add(login)
+        result.append(login)
+
+    return result
+
+
+def _mobile_supermag_services() -> list[str]:
+    """
+    По умолчанию используются все базы,
+    перечисленные в ORACLE_TNS_MAP.
+
+    При необходимости можно ограничить
+    список в /app/.env:
+
+    MOBILE_SUPERMAG_SERVICES=BINUU00,BINUU01,BINCH1
+    """
+    raw = os.getenv(
+        "MOBILE_SUPERMAG_SERVICES",
+        "",
+    ).strip()
+
+    if not raw:
+        return sorted(
+            ORACLE_TNS_MAP.keys()
+        )
+
+    result = []
+    seen = set()
+
+    for token in re.split(
+        r"[,;\s]+",
+        raw,
+    ):
+        db = _normalize_service_key(token)
+
+        if not db or db in seen:
+            continue
+
+        if db not in ORACLE_TNS_MAP:
+            logger.warning(
+                "[MOBILE_SYNC] "
+                "База %s отсутствует "
+                "в ORACLE_TNS_MAP",
+                db,
+            )
+            continue
+
+        seen.add(db)
+        result.append(db)
+
+    return result
+
+
+def _mobile_chunks(
+    values: list[str],
+    size: int = 400,
+):
+    for start in range(
+        0,
+        len(values),
+        size,
+    ):
+        yield values[
+            start:start + size
+        ]
+
+
+def _mobile_oracle_inventory_rows(
+    cur,
+    target_inns: list[str],
+    target_logins: list[str],
+) -> list[dict]:
+    cols = _oracle_get_table_columns_set(
+        cur,
+        owner="SUPERMAG",
+        table="SMSTAFF",
+    )
+
+    if (
+        "SERVERLOGIN" not in cols
+        or "INN" not in cols
+    ):
+        raise ValueError(
+            "В SUPERMAG.SMSTAFF "
+            "отсутствует SERVERLOGIN или INN."
+        )
+
+    found = {}
+
+    def execute_for_values(
+        expression: str,
+        values: list[str],
+    ):
+        for chunk in _mobile_chunks(values):
+            binds = {
+                f"b{i}": value
+                for i, value in enumerate(chunk)
+            }
+
+            placeholders = ", ".join(
+                f":b{i}"
+                for i in range(len(chunk))
+            )
+
+            cur.execute(
+                f"""
+                SELECT
+                    LOWER(TRIM(serverlogin))
+                        AS serverlogin,
+                    TRIM(inn)
+                        AS inn
+                FROM smstaff
+                WHERE {expression}
+                      IN ({placeholders})
+                """,
+                binds,
+            )
+
+            for login, inn in cur.fetchall():
+                normalized_login = (
+                    _mobile_text(login).lower()
+                )
+                normalized_inn = (
+                    _mobile_text(inn)
+                )
+
+                found[
+                    (
+                        normalized_login,
+                        normalized_inn,
+                    )
+                ] = {
+                    "login": normalized_login,
+                    "inn": normalized_inn,
+                }
+
+    if target_inns:
+        execute_for_values(
+            "TRIM(inn)",
+            target_inns,
+        )
+
+    if target_logins:
+        execute_for_values(
+            "LOWER(TRIM(serverlogin))",
+            target_logins,
+        )
+
+    return list(found.values())
+
+
+def _mobile_pick_sm_position(
+    choices: list[dict],
+    config: dict,
+) -> dict:
+    wanted_role = _mobile_normalize(
+        config["orarole"]
+    )
+    wanted_title = _mobile_normalize(
+        config["title"]
+    )
+    wanted_id = int(config["id"])
+
+    # 1. ORAROLE
+    for item in choices:
+        if (
+            _mobile_normalize(
+                item.get("orarole")
+            )
+            == wanted_role
+        ):
+            return item
+
+    # 2. ID
+    for item in choices:
+        try:
+            if int(item.get("id")) == wanted_id:
+                return item
+        except Exception:
+            pass
+
+    # 3. TITLE
+    for item in choices:
+        if (
+            _mobile_normalize(
+                item.get("title")
+            )
+            == wanted_title
+        ):
+            return item
+
+    raise ValueError(
+        "В SMOFFCFG не найдена должность: "
+        f"ID={wanted_id}, "
+        f"TITLE={config['title']}, "
+        f"ORAROLE={config['orarole']}"
+    )
+
+
+def _mobile_load_oracle_inventory(
+    employees: list[dict],
+    services: list[str],
+) -> dict:
+    """
+    Это одновременно предварительная
+    проверка всех Supermag-баз.
+
+    Проверяется:
+
+    - доступность базы;
+    - наличие SMSTAFF.SERVERLOGIN;
+    - наличие SMSTAFF.INN;
+    - наличие должностей в SMOFFCFG;
+    - существующие ИНН;
+    - существующие логины.
+    """
+    target_employees = [
+        employee
+        for employee in employees
+        if employee["needs_supermag"]
+    ]
+
+    target_inns = sorted({
+        employee["inn"]
+        for employee in target_employees
+    })
+
+    required_kinds = sorted({
+        employee["kind"]
+        for employee in target_employees
+    })
+
+    candidate_map = {
+        employee["inn"]:
+            _mobile_login_candidates(employee)
+        for employee in target_employees
+    }
+
+    target_logins = sorted({
+        login
+        for candidates in candidate_map.values()
+        for login in candidates
+    })
+
+    inventory = {
+        "candidate_map": candidate_map,
+        "login_to_inns": defaultdict(set),
+        "inn_to_logins": defaultdict(set),
+        "rows_by_db": {},
+        "positions_by_db": {},
+        "db_errors": {},
+    }
+
+    if not target_employees:
+        return inventory
+
+    def merge_rows(
+        db: str,
+        rows: list[dict],
+    ):
+        current = {
+            (
+                row["login"],
+                row["inn"],
+            ): row
+            for row in inventory[
+                "rows_by_db"
+            ].get(db, [])
+        }
+
+        for row in rows:
+            current[
+                (
+                    row["login"],
+                    row["inn"],
+                )
+            ] = row
+
+            if row["login"]:
+                inventory[
+                    "login_to_inns"
+                ][row["login"]].add(
+                    row["inn"]
+                )
+
+            if row["inn"] and row["login"]:
+                inventory[
+                    "inn_to_logins"
+                ][row["inn"]].add(
+                    row["login"]
+                )
+
+        inventory["rows_by_db"][db] = (
+            list(current.values())
+        )
+
+    # Основная проверка каждой базы.
+    for db in services:
+        conn = None
+        cur = None
+
+        try:
+            conn = _connect_oracle_service(db)
+            cur = conn.cursor()
+
+            rows = _mobile_oracle_inventory_rows(
+                cur,
+                target_inns,
+                target_logins,
+            )
+
+            merge_rows(db, rows)
+
+            choices = (
+                _oracle_fetch_smoffcfg_choices(cur)
+            )
+
+            inventory[
+                "positions_by_db"
+            ][db] = {}
+
+            for kind in required_kinds:
+                config = (
+                    MOBILE_SM_POSITION_CONFIG[kind]
+                )
+
+                inventory[
+                    "positions_by_db"
+                ][db][kind] = (
+                    _mobile_pick_sm_position(
+                        choices,
+                        config,
+                    )
+                )
+
+        except Exception as exc:
+            inventory[
+                "db_errors"
+            ][db] = str(exc)
+
+            logger.exception(
+                "[MOBILE_SYNC][PREFLIGHT] "
+                "db=%s error=%s",
+                db,
+                exc,
+            )
+
+        finally:
+            try:
+                if cur:
+                    cur.close()
+
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    # Если по ИНН обнаружен старый логин,
+    # дополнительно проверяем этот логин
+    # во всех базах на чужой ИНН.
+    discovered_logins = {
+        login
+        for inn in target_inns
+        for login in inventory[
+            "inn_to_logins"
+        ].get(inn, set())
+    }
+
+    extra_logins = sorted(
+        discovered_logins
+        - set(target_logins)
+    )
+
+    if extra_logins:
+        for db in services:
+            if db in inventory["db_errors"]:
+                continue
+
+            conn = None
+            cur = None
+
+            try:
+                conn = _connect_oracle_service(db)
+                cur = conn.cursor()
+
+                rows = (
+                    _mobile_oracle_inventory_rows(
+                        cur,
+                        [],
+                        extra_logins,
+                    )
+                )
+
+                merge_rows(db, rows)
+
+            except Exception as exc:
+                inventory[
+                    "db_errors"
+                ][db] = str(exc)
+
+                logger.exception(
+                    "[MOBILE_SYNC]"
+                    "[PREFLIGHT_EXTRA] "
+                    "db=%s error=%s",
+                    db,
+                    exc,
+                )
+
+            finally:
+                try:
+                    if cur:
+                        cur.close()
+
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
+
+    return inventory
+
+
+def _mobile_plan_logins(
+    employees: list[dict],
+    inventory: dict,
+) -> None:
+    reserved = set()
+
+    login_to_inns = inventory[
+        "login_to_inns"
+    ]
+
+    inn_to_logins = inventory[
+        "inn_to_logins"
+    ]
+
+    all_rows = [
+        {
+            "db": db,
+            **row,
+        }
+        for db, rows in inventory[
+            "rows_by_db"
+        ].items()
+        for row in rows
+    ]
+
+    for employee in employees:
+        if not employee["needs_supermag"]:
+            continue
+
+        inn = employee["inn"]
+
+        candidates = inventory[
+            "candidate_map"
+        ].get(inn, [])
+
+        employee["oracle_test_rows"] = [
+            row
+            for row in all_rows
+            if (
+                row["inn"] == inn
+                or row["login"] in candidates
+            )
+        ]
+
+        blank_login_rows = [
+            row
+            for row in employee[
+                "oracle_test_rows"
+            ]
+            if (
+                row["inn"] == inn
+                and not row["login"]
+            )
+        ]
+
+        if blank_login_rows:
+            employee["login_plan_error"] = (
+                "ИНН уже найден в Supermag "
+                "у записи с пустым логином. "
+                "Автоматическая обработка "
+                "заблокирована, чтобы "
+                "не создать дубль."
+            )
+            continue
+
+        existing_logins = sorted(
+            inn_to_logins.get(
+                inn,
+                set(),
+            )
+        )
+
+        employee[
+            "oracle_existing_logins"
+        ] = existing_logins
+
+        if len(existing_logins) > 1:
+            employee["login_plan_error"] = (
+                "Для одного ИНН найдены "
+                "разные логины в Oracle-базах: "
+                + ", ".join(existing_logins)
+            )
+            continue
+
+        # Если ИНН уже есть и логин везде один,
+        # используем существующий логин.
+        if len(existing_logins) == 1:
+            login = existing_logins[0]
+
+            foreign_inns = {
+                value
+                for value in login_to_inns.get(
+                    login,
+                    set(),
+                )
+                if value != inn
+            }
+
+            if foreign_inns:
+                employee["login_plan_error"] = (
+                    f"Логин {login} связан "
+                    "также с другим или пустым ИНН: "
+                    + ", ".join(
+                        sorted(
+                            value or "<пусто>"
+                            for value in foreign_inns
+                        )
+                    )
+                )
+                continue
+
+            if login in reserved:
+                employee["login_plan_error"] = (
+                    f"Логин {login} уже выбран "
+                    "другому сотруднику "
+                    "этого запуска."
+                )
+                continue
+
+            if not _is_valid_sm_login(login):
+                employee["login_plan_error"] = (
+                    f"Существующий логин "
+                    f"{login!r} имеет "
+                    "недопустимый формат."
+                )
+                continue
+
+            employee["planned_login"] = login
+            employee["login_source"] = (
+                "Существующий логин по ИНН"
+            )
+
+            reserved.add(login)
+            continue
+
+        if not candidates:
+            employee["login_plan_error"] = (
+                "Невозможно сформировать логин: "
+                "не заполнены имя или фамилия."
+            )
+            continue
+
+        selected_login = ""
+
+        for candidate in candidates:
+            occupied_inns = (
+                login_to_inns.get(
+                    candidate,
+                    set(),
+                )
+            )
+
+            occupied_by_other = any(
+                value != inn
+                for value in occupied_inns
+            )
+
+            if (
+                occupied_by_other
+                or candidate in reserved
+            ):
+                continue
+
+            selected_login = candidate
+            break
+
+        if not selected_login:
+            employee["login_plan_error"] = (
+                "Не найден свободный логин "
+                "среди 100 допустимых вариантов."
+            )
+            continue
+
+        employee[
+            "planned_login"
+        ] = selected_login
+
+        employee[
+            "login_source"
+        ] = "Новый сформированный логин"
+
+        reserved.add(selected_login)
+
+        login_to_inns[
+            selected_login
+        ].add(inn)
+
+        inn_to_logins[
+            inn
+        ].add(selected_login)
+
+
+def _mobile_find_or_create_named(
+    model_class,
+    name: str,
+    fallback: str,
+):
+    name = (
+        name
+        or fallback
+    ).strip()[:255]
+
+    obj = (
+        model_class.objects
+        .filter(name=name)
+        .order_by("id")
+        .first()
+    )
+
+    if obj:
+        return obj, False
+
+    return (
+        model_class.objects.create(
+            name=name
+        ),
+        True,
+    )
+
+
+def _mobile_inspect_postgres(
+    employee: dict,
+) -> dict:
+    users = list(
+        User.objects
+        .filter(
+            employee_id=employee["inn"]
+        )
+        .order_by("id")
+        .values(
+            "id",
+            "employee_id",
+            "encrypted_inn",
+            "full_name",
+            "mail",
+            "phone",
+            "department_id",
+            "position_id",
+            "active",
+            "created_at",
+            "updated_at",
+        )
+    )
+
+    result = {
+        "users": users,
+        "user_count": len(users),
+
+        "ukm_rows": [],
+        "ukm_total_count": 0,
+        "ukm_target_existing_count": 0,
+        "ukm_target_required_count": (
+            len(MOBILE_EMPLOYEE_STORE_IDS)
+        ),
+        "missing_store_ids": list(
+            MOBILE_EMPLOYEE_STORE_IDS
+        ),
+        "wrong_role_count": 0,
+        "duplicate_store_count": 0,
+
+        "open_rows": [],
+        "open_count": 0,
+    }
+
+    if len(users) != 1:
+        return result
+
+    user_id = users[0]["id"]
+
+    ukm_rows = list(
+        UKMUser.objects
+        .filter(user_id=user_id)
+        .order_by(
+            "storeid",
+            "id",
+        )
+        .values(
+            "id",
+            "storeid",
+            "roleid",
+            "version",
+        )
+    )
+
+    open_rows = list(
+        OpenInSystem.objects
+        .filter(
+            user_id=user_id,
+            system_id=4,
+        )
+        .order_by("id")
+        .values(
+            "id",
+            "username",
+            "password",
+            "system_id",
+            "status",
+            "isnot2fa",
+        )
+    )
+
+    target_rows = [
+        row
+        for row in ukm_rows
+        if (
+            row["storeid"]
+            in MOBILE_EMPLOYEE_STORE_IDS
+        )
+    ]
+
+    store_counter = Counter(
+        row["storeid"]
+        for row in target_rows
+    )
+
+    existing_store_ids = set(
+        store_counter
+    )
+
+    result.update({
+        "ukm_rows": ukm_rows,
+        "ukm_total_count": len(ukm_rows),
+        "ukm_target_existing_count": (
+            len(existing_store_ids)
+        ),
+        "missing_store_ids": [
+            store_id
+            for store_id
+            in MOBILE_EMPLOYEE_STORE_IDS
+            if store_id
+            not in existing_store_ids
+        ],
+        "wrong_role_count": sum(
+            1
+            for row in target_rows
+            if (
+                row["roleid"]
+                != employee["roleid"]
+            )
+        ),
+        "duplicate_store_count": sum(
+            count - 1
+            for count in store_counter.values()
+            if count > 1
+        ),
+
+        "open_rows": open_rows,
+        "open_count": len(open_rows),
+    })
+
+    return result
+
+
+@transaction.atomic
+def _mobile_sync_postgres_employee(
+    employee: dict,
+) -> tuple[User, dict]:
+    user_rows = list(
+        User.objects
+        .select_for_update()
+        .filter(
+            employee_id=employee["inn"]
+        )
+        .order_by("id")[:3]
+    )
+
+    if len(user_rows) > 1:
+        raise ValueError(
+            "В users найдено несколько "
+            f"записей employee_id={employee['inn']}: "
+            + ", ".join(
+                str(user.id)
+                for user in user_rows
+            )
+        )
+
+    department, department_created = (
+        _mobile_find_or_create_named(
+            Department,
+            employee["department_name"],
+            "Мобильное подразделение",
+        )
+    )
+
+    position, position_created = (
+        _mobile_find_or_create_named(
+            Position,
+            employee["position_name"],
+            "Не указана",
+        )
+    )
+
+    current_time = timezone.now()
+
+    values = {
+        "encrypted_inn": (
+            employee["inn"][:128]
+        ),
+        "full_name": (
+            employee["full_name"][:255]
+        ),
+        "mail": (
+            employee["mail"][:255]
+        ),
+        "phone": (
+            employee["phone"][:50]
+        ),
+        "department_id": department.id,
+        "position_id": position.id,
+        "active": True,
+    }
+
+    if user_rows:
+        user = user_rows[0]
+        changed_fields = []
+
+        for field, value in values.items():
+            if getattr(user, field) != value:
+                setattr(
+                    user,
+                    field,
+                    value,
+                )
+                changed_fields.append(field)
+
+        if changed_fields:
+            user.updated_at = current_time
+            changed_fields.append(
+                "updated_at"
+            )
+
+            user.save(
+                update_fields=changed_fields
+            )
+
+            user_action = "updated"
+        else:
+            user_action = "unchanged"
+
+    else:
+        user = User.objects.create(
+            employee_id=employee["inn"],
+            max_id=None,
+            tg_status=False,
+            tg_id=None,
+            created_at=current_time,
+            updated_at=current_time,
+            **values,
+        )
+
+        user_action = "created"
+
+    existing_rows = list(
+        UKMUser.objects
+        .select_for_update()
+        .filter(
+            user_id=user.id,
+            storeid__in=(
+                MOBILE_EMPLOYEE_STORE_IDS
+            ),
+        )
+        .order_by(
+            "storeid",
+            "id",
+        )
+    )
+
+    existing_store_ids = set()
+    rows_to_update = []
+    duplicate_rows = 0
+
+    for row in existing_rows:
+        if row.storeid in existing_store_ids:
+            duplicate_rows += 1
+
+        existing_store_ids.add(
+            row.storeid
+        )
+
+        if row.roleid != employee["roleid"]:
+            row.roleid = employee["roleid"]
+            rows_to_update.append(row)
+
+    if rows_to_update:
+        UKMUser.objects.bulk_update(
+            rows_to_update,
+            ["roleid"],
+            batch_size=500,
+        )
+
+    missing_store_ids = [
+        store_id
+        for store_id
+        in MOBILE_EMPLOYEE_STORE_IDS
+        if store_id
+        not in existing_store_ids
+    ]
+
+    rows_to_create = [
+        UKMUser(
+            user_id=user.id,
+            roleid=employee["roleid"],
+            storeid=store_id,
+            version=MOBILE_UKM_VERSION,
+        )
+        for store_id in missing_store_ids
+    ]
+
+    if rows_to_create:
+        UKMUser.objects.bulk_create(
+            rows_to_create,
+            batch_size=500,
+        )
+
+    return user, {
+        "user_id": user.id,
+        "user_action": user_action,
+
+        "department_id": department.id,
+        "department_created": (
+            department_created
+        ),
+
+        "position_id": position.id,
+        "position_created": (
+            position_created
+        ),
+
+        "ukm_created": len(
+            rows_to_create
+        ),
+        "ukm_role_updated": len(
+            rows_to_update
+        ),
+        "ukm_already_present": len(
+            existing_rows
+        ),
+        "ukm_duplicate_rows": (
+            duplicate_rows
+        ),
+    }
+
+
+def _mobile_apply_supermag(
+    employees: list[dict],
+    services: list[str],
+    positions_by_db: dict,
+) -> dict[str, dict]:
+    result = {
+        employee["inn"]: {
+            "success_dbs": [],
+            "errors": [],
+            "target_count": len(services),
+        }
+        for employee in employees
+    }
+
+    proc_name = os.getenv(
+        "SM_BIN_CREATEUSER_PROC",
+        "bin_createuser",
+    ).strip()
+
+    if not re.fullmatch(
+        r"[A-Za-z0-9_.$]+",
+        proc_name,
+    ):
+        raise ValueError(
+            "Некорректное имя процедуры "
+            "в SM_BIN_CREATEUSER_PROC."
+        )
+
+    for db in services:
+        conn = None
+        cur = None
+
+        try:
+            conn = _connect_oracle_service(db)
+            cur = conn.cursor()
+
+            for employee in employees:
+                inn = employee["inn"]
+                login = employee["planned_login"]
+                password = (
+                    employee[
+                        "generated_password"
+                    ]
+                )
+
+                try:
+                    position = (
+                        positions_by_db[
+                            db
+                        ][employee["kind"]]
+                    )
+
+                    conflicts = (
+                        _oracle_fetch_smstaff_conflicts(
+                            cur,
+                            login,
+                            inn,
+                        )
+                    )
+
+                    for row in conflicts:
+                        row_login = (
+                            _mobile_text(
+                                row.get(
+                                    "serverlogin"
+                                )
+                            ).lower()
+                        )
+
+                        row_inn = _mobile_text(
+                            row.get("inn")
+                        )
+
+                        if (
+                            row_login == login
+                            and row_inn != inn
+                        ):
+                            raise ValueError(
+                                f"Логин {login} "
+                                "уже принадлежит ИНН "
+                                f"{row_inn or '<пусто>'}."
+                            )
+
+                        if (
+                            row_inn == inn
+                            and row_login != login
+                        ):
+                            raise ValueError(
+                                f"ИНН {inn} "
+                                "уже принадлежит логину "
+                                f"{row_login or '<пусто>'}."
+                            )
+
+                    proc_adol = (
+                        _mobile_text(
+                            position.get("orarole")
+                        )
+                        or MOBILE_SM_POSITION_CONFIG[
+                            employee["kind"]
+                        ]["orarole"]
+                    )
+
+                    afio = _mobile_shorten_fio(
+                        employee,
+                        max_length=30,
+                    )
+
+                    cur.execute(
+                        f"""
+                        BEGIN
+                            {proc_name}(
+                                AUSER =>
+                                    :p_auser,
+                                APASS =>
+                                    :p_apass,
+                                ADOL =>
+                                    :p_adol,
+                                ACHECK =>
+                                    :p_acheck,
+                                AUSERENABLED =>
+                                    :p_auserenabled,
+                                AINN =>
+                                    :p_ainn,
+                                AFIO =>
+                                    :p_afio
+                            );
+                        END;
+                        """,
+                        p_auser=login,
+                        p_apass=password,
+                        p_adol=proc_adol,
+                        p_acheck=1,
+                        p_auserenabled=1,
+                        p_ainn=inn,
+                        p_afio=afio,
+                    )
+
+                    _oracle_update_smstaff_after_create(
+                        cur=cur,
+                        login=login,
+                        inn=inn,
+                        afio=afio,
+                        offindex=int(
+                            position["id"]
+                        ),
+                    )
+
+                    # Проверяем результат ДО commit,
+                    # чтобы ошибку этой базы
+                    # можно было откатить.
+                    current_rows = (
+                        _oracle_fetch_smstaff_by_login(
+                            cur,
+                            login,
+                        )
+                    )
+
+                    verified = any(
+                        _mobile_text(
+                            row.get("inn")
+                        ) == inn
+                        for row in current_rows
+                    )
+
+                    if not verified:
+                        raise ValueError(
+                            "Процедура завершилась "
+                            "без ошибки, но "
+                            "контрольное чтение "
+                            "не нашло логин "
+                            "с нужным ИНН."
+                        )
+
+                    conn.commit()
+
+                    result[
+                        inn
+                    ]["success_dbs"].append(db)
+
+                    logger.info(
+                        "[MOBILE_SYNC]"
+                        "[SUPERMAG] "
+                        "success db=%s "
+                        "inn=%s login=%s",
+                        db,
+                        inn,
+                        login,
+                    )
+
+                except Exception as exc:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+                    result[
+                        inn
+                    ]["errors"].append({
+                        "db": db,
+                        "message": str(exc),
+                    })
+
+                    logger.exception(
+                        "[MOBILE_SYNC]"
+                        "[SUPERMAG] "
+                        "db=%s inn=%s "
+                        "login=%s error=%s",
+                        db,
+                        inn,
+                        login,
+                        exc,
+                    )
+
+        except Exception as exc:
+            logger.exception(
+                "[MOBILE_SYNC]"
+                "[SUPERMAG] "
+                "runtime connection error "
+                "db=%s error=%s",
+                db,
+                exc,
+            )
+
+            for employee in employees:
+                result[
+                    employee["inn"]
+                ]["errors"].append({
+                    "db": db,
+                    "message": str(exc),
+                })
+
+        finally:
+            try:
+                if cur:
+                    cur.close()
+
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    for employee in employees:
+        item = result[employee["inn"]]
+
+        item["success_count"] = len(
+            item["success_dbs"]
+        )
+
+        item["error_count"] = len(
+            item["errors"]
+        )
+
+        item["all_success"] = (
+            item["target_count"] > 0
+            and (
+                item["success_count"]
+                == item["target_count"]
+            )
+            and item["error_count"] == 0
+        )
+
+    return result
+
+
+@transaction.atomic
+def _mobile_upsert_open_in_system(
+    user_id: int,
+    login: str,
+    password: str,
+) -> dict:
+    qs = (
+        OpenInSystem.objects
+        .select_for_update()
+        .filter(
+            user_id=user_id,
+            system_id=4,
+        )
+    )
+
+    existing_count = qs.count()
+
+    values = {
+        "username": login,
+        "password": password,
+        "status": True,
+        "isnot2fa": False,
+    }
+
+    if existing_count:
+        qs.update(**values)
+
+        action = "updated"
+        affected = existing_count
+    else:
+        OpenInSystem.objects.create(
+            user_id=user_id,
+            system_id=4,
+            **values,
+        )
+
+        action = "created"
+        affected = 1
+
+    return {
+        "action": action,
+        "rows_affected": affected,
+        "duplicates_updated": max(
+            0,
+            existing_count - 1,
+        ),
+    }
+
+
+def _mobile_summary(
+    raw_count: int,
+    employees: list[dict],
+    rejected: list[dict],
+    duplicates: list[dict],
+) -> dict:
+    counter = Counter(
+        employee["kind"]
+        for employee in employees
+    )
+
+    return {
+        "onec_total": raw_count,
+        "mobile_total": len(employees),
+        "rejected_total": len(rejected),
+        "duplicates_total": len(duplicates),
+
+        "admin_total": counter.get(
+            "admin",
+            0,
+        ),
+        "receiver_total": counter.get(
+            "receiver",
+            0,
+        ),
+        "sales_floor_total": counter.get(
+            "sales_floor",
+            0,
+        ),
+        "other_total": counter.get(
+            "other",
+            0,
+        ),
+
+        "stores_total": len(
+            MOBILE_EMPLOYEE_STORE_IDS
+        ),
+    }
+
+
+@staff_member_required(
+    login_url="/admin/login/"
+)
+@require_http_methods([
+    "GET",
+    "POST",
+])
+@csrf_protect
+def mobile_employees_sync_ui(request):
+    services = (
+        _mobile_supermag_services()
+    )
+
+    context = {
+        "mode": "",
+        "employees": [],
+        "rejected": [],
+        "duplicates": [],
+        "summary": {},
+        "oracle_db_errors": {},
+
+        "oracle_services_count": len(
+            services
+        ),
+        "store_ids_count": len(
+            MOBILE_EMPLOYEE_STORE_IDS
+        ),
+
+        "fatal_error": "",
+        "run_completed": False,
+    }
+
+    if request.method == "GET":
+        return render(
+            request,
+            "frostapp/"
+            "mobile_employees_sync.html",
+            context,
+        )
+
+    action = _mobile_text(
+        request.POST.get("action")
+    ).lower()
+
+    if action not in {
+        "test",
+        "run",
+    }:
+        context["fatal_error"] = (
+            "Неизвестное действие."
+        )
+
+        return render(
+            request,
+            "frostapp/"
+            "mobile_employees_sync.html",
+            context,
+            status=400,
+        )
+
+    local_lock_acquired = False
+    database_lock_acquired = False
+
+    try:
+        # Защита применяется только
+        # к реальному запуску.
+        if action == "run":
+            local_lock_acquired = (
+                _MOBILE_SYNC_LOCAL_LOCK
+                .acquire(
+                    blocking=False
+                )
+            )
+
+            if not local_lock_acquired:
+                raise RuntimeError(
+                    "Другой запуск уже "
+                    "выполняется в этом "
+                    "процессе Django."
+                )
+
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        pg_try_advisory_lock(%s)
+                    """,
+                    [MOBILE_SYNC_DB_LOCK_KEY],
+                )
+
+                database_lock_acquired = bool(
+                    cur.fetchone()[0]
+                )
+
+            if not database_lock_acquired:
+                raise RuntimeError(
+                    "Другой запуск уже "
+                    "выполняется другим "
+                    "процессом Django."
+                )
+
+        # Существующую функцию запроса
+        # к 1С не меняем.
+        raw_employees = (
+            _fetch_onec_working_employees()
+        )
+
+        (
+            employees,
+            rejected,
+            duplicates,
+        ) = _mobile_prepare_employees(
+            raw_employees
+        )
+
+        # Предварительная проверка Oracle.
+        inventory = (
+            _mobile_load_oracle_inventory(
+                employees,
+                services,
+            )
+        )
+
+        _mobile_plan_logins(
+            employees,
+            inventory,
+        )
+
+        # Состояние PostgreSQL до запуска.
+        for employee in employees:
+            employee[
+                "postgres_before"
+            ] = _mobile_inspect_postgres(
+                employee
+            )
+
+        context.update({
+            "mode": action,
+            "employees": employees,
+            "rejected": rejected,
+            "duplicates": duplicates,
+
+            "summary": _mobile_summary(
+                len(raw_employees),
+                employees,
+                rejected,
+                duplicates,
+            ),
+
+            "oracle_db_errors": (
+                inventory["db_errors"]
+            ),
+
+            "oracle_services_count": len(
+                services
+            ),
+        })
+
+        # Тестовый запуск заканчивается здесь.
+        # Изменений не производится.
+        if action == "test":
+            return render(
+                request,
+                "frostapp/"
+                "mobile_employees_sync.html",
+                context,
+            )
+
+        supermag_employees = [
+            employee
+            for employee in employees
+            if employee["needs_supermag"]
+        ]
+
+        if (
+            supermag_employees
+            and not services
+        ):
+            raise RuntimeError(
+                "Не задано ни одной "
+                "Oracle-базы для Supermag."
+            )
+
+        # КЛЮЧЕВОЕ ПОВЕДЕНИЕ:
+        #
+        # если хотя бы одна база недоступна,
+        # в ней нет нужной таблицы или должности,
+        # реальный запуск прекращается
+        # ДО изменения PostgreSQL и Oracle.
+        if (
+            supermag_employees
+            and inventory["db_errors"]
+        ):
+            failed = ", ".join(
+                sorted(
+                    inventory[
+                        "db_errors"
+                    ]
+                )
+            )
+
+            raise RuntimeError(
+                "Запуск остановлен до "
+                "изменения данных: "
+                "не пройдена проверка "
+                "всех Supermag-баз. "
+                f"Проблемные базы: {failed}."
+            )
+
+        # users + ukm_users.
+        for employee in employees:
+            try:
+                (
+                    user,
+                    pg_result,
+                ) = (
+                    _mobile_sync_postgres_employee(
+                        employee
+                    )
+                )
+
+                employee[
+                    "postgres_result"
+                ] = pg_result
+
+                employee["user_id"] = user.id
+
+            except Exception as exc:
+                employee[
+                    "postgres_result"
+                ] = {
+                    "error": str(exc)
+                }
+
+                logger.exception(
+                    "[MOBILE_SYNC]"
+                    "[POSTGRES] "
+                    "inn=%s fio=%s "
+                    "error=%s",
+                    employee["inn"],
+                    employee["full_name"],
+                    exc,
+                )
+
+        ready_for_supermag = []
+
+        for employee in employees:
+            if not employee["needs_supermag"]:
+                continue
+
+            if employee[
+                "postgres_result"
+            ].get("error"):
+                continue
+
+            if employee["login_plan_error"]:
+                employee[
+                    "supermag_result"
+                ] = {
+                    "success_count": 0,
+                    "target_count": len(
+                        services
+                    ),
+                    "all_success": False,
+                    "errors": [{
+                        "db": "Планирование",
+                        "message": (
+                            employee[
+                                "login_plan_error"
+                            ]
+                        ),
+                    }],
+                }
+                continue
+
+            # Один PIN на сотрудника.
+            # Этот же PIN отправляется
+            # во все базы и open_in_system.
+            employee[
+                "generated_password"
+            ] = _generate_sm_password(4)
+
+            ready_for_supermag.append(
+                employee
+            )
+
+        if ready_for_supermag:
+            sm_results = (
+                _mobile_apply_supermag(
+                    ready_for_supermag,
+                    services,
+                    inventory[
+                        "positions_by_db"
+                    ],
+                )
+            )
+
+            for employee in (
+                ready_for_supermag
+            ):
+                employee[
+                    "supermag_result"
+                ] = sm_results[
+                    employee["inn"]
+                ]
+
+                # open_in_system меняем
+                # только после успеха
+                # во всех Supermag-базах.
+                if employee[
+                    "supermag_result"
+                ]["all_success"]:
+                    try:
+                        employee[
+                            "open_result"
+                        ] = (
+                            _mobile_upsert_open_in_system(
+                                user_id=(
+                                    employee[
+                                        "user_id"
+                                    ]
+                                ),
+                                login=(
+                                    employee[
+                                        "planned_login"
+                                    ]
+                                ),
+                                password=(
+                                    employee[
+                                        "generated_password"
+                                    ]
+                                ),
+                            )
+                        )
+
+                    except Exception as exc:
+                        employee[
+                            "open_result"
+                        ] = {
+                            "error": str(exc)
+                        }
+
+                        logger.exception(
+                            "[MOBILE_SYNC]"
+                            "[OPEN_IN_SYSTEM] "
+                            "inn=%s user_id=%s "
+                            "error=%s",
+                            employee["inn"],
+                            employee["user_id"],
+                            exc,
+                        )
+                else:
+                    employee[
+                        "open_result"
+                    ] = {
+                        "skipped": True,
+                        "message": (
+                            "Не обновлено: "
+                            "сотрудник обработан "
+                            "не во всех "
+                            "Supermag-базах."
+                        ),
+                    }
+
+        # Итоговое состояние PostgreSQL.
+        for employee in employees:
+            employee[
+                "postgres_after"
+            ] = _mobile_inspect_postgres(
+                employee
+            )
+
+        context["run_completed"] = True
+
+        return render(
+            request,
+            "frostapp/"
+            "mobile_employees_sync.html",
+            context,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[MOBILE_SYNC][UI] "
+            "fatal error=%s",
+            exc,
+        )
+
+        context["fatal_error"] = str(exc)
+
+        return render(
+            request,
+            "frostapp/"
+            "mobile_employees_sync.html",
+            context,
+            status=500,
+        )
+
+    finally:
+        if database_lock_acquired:
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            pg_advisory_unlock(%s)
+                        """,
+                        [
+                            MOBILE_SYNC_DB_LOCK_KEY
+                        ],
+                    )
+            except Exception:
+                logger.exception(
+                    "[MOBILE_SYNC] "
+                    "Не удалось снять "
+                    "PostgreSQL lock"
+                )
+
+        if local_lock_acquired:
+            _MOBILE_SYNC_LOCAL_LOCK.release()
+
+
+
+
+
+
+# конец 16.07 по мобильным
+
+
+
+
+
+
+
+
+
 def _normalize_selected_services(raw_items: Iterable[str]) -> list[str]:
     """
     Нормализует и фильтрует список выбранных баз.
