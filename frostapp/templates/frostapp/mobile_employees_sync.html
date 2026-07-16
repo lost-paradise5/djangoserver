@@ -103,16 +103,22 @@
 
       <div class="alert alert-warning">
         <b>Тестовый запуск</b>
-        ничего не меняет.
-        <br>
-
+        проверяет сотрудников, PostgreSQL и доступность баз Supermag,
+        но ничего не изменяет.
+        <br><br>
+      
         <b>Запуск</b>
         сначала проверяет все
         {{ oracle_services_count }}
         Supermag-баз.
-
-        Если хотя бы одна из них недоступна,
-        изменения не начинаются.
+        Доступные базы будут обработаны, а недоступные —
+        пропущены и показаны в отчёте.
+        <br><br>
+      
+        Записи в <b>users</b> и <b>ukm_users</b>
+        обрабатываются независимо от доступности Supermag.
+        Один и тот же PIN сотрудника передаётся во все доступные базы
+        и записывается в <b>open_in_system</b>.
       </div>
 
       <div class="d-flex flex-wrap gap-2">
@@ -132,7 +138,7 @@
         <form
           method="post"
           onsubmit="return confirm(
-            'Выполнить реальный запуск? Будут изменены PostgreSQL и Supermag.'
+            'Выполнить реальный запуск? Будут изменены users, ukm_users, доступные базы Supermag и open_in_system. Недоступные базы будут пропущены.'
           );"
         >
           {% csrf_token %}
@@ -198,6 +204,88 @@
       {% endif %}
 
     </div>
+  {% endif %}
+
+  {% if mode %}
+
+    <div class="row g-2 mb-4">
+  
+      <div class="col-md-4">
+        <div class="card shadow-sm border-secondary h-100">
+          <div class="card-body">
+            <div class="text-muted small">
+              Всего настроено Supermag-баз
+            </div>
+  
+            <div class="fs-4 fw-bold">
+              {{ oracle_services_count }}
+            </div>
+          </div>
+        </div>
+      </div>
+  
+      <div class="col-md-4">
+        <div class="card shadow-sm border-success h-100">
+          <div class="card-body">
+            <div class="text-success small">
+              Доступно и прошло проверку
+            </div>
+  
+            <div class="fs-4 fw-bold text-success">
+              {{ available_oracle_services_count }}
+            </div>
+  
+            {% if available_oracle_services %}
+              <details class="mt-2">
+                <summary>
+                  Показать доступные базы
+                </summary>
+  
+                <div class="mt-2">
+                  {% for db in available_oracle_services %}
+                    <span class="badge text-bg-success me-1 mb-1">
+                      {{ db }}
+                    </span>
+                  {% endfor %}
+                </div>
+              </details>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+  
+      <div class="col-md-4">
+        <div class="card shadow-sm border-warning h-100">
+          <div class="card-body">
+            <div class="text-warning-emphasis small">
+              Будет пропущено
+            </div>
+  
+            <div class="fs-4 fw-bold text-warning-emphasis">
+              {{ skipped_oracle_services_count }}
+            </div>
+  
+            {% if skipped_oracle_services %}
+              <details class="mt-2">
+                <summary>
+                  Показать пропущенные базы
+                </summary>
+  
+                <div class="mt-2">
+                  {% for db in skipped_oracle_services %}
+                    <span class="badge text-bg-warning me-1 mb-1">
+                      {{ db }}
+                    </span>
+                  {% endfor %}
+                </div>
+              </details>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+  
+    </div>
+  
   {% endif %}
 
 
@@ -288,13 +376,17 @@
 
   {% if oracle_db_errors %}
 
-    <div class="card border-danger shadow-sm mb-4">
-
-      <div class="card-header text-bg-danger">
+    <div class="card border-warning shadow-sm mb-4">
+  
+      <div class="card-header text-bg-warning">
         <b>
-          Базы, не прошедшие
-          предварительную проверку
+          Пропущенные базы Supermag
         </b>
+  
+        <div class="small mt-1">
+          Эти базы не будут останавливать запуск.
+          Доступные базы продолжат обработку.
+        </div>
       </div>
 
       <div class="table-responsive">
@@ -752,58 +844,152 @@
                       class="alert
                       {% if employee.supermag_result.all_success %}
                         alert-success
-                      {% else %}
+                      {% elif employee.supermag_result.success_count %}
                         alert-warning
+                      {% else %}
+                        alert-danger
                       {% endif %}
                       py-2"
                     >
-
+                  
                       <b>Supermag:</b>
-
-                      {{ employee.supermag_result.success_count }}
-                      /
-                      {{ employee.supermag_result.target_count }}
-                      баз.
                       <br>
-
-                      {% if employee.generated_password %}
-
-                        PIN:
-
-                        <code class="fs-6">
-                          {{ employee.generated_password }}
-                        </code>
-
+                  
+                      Успешно обработано доступных баз:
+                  
+                      <b>
+                        {{ employee.supermag_result.success_count }}
+                        /
+                        {{ employee.supermag_result.target_count }}
+                      </b>.
+                  
+                      {% if employee.supermag_result.skipped_count %}
+                        <br>
+                  
+                        Пропущено при предварительной проверке:
+                  
+                        <b>
+                          {{ employee.supermag_result.skipped_count }}
+                        </b>.
                       {% endif %}
-
+                  
+                      {% if employee.supermag_result.error_count %}
+                        <br>
+                  
+                        Ошибок во время обработки доступных баз:
+                  
+                        <b>
+                          {{ employee.supermag_result.error_count }}
+                        </b>.
+                      {% endif %}
+                  
+                  
+                      {% if employee.supermag_result.message %}
+                        <hr class="my-2">
+                  
+                        {{ employee.supermag_result.message }}
+                      {% endif %}
+                  
+                  
+                      {% if employee.generated_password %}
+                        <hr class="my-2">
+                  
+                        <div>
+                          <b>Единый PIN сотрудника:</b>
+                  
+                          <code class="fs-5">
+                            {{ employee.generated_password }}
+                          </code>
+                        </div>
+                  
+                        {% if employee.password_source %}
+                          <div class="small text-muted mt-1">
+                            {{ employee.password_source }}
+                          </div>
+                        {% endif %}
+                      {% endif %}
+                  
                     </div>
-
-
-                    {% if employee.supermag_result.errors %}
-
-                      <details>
-
+                  
+                  
+                    {% if employee.supermag_result.success_dbs %}
+                  
+                      <details class="mb-2">
+                  
                         <summary>
-                          Ошибки Supermag
+                          Успешно обработанные базы
                         </summary>
-
+                  
+                        <div class="mt-2">
+                  
+                          {% for db in employee.supermag_result.success_dbs %}
+                  
+                            <span class="badge text-bg-success me-1 mb-1">
+                              {{ db }}
+                            </span>
+                  
+                          {% endfor %}
+                  
+                        </div>
+                  
+                      </details>
+                  
+                    {% endif %}
+                  
+                  
+                    {% if employee.supermag_result.skipped_dbs %}
+                  
+                      <details class="mb-2">
+                  
+                        <summary>
+                          Базы, пропущенные при проверке
+                        </summary>
+                  
+                        <div class="mt-2">
+                  
+                          {% for db in employee.supermag_result.skipped_dbs %}
+                  
+                            <span class="badge text-bg-warning me-1 mb-1">
+                              {{ db }}
+                            </span>
+                  
+                          {% endfor %}
+                  
+                        </div>
+                  
+                      </details>
+                  
+                    {% endif %}
+                  
+                  
+                    {% if employee.supermag_result.errors %}
+                  
+                      <details class="mb-2">
+                  
+                        <summary>
+                          Ошибки обработки Supermag
+                        </summary>
+                  
                         {% for error in employee.supermag_result.errors %}
-
+                  
                           <div
-                            class="border rounded
+                            class="border border-danger rounded
                             p-2 mt-1 small"
                           >
-                            <code>{{ error.db }}</code>:
-
+                            <b>
+                              <code>{{ error.db }}</code>
+                            </b>
+                            <br>
+                  
                             {{ error.message }}
                           </div>
-
+                  
                         {% endfor %}
-
+                  
                       </details>
-
+                  
                     {% endif %}
-
+                  
                   {% endif %}
 
 
@@ -830,18 +1016,62 @@
                   {% elif employee.open_result %}
 
                     <div class="alert alert-success py-2 mt-2">
-
+                  
                       <b>open_in_system:</b>
-
+                  
                       {{ employee.open_result.action }}.
                       <br>
-
+                  
                       Строк обработано:
-
-                      {{ employee.open_result.rows_affected }}.
-
+                  
+                      <b>
+                        {{ employee.open_result.rows_affected }}
+                      </b>.
+                  
+                      {% if employee.open_result.duplicates_updated %}
+                        <br>
+                  
+                        Обновлено дублирующих записей:
+                  
+                        <b>
+                          {{ employee.open_result.duplicates_updated }}
+                        </b>.
+                      {% endif %}
+                  
+                  
+                      {% if employee.open_result.message %}
+                        <hr class="my-2">
+                  
+                        {{ employee.open_result.message }}
+                      {% endif %}
+                  
+                  
+                      {% if employee.open_result.password_source %}
+                        <div class="small text-muted mt-2">
+                          {{ employee.open_result.password_source }}
+                        </div>
+                      {% endif %}
+                  
+                  
+                      {% if employee.generated_password %}
+                        <div class="mt-2">
+                          Логин:
+                  
+                          <code>
+                            {{ employee.planned_login }}
+                          </code>
+                          <br>
+                  
+                          PIN:
+                  
+                          <code class="fs-6">
+                            {{ employee.generated_password }}
+                          </code>
+                        </div>
+                      {% endif %}
+                  
                     </div>
-
+                  
                   {% endif %}
 
                 </td>
