@@ -4654,19 +4654,57 @@ def connect_store_mysql(host: str):
 
 ### Это для API УКМ-5
 
-UKM5_API_HOST = os.getenv("UKM5_API_HOST", "192.168.17.38")
-UKM5_API_PORT = int(os.getenv("UKM5_API_PORT", "29017"))
+UKM5_API_HOST = _env_value(
+    "UKM5_API_HOST",
+    "192.168.17.38",
+)
+UKM5_API_PORT = int(
+    _env_value("UKM5_API_PORT", "29017")
+)
 
-UKM5_DB_HOST = os.getenv("UKM5_DB_HOST", "192.168.17.38")
-UKM5_DB_PORT = int(os.getenv("UKM5_DB_PORT", "3306"))
-UKM5_DB_NAME = os.getenv("UKM5_DB_NAME", "srvdata")
-UKM5_DB_USER = os.getenv("UKM5_DB_USER", "ukminfo")
-UKM5_DB_PASSWORD = os.getenv("UKM5_DB_PASSWORD", "CtHDbCGK.C")
+UKM5_DB_HOST = _env_value(
+    "UKM5_DB_HOST",
+    "192.168.17.38",
+)
+UKM5_DB_PORT = int(
+    _env_value("UKM5_DB_PORT", "3306")
+)
+UKM5_DB_NAME = _env_value(
+    "UKM5_DB_NAME",
+    "srvdata",
+)
+UKM5_DB_USER = _env_value(
+    "UKM5_DB_USER",
+    "ukminfo",
+)
+UKM5_DB_PASSWORD = _env_value(
+    "UKM5_DB_PASSWORD",
+    "CtHDbCGK.C",
+)
 
-UKM5_HTTP_TIMEOUT = int(os.getenv("UKM5_HTTP_TIMEOUT", "20"))
-UKM5_VERIFY_TIMEOUT = int(os.getenv("UKM5_VERIFY_TIMEOUT", "20"))
-UKM5_VERIFY_SLEEP = float(os.getenv("UKM5_VERIFY_SLEEP", "1.0"))
-UKM5_CARD_TZ = os.getenv("UKM5_CARD_TZ", os.getenv("ROTATION_TZ", "Asia/Irkutsk"))
+UKM5_HTTP_TIMEOUT = int(
+    _env_value("UKM5_HTTP_TIMEOUT", "20")
+)
+
+# Полный срок ожидания появления результата импорта.
+UKM5_VERIFY_TIMEOUT = int(
+    _env_value("UKM5_VERIFY_TIMEOUT", "20")
+)
+
+UKM5_VERIFY_SLEEP = float(
+    _env_value("UKM5_VERIFY_SLEEP", "1.0")
+)
+
+# Количество повторных отправок импорта при задержке УКМ-5.
+UKM5_SYNC_ATTEMPTS = max(
+    1,
+    int(_env_value("UKM5_SYNC_ATTEMPTS", "2")),
+)
+
+UKM5_CARD_TZ = _env_value(
+    "UKM5_CARD_TZ",
+    _env_value("ROTATION_TZ", "Asia/Irkutsk"),
+)
 
 _UKM5_HTTP = requests.Session()
 _UKM5_HTTP.headers.update({"Content-Type": "application/json"})
@@ -4679,6 +4717,69 @@ def _mask_secret(value: str, left: int = 6, right: int = 4) -> str:
     if len(s) <= left + right:
         return "*" * len(s)
     return f"{s[:left]}...{s[-right:]}"
+
+
+
+
+
+def _ukm5_text(value) -> str:
+    """
+    Безопасно приводит значение из PyMySQL к строке.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return bytes(value).decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
+        except Exception:
+            return str(value).strip()
+
+    return str(value).strip()
+
+
+def _ukm5_is_active(value) -> bool:
+    """
+    Нормализует active из TINYINT, BIT, bytes или строки.
+    """
+    if value is None:
+        return False
+
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+
+        if raw in {b"", b"\x00", b"0"}:
+            return False
+
+        if raw in {b"\x01", b"1"}:
+            return True
+
+        try:
+            value = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return bool(raw)
+
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+            "none",
+            "null",
+        }
+
+    return bool(value)
 
 
 def connect_ukm5_srvdata():
@@ -4923,19 +5024,53 @@ def _poll_ukm5_user_state(
     expected_password: str | None = None,
     expected_active_number: str | None = None,
     forbidden_active_numbers: set[str] | None = None,
+    timeout_sec: int | float | None = None,
 ) -> tuple[dict, bool]:
-    deadline = time.monotonic() + UKM5_VERIFY_TIMEOUT
-    last_state = {"user": None, "cards": []}
-    forbidden_active_numbers = {
-        str(x).strip()
-        for x in (forbidden_active_numbers or set())
-        if str(x).strip()
+    """
+    Проверяет результат асинхронного импорта УКМ-5.
+
+    Важно: одинаковое состояние несколько раз подряд не означает,
+    что импорт завершился. Поэтому ждём до полного timeout и не
+    завершаем проверку преждевременно.
+    """
+    timeout_value = float(
+        timeout_sec
+        if timeout_sec is not None
+        else UKM5_VERIFY_TIMEOUT
+    )
+    timeout_value = max(1.0, timeout_value)
+
+    deadline = time.monotonic() + timeout_value
+
+    last_state = {
+        "user": None,
+        "cards": [],
     }
 
+    expected_password_text = (
+        _ukm5_text(expected_password)
+        if expected_password is not None
+        else None
+    )
+
+    expected_active_text = (
+        _ukm5_text(expected_active_number)
+        if expected_active_number is not None
+        else None
+    )
+
+    forbidden_active_numbers = {
+        _ukm5_text(number)
+        for number in (forbidden_active_numbers or set())
+        if _ukm5_text(number)
+    }
+
+    poll_number = 0
     last_signature = None
-    same_signature_count = 0
 
     while True:
+        poll_number += 1
+
         state = _fetch_ukm5_user_and_cards(
             internal_store_id=internal_store_id,
             plain_inn=plain_inn,
@@ -4947,45 +5082,99 @@ def _poll_ukm5_user_state(
         cards = state.get("cards") or []
 
         active_numbers = {
-            str(c.get("number") or "").strip()
-            for c in cards
-            if bool(c.get("active"))
+            _ukm5_text(card.get("number"))
+            for card in cards
+            if _ukm5_is_active(card.get("active"))
+            and _ukm5_text(card.get("number"))
         }
 
         user_found = bool(user_row)
-        password_ok = (expected_password is None) or (
-            user_found and (str(user_row.get("password") or "") == str(expected_password))
-        )
-        expected_card_ok = (expected_active_number is None) or (str(expected_active_number) in active_numbers)
-        forbidden_ok = not bool(active_numbers.intersection(forbidden_active_numbers))
 
-        if user_found and password_ok and expected_card_ok and forbidden_ok:
+        current_password = (
+            _ukm5_text(user_row.get("password"))
+            if user_found
+            else ""
+        )
+
+        password_ok = (
+            expected_password_text is None
+            or (
+                user_found
+                and current_password == expected_password_text
+            )
+        )
+
+        expected_card_ok = (
+            expected_active_text is None
+            or expected_active_text in active_numbers
+        )
+
+        stale_active_numbers = active_numbers.intersection(
+            forbidden_active_numbers
+        )
+        forbidden_ok = not stale_active_numbers
+
+        ready = (
+            user_found
+            and password_ok
+            and expected_card_ok
+            and forbidden_ok
+        )
+
+        if ready:
+            logger.info(
+                f"[UKM5][VERIFY] ready "
+                f"store_id={internal_store_id} "
+                f"cashier_id={cashier_id} "
+                f"poll={poll_number} "
+                f"active_count={len(active_numbers)}"
+            )
             return state, True
 
         signature = (
-            int(user_row["id"]) if user_found and user_row.get("id") is not None else None,
-            str(user_row.get("password") or ""),
-            tuple(sorted(
-                (str(c.get("number") or "").strip(), int(bool(c.get("active"))))
-                for c in cards
-            )),
+            int(user_row["id"])
+            if user_found
+            and user_row.get("id") is not None
+            else None,
+            current_password,
+            tuple(sorted(active_numbers)),
         )
 
-        if signature == last_signature:
-            same_signature_count += 1
-        else:
+        if signature != last_signature:
+            logger.info(
+                f"[UKM5][VERIFY] state_changed "
+                f"store_id={internal_store_id} "
+                f"cashier_id={cashier_id} "
+                f"poll={poll_number} "
+                f"user_found={user_found} "
+                f"password_ok={password_ok} "
+                f"expected_card_ok={expected_card_ok} "
+                f"active_count={len(active_numbers)} "
+                f"stale_count={len(stale_active_numbers)}"
+            )
             last_signature = signature
-            same_signature_count = 0
 
-        # Если пользователь уже появился, но состояние не меняется несколько опросов подряд,
-        # дальше ждать обычно бессмысленно.
-        if user_found and same_signature_count >= UKM5_VERIFY_MAX_SAME_POLLS:
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            logger.warning(
+                f"[UKM5][VERIFY] timeout "
+                f"store_id={internal_store_id} "
+                f"cashier_id={cashier_id} "
+                f"timeout={timeout_value:.1f}s "
+                f"user_found={user_found} "
+                f"password_ok={password_ok} "
+                f"expected_card_ok={expected_card_ok} "
+                f"active_count={len(active_numbers)} "
+                f"stale_count={len(stale_active_numbers)}"
+            )
             return last_state, False
 
-        if time.monotonic() >= deadline:
-            return last_state, False
-
-        time.sleep(UKM5_VERIFY_SLEEP)
+        sleep_sec = min(
+            max(0.1, float(UKM5_VERIFY_SLEEP)),
+            remaining,
+        )
+        time.sleep(sleep_sec)
 
 
 def _sync_user_to_ukm5(
@@ -4998,123 +5187,271 @@ def _sync_user_to_ukm5(
     password_plain: str,
 ) -> dict:
     """
-    1) POST активной карты number=password_plain
-    2) ждём, пока user/password/card появятся в srvdata
-    3) находим старые active user_card != new number
-    4) отправляем POST по каждой старой карте с active=false
-    5) снова poll и проверяем финальное состояние
+    Синхронизация пользователя с УКМ-5.
+
+    1. Отправляет новую активную карту.
+    2. Полностью ожидает появления нового пароля и карты.
+    3. Только после подтверждения новой карты отключает старые.
+    4. Повторяет импорт при задержке асинхронной очереди.
+    5. Выполняет финальную проверку.
     """
     binding = _resolve_ukm5_store_binding(store_id)
-    internal_store_id = int(binding["internal_store_id"])
-    external_store_id = int(binding["external_store_id"])
+
+    internal_store_id = int(
+        binding["internal_store_id"]
+    )
+    external_store_id = int(
+        binding["external_store_id"]
+    )
 
     date_from, date_till = _make_ukm5_card_dates()
 
-    active_payload = _build_ukm5_user_payload(
-        cashier_id=int(cashier_id),
-        fio=fio,
-        plain_inn=plain_inn,
-        password_plain=password_plain,
-        role_id=int(role_id),
-        card_number=password_plain,
-        card_active=True,
-        date_from=date_from,
-        date_till=date_till,
-    )
+    active_import_attempts = []
 
-    active_api = _import_user_to_ukm5(
-        external_store_id=external_store_id,
-        payload=active_payload,
-    )
+    state_after_create = {
+        "user": None,
+        "cards": [],
+    }
+    create_ready = False
 
-    state_after_create, create_ready = _poll_ukm5_user_state(
-        internal_store_id=internal_store_id,
-        plain_inn=plain_inn,
-        cashier_id=int(cashier_id),
-        expected_password=password_plain,
-        expected_active_number=password_plain,
-    )
-
-    user_row = state_after_create.get("user") or {}
-    cards_after_create = state_after_create.get("cards") or []
-
-    actual_user_id = int(user_row["id"]) if user_row and user_row.get("id") is not None else int(cashier_id)
-
-    stale_active_numbers = [
-        str(c.get("number") or "").strip()
-        for c in cards_after_create
-        if str(c.get("number") or "").strip() != str(password_plain)
-        and bool(c.get("active"))
-    ]
-
-    deactivated = []
-    for old_number in stale_active_numbers:
-        deactivate_payload = _build_ukm5_user_payload(
-            cashier_id=actual_user_id,
+    # Сначала добиваемся появления новой карты и нового пароля.
+    for attempt in range(1, UKM5_SYNC_ATTEMPTS + 1):
+        active_payload = _build_ukm5_user_payload(
+            cashier_id=int(cashier_id),
             fio=fio,
             plain_inn=plain_inn,
             password_plain=password_plain,
             role_id=int(role_id),
-            card_number=old_number,
-            card_active=False,
+            card_number=password_plain,
+            card_active=True,
             date_from=date_from,
             date_till=date_till,
         )
 
-        api_res = _import_user_to_ukm5(
+        active_api = _import_user_to_ukm5(
             external_store_id=external_store_id,
-            payload=deactivate_payload,
+            payload=active_payload,
         )
 
-        deactivated.append({
-            "number_masked": _mask_secret(old_number),
-            "api_status_code": api_res.get("status_code"),
+        active_import_attempts.append({
+            "attempt": attempt,
+            "status_code": active_api.get("status_code"),
         })
 
-    final_state, final_ready = _poll_ukm5_user_state(
-        internal_store_id=internal_store_id,
-        plain_inn=plain_inn,
-        cashier_id=actual_user_id,
-        expected_password=password_plain,
-        expected_active_number=password_plain,
-        forbidden_active_numbers=set(stale_active_numbers),
+        state_after_create, create_ready = (
+            _poll_ukm5_user_state(
+                internal_store_id=internal_store_id,
+                plain_inn=plain_inn,
+                cashier_id=int(cashier_id),
+                expected_password=password_plain,
+                expected_active_number=password_plain,
+            )
+        )
+
+        if create_ready:
+            break
+
+        logger.warning(
+            f"[UKM5] Новая карта пока не подтверждена, "
+            f"повторяю импорт: "
+            f"storeid={store_id}, "
+            f"cashier_id={cashier_id}, "
+            f"attempt={attempt}/{UKM5_SYNC_ATTEMPTS}"
+        )
+
+    user_row = state_after_create.get("user") or {}
+    cards_after_create = (
+        state_after_create.get("cards") or []
     )
+
+    actual_user_id = (
+        int(user_row["id"])
+        if user_row
+        and user_row.get("id") is not None
+        else int(cashier_id)
+    )
+
+    all_stale_numbers = {
+        _ukm5_text(card.get("number"))
+        for card in cards_after_create
+        if _ukm5_is_active(card.get("active"))
+        and _ukm5_text(card.get("number"))
+        and _ukm5_text(card.get("number"))
+        != _ukm5_text(password_plain)
+    }
+
+    deactivation_attempts = []
+
+    final_state = state_after_create
+    final_ready = False
+
+    if create_ready:
+        # Повторяем отключение старых карт при задержке очереди.
+        for deactivate_round in range(
+            1,
+            UKM5_SYNC_ATTEMPTS + 1,
+        ):
+            current_cards = (
+                final_state.get("cards") or []
+            )
+
+            stale_now = {
+                _ukm5_text(card.get("number"))
+                for card in current_cards
+                if _ukm5_is_active(card.get("active"))
+                and _ukm5_text(card.get("number"))
+                and _ukm5_text(card.get("number"))
+                != _ukm5_text(password_plain)
+            }
+
+            all_stale_numbers.update(stale_now)
+
+            for old_number in sorted(stale_now):
+                deactivate_payload = (
+                    _build_ukm5_user_payload(
+                        cashier_id=actual_user_id,
+                        fio=fio,
+                        plain_inn=plain_inn,
+                        password_plain=password_plain,
+                        role_id=int(role_id),
+                        card_number=old_number,
+                        card_active=False,
+                        date_from=date_from,
+                        date_till=date_till,
+                    )
+                )
+
+                api_res = _import_user_to_ukm5(
+                    external_store_id=external_store_id,
+                    payload=deactivate_payload,
+                )
+
+                deactivation_attempts.append({
+                    "round": deactivate_round,
+                    "number_masked": _mask_secret(
+                        old_number
+                    ),
+                    "api_status_code": api_res.get(
+                        "status_code"
+                    ),
+                })
+
+            final_state, final_ready = (
+                _poll_ukm5_user_state(
+                    internal_store_id=internal_store_id,
+                    plain_inn=plain_inn,
+                    cashier_id=actual_user_id,
+                    expected_password=password_plain,
+                    expected_active_number=password_plain,
+                    forbidden_active_numbers=all_stale_numbers,
+                )
+            )
+
+            if final_ready:
+                break
+
+            logger.warning(
+                f"[UKM5] Финальная проверка не прошла, "
+                f"повторяю отключение старых карт: "
+                f"storeid={store_id}, "
+                f"cashier_id={actual_user_id}, "
+                f"round={deactivate_round}/"
+                f"{UKM5_SYNC_ATTEMPTS}"
+            )
+    else:
+        logger.warning(
+            f"[UKM5] Новая карта не подтверждена. "
+            f"Старые карты не отключаем, чтобы сотрудник "
+            f"не остался без рабочего бейджа. "
+            f"storeid={store_id}, cashier_id={cashier_id}"
+        )
 
     final_user = final_state.get("user") or {}
     final_cards = final_state.get("cards") or []
 
     final_active_numbers = [
-        str(c.get("number") or "").strip()
-        for c in final_cards
-        if bool(c.get("active"))
+        _ukm5_text(card.get("number"))
+        for card in final_cards
+        if _ukm5_is_active(card.get("active"))
+        and _ukm5_text(card.get("number"))
     ]
-    final_active_numbers_masked = [_mask_secret(x) for x in final_active_numbers]
 
-    password_matches = bool(final_user) and str(final_user.get("password") or "") == str(password_plain)
+    final_active_numbers = sorted(
+        set(final_active_numbers)
+    )
+
+    password_matches = (
+        bool(final_user)
+        and _ukm5_text(final_user.get("password"))
+        == _ukm5_text(password_plain)
+    )
+
     stale_active_left = [
-        x for x in final_active_numbers
-        if x != str(password_plain)
+        number
+        for number in final_active_numbers
+        if number != _ukm5_text(password_plain)
     ]
+
+    strict_final_ready = (
+        bool(final_user)
+        and password_matches
+        and final_active_numbers
+        == [_ukm5_text(password_plain)]
+        and not stale_active_left
+    )
+
+    final_ready = bool(
+        final_ready or strict_final_ready
+    )
+
+    unique_deactivated_numbers = {
+        item["number_masked"]
+        for item in deactivation_attempts
+    }
 
     return {
         "binding": {
             "internal_store_id": internal_store_id,
             "external_store_id": external_store_id,
-            "store_name": binding.get("store_name") or "",
+            "store_name": (
+                binding.get("store_name") or ""
+            ),
         },
-        "active_import_status_code": active_api.get("status_code"),
+        "active_import_status_code": (
+            active_import_attempts[-1]["status_code"]
+            if active_import_attempts
+            else None
+        ),
+        "active_import_attempts": active_import_attempts,
         "create_ready": create_ready,
-        "deactivated_count": len(deactivated),
-        "deactivated_cards": deactivated,
+        "deactivated_count": len(
+            unique_deactivated_numbers
+        ),
+        "deactivated_cards": deactivation_attempts,
         "verification": {
             "final_ready": final_ready,
             "user_found": bool(final_user),
-            "user_id": int(final_user["id"]) if final_user and final_user.get("id") is not None else None,
+            "user_id": (
+                int(final_user["id"])
+                if final_user
+                and final_user.get("id") is not None
+                else None
+            ),
             "password_matches": password_matches,
-            "active_numbers_masked": final_active_numbers_masked,
-            "active_count": len(final_active_numbers),
-            "stale_active_left_masked": [_mask_secret(x) for x in stale_active_left],
-            "stale_active_left_count": len(stale_active_left),
+            "active_numbers_masked": [
+                _mask_secret(number)
+                for number in final_active_numbers
+            ],
+            "active_count": len(
+                final_active_numbers
+            ),
+            "stale_active_left_masked": [
+                _mask_secret(number)
+                for number in stale_active_left
+            ],
+            "stale_active_left_count": len(
+                stale_active_left
+            ),
         },
     }
 
