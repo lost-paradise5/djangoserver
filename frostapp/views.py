@@ -14598,7 +14598,17 @@ MOBILE_SM_POSITION_CONFIG = {
         "title": "Админ_УУ_Николаевский_Мобил",
         "orarole": "ADMIN_UU_NIKOLAEVSKIY_MOBIL",
     },
+
     "receiver": {
+        "id": 625,
+        "title": "Прием_УУ_Николаевский_Мобил",
+        "orarole": "PRIEM_UU_NIKOLAEVSKIY_MOBIL",
+    },
+
+    # Сотрудникам и специалистам торгового зала
+    # создаём Supermag с той же должностью,
+    # что и приемщикам.
+    "sales_floor": {
         "id": 625,
         "title": "Прием_УУ_Николаевский_Мобил",
         "orarole": "PRIEM_UU_NIKOLAEVSKIY_MOBIL",
@@ -14662,7 +14672,7 @@ def _mobile_classify_position(
             "sales_floor",
             "Сотрудник торгового зала",
             1,
-            False,
+            True,
         )
 
     # Из мобильного подразделения берём всех.
