@@ -14584,6 +14584,14 @@ MOBILE_UKM_VERSION = int(
     os.getenv("MOBILE_UKM_VERSION", "1")
 )
 
+# department_id для всех сотрудников мобильного подразделения.
+MOBILE_EMPLOYEE_DEPARTMENT_ID = int(
+    os.getenv(
+        "MOBILE_EMPLOYEE_DEPARTMENT_ID",
+        "458",
+    )
+)
+
 # Используется, чтобы два реальных запуска не выполнялись одновременно.
 MOBILE_SYNC_DB_LOCK_KEY = int(
     os.getenv("MOBILE_SYNC_DB_LOCK_KEY", "2026071601")
@@ -15814,14 +15822,10 @@ def _mobile_sync_postgres_employee(
             )
         )
 
-    department, department_created = (
-        _mobile_find_or_create_named(
-            Department,
-            employee["department_name"],
-            "Мобильное подразделение",
-        )
-    )
-
+    # Всем сотрудникам мобильного подразделения
+    # всегда устанавливаем department_id=458.
+    department_id = MOBILE_EMPLOYEE_DEPARTMENT_ID
+    
     position, position_created = (
         _mobile_find_or_create_named(
             Position,
@@ -15845,7 +15849,11 @@ def _mobile_sync_postgres_employee(
         "phone": (
             employee["phone"][:50]
         ),
-        "department_id": department.id,
+    
+        # Фиксированное подразделение для всех
+        # мобильных сотрудников.
+        "department_id": department_id,
+    
         "position_id": position.id,
         "active": True,
     }
@@ -15956,11 +15964,9 @@ def _mobile_sync_postgres_employee(
         "user_id": user.id,
         "user_action": user_action,
 
-        "department_id": department.id,
-        "department_created": (
-            department_created
-        ),
-
+        "department_id": department_id,
+        "department_created": False,
+        
         "position_id": position.id,
         "position_created": (
             position_created
