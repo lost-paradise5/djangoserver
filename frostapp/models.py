@@ -97,17 +97,50 @@ class UKMUser(models.Model):
         managed = False
 
 
+# class OpenInSystem(models.Model):
+#     id        = models.AutoField(primary_key=True)
+#     user_id   = models.IntegerField(db_column='user_id')
+#     username = models.CharField(max_length=255)
+#     password = models.CharField(max_length=128)
+#     system_id = models.IntegerField()
+#     status = models.BooleanField()
+#     isnot2fa = models.BooleanField(db_column='isnot2fa', null=True, blank=True, default=False)
+
+#     class Meta:
+#         db_table = 'open_in_system'
+#         managed = False
+
 class OpenInSystem(models.Model):
-    id        = models.AutoField(primary_key=True)
-    user_id   = models.IntegerField(db_column='user_id')
+    id = models.AutoField(primary_key=True)
+    user_id = models.IntegerField(db_column="user_id")
     username = models.CharField(max_length=255)
     password = models.CharField(max_length=128)
     system_id = models.IntegerField()
     status = models.BooleanField()
-    isnot2fa = models.BooleanField(db_column='isnot2fa', null=True, blank=True, default=False)
+    isnot2fa = models.BooleanField(
+        db_column="isnot2fa",
+        null=True,
+        blank=True,
+        default=False,
+    )
+
+    # База Supermag выбранного мобильным сотрудником магазина.
+    for_mobile = models.TextField(
+        null=True,
+        blank=True,
+        default=None,
+    )
+
+    # Здесь хранится stores.ukm4store выбранного магазина.
+    # Поле нужно, чтобы однозначно определить магазин.
+    for_mobile_storeid = models.IntegerField(
+        null=True,
+        blank=True,
+        default=None,
+    )
 
     class Meta:
-        db_table = 'open_in_system'
+        db_table = "open_in_system"
         managed = False
 
 
