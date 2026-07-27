@@ -136,7 +136,7 @@ from .forms import (
 _HEX = set("0123456789abcdefABCDEF")
 logger = logging.getLogger(__name__)
 AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "zDFbCQWRzL7pKYxzpfSSLVdqCrAYsHiN7FORRUDt1hE")
-MAX_BOT_INTERNAL_TOKEN = os.getenv("MAX_BOT_INTERNAL_TOKEN", "wc3wow")
+
 UKM5_FULL_XML_STORE_ID = 2013
 
 # Для логов auth_start и auth_verify_pin
@@ -14564,7 +14564,11 @@ def _generate_sm_password(length: int = 4) -> str:
 def max_bot_internal_token_required(view_func):
     @wraps(view_func)
     def wrapped(request, *args, **kwargs):
-        expected = str(MAX_BOT_INTERNAL_TOKEN or "").strip()
+        expected = _env_value(
+            "MAX_BOT_INTERNAL_TOKEN",
+            "",
+        ).strip()
+
         received = str(
             request.headers.get("X-Bot-Token")
             or request.META.get("HTTP_X_BOT_TOKEN")
@@ -14573,8 +14577,10 @@ def max_bot_internal_token_required(view_func):
 
         if not expected:
             logger.error(
-                "[MAX/MOBILE_SM] MAX_BOT_INTERNAL_TOKEN не настроен"
+                "[MAX/MOBILE_SM] MAX_BOT_INTERNAL_TOKEN "
+                "не настроен ни в окружении, ни в /app/.env"
             )
+
             return JsonResponse(
                 {
                     "status": "error",
@@ -14583,7 +14589,27 @@ def max_bot_internal_token_required(view_func):
                 status=503,
             )
 
-        if not received or not hmac.compare_digest(received, expected):
+        if not received:
+            logger.warning(
+                "[MAX/MOBILE_SM] Запрос пришёл без X-Bot-Token"
+            )
+
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Доступ запрещён",
+                },
+                status=403,
+            )
+
+        if not hmac.compare_digest(received, expected):
+            logger.warning(
+                "[MAX/MOBILE_SM] Неверный X-Bot-Token: "
+                "received_length=%s expected_length=%s",
+                len(received),
+                len(expected),
+            )
+
             return JsonResponse(
                 {
                     "status": "error",
@@ -15244,7 +15270,7 @@ def _call_mobile_bin_createuser2(
     fio: str,
     smstore: int,
 ) -> None:
-    proc_name = os.getenv(
+    proc_name = _env_value(
         "SM_BIN_CREATEUSER2_PROC",
         "SUPERMAG.bin_createuser2",
     ).strip()
