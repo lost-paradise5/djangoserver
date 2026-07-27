@@ -5,6 +5,7 @@ import logging
 import requests
 from io import BytesIO
 from requests.exceptions import RequestException
+from contextlib import contextmanager
 import time
 from typing import Tuple, Optional, Any, Iterable
 import random
@@ -149,6 +150,17 @@ AGENT_AUTH_AUDIT_LOG_MAX_BYTES = int(
 AGENT_AUTH_AUDIT_LOG_BACKUP_COUNT = int(
     os.getenv("AGENT_AUTH_AUDIT_LOG_BACKUP_COUNT", "10")
 )
+
+
+MOBILE_SUPERMAG_DEPARTMENT_ID = int(
+    os.getenv("MOBILE_SUPERMAG_DEPARTMENT_ID", "458")
+)
+
+MOBILE_SUPERMAG_ROLE_TITLES = {
+    13: "АДМИНИСТРАТОР МАГАЗИНА",
+    1: "ПРИЕМЩИК ТОВАРА",
+}
+
 
 _AGENT_AUTH_AUDIT_LOGGER = None
 _AGENT_AUTH_SENSITIVE_KEYS = {
@@ -9331,82 +9343,213 @@ def _create_auth_session_and_deliver_pin(user, pin: str, expires_at):
 
 
 
-
-
-
 def _get_agent_user_stores(user):
     """
-    Возвращает уникальные магазины пользователя из ukm_users
-    + обогащает их данными из Postgres stores и Oracle Supermag.
+    Для обычных сотрудников возвращает все магазины из ukm_users.
+
+    Для department_id=458 возвращает только магазин,
+    выбранный через MAX и записанный в for_mobile_storeid.
     """
-    ukm_links = list(
+    links_qs = (
         UKMUser.objects
         .filter(user=user)
-        .values('storeid', 'roleid')
-        .order_by('storeid', 'id')
+        .values("storeid", "roleid")
+        .order_by("storeid", "id")
     )
+
+    is_mobile_employee = (
+        int(getattr(user, "department_id", 0) or 0)
+        == MOBILE_SUPERMAG_DEPARTMENT_ID
+    )
+
+    if is_mobile_employee:
+        selected_storeid = _get_mobile_selected_ukm_storeid(user)
+
+        if selected_storeid is None:
+            return []
+
+        links_qs = links_qs.filter(
+            storeid=selected_storeid
+        )
+
+    ukm_links = list(links_qs)
 
     if not ukm_links:
         return []
 
     unique_links = {}
+
     for row in ukm_links:
-        sid = row['storeid']
+        sid = row["storeid"]
+
         if sid not in unique_links:
+            unique_links[sid] = row
+
+        # При наличии двух ролей приоритет у администратора.
+        elif int(row.get("roleid") or 0) == 13:
             unique_links[sid] = row
 
     store_ids = list(unique_links.keys())
 
     store_map = {
-        s.ukm4store: s
-        for s in Store.objects.filter(ukm4store__in=store_ids)
+        store.ukm4store: store
+        for store in Store.objects.filter(
+            ukm4store__in=store_ids
+        )
     }
 
     smstore_ids = []
+
     for sid in store_ids:
         store_obj = store_map.get(sid)
+
         if store_obj and store_obj.smstore is not None:
             smstore_ids.append(store_obj.smstore)
 
-    supermag_meta_map = _get_supermag_store_meta_map(smstore_ids)
+    supermag_meta_map = _get_supermag_store_meta_map(
+        smstore_ids
+    )
 
     stores_payload = []
+
     for sid, row in unique_links.items():
         store_obj = store_map.get(sid)
         smstore = store_obj.smstore if store_obj else None
-        meta = supermag_meta_map.get(int(smstore), {}) if smstore is not None else {}
 
-        dbname = meta.get('dbname')
+        meta = (
+            supermag_meta_map.get(int(smstore), {})
+            if smstore is not None
+            else {}
+        )
 
-        if not dbname and store_obj and getattr(store_obj, "dbname", None):
+        dbname = meta.get("dbname")
+
+        if (
+            not dbname
+            and store_obj
+            and getattr(store_obj, "dbname", None)
+        ):
             dbname = _safe_text(store_obj.dbname)
-        
+
         if not dbname and smstore is not None:
             try:
                 dbname = get_dbname_for_smstore(smstore)
-            except Exception as e:
+            except Exception as exc:
                 logger.error(
-                    f"[AGENT_AUTH] Ошибка получения DBNAME для smstore={smstore}: {e}",
-                    exc_info=True
+                    "[AGENT_AUTH] Ошибка получения DBNAME "
+                    "для smstore=%s: %s",
+                    smstore,
+                    exc,
+                    exc_info=True,
                 )
                 dbname = None
 
         stores_payload.append({
-            'ukm_storeid': sid,
-            'smstore': smstore,
-            'name': meta.get('name') or (store_obj.name if store_obj else '') or '',
-            'address': meta.get('address') or (store_obj.address if store_obj else '') or '',
-            'roleid': row.get('roleid'),
-            'dbname': dbname,
-            'dbname_source': meta.get('dbname_source'),
-            'ukm_server_ip': meta.get('ukm_server_ip') or (str(store_obj.ukm4ip) if store_obj and store_obj.ukm4ip else None),
-            'inn': meta.get('inn'),
-            'kpp': meta.get('kpp'),
-            'fsrar_id': meta.get('fsrar_id'),
-            'market': meta.get('market'),
+            "ukm_storeid": sid,
+            "smstore": smstore,
+            "name": (
+                meta.get("name")
+                or (store_obj.name if store_obj else "")
+                or ""
+            ),
+            "address": (
+                meta.get("address")
+                or (store_obj.address if store_obj else "")
+                or ""
+            ),
+            "roleid": row.get("roleid"),
+            "dbname": dbname,
+            "dbname_source": meta.get("dbname_source"),
+            "ukm_server_ip": (
+                meta.get("ukm_server_ip")
+                or (
+                    str(store_obj.ukm4ip)
+                    if store_obj and store_obj.ukm4ip
+                    else None
+                )
+            ),
+            "inn": meta.get("inn"),
+            "kpp": meta.get("kpp"),
+            "fsrar_id": meta.get("fsrar_id"),
+            "market": meta.get("market"),
         })
 
     return stores_payload
+
+
+# def _get_agent_user_stores(user):
+#     """
+#     Возвращает уникальные магазины пользователя из ukm_users
+#     + обогащает их данными из Postgres stores и Oracle Supermag.
+#     """
+#     ukm_links = list(
+#         UKMUser.objects
+#         .filter(user=user)
+#         .values('storeid', 'roleid')
+#         .order_by('storeid', 'id')
+#     )
+
+#     if not ukm_links:
+#         return []
+
+#     unique_links = {}
+#     for row in ukm_links:
+#         sid = row['storeid']
+#         if sid not in unique_links:
+#             unique_links[sid] = row
+
+#     store_ids = list(unique_links.keys())
+
+#     store_map = {
+#         s.ukm4store: s
+#         for s in Store.objects.filter(ukm4store__in=store_ids)
+#     }
+
+#     smstore_ids = []
+#     for sid in store_ids:
+#         store_obj = store_map.get(sid)
+#         if store_obj and store_obj.smstore is not None:
+#             smstore_ids.append(store_obj.smstore)
+
+#     supermag_meta_map = _get_supermag_store_meta_map(smstore_ids)
+
+#     stores_payload = []
+#     for sid, row in unique_links.items():
+#         store_obj = store_map.get(sid)
+#         smstore = store_obj.smstore if store_obj else None
+#         meta = supermag_meta_map.get(int(smstore), {}) if smstore is not None else {}
+
+#         dbname = meta.get('dbname')
+
+#         if not dbname and store_obj and getattr(store_obj, "dbname", None):
+#             dbname = _safe_text(store_obj.dbname)
+        
+#         if not dbname and smstore is not None:
+#             try:
+#                 dbname = get_dbname_for_smstore(smstore)
+#             except Exception as e:
+#                 logger.error(
+#                     f"[AGENT_AUTH] Ошибка получения DBNAME для smstore={smstore}: {e}",
+#                     exc_info=True
+#                 )
+#                 dbname = None
+
+#         stores_payload.append({
+#             'ukm_storeid': sid,
+#             'smstore': smstore,
+#             'name': meta.get('name') or (store_obj.name if store_obj else '') or '',
+#             'address': meta.get('address') or (store_obj.address if store_obj else '') or '',
+#             'roleid': row.get('roleid'),
+#             'dbname': dbname,
+#             'dbname_source': meta.get('dbname_source'),
+#             'ukm_server_ip': meta.get('ukm_server_ip') or (str(store_obj.ukm4ip) if store_obj and store_obj.ukm4ip else None),
+#             'inn': meta.get('inn'),
+#             'kpp': meta.get('kpp'),
+#             'fsrar_id': meta.get('fsrar_id'),
+#             'market': meta.get('market'),
+#         })
+
+#     return stores_payload
 
 
 # def _get_agent_primary_credentials(user_id):
@@ -9601,33 +9744,112 @@ def _get_request_ip(request) -> str:
     )
 
 
+# def _get_agent_user_store_brief(user):
+#     if not user:
+#         return []
+
+#     store_ids = list(
+#         UKMUser.objects
+#         .filter(user=user)
+#         .order_by("storeid")
+#         .values_list("storeid", flat=True)
+#         .distinct()
+#     )
+
+#     if not store_ids:
+#         return []
+
+#     store_name_map = {
+#         s.ukm4store: (s.name or "")
+#         for s in Store.objects.filter(ukm4store__in=store_ids).only("ukm4store", "name")
+#     }
+
+#     return [
+#         {
+#             "ukm_storeid": sid,
+#             "name": store_name_map.get(sid, ""),
+#         }
+#         for sid in store_ids
+#     ]
+
+
 def _get_agent_user_store_brief(user):
     if not user:
         return []
 
-    store_ids = list(
-        UKMUser.objects
-        .filter(user=user)
-        .order_by("storeid")
-        .values_list("storeid", flat=True)
-        .distinct()
+    store_links = UKMUser.objects.filter(user=user)
+
+    if (
+        int(getattr(user, "department_id", 0) or 0)
+        == MOBILE_SUPERMAG_DEPARTMENT_ID
+    ):
+        selected_storeid = _get_mobile_selected_ukm_storeid(user)
+
+        if selected_storeid is None:
+            return []
+
+        store_links = store_links.filter(
+            storeid=selected_storeid
+        )
+
+    rows = list(
+        store_links
+        .values("storeid", "roleid")
+        .order_by("storeid", "id")
     )
 
-    if not store_ids:
+    unique_links = {}
+
+    for row in rows:
+        sid = row["storeid"]
+
+        if sid not in unique_links:
+            unique_links[sid] = row
+        elif int(row.get("roleid") or 0) == 13:
+            unique_links[sid] = row
+
+    if not unique_links:
         return []
 
     store_name_map = {
-        s.ukm4store: (s.name or "")
-        for s in Store.objects.filter(ukm4store__in=store_ids).only("ukm4store", "name")
+        store.ukm4store: {
+            "name": store.name or "",
+            "dbname": store.dbname or "",
+            "smstore": store.smstore,
+        }
+        for store in Store.objects.filter(
+            ukm4store__in=list(unique_links.keys())
+        )
     }
 
-    return [
-        {
+    result = []
+
+    for sid, row in unique_links.items():
+        store_data = store_name_map.get(sid, {})
+
+        result.append({
             "ukm_storeid": sid,
-            "name": store_name_map.get(sid, ""),
-        }
-        for sid in store_ids
-    ]
+            "smstore": store_data.get("smstore"),
+            "name": store_data.get("name", ""),
+            "dbname": store_data.get("dbname", ""),
+            "roleid": row.get("roleid"),
+        })
+
+    return result
+
+
+def _agent_no_stores_message(user) -> str:
+    if (
+        user
+        and int(getattr(user, "department_id", 0) or 0)
+        == MOBILE_SUPERMAG_DEPARTMENT_ID
+    ):
+        return (
+            "Сначала выберите магазин в MAX через кнопку "
+            "«Доступ в Супермаг (мобильное подразделение)»"
+        )
+
+    return "У пользователя нет магазинов в ukm_users"
 
 
 def _build_agent_auth_requester(user=None, **extra):
@@ -9965,7 +10187,7 @@ def agent_auth_start(request):
         users = list(
             User.objects
             .filter(phone__in=list(phone_candidates))
-            .only('id', 'full_name', 'tg_id', 'max_id', 'mail', 'employee_id')
+            .only('id', 'full_name', 'tg_id', 'max_id', 'mail', 'employee_id', 'department_id')
             .order_by('id')[:2]
         )
 
@@ -10005,12 +10227,11 @@ def agent_auth_start(request):
         )
         stores_for_log = _get_agent_user_store_brief(user)
 
-        has_store = UKMUser.objects.filter(user=user).exists()
-        if not has_store:
+        if not stores_for_log:
             return _agent_audit_error(
                 request,
                 event=event,
-                message='У пользователя нет магазинов в ukm_users',
+                message=_agent_no_stores_message(user),
                 status=500,
                 request_payload=request_payload,
                 requester=requester,
@@ -10044,7 +10265,7 @@ def agent_auth_start(request):
                 return _agent_audit_error(
                     request,
                     event=event,
-                    message='У пользователя нет магазинов в ukm_users',
+                    message=_agent_no_stores_message(user),
                     status=500,
                     request_payload=request_payload,
                     requester=requester,
@@ -10360,7 +10581,7 @@ def agent_auth_verify_pin(request):
             return _agent_audit_error(
                 request,
                 event=event,
-                message='У пользователя нет магазинов в ukm_users',
+                message=_agent_no_stores_message(sess.user),
                 status=500,
                 request_payload=request_payload,
                 requester=requester,
@@ -14330,6 +14551,1291 @@ def _is_sm_block_mode(acheck_raw: str, auserenabled_raw: str) -> bool:
 
 def _generate_sm_password(length: int = 4) -> str:
     return "".join(random.choices(string.digits, k=length))
+
+
+
+
+
+
+
+
+###28.07.2026 MOBILE
+
+def max_bot_internal_token_required(view_func):
+    @wraps(view_func)
+    def wrapped(request, *args, **kwargs):
+        expected = str(MAX_BOT_INTERNAL_TOKEN or "").strip()
+        received = str(
+            request.headers.get("X-Bot-Token")
+            or request.META.get("HTTP_X_BOT_TOKEN")
+            or ""
+        ).strip()
+
+        if not expected:
+            logger.error(
+                "[MAX/MOBILE_SM] MAX_BOT_INTERNAL_TOKEN не настроен"
+            )
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Сервис временно не настроен",
+                },
+                status=503,
+            )
+
+        if not received or not hmac.compare_digest(received, expected):
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Доступ запрещён",
+                },
+                status=403,
+            )
+
+        return view_func(request, *args, **kwargs)
+
+    return wrapped
+
+
+
+
+class MobileSupermagBusyError(Exception):
+    pass
+
+
+def _read_json_request(request) -> dict:
+    try:
+        raw = request.body.decode("utf-8", errors="replace")
+        data = json.loads(raw or "{}")
+    except Exception as exc:
+        raise ValueError("Некорректный JSON") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("Тело запроса должно быть JSON-объектом")
+
+    return data
+
+
+def _get_mobile_open_system_record(
+    user_id: int,
+    *,
+    for_update: bool = False,
+) -> Optional[OpenInSystem]:
+    """
+    Возвращает основную запись system_id=4.
+
+    Сначала активную, затем любую существующую.
+    """
+    qs = OpenInSystem.objects.filter(
+        user_id=int(user_id),
+        system_id=4,
+    )
+
+    if for_update:
+        qs = qs.select_for_update()
+
+    active_record = qs.filter(status=True).order_by("id").first()
+    if active_record:
+        return active_record
+
+    return qs.order_by("id").first()
+
+
+@contextmanager
+def _mobile_supermag_user_lock(user_id: int):
+    """
+    Не позволяет одновременно запустить два Oracle-запроса
+    для одного сотрудника.
+
+    Блокировка действует даже при прямом обращении к Django,
+    а не только через интерфейс MAX.
+    """
+    if connection.vendor != "postgresql":
+        yield
+        return
+
+    lock_key = 4_580_000_000_000 + int(user_id)
+    acquired = False
+
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_lock(%s)",
+                [lock_key],
+            )
+            row = cur.fetchone()
+            acquired = bool(row and row[0])
+
+        if not acquired:
+            raise MobileSupermagBusyError(
+                "Запрос для этого сотрудника уже обрабатывается"
+            )
+
+        yield
+
+    finally:
+        if acquired:
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_unlock(%s)",
+                        [lock_key],
+                    )
+            except Exception:
+                logger.exception(
+                    "[MAX/MOBILE_SM] Ошибка снятия advisory lock "
+                    "user_id=%s",
+                    user_id,
+                )
+
+
+def _get_mobile_selected_ukm_storeid(
+    user: User,
+) -> Optional[int]:
+    """
+    Возвращает точный ukm4store, выбранный мобильным сотрудником.
+
+    Старый fallback по for_mobile оставлен на случай записей,
+    созданных до появления for_mobile_storeid.
+    """
+    if int(getattr(user, "department_id", 0) or 0) != MOBILE_SUPERMAG_DEPARTMENT_ID:
+        return None
+
+    record = _get_mobile_open_system_record(user.id)
+    if not record:
+        return None
+
+    selected_storeid = getattr(record, "for_mobile_storeid", None)
+
+    if selected_storeid is not None:
+        try:
+            selected_storeid = int(selected_storeid)
+        except Exception:
+            selected_storeid = None
+
+    if selected_storeid is not None:
+        has_access = UKMUser.objects.filter(
+            user_id=user.id,
+            storeid=selected_storeid,
+        ).exists()
+
+        if has_access:
+            return selected_storeid
+
+    # Совместимость с записями, где заполнен только DBNAME.
+    selected_dbname = str(
+        getattr(record, "for_mobile", "") or ""
+    ).strip()
+
+    if not selected_dbname:
+        return None
+
+    user_storeids = list(
+        UKMUser.objects
+        .filter(user_id=user.id)
+        .values_list("storeid", flat=True)
+        .distinct()
+    )
+
+    matched_storeids = list(
+        Store.objects
+        .filter(
+            ukm4store__in=user_storeids,
+            dbname__iexact=selected_dbname,
+        )
+        .exclude(ukm4store__isnull=True)
+        .values_list("ukm4store", flat=True)
+        .distinct()
+    )
+
+    # По DBNAME разрешаем выбор только тогда, когда найден ровно один магазин.
+    if len(matched_storeids) == 1:
+        return int(matched_storeids[0])
+
+    return None
+
+
+def _get_mobile_user_by_max_id(max_id) -> Optional[User]:
+    return (
+        User.objects
+        .filter(
+            max_id=max_id,
+            active=True,
+        )
+        .only(
+            "id",
+            "max_id",
+            "full_name",
+            "employee_id",
+            "department_id",
+            "active",
+        )
+        .first()
+    )
+
+
+def _get_mobile_role_for_store(
+    user_id: int,
+    ukm_storeid: int,
+) -> tuple[Optional[int], Optional[str]]:
+    role_ids = {
+        int(role_id)
+        for role_id in UKMUser.objects.filter(
+            user_id=user_id,
+            storeid=ukm_storeid,
+        ).values_list("roleid", flat=True)
+        if role_id is not None
+    }
+
+    # Если случайно имеются обе роли, администратор имеет приоритет.
+    if 13 in role_ids:
+        return 13, MOBILE_SUPERMAG_ROLE_TITLES[13]
+
+    if 1 in role_ids:
+        return 1, MOBILE_SUPERMAG_ROLE_TITLES[1]
+
+    return None, None
+
+
+def _get_mobile_stores_for_user(
+    user: User,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Возвращает:
+      1. доступные магазины;
+      2. пропущенные привязки с некорректными stores.
+    """
+    role_rows = list(
+        UKMUser.objects
+        .filter(
+            user_id=user.id,
+            roleid__in=[1, 13],
+        )
+        .values("storeid", "roleid")
+        .order_by("storeid", "id")
+    )
+
+    role_by_store: dict[int, int] = {}
+
+    for row in role_rows:
+        try:
+            storeid = int(row["storeid"])
+            roleid = int(row["roleid"])
+        except Exception:
+            continue
+
+        previous_role = role_by_store.get(storeid)
+
+        if previous_role is None or roleid == 13:
+            role_by_store[storeid] = roleid
+
+    if not role_by_store:
+        return [], []
+
+    store_map = {
+        int(store.ukm4store): store
+        for store in Store.objects.filter(
+            ukm4store__in=list(role_by_store.keys())
+        )
+        if store.ukm4store is not None
+    }
+
+    selected_storeid = _get_mobile_selected_ukm_storeid(user)
+
+    result = []
+    skipped = []
+
+    for ukm_storeid, roleid in role_by_store.items():
+        store = store_map.get(ukm_storeid)
+
+        if not store:
+            skipped.append({
+                "ukm_storeid": ukm_storeid,
+                "reason": "Магазин отсутствует в stores",
+            })
+            continue
+
+        dbname = str(store.dbname or "").strip().upper()
+
+        if not dbname:
+            skipped.append({
+                "ukm_storeid": ukm_storeid,
+                "name": str(store.name or ""),
+                "reason": "Не заполнен stores.dbname",
+            })
+            continue
+
+        if store.smstore is None:
+            skipped.append({
+                "ukm_storeid": ukm_storeid,
+                "name": str(store.name or ""),
+                "reason": "Не заполнен stores.smstore",
+            })
+            continue
+
+        result.append({
+            "ukm_storeid": ukm_storeid,
+            "smstore": int(store.smstore),
+            "dbname": dbname,
+            "name": str(store.name or "").strip()
+                    or f"Магазин {ukm_storeid}",
+            "address": str(store.address or "").strip(),
+            "roleid": roleid,
+            "role_title": MOBILE_SUPERMAG_ROLE_TITLES[roleid],
+            "selected": selected_storeid == ukm_storeid,
+        })
+
+    result.sort(
+        key=lambda item: (
+            item["name"].casefold(),
+            item["ukm_storeid"],
+        )
+    )
+
+    return result, skipped
+
+
+
+
+
+
+def _compact_mobile_supermag_fio(
+    full_name: str,
+    max_length: int = 30,
+) -> str:
+    parts = [
+        part
+        for part in re.split(r"\s+", str(full_name or "").strip())
+        if part
+    ]
+
+    if not parts:
+        return ""
+
+    original = " ".join(parts)
+
+    if len(original) <= max_length:
+        return original
+
+    surname = parts[0]
+    name = parts[1] if len(parts) > 1 else ""
+    patronymic = parts[2] if len(parts) > 2 else ""
+
+    # Фамилия Имя И.
+    candidate = " ".join(
+        part
+        for part in [
+            surname,
+            name,
+            f"{patronymic[0]}." if patronymic else "",
+        ]
+        if part
+    )
+
+    if len(candidate) <= max_length:
+        return candidate
+
+    # Фамилия И. О.
+    candidate = " ".join(
+        part
+        for part in [
+            surname,
+            f"{name[0]}." if name else "",
+            f"{patronymic[0]}." if patronymic else "",
+        ]
+        if part
+    )
+
+    if len(candidate) <= max_length:
+        return candidate
+
+    # На случай очень длинной фамилии.
+    return candidate[:max_length].rstrip(" .")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _oracle_fetch_mobile_staff_by_inn(
+    cur,
+    inn: str,
+) -> list[dict]:
+    cols_set = {
+        str(col).upper()
+        for col in _oracle_get_table_columns_set(
+            cur,
+            owner="SUPERMAG",
+            table="SMSTAFF",
+        )
+    }
+
+    if "INN" not in cols_set:
+        raise RuntimeError(
+            "В таблице SUPERMAG.SMSTAFF отсутствует поле INN"
+        )
+
+    def has_col(name: str) -> bool:
+        return name.upper() in cols_set
+
+    select_parts = [
+        "s.id AS id" if has_col("ID") else "NULL AS id",
+        _smstaff_afio_sql("s", cols_set),
+        (
+            "s.serverlogin AS serverlogin"
+            if has_col("SERVERLOGIN")
+            else "NULL AS serverlogin"
+        ),
+        "s.inn AS inn",
+        (
+            "s.userenabled AS userenabled"
+            if has_col("USERENABLED")
+            else "NULL AS userenabled"
+        ),
+        (
+            "s.offindex AS offindex"
+            if has_col("OFFINDEX")
+            else "NULL AS offindex"
+        ),
+    ]
+
+    if has_col("OFFINDEX"):
+        select_parts.append("""
+            (
+                SELECT c.title
+                FROM smoffcfg c
+                WHERE c.id = s.offindex
+                  AND ROWNUM = 1
+            ) AS off_title
+        """)
+    else:
+        select_parts.append("NULL AS off_title")
+
+    order_parts = []
+
+    if has_col("USERENABLED"):
+        order_parts.append("""
+            CASE
+                WHEN TO_CHAR(s.userenabled) = '1' THEN 0
+                ELSE 1
+            END
+        """)
+
+    if has_col("ID"):
+        order_parts.append("s.id")
+    else:
+        order_parts.append("s.serverlogin")
+
+    sql = f"""
+        SELECT {", ".join(select_parts)}
+        FROM smstaff s
+        WHERE TRIM(s.inn) = :b_inn
+        ORDER BY {", ".join(order_parts)}
+    """
+
+    cur.execute(sql, b_inn=str(inn).strip())
+    return _oracle_rows_to_jsonable(cur)
+
+
+def _pick_mobile_staff_by_inn(
+    rows: list[dict],
+) -> Optional[dict]:
+    if not rows:
+        return None
+
+    rows_with_login = [
+        row
+        for row in rows
+        if str(row.get("serverlogin") or "").strip()
+    ]
+
+    if not rows_with_login:
+        return None
+
+    unique_logins = {
+        str(row.get("serverlogin") or "").strip().lower()
+        for row in rows_with_login
+    }
+
+    if len(unique_logins) > 1:
+        raise RuntimeError(
+            "В Supermag по одному ИНН найдено несколько разных логинов"
+        )
+
+    return rows_with_login[0]
+
+
+
+
+
+
+def _mobile_login_with_suffix(
+    base: str,
+    suffix: str,
+    max_length: int = 64,
+) -> str:
+    suffix = str(suffix or "")
+    available_length = max_length - len(suffix)
+
+    if available_length <= 0:
+        raise ValueError("Не удалось сформировать логин")
+
+    return f"{base[:available_length]}{suffix}"
+
+
+def _oracle_mobile_login_exists(
+    cur,
+    login: str,
+) -> bool:
+    rows = _oracle_fetch_smstaff_conflicts(
+        cur,
+        login=login,
+        inn="",
+    )
+
+    target = str(login or "").strip().lower()
+
+    return any(
+        str(row.get("serverlogin") or "").strip().lower() == target
+        for row in rows
+    )
+
+
+def _generate_unique_mobile_supermag_login(
+    cur,
+    full_name: str,
+) -> str:
+    parts = [
+        part
+        for part in re.split(r"\s+", str(full_name or "").strip())
+        if part
+    ]
+
+    if len(parts) < 2:
+        raise ValueError(
+            "Для генерации логина требуется минимум фамилия и имя"
+        )
+
+    surname = _normalize_login_piece(parts[0])
+    first_name = _normalize_login_piece(parts[1])
+    patronymic = (
+        _normalize_login_piece(parts[2])
+        if len(parts) > 2
+        else ""
+    )
+
+    if not surname or not first_name:
+        raise ValueError(
+            "Не удалось транслитерировать фамилию или имя"
+        )
+
+    candidates = [
+        f"{first_name}_{surname}",
+    ]
+
+    if patronymic:
+        candidates.append(
+            f"{first_name}_{surname}_{patronymic[0]}"
+        )
+
+    # Дополнительный запасной вариант.
+    candidates.append(
+        f"{first_name[0]}_{surname}"
+    )
+
+    checked = set()
+
+    for candidate in candidates:
+        candidate = candidate[:64].strip("_")
+
+        if not candidate or candidate in checked:
+            continue
+
+        checked.add(candidate)
+
+        if not _oracle_mobile_login_exists(cur, candidate):
+            return candidate
+
+    numeric_base = candidates[1] if len(candidates) > 1 else candidates[0]
+
+    for number in range(2, 1000):
+        candidate = _mobile_login_with_suffix(
+            numeric_base,
+            f"_{number}",
+        )
+
+        if not _oracle_mobile_login_exists(cur, candidate):
+            return candidate
+
+    raise RuntimeError(
+        "Не удалось подобрать свободный логин Supermag"
+    )
+
+
+
+
+
+
+
+def _assert_mobile_login_belongs_to_employee(
+    cur,
+    *,
+    login: str,
+    inn: str,
+    full_name: str,
+) -> None:
+    rows = _oracle_fetch_smstaff_conflicts(
+        cur,
+        login=login,
+        inn="",
+    )
+
+    target_login = str(login or "").strip().lower()
+    target_inn = str(inn or "").strip()
+    target_fio = _normalize_fio_for_compare(full_name)
+
+    for row in rows:
+        row_login = str(
+            row.get("serverlogin") or ""
+        ).strip().lower()
+
+        if row_login != target_login:
+            continue
+
+        row_inn = str(row.get("inn") or "").strip()
+        row_fio = _normalize_fio_for_compare(
+            row.get("afio")
+        )
+
+        if row_inn:
+            if row_inn != target_inn:
+                raise RuntimeError(
+                    f"Логин {login} уже принадлежит другому ИНН"
+                )
+            continue
+
+        # Если у существующей записи ИНН пустой,
+        # разрешаем продолжить только при совпадении ФИО.
+        if row_fio and row_fio != target_fio:
+            raise RuntimeError(
+                f"Логин {login} уже занят другим сотрудником"
+            )
+
+
+
+
+
+
+def _call_mobile_bin_createuser2(
+    cur,
+    *,
+    username: str,
+    password: str,
+    role_title: str,
+    inn: str,
+    fio: str,
+    smstore: int,
+) -> None:
+    proc_name = os.getenv(
+        "SM_BIN_CREATEUSER2_PROC",
+        "SUPERMAG.bin_createuser2",
+    ).strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9_.$]+", proc_name):
+        raise ValueError(
+            "Некорректное значение SM_BIN_CREATEUSER2_PROC"
+        )
+
+    cur.execute(
+        f"""
+        BEGIN
+            {proc_name}(
+                AUSER => :p_auser,
+                APASS => :p_apass,
+                ADOL => :p_adol,
+                ACHECK => :p_acheck,
+                AUSERENABLED => :p_auserenabled,
+                AINN => :p_ainn,
+                AFIO => :p_afio,
+                ASTOREID => :p_astoreid
+            );
+        END;
+        """,
+        p_auser=username,
+        p_apass=password,
+        p_adol=role_title,
+        p_acheck=1,
+        p_auserenabled=1,
+        p_ainn=inn,
+        p_afio=fio,
+        p_astoreid=int(smstore),
+    )
+
+
+
+
+
+def _save_mobile_open_system_credentials(
+    *,
+    user_id: int,
+    username: str,
+    password: str,
+    dbname: str,
+    ukm_storeid: int,
+) -> OpenInSystem:
+    with transaction.atomic():
+        record = _get_mobile_open_system_record(
+            user_id,
+            for_update=True,
+        )
+
+        if record:
+            record.username = username
+            record.password = password
+            record.status = True
+            record.for_mobile = dbname
+            record.for_mobile_storeid = ukm_storeid
+
+            record.save(update_fields=[
+                "username",
+                "password",
+                "status",
+                "for_mobile",
+                "for_mobile_storeid",
+            ])
+
+            return record
+
+        return OpenInSystem.objects.create(
+            user_id=user_id,
+            username=username,
+            password=password,
+            system_id=4,
+            status=True,
+            isnot2fa=False,
+            for_mobile=dbname,
+            for_mobile_storeid=ukm_storeid,
+        )
+
+
+
+
+@csrf_exempt
+@require_POST
+@max_bot_internal_token_required
+def max_mobile_supermag_stores(request):
+    try:
+        data = _read_json_request(request)
+    except ValueError as exc:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": str(exc),
+            },
+            status=400,
+        )
+
+    max_id = str(data.get("max_id") or "").strip()
+
+    if not max_id:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Не указан max_id",
+            },
+            status=400,
+        )
+
+    user = _get_mobile_user_by_max_id(max_id)
+
+    if not user:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Пользователь не найден",
+            },
+            status=404,
+        )
+
+    if int(user.department_id or 0) != MOBILE_SUPERMAG_DEPARTMENT_ID:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": (
+                    "Функция доступна только сотрудникам "
+                    "мобильного подразделения"
+                ),
+            },
+            status=403,
+        )
+
+    stores, skipped = _get_mobile_stores_for_user(user)
+
+    if not stores:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": (
+                    "Не найдены доступные магазины с заполненными "
+                    "dbname и smstore"
+                ),
+                "skipped": skipped,
+            },
+            status=404,
+        )
+
+    selected_storeid = _get_mobile_selected_ukm_storeid(user)
+
+    return JsonResponse(
+        {
+            "status": "ok",
+            "stores": stores,
+            "selected_ukm_storeid": selected_storeid,
+            "skipped_count": len(skipped),
+        },
+        status=200,
+        json_dumps_params={"ensure_ascii": False},
+    )
+
+
+
+
+
+@csrf_exempt
+@require_POST
+@max_bot_internal_token_required
+def max_mobile_supermag_open(request):
+    user = None
+    store = None
+    ukm_storeid = None
+    roleid = None
+    role_title = None
+    dbname = ""
+    credential_source = ""
+    oracle_conn = None
+    oracle_cur = None
+
+    try:
+        data = _read_json_request(request)
+
+        max_id = str(data.get("max_id") or "").strip()
+        ukm_storeid_raw = data.get("ukm_storeid")
+
+        if not max_id:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Не указан max_id",
+                },
+                status=400,
+            )
+
+        try:
+            ukm_storeid = int(ukm_storeid_raw)
+        except Exception:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Некорректный ukm_storeid",
+                },
+                status=400,
+            )
+
+        user = _get_mobile_user_by_max_id(max_id)
+
+        if not user:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Пользователь не найден",
+                },
+                status=404,
+            )
+
+        if int(user.department_id or 0) != MOBILE_SUPERMAG_DEPARTMENT_ID:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        "Функция доступна только сотрудникам "
+                        "мобильного подразделения"
+                    ),
+                },
+                status=403,
+            )
+
+        roleid, role_title = _get_mobile_role_for_store(
+            user.id,
+            ukm_storeid,
+        )
+
+        if roleid not in {1, 13} or not role_title:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        "У сотрудника нет роли 1 или 13 "
+                        "в выбранном магазине"
+                    ),
+                },
+                status=403,
+            )
+
+        store = (
+            Store.objects
+            .filter(ukm4store=ukm_storeid)
+            .only(
+                "id",
+                "name",
+                "address",
+                "ukm4store",
+                "smstore",
+                "dbname",
+            )
+            .first()
+        )
+
+        if not store:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Магазин не найден в таблице stores",
+                },
+                status=404,
+            )
+
+        if store.smstore is None:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "У магазина не заполнен stores.smstore",
+                },
+                status=400,
+            )
+
+        dbname = str(store.dbname or "").strip().upper()
+
+        if not dbname:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "У магазина не заполнен stores.dbname",
+                },
+                status=400,
+            )
+
+        if dbname not in ORACLE_TNS_MAP:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        f"База {dbname} отсутствует в ORACLE_TNS_MAP"
+                    ),
+                },
+                status=400,
+            )
+
+        employee_inn = str(
+            user.employee_id or ""
+        ).strip()
+
+        if not _is_valid_inn_digits(employee_inn):
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        "В users.employee_id должен быть указан "
+                        "ИНН из 10 или 12 цифр"
+                    ),
+                },
+                status=400,
+            )
+
+        employee_full_name = re.sub(
+            r"\s+",
+            " ",
+            str(user.full_name or "").strip(),
+        )
+
+        if not employee_full_name:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "У сотрудника не заполнено ФИО",
+                },
+                status=400,
+            )
+
+        employee_fio_for_oracle = _compact_mobile_supermag_fio(
+            employee_full_name,
+            max_length=30,
+        )
+
+        with _mobile_supermag_user_lock(user.id):
+            open_record = _get_mobile_open_system_record(user.id)
+
+            stored_username = (
+                str(open_record.username or "").strip().lower()
+                if open_record
+                else ""
+            )
+            stored_password = (
+                str(open_record.password or "").strip()
+                if open_record
+                else ""
+            )
+
+            oracle_conn = _connect_oracle_service(dbname)
+            oracle_cur = oracle_conn.cursor()
+
+            # Если логин и пароль уже существуют — используем их.
+            if stored_username and stored_password:
+                username = stored_username
+                password = stored_password
+                credential_source = "open_in_system"
+
+            else:
+                oracle_rows = _oracle_fetch_mobile_staff_by_inn(
+                    oracle_cur,
+                    employee_inn,
+                )
+
+                oracle_employee = _pick_mobile_staff_by_inn(
+                    oracle_rows
+                )
+
+                if oracle_employee:
+                    username = str(
+                        oracle_employee.get("serverlogin") or ""
+                    ).strip().lower()
+
+                    if not username:
+                        raise RuntimeError(
+                            "У найденного сотрудника в SMSTAFF "
+                            "не заполнен SERVERLOGIN"
+                        )
+
+                    credential_source = "oracle_by_inn"
+
+                else:
+                    username = _generate_unique_mobile_supermag_login(
+                        oracle_cur,
+                        employee_full_name,
+                    )
+                    credential_source = "generated"
+
+                # При отсутствии полного комплекта учётных данных
+                # всегда задаём новый четырёхзначный пароль.
+                password = _generate_sm_password(4)
+
+            if not _is_valid_sm_login(username):
+                raise RuntimeError(
+                    f"Некорректный логин Supermag: {username!r}"
+                )
+
+            if not password:
+                raise RuntimeError(
+                    "Не удалось получить или сформировать пароль"
+                )
+
+            _assert_mobile_login_belongs_to_employee(
+                oracle_cur,
+                login=username,
+                inn=employee_inn,
+                full_name=employee_full_name,
+            )
+
+            _call_mobile_bin_createuser2(
+                oracle_cur,
+                username=username,
+                password=password,
+                role_title=role_title,
+                inn=employee_inn,
+                fio=employee_fio_for_oracle,
+                smstore=int(store.smstore),
+            )
+
+            oracle_conn.commit()
+
+            # Записываем выбор магазина только после успешного Oracle COMMIT.
+            _save_mobile_open_system_credentials(
+                user_id=user.id,
+                username=username,
+                password=password,
+                dbname=dbname,
+                ukm_storeid=ukm_storeid,
+            )
+
+        store_name = (
+            str(store.name or "").strip()
+            or f"Магазин {ukm_storeid}"
+        )
+
+        _send_max_log_async(
+            "\n".join([
+                "🔓 Доступ в Супермаг — мобильное подразделение",
+                f"Сотрудник: {employee_full_name}",
+                f"ИНН: {employee_inn}",
+                f"Магазин: {store_name}",
+                f"UKM4 storeid: {ukm_storeid}",
+                f"Supermag storeid: {store.smstore}",
+                f"База: {dbname}",
+                f"Роль: {role_title} ({roleid})",
+                f"Логин: {username}",
+                f"Источник логина: {credential_source}",
+                "Результат: доступ открыт",
+            ])
+        )
+
+        return JsonResponse(
+            {
+                "status": "ok",
+                "message": "Доступ открыт",
+                "store": {
+                    "name": store_name,
+                    "address": str(store.address or "").strip(),
+                    "ukm_storeid": ukm_storeid,
+                    "smstore": int(store.smstore),
+                    "dbname": dbname,
+                },
+                "roleid": roleid,
+                "role_title": role_title,
+                "username": username,
+                "credential_source": credential_source,
+            },
+            status=200,
+            json_dumps_params={"ensure_ascii": False},
+        )
+
+    except MobileSupermagBusyError as exc:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": str(exc),
+            },
+            status=409,
+        )
+
+    except ValueError as exc:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": str(exc),
+            },
+            status=400,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[MAX/MOBILE_SM] Ошибка открытия доступа "
+            "user_id=%s ukm_storeid=%s db=%s: %s",
+            getattr(user, "id", None),
+            ukm_storeid,
+            dbname,
+            exc,
+        )
+
+        if user:
+            _send_max_log_async(
+                "\n".join([
+                    "❌ Ошибка доступа в Супермаг — мобильное подразделение",
+                    f"Сотрудник: {getattr(user, 'full_name', '') or '—'}",
+                    f"ИНН: {getattr(user, 'employee_id', '') or '—'}",
+                    f"UKM4 storeid: {ukm_storeid or '—'}",
+                    f"База: {dbname or '—'}",
+                    f"Роль: {role_title or '—'}",
+                    f"Ошибка: {str(exc)[:1000]}",
+                ])
+            )
+
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": (
+                    "Не удалось открыть доступ к магазину. "
+                    "Администратору отправлен технический лог."
+                ),
+            },
+            status=500,
+        )
+
+    finally:
+        try:
+            if oracle_cur:
+                oracle_cur.close()
+        except Exception:
+            pass
+
+        try:
+            if oracle_conn:
+                oracle_conn.close()
+        except Exception:
+            pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _is_valid_sm_login(login: str) -> bool:
