@@ -237,6 +237,17 @@ urlpatterns = [
         views.mobile_employees_sync_ui,
         name="mobile_employees_sync_ui",
     ),
+
+    path(
+        "max/mobile-supermag/stores/",
+        views.max_mobile_supermag_stores,
+        name="max_mobile_supermag_stores",
+    ),
+    path(
+        "max/mobile-supermag/open/",
+        views.max_mobile_supermag_open,
+        name="max_mobile_supermag_open",
+    ),
     
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
