@@ -255,10 +255,26 @@ def _cleanup_old_exports() -> None:
 
 
 def _excel_value(value: Any) -> Any:
+    """
+    Приводит значение к формату, который поддерживает openpyxl.
+
+    Excel не поддерживает datetime/time с tzinfo.
+    Для aware-datetime сначала сохраняем локальное время Django,
+    затем удаляем только информацию о часовом поясе.
+    """
     if value is None:
         return None
 
-    if isinstance(value, (dt.datetime, dt.date, int, float, bool)):
+    if isinstance(value, dt.datetime):
+        if timezone.is_aware(value):
+            value = timezone.localtime(value)
+
+        return value.replace(tzinfo=None)
+
+    if isinstance(value, dt.time):
+        return value.replace(tzinfo=None)
+
+    if isinstance(value, (dt.date, int, float, bool)):
         return value
 
     return str(value)
@@ -389,7 +405,10 @@ def _build_workbook(
     )
 
     summary_ws.append(["Показатель", "Значение"])
-    summary_ws.append(["Дата формирования", generated_at])
+    summary_ws.append([
+        "Дата формирования",
+        _excel_value(generated_at),
+    ])
     summary_ws.append(["Целевых магазинов", len(report_rows)])
     summary_ws.append(["Успешно обработано", success_count])
     summary_ws.append(["С предупреждениями", warning_count])
@@ -543,7 +562,11 @@ def build_trm_users_export() -> dict[str, Any]:
         report_rows=report_rows,
         generated_at=generated_at,
     )
-    workbook.save(file_path)
+    try:
+        workbook.save(file_path)
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
 
     elapsed_sec = round(time.monotonic() - started_at, 2)
 
