@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Выгрузка сотрудников кассовых серверов</title>
+
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  >
+
+  <style>
+    body {
+      background: #f5f6f8;
+    }
+
+    .page-shell {
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 28px 16px 50px;
+    }
+
+    .summary-card {
+      min-height: 112px;
+    }
+
+    .table-wrap {
+      max-height: 620px;
+      overflow: auto;
+    }
+
+    .table-wrap thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #f8f9fa;
+    }
+
+    .error-text {
+      max-width: 560px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <main class="page-shell">
+    <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
+      <div>
+        <h1 class="h3 mb-2">Сотрудники кассовых серверов</h1>
+        <p class="text-secondary mb-0">
+          Выгрузка действующих записей из <code>trm_in_users</code>
+          по целевым магазинам. В Excel попадут только строки с
+          <code>deleted = 0</code>.
+        </p>
+      </div>
+
+      <button id="runButton" class="btn btn-primary btn-lg" type="button">
+        Сформировать Excel
+      </button>
+    </div>
+
+    <form id="csrfForm" class="d-none">
+      {% csrf_token %}
+    </form>
+
+    <div id="progressBox" class="alert alert-info d-none" role="alert">
+      <div class="d-flex align-items-center gap-3">
+        <div class="spinner-border spinner-border-sm" aria-hidden="true"></div>
+        <div>
+          Подключаюсь к кассовым серверам и собираю записи.
+          Не закрывайте страницу до завершения.
+        </div>
+      </div>
+    </div>
+
+    <div id="errorBox" class="alert alert-danger d-none" role="alert"></div>
+
+    <section id="resultSection" class="d-none">
+      <div class="row g-3 mb-4">
+        <div class="col-sm-6 col-lg-3">
+          <div class="card summary-card shadow-sm border-0">
+            <div class="card-body">
+              <div class="text-secondary small">Магазинов</div>
+              <div id="storeCount" class="display-6"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-sm-6 col-lg-3">
+          <div class="card summary-card shadow-sm border-0">
+            <div class="card-body">
+              <div class="text-secondary small">Кассовых серверов</div>
+              <div id="hostCount" class="display-6"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-sm-6 col-lg-3">
+          <div class="card summary-card shadow-sm border-0">
+            <div class="card-body">
+              <div class="text-secondary small">Записей сотрудников</div>
+              <div id="employeeCount" class="display-6"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-sm-6 col-lg-3">
+          <div class="card summary-card shadow-sm border-0">
+            <div class="card-body">
+              <div class="text-secondary small">Время обработки</div>
+              <div id="elapsedTime" class="display-6"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="d-flex flex-wrap align-items-center gap-3 mb-3">
+        <a id="downloadButton" class="btn btn-success" href="#">
+          Скачать Excel ещё раз
+        </a>
+
+        <div id="resultText" class="text-secondary"></div>
+      </div>
+
+      <div class="card shadow-sm border-0">
+        <div class="card-header bg-white py-3">
+          <strong>Результат по магазинам</strong>
+        </div>
+
+        <div class="table-wrap">
+          <table class="table table-hover table-sm align-middle mb-0">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Магазин</th>
+                <th>Сервер</th>
+                <th>Статус</th>
+                <th class="text-end">Записей</th>
+                <th>Предупреждение / ошибка</th>
+              </tr>
+            </thead>
+            <tbody id="reportBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const runButton = document.getElementById("runButton");
+    const progressBox = document.getElementById("progressBox");
+    const errorBox = document.getElementById("errorBox");
+    const resultSection = document.getElementById("resultSection");
+    const reportBody = document.getElementById("reportBody");
+    const csrfToken = document.querySelector(
+      "#csrfForm input[name='csrfmiddlewaretoken']"
+    ).value;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function statusBadge(status) {
+      const variants = {
+        ok: ["Успешно", "success"],
+        empty: ["Записей нет", "secondary"],
+        warning: ["Предупреждение", "warning"],
+        missing_store: ["Нет в stores", "danger"],
+        missing_ip: ["Нет IP", "danger"],
+        error: ["Ошибка", "danger"],
+      };
+
+      const item = variants[status] || [status || "—", "secondary"];
+      return `<span class="badge text-bg-${item[1]}">${escapeHtml(item[0])}</span>`;
+    }
+
+    function renderResult(result) {
+      document.getElementById("storeCount").textContent =
+        result.target_store_count;
+      document.getElementById("hostCount").textContent =
+        result.unique_host_count;
+      document.getElementById("employeeCount").textContent =
+        result.employee_count;
+      document.getElementById("elapsedTime").textContent =
+        `${result.elapsed_sec} с`;
+
+      document.getElementById("resultText").textContent =
+        `Успешно: ${result.success_store_count}; ` +
+        `с предупреждениями: ${result.warning_store_count}; ` +
+        `с ошибками: ${result.failed_store_count}.`;
+
+      const downloadButton = document.getElementById("downloadButton");
+      downloadButton.href = result.download_url;
+
+      reportBody.innerHTML = result.stores.map((item) => {
+        const detail = item.error || item.warning || "";
+
+        return `
+          <tr>
+            <td>${escapeHtml(item.store_id)}</td>
+            <td>${escapeHtml(item.store_name || "—")}</td>
+            <td><code>${escapeHtml(item.host || "—")}</code></td>
+            <td>${statusBadge(item.status)}</td>
+            <td class="text-end">${escapeHtml(item.row_count)}</td>
+            <td class="error-text">${escapeHtml(detail)}</td>
+          </tr>
+        `;
+      }).join("");
+
+      resultSection.classList.remove("d-none");
+
+      // Автоматически начинаем скачивание после успешного формирования.
+      window.location.href = result.download_url;
+    }
+
+    runButton.addEventListener("click", async () => {
+      runButton.disabled = true;
+      progressBox.classList.remove("d-none");
+      errorBox.classList.add("d-none");
+      resultSection.classList.add("d-none");
+
+      try {
+        const response = await fetch("{% url 'trm_users_export_run' %}", {
+          method: "POST",
+          headers: {
+            "X-CSRFToken": csrfToken,
+            "X-Requested-With": "XMLHttpRequest",
+          },
+          credentials: "same-origin",
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || data.status !== "ok") {
+          throw new Error(data.message || "Не удалось сформировать отчёт");
+        }
+
+        renderResult(data.result);
+      } catch (error) {
+        errorBox.textContent = error.message || String(error);
+        errorBox.classList.remove("d-none");
+      } finally {
+        progressBox.classList.add("d-none");
+        runButton.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
