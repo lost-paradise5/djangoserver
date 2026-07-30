@@ -248,6 +248,22 @@ urlpatterns = [
         views.max_mobile_supermag_open,
         name="max_mobile_supermag_open",
     ),
+
+    path(
+        "reports/trm-users/",
+        views.trm_users_export_page,
+        name="trm_users_export_page",
+    ),
+    path(
+        "reports/trm-users/run/",
+        views.trm_users_export_run,
+        name="trm_users_export_run",
+    ),
+    path(
+        "reports/trm-users/download/<str:token>/",
+        views.trm_users_export_download,
+        name="trm_users_export_download",
+    ),
     
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
