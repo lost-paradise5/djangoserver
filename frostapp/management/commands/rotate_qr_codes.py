@@ -540,36 +540,10 @@ class Command(BaseCommand):
                 skipped_rows += 1
                 continue
 
-            state_raw = self._field_value(
-                row,
-                "Состояние",
-                "state",
-                "status",
-            )
-            state = str(state_raw or "").strip().casefold()
-            if state and state not in {
-                "работа",
-                "работает",
-                "working",
-            }:
-                skipped_rows += 1
-                continue
-
-            contract_raw = self._field_value(
-                row,
-                "ОформленПоТрудовомуДоговору",
-                "employment_contract",
-            )
-            if contract_raw is not None:
-                contract_text = str(contract_raw).strip().casefold()
-                if contract_raw is False or contract_text in {
-                    "false",
-                    "0",
-                    "нет",
-                    "no",
-                }:
-                    skipped_rows += 1
-                    continue
+            # Никакой фильтрации по полям «Состояние» и
+            # «ОформленПоТрудовомуДоговору».
+            # В индекс попадает любая строка, которую вернул endpoint 1С,
+            # если в ней присутствует корректный ИНН сотрудника.
 
             company_inn = self._digits_only(
                 self._field_value(
