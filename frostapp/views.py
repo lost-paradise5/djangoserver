@@ -86,6 +86,12 @@ from django.db import connection
 from django.core.files.base import ContentFile
 from django.utils.html import escape
 
+
+from frostapp.services.trm_users_export import (
+    build_trm_users_export,
+    get_export_file_path,
+)
+
 from .models import (
     Queue, 
     MODUL_logs, 
@@ -29305,6 +29311,78 @@ def working_employees_by_stores_excel(request):
 
 
 
+@staff_member_required
+@require_GET
+def trm_users_export_page(request):
+    return render(request, "frostapp/trm_users_export.html")
+
+
+@staff_member_required
+@require_POST
+def trm_users_export_run(request):
+    try:
+        result = build_trm_users_export()
+
+        # Храним в сессии только имя файла, а не полный серверный путь.
+        files = request.session.get("trm_users_export_files", {})
+        files[result["token"]] = result["filename"]
+
+        # Не даём сессии бесконечно расти.
+        if len(files) > 10:
+            files = dict(list(files.items())[-10:])
+
+        request.session["trm_users_export_files"] = files
+        request.session.modified = True
+
+        result["download_url"] = reverse(
+            "trm_users_export_download",
+            kwargs={"token": result["token"]},
+        )
+        result.pop("file_path", None)
+
+        return JsonResponse({
+            "status": "ok",
+            "result": result,
+        })
+
+    except Exception as exc:
+        logger.exception("[TRM EXPORT] Ошибка формирования Excel: %s", exc)
+        return JsonResponse({
+            "status": "error",
+            "message": str(exc),
+        }, status=500)
+
+
+@staff_member_required
+@require_GET
+def trm_users_export_download(request, token: str):
+    token = str(token or "").strip()
+    files = request.session.get("trm_users_export_files", {})
+    filename = files.get(token)
+
+    if not filename:
+        return JsonResponse({
+            "status": "error",
+            "message": "Файл не найден в текущей сессии или ссылка устарела.",
+        }, status=404)
+
+    file_path = get_export_file_path(filename)
+
+    if not file_path:
+        return JsonResponse({
+            "status": "error",
+            "message": "Файл уже удалён или не был сформирован.",
+        }, status=404)
+
+    return FileResponse(
+        open(file_path, "rb"),
+        as_attachment=True,
+        filename=filename,
+        content_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
 
 
 
