@@ -13103,7 +13103,7 @@ def pos_list_by_tg(request):
     ).strip()
 
     action = str(
-        body.get("action") or "all"
+        body.get("action") or "stores"
     ).strip().lower()
 
     if not tg_id and not max_id:
