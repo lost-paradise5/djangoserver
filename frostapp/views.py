@@ -12398,6 +12398,282 @@ def _get_store_name_from_pg_by_smstore(smstore) -> str:
 
 
 
+
+
+
+def get_reboot_stores_for_user(user: User) -> list[dict]:
+    """
+    Быстро возвращает магазины пользователя только из PostgreSQL.
+
+    Здесь нет подключений:
+      - к Oracle;
+      - к MySQL УКМ-4;
+      - к MySQL УКМ-5.
+    """
+    if not user:
+        return []
+
+    links = list(
+        UKMUser.objects
+        .filter(user_id=user.id)
+        .values("storeid", "roleid")
+    )
+
+    role_by_store: dict[int, int | None] = {}
+
+    for link in links:
+        try:
+            storeid = int(link.get("storeid"))
+        except (TypeError, ValueError):
+            continue
+
+        try:
+            roleid = int(link.get("roleid"))
+        except (TypeError, ValueError):
+            roleid = None
+
+        # Если случайно есть несколько записей одного магазина,
+        # роль 13 имеет приоритет.
+        current_role = role_by_store.get(storeid)
+
+        if (
+            storeid not in role_by_store
+            or roleid == 13
+            or current_role is None
+        ):
+            role_by_store[storeid] = roleid
+
+    if not role_by_store:
+        return []
+
+    store_ids = sorted(role_by_store.keys())
+
+    stores_from_pg = {
+        int(store.ukm4store): store
+        for store in (
+            Store.objects
+            .filter(ukm4store__in=store_ids)
+            .only(
+                "ukm4store",
+                "smstore",
+                "name",
+                "dbname",
+                "ukm4ip",
+                "ukm5store",
+            )
+        )
+        if store.ukm4store is not None
+    }
+
+    result: list[dict] = []
+
+    for ukm_store_id in store_ids:
+        store = stores_from_pg.get(ukm_store_id)
+
+        result.append({
+            "ukm_store_id": ukm_store_id,
+            "sm_store_id": (
+                int(store.smstore)
+                if store and store.smstore is not None
+                else None
+            ),
+            "store_name": (
+                str(store.name or "").strip()
+                if store
+                else ""
+            ) or f"Магазин {ukm_store_id}",
+            "role_id": role_by_store.get(ukm_store_id),
+        })
+
+    result.sort(
+        key=lambda item: (
+            str(item.get("store_name") or "").casefold(),
+            int(item.get("ukm_store_id") or 0),
+        )
+    )
+
+    return result
+
+
+def get_devices_for_user_store(
+    user: User,
+    ukm_store_id: int,
+) -> tuple[list[dict], list[str]]:
+    """
+    Загружает кассы только одного выбранного магазина.
+
+    Одновременно проверяет, что магазин действительно привязан
+    к пользователю через ukm_users.
+    """
+    try:
+        ukm_store_id = int(ukm_store_id)
+    except (TypeError, ValueError):
+        raise ValueError("Некорректный ukm_store_id")
+
+    link = (
+        UKMUser.objects
+        .filter(
+            user_id=user.id,
+            storeid=ukm_store_id,
+        )
+        .values("roleid")
+        .first()
+    )
+
+    if not link:
+        raise PermissionError(
+            f"Магазин {ukm_store_id} не привязан к пользователю"
+        )
+
+    try:
+        role_id = int(link.get("roleid"))
+    except (TypeError, ValueError):
+        role_id = None
+
+    store = (
+        Store.objects
+        .filter(ukm4store=ukm_store_id)
+        .only(
+            "ukm4store",
+            "smstore",
+            "name",
+            "ukm4ip",
+            "ukm5store",
+        )
+        .first()
+    )
+
+    smstore = (
+        int(store.smstore)
+        if store and store.smstore is not None
+        else None
+    )
+
+    store_name = (
+        str(store.name or "").strip()
+        if store
+        else ""
+    )
+
+    # Один вызов Oracle на выбранный магазин.
+    # Раньше get_store_info() вызывался дважды для каждого магазина.
+    if smstore is not None:
+        store_info = get_store_info(smstore)
+    else:
+        store_info = get_store_info(ukm_store_id)
+        smstore_raw = store_info.get("smstore")
+
+        try:
+            smstore = int(smstore_raw)
+        except (TypeError, ValueError):
+            smstore = None
+
+    if smstore is None:
+        return [], [
+            (
+                f"Не удалось определить smstore "
+                f"для магазина UKM4={ukm_store_id}"
+            )
+        ]
+
+    if not store_name:
+        store_name = _get_store_name_from_pg_by_smstore(smstore)
+
+    if not store_name:
+        store_name = f"Магазин {ukm_store_id}"
+
+    devices: list[dict] = []
+    warnings: list[str] = []
+
+    ukm4_host = str(
+        store_info.get("ukm4ip") or ""
+    ).strip()
+
+    if ukm4_host:
+        try:
+            devices.extend(
+                fetch_ukm4_pos_list(
+                    ukm4_storeid=ukm_store_id,
+                    smstore=smstore,
+                    role_id=role_id,
+                    store_name=store_name,
+                    store_info=store_info,
+                )
+            )
+        except Exception as exc:
+            logger.exception(
+                "[POS] UKM4 list error "
+                f"ukm4store={ukm_store_id}, "
+                f"smstore={smstore}, "
+                f"host={ukm4_host}: {exc}"
+            )
+
+            warnings.append(
+                f"УКМ-4 {ukm4_host}: {exc}"
+            )
+    else:
+        warnings.append(
+            "Для магазина не найден адрес сервера УКМ-4"
+        )
+
+    if store_info.get("is_ukm5", False):
+        try:
+            devices.extend(
+                fetch_ukm5_pos_list(
+                    smstore=smstore,
+                    ukm4_storeid=ukm_store_id,
+                    role_id=role_id,
+                    store_name=store_name,
+                )
+            )
+        except Exception as exc:
+            logger.exception(
+                "[POS] UKM5 list error "
+                f"ukm4store={ukm_store_id}, "
+                f"smstore={smstore}: {exc}"
+            )
+
+            warnings.append(
+                f"УКМ-5: {exc}"
+            )
+
+    return devices, warnings
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def get_devices_for_user(user: User) -> tuple[Optional[User], list[dict]]:
     if not user:
         return None, []
@@ -12607,9 +12883,18 @@ def fetch_ukm4_pos_list(
     smstore: int,
     role_id: int | None = None,
     store_name: str = "",
+    store_info: dict | None = None,
 ) -> list[dict]:
-    info = get_store_info(smstore)
-    ukm_host = info.get("ukm4ip")
+    info = store_info or get_store_info(smstore)
+
+    ukm_host = str(
+        info.get("ukm4ip") or ""
+    ).strip()
+
+    if not ukm_host:
+        raise RuntimeError(
+            f"Для smstore={smstore} не найден сервер УКМ-4"
+        )
 
     conn = cur = None
     items: list[dict] = []
@@ -12774,35 +13059,180 @@ def get_devices_for_ids(*, tg_id: str, max_id: str) -> tuple[Optional[User], lis
 @csrf_exempt
 def pos_list_by_tg(request):
     """
-    POST {"tg_id":"..."} или {"max_id":"..."} или оба -> список касс/КСО UKM4 + UKM5 с ip.
+    Режимы:
+
+    action=stores:
+      быстро возвращает магазины из PostgreSQL.
+
+    action=devices:
+      получает кассы только выбранного магазина.
+
+    action=all:
+      старое поведение для обратной совместимости.
     """
     if request.method != "POST":
-        return JsonResponse({"status": "error", "message": "Только POST"}, status=405)
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Только POST",
+            },
+            status=405,
+        )
 
     try:
-        body = json.loads(request.body.decode("utf-8") if request.body else "{}")
+        body = json.loads(
+            request.body.decode("utf-8")
+            if request.body
+            else "{}"
+        )
     except Exception:
-        return JsonResponse({"status": "error", "message": "Некорректный JSON"}, status=400)
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Некорректный JSON",
+            },
+            status=400,
+        )
 
-    tg_id = str(body.get("tg_id") or "").strip()
-    max_id = str(body.get("max_id") or "").strip()
+    tg_id = str(
+        body.get("tg_id") or ""
+    ).strip()
+
+    max_id = str(
+        body.get("max_id") or ""
+    ).strip()
+
+    action = str(
+        body.get("action") or "all"
+    ).strip().lower()
 
     if not tg_id and not max_id:
-        return JsonResponse({"status": "error", "message": "Не указан tg_id или max_id"}, status=400)
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Не указан tg_id или max_id",
+            },
+            status=400,
+        )
 
-    user, devices, err = get_devices_for_ids(tg_id=tg_id, max_id=max_id)
+    user, err = _resolve_user_by_ids(
+        tg_id=tg_id,
+        max_id=max_id,
+    )
+
     if not user:
-        return JsonResponse({"status": "error", "message": err or "Пользователь не найден"}, status=404)
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": err or "Пользователь не найден",
+            },
+            status=404,
+        )
+
+    base_response = {
+        "status": "ok",
+        "tg_id": str(
+            getattr(user, "tg_id", "") or ""
+        ).strip(),
+        "max_id": str(
+            getattr(user, "max_id", "") or ""
+        ).strip(),
+        "user_id": user.id,
+    }
+
+    if action == "stores":
+        stores = get_reboot_stores_for_user(user)
+
+        return JsonResponse(
+            {
+                **base_response,
+                "stores": stores,
+            },
+            json_dumps_params={
+                "ensure_ascii": False,
+            },
+        )
+
+    if action == "devices":
+        try:
+            ukm_store_id = int(
+                body.get("ukm_storeid")
+            )
+        except (TypeError, ValueError):
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "Не указан корректный ukm_storeid",
+                },
+                status=400,
+            )
+
+        try:
+            devices, warnings = (
+                get_devices_for_user_store(
+                    user,
+                    ukm_store_id,
+                )
+            )
+        except PermissionError as exc:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": str(exc),
+                },
+                status=403,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[POS] Ошибка получения касс "
+                f"user_id={user.id}, "
+                f"ukm_store_id={ukm_store_id}: {exc}"
+            )
+
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        "Не удалось получить кассы "
+                        "выбранного магазина"
+                    ),
+                },
+                status=502,
+            )
+
+        return JsonResponse(
+            {
+                **base_response,
+                "ukm_store_id": ukm_store_id,
+                "devices": devices,
+                "warnings": warnings,
+            },
+            json_dumps_params={
+                "ensure_ascii": False,
+            },
+        )
+
+    if action == "all":
+        # Оставлено только для старых клиентов.
+        # Новый MAX-бот этот режим использовать не должен.
+        user, devices = get_devices_for_user(user)
+
+        return JsonResponse(
+            {
+                **base_response,
+                "devices": devices,
+            },
+            json_dumps_params={
+                "ensure_ascii": False,
+            },
+        )
 
     return JsonResponse(
         {
-            "status": "ok",
-            "tg_id": str(getattr(user, "tg_id", "") or "").strip(),
-            "max_id": str(getattr(user, "max_id", "") or "").strip(),
-            "user_id": user.id,
-            "devices": devices,
+            "status": "error",
+            "message": f"Неизвестное действие: {action}",
         },
-        json_dumps_params={"ensure_ascii": False},
+        status=400,
     )
 
 
@@ -12988,8 +13418,37 @@ def pos_reboot(request):
         )
         return JsonResponse({"status": "error", "message": f"IP {ip} запрещён (allowlist)"}, status=403)
 
-    user, devices, err = get_devices_for_ids(tg_id=tg_id, max_id=max_id)
-
+    requested_ukm_store_id = _safe_int_or_none(
+        body.get("ukm_store_id")
+        or body.get("ukm_storeid")
+        or body.get("storeid")
+    )
+    
+    if requested_ukm_store_id is None:
+        _write_pos_log(
+            status="error",
+            error_message="Не указан ukm_store_id",
+            extra={
+                "stage": "store_validation",
+                "tg_id": tg_id,
+                "max_id": max_id,
+                "ip": ip,
+            },
+        )
+    
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Не указан ukm_store_id",
+            },
+            status=400,
+        )
+    
+    user, err = _resolve_user_by_ids(
+        tg_id=tg_id,
+        max_id=max_id,
+    )
+    
     if not user:
         _write_pos_log(
             status="error",
@@ -13000,11 +13459,129 @@ def pos_reboot(request):
                 "max_id": max_id,
             },
         )
-        return JsonResponse({"status": "error", "message": err or "Пользователь не найден"}, status=404)
-
-    tg_id_user = str(getattr(user, "tg_id", "") or "").strip()
-
-    dev = next((d for d in devices if str(d.get("ip") or "").strip() == ip), None)
+    
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": err or "Пользователь не найден",
+            },
+            status=404,
+        )
+    
+    tg_id_user = str(
+        getattr(user, "tg_id", "") or ""
+    ).strip()
+    
+    try:
+        devices, device_warnings = (
+            get_devices_for_user_store(
+                user,
+                requested_ukm_store_id,
+            )
+        )
+    except PermissionError as exc:
+        _write_pos_log(
+            status="error",
+            error_message=str(exc),
+            user_obj=user,
+            extra={
+                "stage": "store_access_check",
+                "ukm_store_id": requested_ukm_store_id,
+            },
+        )
+    
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": str(exc),
+            },
+            status=403,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[POS/REBOOT] Не удалось получить кассы "
+            f"магазина {requested_ukm_store_id}: {exc}"
+        )
+    
+        _write_pos_log(
+            status="error",
+            error_message=str(exc),
+            user_obj=user,
+            extra={
+                "stage": "load_store_devices",
+                "ukm_store_id": requested_ukm_store_id,
+            },
+        )
+    
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": (
+                    "Не удалось подключиться к выбранному магазину"
+                ),
+            },
+            status=502,
+        )
+    
+    if not devices and device_warnings:
+        warning_text = "; ".join(
+            str(item)
+            for item in device_warnings
+            if item
+        )
+    
+        _write_pos_log(
+            status="error",
+            error_message=warning_text,
+            user_obj=user,
+            extra={
+                "stage": "load_store_devices",
+                "ukm_store_id": requested_ukm_store_id,
+                "warnings": device_warnings,
+            },
+        )
+    
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": (
+                    "Не удалось получить кассы магазина: "
+                    f"{warning_text}"
+                ),
+            },
+            status=503,
+            json_dumps_params={
+                "ensure_ascii": False,
+            },
+        )
+    
+    requested_cash_id = str(
+        body.get("cash_id") or ""
+    ).strip()
+    
+    
+    def device_matches(device: dict) -> bool:
+        if str(device.get("ip") or "").strip() != ip:
+            return False
+    
+        if (
+            requested_cash_id
+            and str(device.get("cash_id") or "").strip()
+            != requested_cash_id
+        ):
+            return False
+    
+        return True
+    
+    
+    dev = next(
+        (
+            device
+            for device in devices
+            if device_matches(device)
+        ),
+        None,
+    )
 
     if not dev:
         _write_pos_log(
