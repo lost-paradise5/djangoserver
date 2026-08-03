@@ -42,23 +42,39 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+
+    .export-actions {
+      min-width: min(100%, 390px);
+    }
   </style>
 </head>
 <body>
   <main class="page-shell">
-    <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
-      <div>
+    <div class="d-flex flex-wrap justify-content-between align-items-start gap-4 mb-4">
+      <div class="flex-grow-1">
         <h1 class="h3 mb-2">Сотрудники кассовых серверов</h1>
+        <p class="text-secondary mb-2">
+          Обычная выгрузка собирает действующие записи из
+          <code>trm_in_users</code> по целевым магазинам.
+        </p>
         <p class="text-secondary mb-0">
-          Выгрузка действующих записей из <code>trm_in_users</code>
-          по целевым магазинам. В Excel попадут только строки с
-          <code>deleted = 0</code>.
+          Выгрузка КСО собирает все строки <code>user_card</code>, где
+          <code>active = 1</code>, с сервера
+          <code>192.168.17.38:3306 / srvdata</code>.
+          Карты без записи в таблице <code>user</code> также попадут в Excel
+          и будут явно помечены.
         </p>
       </div>
 
-      <button id="runButton" class="btn btn-primary btn-lg" type="button">
-        Сформировать Excel
-      </button>
+      <div class="export-actions d-grid gap-2">
+        <button id="runButton" class="btn btn-primary btn-lg" type="button">
+          Сформировать Excel
+        </button>
+
+        <button id="runKsoButton" class="btn btn-success btn-lg" type="button">
+          Сформировать Excel для КСО
+        </button>
+      </div>
     </div>
 
     <form id="csrfForm" class="d-none">
@@ -68,9 +84,8 @@
     <div id="progressBox" class="alert alert-info d-none" role="alert">
       <div class="d-flex align-items-center gap-3">
         <div class="spinner-border spinner-border-sm" aria-hidden="true"></div>
-        <div>
-          Подключаюсь к кассовым серверам и собираю записи.
-          Не закрывайте страницу до завершения.
+        <div id="progressText">
+          Подключаюсь к серверу и формирую Excel.
         </div>
       </div>
     </div>
@@ -78,11 +93,13 @@
     <div id="errorBox" class="alert alert-danger d-none" role="alert"></div>
 
     <section id="resultSection" class="d-none">
+      <h2 id="resultTitle" class="h5 mb-3"></h2>
+
       <div class="row g-3 mb-4">
         <div class="col-sm-6 col-lg-3">
           <div class="card summary-card shadow-sm border-0">
             <div class="card-body">
-              <div class="text-secondary small">Магазинов</div>
+              <div id="storeCountLabel" class="text-secondary small">Магазинов</div>
               <div id="storeCount" class="display-6"></div>
             </div>
           </div>
@@ -91,7 +108,7 @@
         <div class="col-sm-6 col-lg-3">
           <div class="card summary-card shadow-sm border-0">
             <div class="card-body">
-              <div class="text-secondary small">Кассовых серверов</div>
+              <div id="hostCountLabel" class="text-secondary small">Кассовых серверов</div>
               <div id="hostCount" class="display-6"></div>
             </div>
           </div>
@@ -100,7 +117,7 @@
         <div class="col-sm-6 col-lg-3">
           <div class="card summary-card shadow-sm border-0">
             <div class="card-body">
-              <div class="text-secondary small">Записей сотрудников</div>
+              <div id="employeeCountLabel" class="text-secondary small">Записей сотрудников</div>
               <div id="employeeCount" class="display-6"></div>
             </div>
           </div>
@@ -109,7 +126,7 @@
         <div class="col-sm-6 col-lg-3">
           <div class="card summary-card shadow-sm border-0">
             <div class="card-body">
-              <div class="text-secondary small">Время обработки</div>
+              <div id="elapsedTimeLabel" class="text-secondary small">Время обработки</div>
               <div id="elapsedTime" class="display-6"></div>
             </div>
           </div>
@@ -150,13 +167,18 @@
 
   <script>
     const runButton = document.getElementById("runButton");
+    const runKsoButton = document.getElementById("runKsoButton");
     const progressBox = document.getElementById("progressBox");
+    const progressText = document.getElementById("progressText");
     const errorBox = document.getElementById("errorBox");
     const resultSection = document.getElementById("resultSection");
     const reportBody = document.getElementById("reportBody");
     const csrfToken = document.querySelector(
       "#csrfForm input[name='csrfmiddlewaretoken']"
     ).value;
+
+    const TRM_RUN_URL = "{% url 'trm_users_export_run' %}";
+    const KSO_RUN_URL = "{% url 'trm_users_export_kso_run' %}";
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -181,7 +203,26 @@
       return `<span class="badge text-bg-${item[1]}">${escapeHtml(item[0])}</span>`;
     }
 
+    function setButtonsDisabled(disabled) {
+      runButton.disabled = disabled;
+      runKsoButton.disabled = disabled;
+    }
+
     function renderResult(result) {
+      const labels = result.summary_labels || {};
+
+      document.getElementById("resultTitle").textContent =
+        result.result_title || "Выгрузка сформирована";
+
+      document.getElementById("storeCountLabel").textContent =
+        labels.stores || "Магазинов";
+      document.getElementById("hostCountLabel").textContent =
+        labels.hosts || "Кассовых серверов";
+      document.getElementById("employeeCountLabel").textContent =
+        labels.rows || "Записей сотрудников";
+      document.getElementById("elapsedTimeLabel").textContent =
+        labels.elapsed || "Время обработки";
+
       document.getElementById("storeCount").textContent =
         result.target_store_count;
       document.getElementById("hostCount").textContent =
@@ -192,14 +233,17 @@
         `${result.elapsed_sec} с`;
 
       document.getElementById("resultText").textContent =
-        `Успешно: ${result.success_store_count}; ` +
-        `с предупреждениями: ${result.warning_store_count}; ` +
-        `с ошибками: ${result.failed_store_count}.`;
+        result.details_text || (
+          `Успешно: ${result.success_store_count}; ` +
+          `с предупреждениями: ${result.warning_store_count}; ` +
+          `с ошибками: ${result.failed_store_count}.`
+        );
 
       const downloadButton = document.getElementById("downloadButton");
       downloadButton.href = result.download_url;
 
-      reportBody.innerHTML = result.stores.map((item) => {
+      const stores = Array.isArray(result.stores) ? result.stores : [];
+      reportBody.innerHTML = stores.map((item) => {
         const detail = item.error || item.warning || "";
 
         return `
@@ -214,20 +258,31 @@
         `;
       }).join("");
 
+      if (!stores.length) {
+        reportBody.innerHTML = `
+          <tr>
+            <td colspan="6" class="text-center text-secondary py-4">
+              Записей для отображения нет.
+            </td>
+          </tr>
+        `;
+      }
+
       resultSection.classList.remove("d-none");
 
       // Автоматически начинаем скачивание после успешного формирования.
       window.location.href = result.download_url;
     }
 
-    runButton.addEventListener("click", async () => {
-      runButton.disabled = true;
+    async function runExport(url, progressMessage) {
+      setButtonsDisabled(true);
+      progressText.textContent = progressMessage;
       progressBox.classList.remove("d-none");
       errorBox.classList.add("d-none");
       resultSection.classList.add("d-none");
 
       try {
-        const response = await fetch("{% url 'trm_users_export_run' %}", {
+        const response = await fetch(url, {
           method: "POST",
           headers: {
             "X-CSRFToken": csrfToken,
@@ -248,8 +303,22 @@
         errorBox.classList.remove("d-none");
       } finally {
         progressBox.classList.add("d-none");
-        runButton.disabled = false;
+        setButtonsDisabled(false);
       }
+    }
+
+    runButton.addEventListener("click", () => {
+      runExport(
+        TRM_RUN_URL,
+        "Подключаюсь к кассовым серверам и собираю trm_in_users. Не закрывайте страницу до завершения."
+      );
+    });
+
+    runKsoButton.addEventListener("click", () => {
+      runExport(
+        KSO_RUN_URL,
+        "Подключаюсь к серверу КСО и потоково читаю все активные карты. Обработка большого объёма может занять некоторое время."
+      );
     });
   </script>
 </body>
