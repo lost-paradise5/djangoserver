@@ -90,6 +90,7 @@ from django.utils.html import escape
 from frostapp.services.trm_users_export import (
     build_trm_users_export,
     get_export_file_path,
+    build_kso_users_export,
 )
 
 from .models import (
@@ -29888,6 +29889,29 @@ def working_employees_by_stores_excel(request):
 
 
 
+def _register_users_export_in_session(request, result: dict, route_name: str) -> dict:
+    """
+    Сохраняет только имя сформированного файла в сессии пользователя.
+    Полный путь на сервере в браузер не отдаётся.
+    """
+    files = request.session.get("trm_users_export_files", {})
+    files[result["token"]] = result["filename"]
+
+    # Не даём сессии бесконечно расти.
+    if len(files) > 10:
+        files = dict(list(files.items())[-10:])
+
+    request.session["trm_users_export_files"] = files
+    request.session.modified = True
+
+    result["download_url"] = reverse(
+        route_name,
+        kwargs={"token": result["token"]},
+    )
+    result.pop("file_path", None)
+    return result
+
+
 @staff_member_required
 @require_GET
 def trm_users_export_page(request):
@@ -29899,23 +29923,11 @@ def trm_users_export_page(request):
 def trm_users_export_run(request):
     try:
         result = build_trm_users_export()
-
-        # Храним в сессии только имя файла, а не полный серверный путь.
-        files = request.session.get("trm_users_export_files", {})
-        files[result["token"]] = result["filename"]
-
-        # Не даём сессии бесконечно расти.
-        if len(files) > 10:
-            files = dict(list(files.items())[-10:])
-
-        request.session["trm_users_export_files"] = files
-        request.session.modified = True
-
-        result["download_url"] = reverse(
+        result = _register_users_export_in_session(
+            request,
+            result,
             "trm_users_export_download",
-            kwargs={"token": result["token"]},
         )
-        result.pop("file_path", None)
 
         return JsonResponse({
             "status": "ok",
@@ -29924,6 +29936,30 @@ def trm_users_export_run(request):
 
     except Exception as exc:
         logger.exception("[TRM EXPORT] Ошибка формирования Excel: %s", exc)
+        return JsonResponse({
+            "status": "error",
+            "message": str(exc),
+        }, status=500)
+
+
+@staff_member_required
+@require_POST
+def trm_users_export_kso_run(request):
+    try:
+        result = build_kso_users_export()
+        result = _register_users_export_in_session(
+            request,
+            result,
+            "trm_users_export_download",
+        )
+
+        return JsonResponse({
+            "status": "ok",
+            "result": result,
+        })
+
+    except Exception as exc:
+        logger.exception("[KSO EXPORT] Ошибка формирования Excel: %s", exc)
         return JsonResponse({
             "status": "error",
             "message": str(exc),
