@@ -264,6 +264,12 @@ urlpatterns = [
         views.trm_users_export_download,
         name="trm_users_export_download",
     ),
+
+    path(
+        "reports/trm-users/kso/run/",
+        views.trm_users_export_kso_run,
+        name="trm_users_export_kso_run",
+    ),
     
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
