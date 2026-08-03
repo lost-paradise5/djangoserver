@@ -12,6 +12,7 @@ from uuid import uuid4
 import pymysql
 from django.utils import timezone
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -43,6 +44,28 @@ EXPORT_MAX_WORKERS = max(
     1,
     int(os.getenv("TRM_USERS_EXPORT_MAX_WORKERS", "6")),
 )
+
+# Отдельный сервер КСО. Пароль лучше передавать через .env.
+# Если KSO_DB_USER/KSO_DB_PASSWORD не заданы, используем те же
+# учётные данные, что и для обычных кассовых серверов UKM.
+KSO_DB_HOST = os.getenv("KSO_DB_HOST", "192.168.17.38")
+KSO_DB_PORT = int(os.getenv("KSO_DB_PORT", "3306"))
+KSO_DB_USER = os.getenv(
+    "KSO_DB_USER",
+    os.getenv("UKMSERVER_USER", "ukminfo"),
+)
+KSO_DB_PASSWORD = os.getenv(
+    "KSO_DB_PASSWORD",
+    os.getenv("UKMSERVER_PASSWORD", ""),
+)
+KSO_DB_NAME = os.getenv("KSO_DB_NAME", "srvdata")
+KSO_EXPORT_BATCH_SIZE = max(
+    100,
+    int(os.getenv("KSO_EXPORT_BATCH_SIZE", "5000")),
+)
+KSO_CONNECT_TIMEOUT = int(os.getenv("KSO_DB_CONNECT_TIMEOUT", "10"))
+KSO_READ_TIMEOUT = int(os.getenv("KSO_DB_READ_TIMEOUT", "600"))
+KSO_WRITE_TIMEOUT = int(os.getenv("KSO_DB_WRITE_TIMEOUT", "30"))
 
 
 _COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
@@ -246,7 +269,7 @@ def _cleanup_old_exports() -> None:
 
     cutoff = time.time() - EXPORT_TTL_SECONDS
 
-    for file_path in EXPORT_DIR.glob("trm_users_*.xlsx"):
+    for file_path in EXPORT_DIR.glob("*_users_*.xlsx"):
         try:
             if file_path.stat().st_mtime < cutoff:
                 file_path.unlink(missing_ok=True)
@@ -258,9 +281,8 @@ def _excel_value(value: Any) -> Any:
     """
     Приводит значение к формату, который поддерживает openpyxl.
 
-    Excel не поддерживает datetime/time с tzinfo.
-    Для aware-datetime сначала сохраняем локальное время Django,
-    затем удаляем только информацию о часовом поясе.
+    Excel не умеет сохранять datetime/time с tzinfo. Для aware-datetime
+    сначала сохраняем локальное время Django, затем удаляем только tzinfo.
     """
     if value is None:
         return None
@@ -268,7 +290,6 @@ def _excel_value(value: Any) -> Any:
     if isinstance(value, dt.datetime):
         if timezone.is_aware(value):
             value = timezone.localtime(value)
-
         return value.replace(tzinfo=None)
 
     if isinstance(value, dt.time):
@@ -405,10 +426,7 @@ def _build_workbook(
     )
 
     summary_ws.append(["Показатель", "Значение"])
-    summary_ws.append([
-        "Дата формирования",
-        _excel_value(generated_at),
-    ])
+    summary_ws.append(["Дата формирования", _excel_value(generated_at)])
     summary_ws.append(["Целевых магазинов", len(report_rows)])
     summary_ws.append(["Успешно обработано", success_count])
     summary_ws.append(["С предупреждениями", warning_count])
@@ -579,6 +597,8 @@ def build_trm_users_export() -> dict[str, Any]:
     failed_stores = len(report_rows) - success_stores - warning_stores
 
     return {
+        "export_type": "trm",
+        "result_title": "Выгрузка сотрудников кассовых серверов",
         "token": token,
         "filename": filename,
         "file_path": str(file_path),
@@ -590,6 +610,397 @@ def build_trm_users_export() -> dict[str, Any]:
         "success_store_count": success_stores,
         "warning_store_count": warning_stores,
         "failed_store_count": failed_stores,
+        "summary_labels": {
+            "stores": "Магазинов",
+            "hosts": "Кассовых серверов",
+            "rows": "Записей сотрудников",
+            "elapsed": "Время обработки",
+        },
+        "details_text": (
+            f"Успешно: {success_stores}; "
+            f"с предупреждениями: {warning_stores}; "
+            f"с ошибками: {failed_stores}."
+        ),
+        "stores": report_rows,
+    }
+
+
+def _kso_mysql_connection():
+    if not KSO_DB_PASSWORD:
+        raise TRMExportError(
+            "Не задан пароль КСО. Добавьте KSO_DB_PASSWORD "
+            "или UKMSERVER_PASSWORD в .env и передайте его контейнеру."
+        )
+
+    return pymysql.connect(
+        host=KSO_DB_HOST,
+        port=KSO_DB_PORT,
+        user=KSO_DB_USER,
+        password=KSO_DB_PASSWORD,
+        database=KSO_DB_NAME,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.SSDictCursor,
+        connect_timeout=KSO_CONNECT_TIMEOUT,
+        read_timeout=KSO_READ_TIMEOUT,
+        write_timeout=KSO_WRITE_TIMEOUT,
+        autocommit=True,
+    )
+
+
+def _validate_kso_schema(cur) -> None:
+    required_columns = {
+        "store": {"id", "name"},
+        "user_role": {"id", "name"},
+        "user": {"store_id", "id", "name", "role_id", "inn"},
+        "user_card": {
+            "store_id",
+            "number",
+            "user_id",
+            "date_from",
+            "date_till",
+            "active",
+        },
+    }
+
+    for table_name, required in required_columns.items():
+        cur.execute(f"SHOW COLUMNS FROM `{table_name}`")
+        actual = {
+            str(row.get("Field") or "").strip()
+            for row in (cur.fetchall() or [])
+            if row.get("Field")
+        }
+        missing = sorted(required - actual)
+        if missing:
+            raise TRMExportError(
+                f"В таблице {table_name} отсутствуют колонки: "
+                + ", ".join(missing)
+            )
+
+
+def _write_only_cell(
+    ws,
+    value: Any,
+    *,
+    header: bool = False,
+    number_format: str | None = None,
+):
+    cell = WriteOnlyCell(ws, value=_excel_value(value))
+    thin = Side(style="thin", color="D9E2F3")
+    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    if header:
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+
+    if number_format:
+        cell.number_format = number_format
+
+    return cell
+
+
+def _append_kso_header(ws) -> None:
+    ws.append([
+        _write_only_cell(ws, "Магазин", header=True),
+        _write_only_cell(ws, "ФИО", header=True),
+        _write_only_cell(ws, "ИНН", header=True),
+        _write_only_cell(ws, "Роль", header=True),
+        _write_only_cell(ws, "Дата начала", header=True),
+        _write_only_cell(ws, "Дата окончания", header=True),
+    ])
+
+
+def build_kso_users_export() -> dict[str, Any]:
+    """
+    Формирует потоковую выгрузку всех активных записей user_card КСО.
+
+    Одна строка Excel соответствует одной записи user_card с active=1.
+    LEFT JOIN сохраняет карты, у которых уже нет строки в таблице user.
+    Пользователь связывается одновременно по user.id и user.store_id,
+    чтобы не сопоставить одинаковый user_id из другого магазина.
+    """
+    started_at = time.monotonic()
+    generated_at = timezone.localtime()
+    _cleanup_old_exports()
+
+    token = uuid4().hex
+    filename = (
+        "kso_users_"
+        + generated_at.strftime("%Y%m%d_%H%M%S")
+        + f"_{token[:8]}.xlsx"
+    )
+    file_path = EXPORT_DIR / filename
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook(write_only=True)
+    data_ws = wb.create_sheet("КСО")
+    data_ws.freeze_panes = "A2"
+    data_ws.column_dimensions["A"].width = 38
+    data_ws.column_dimensions["B"].width = 42
+    data_ws.column_dimensions["C"].width = 18
+    data_ws.column_dimensions["D"].width = 32
+    data_ws.column_dimensions["E"].width = 21
+    data_ws.column_dimensions["F"].width = 21
+    _append_kso_header(data_ws)
+
+    total_rows = 0
+    linked_users = 0
+    missing_users = 0
+    missing_roles = 0
+    missing_stores = 0
+    store_stats: dict[int, dict[str, Any]] = {}
+
+    conn = cur = None
+    try:
+        conn = _kso_mysql_connection()
+        cur = conn.cursor()
+        _validate_kso_schema(cur)
+
+        sql = """
+            SELECT
+                uc.`store_id` AS `store_id`,
+                uc.`number` AS `card_number`,
+                uc.`user_id` AS `card_user_id`,
+                uc.`date_from` AS `date_from`,
+                uc.`date_till` AS `date_till`,
+                s.`name` AS `store_name`,
+                u.`id` AS `matched_user_id`,
+                u.`name` AS `user_name`,
+                u.`inn` AS `user_inn`,
+                u.`role_id` AS `role_id`,
+                ur.`name` AS `role_name`
+            FROM `user_card` AS uc
+            LEFT JOIN `store` AS s
+              ON s.`id` = uc.`store_id`
+            LEFT JOIN `user` AS u
+              ON u.`store_id` = uc.`store_id`
+             AND u.`id` = uc.`user_id`
+            LEFT JOIN `user_role` AS ur
+              ON ur.`id` = u.`role_id`
+            WHERE uc.`active` = 1
+            ORDER BY
+                uc.`store_id`,
+                COALESCE(u.`name`, ''),
+                uc.`user_id`,
+                uc.`number`
+        """
+        cur.execute(sql)
+
+        while True:
+            batch = cur.fetchmany(KSO_EXPORT_BATCH_SIZE)
+            if not batch:
+                break
+
+            for row in batch:
+                total_rows += 1
+                store_id = _safe_int(row.get("store_id"))
+                if store_id is None:
+                    store_id = 0
+
+                raw_store_name = str(row.get("store_name") or "").strip()
+                store_missing = not bool(raw_store_name)
+                store_name = (
+                    raw_store_name
+                    if raw_store_name
+                    else f"[МАГАЗИН НЕ НАЙДЕН] store_id={store_id}"
+                )
+
+                matched_user_id = row.get("matched_user_id")
+                user_missing = matched_user_id is None
+                card_user_id = row.get("card_user_id")
+                card_number = str(row.get("card_number") or "").strip()
+
+                if user_missing:
+                    missing_users += 1
+                    fio = (
+                        f"[ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН] "
+                        f"user_id={card_user_id}"
+                    )
+                    if card_number:
+                        fio += f", карта={card_number}"
+                    user_inn = ""
+                    role_name = "[ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН]"
+                else:
+                    linked_users += 1
+                    fio = str(row.get("user_name") or "").strip()
+                    if not fio:
+                        fio = f"[ФИО НЕ УКАЗАНО] user_id={matched_user_id}"
+
+                    user_inn = str(row.get("user_inn") or "").strip()
+                    raw_role_name = str(row.get("role_name") or "").strip()
+                    if raw_role_name:
+                        role_name = raw_role_name
+                    else:
+                        missing_roles += 1
+                        role_id = row.get("role_id")
+                        role_name = (
+                            f"[РОЛЬ НЕ НАЙДЕНА] role_id={role_id}"
+                            if role_id not in (None, "")
+                            else "[РОЛЬ НЕ УКАЗАНА]"
+                        )
+
+                if store_missing:
+                    missing_stores += 1
+
+                stat = store_stats.setdefault(store_id, {
+                    "store_id": store_id,
+                    "store_name": store_name,
+                    "host": f"{KSO_DB_HOST}:{KSO_DB_PORT}/{KSO_DB_NAME}",
+                    "row_count": 0,
+                    "missing_user_count": 0,
+                    "missing_role_count": 0,
+                    "missing_store_count": 0,
+                })
+                stat["row_count"] += 1
+                if user_missing:
+                    stat["missing_user_count"] += 1
+                elif not str(row.get("role_name") or "").strip():
+                    stat["missing_role_count"] += 1
+                if store_missing:
+                    stat["missing_store_count"] += 1
+
+                data_ws.append([
+                    _write_only_cell(data_ws, store_name),
+                    _write_only_cell(data_ws, fio),
+                    _write_only_cell(data_ws, user_inn, number_format="@"),
+                    _write_only_cell(data_ws, role_name),
+                    _write_only_cell(
+                        data_ws,
+                        row.get("date_from"),
+                        number_format="DD.MM.YYYY HH:MM:SS",
+                    ),
+                    _write_only_cell(
+                        data_ws,
+                        row.get("date_till"),
+                        number_format="DD.MM.YYYY HH:MM:SS",
+                    ),
+                ])
+
+        data_ws.auto_filter.ref = f"A1:F{max(1, total_rows + 1)}"
+
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+    report_rows: list[dict[str, Any]] = []
+    for store_id in sorted(store_stats):
+        stat = store_stats[store_id]
+        warning_parts = []
+        if stat["missing_user_count"]:
+            warning_parts.append(
+                f"без записи user: {stat['missing_user_count']}"
+            )
+        if stat["missing_role_count"]:
+            warning_parts.append(
+                f"роль не найдена: {stat['missing_role_count']}"
+            )
+        if stat["missing_store_count"]:
+            warning_parts.append(
+                f"магазин не найден: {stat['missing_store_count']}"
+            )
+
+        warning = "; ".join(warning_parts)
+        report_rows.append({
+            "store_id": store_id,
+            "store_name": stat["store_name"],
+            "host": stat["host"],
+            "status": "warning" if warning else "ok",
+            "row_count": stat["row_count"],
+            "warning": warning,
+            "error": "",
+        })
+
+    summary_ws = wb.create_sheet("Сводка")
+    summary_rows = [
+        ["Показатель", "Значение"],
+        ["Дата формирования", _excel_value(generated_at)],
+        ["Сервер", f"{KSO_DB_HOST}:{KSO_DB_PORT}"],
+        ["База данных", KSO_DB_NAME],
+        ["Активных записей user_card", total_rows],
+        ["С найденным пользователем", linked_users],
+        ["Без записи в user", missing_users],
+        ["Без найденной роли", missing_roles],
+        ["Без записи в store", missing_stores],
+        ["Магазинов в выгрузке", len(store_stats)],
+        [
+            "Принцип выгрузки",
+            "Одна строка Excel = одна запись user_card с active=1",
+        ],
+    ]
+    for row_index, values in enumerate(summary_rows):
+        summary_ws.append([
+            _write_only_cell(
+                summary_ws,
+                values[0],
+                header=(row_index == 0),
+            ),
+            _write_only_cell(
+                summary_ws,
+                values[1],
+                header=(row_index == 0),
+                number_format=(
+                    "DD.MM.YYYY HH:MM:SS"
+                    if row_index == 1
+                    else None
+                ),
+            ),
+        ])
+    summary_ws.freeze_panes = "A2"
+    summary_ws.column_dimensions["A"].width = 36
+    summary_ws.column_dimensions["B"].width = 58
+
+    try:
+        wb.save(file_path)
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
+
+    elapsed_sec = round(time.monotonic() - started_at, 2)
+    warning_stores = sum(
+        1 for row in report_rows if row.get("status") == "warning"
+    )
+    success_stores = len(report_rows) - warning_stores
+
+    return {
+        "export_type": "kso",
+        "result_title": "Выгрузка активных карт КСО",
+        "token": token,
+        "filename": filename,
+        "file_path": str(file_path),
+        "generated_at": generated_at.isoformat(),
+        "elapsed_sec": elapsed_sec,
+        "target_store_count": len(store_stats),
+        "unique_host_count": 1,
+        "employee_count": total_rows,
+        "success_store_count": success_stores,
+        "warning_store_count": warning_stores,
+        "failed_store_count": 0,
+        "summary_labels": {
+            "stores": "Магазинов в выгрузке",
+            "hosts": "Серверов КСО",
+            "rows": "Активных карт",
+            "elapsed": "Время обработки",
+        },
+        "details_text": (
+            f"Активных карт: {total_rows}; "
+            f"с найденным user: {linked_users}; "
+            f"без user: {missing_users}; "
+            f"без роли: {missing_roles}; "
+            f"без магазина: {missing_stores}."
+        ),
         "stores": report_rows,
     }
 
@@ -597,7 +1008,11 @@ def build_trm_users_export() -> dict[str, Any]:
 def get_export_file_path(filename: str) -> Path | None:
     filename = str(filename or "").strip()
 
-    if not filename.startswith("trm_users_") or not filename.endswith(".xlsx"):
+    allowed_prefixes = ("trm_users_", "kso_users_")
+    if (
+        not filename.startswith(allowed_prefixes)
+        or not filename.endswith(".xlsx")
+    ):
         return None
 
     if Path(filename).name != filename:
