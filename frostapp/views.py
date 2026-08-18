@@ -4848,26 +4848,38 @@ def _resolve_pg_smstore_by_ukm4store(store_id: int) -> int:
 @lru_cache(maxsize=256)
 def _resolve_ukm5_store_binding_cached(store_id_key: str):
     store_id = int(store_id_key)
-    external_store_id = _resolve_pg_smstore_by_ukm4store(store_id)
+
+    external_store_id = _resolve_pg_smstore_by_ukm4store(
+        store_id
+    )
 
     conn = cur = None
+
     try:
         conn = connect_ukm5_srvdata()
         cur = conn.cursor()
+
         cur.execute("""
             SELECT
                 sep.id AS store_id,
                 sep.external_id,
                 s.name AS store_name
-            FROM store_external_params sep
-            LEFT JOIN store s ON s.id = sep.id
+            FROM store_external_params AS sep
+            INNER JOIN `store` AS s
+                ON s.id = sep.id
             WHERE sep.external_id = %s
+              AND s.deleted = 0
+            ORDER BY s.id DESC
             LIMIT 1
         """, (str(external_store_id),))
+
         row = cur.fetchone()
+
         if not row:
             raise ValueError(
-                f"В UKM5 srvdata.store_external_params не найден external_id={external_store_id}"
+                "В UKM5 srvdata не найден активный магазин "
+                f"для external_id={external_store_id} "
+                "(требуется store.deleted=0)"
             )
 
         return (
@@ -4875,14 +4887,56 @@ def _resolve_ukm5_store_binding_cached(store_id_key: str):
             int(row["external_id"]),
             row.get("store_name") or "",
         )
+
     finally:
         try:
             if cur:
                 cur.close()
+
             if conn:
                 conn.close()
+
         except Exception:
             pass
+
+# @lru_cache(maxsize=256)
+# def _resolve_ukm5_store_binding_cached(store_id_key: str):
+#     store_id = int(store_id_key)
+#     external_store_id = _resolve_pg_smstore_by_ukm4store(store_id)
+
+#     conn = cur = None
+#     try:
+#         conn = connect_ukm5_srvdata()
+#         cur = conn.cursor()
+#         cur.execute("""
+#             SELECT
+#                 sep.id AS store_id,
+#                 sep.external_id,
+#                 s.name AS store_name
+#             FROM store_external_params sep
+#             LEFT JOIN store s ON s.id = sep.id
+#             WHERE sep.external_id = %s
+#             LIMIT 1
+#         """, (str(external_store_id),))
+#         row = cur.fetchone()
+#         if not row:
+#             raise ValueError(
+#                 f"В UKM5 srvdata.store_external_params не найден external_id={external_store_id}"
+#             )
+
+#         return (
+#             int(row["store_id"]),
+#             int(row["external_id"]),
+#             row.get("store_name") or "",
+#         )
+#     finally:
+#         try:
+#             if cur:
+#                 cur.close()
+#             if conn:
+#                 conn.close()
+#         except Exception:
+#             pass
 
 
 
