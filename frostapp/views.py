@@ -5306,6 +5306,34 @@ def _sync_user_to_ukm5(
             payload=active_payload,
         )
 
+        api_response_for_log = str(
+            active_api.get("body")
+        )
+        
+        if password_plain:
+            api_response_for_log = api_response_for_log.replace(
+                password_plain,
+                _mask_secret(password_plain),
+            )
+        
+        logger.warning(
+            "[UKM5][IMPORT] "
+            "storeid=%s "
+            "internal_store_id=%s "
+            "external_store_id=%s "
+            "cashier_id=%s "
+            "attempt=%s "
+            "http_status=%s "
+            "response=%s",
+            store_id,
+            internal_store_id,
+            external_store_id,
+            cashier_id,
+            attempt,
+            active_api.get("status_code"),
+            api_response_for_log[:2000],
+        )
+
         active_import_attempts.append({
             "attempt": attempt,
             "status_code": active_api.get("status_code"),
