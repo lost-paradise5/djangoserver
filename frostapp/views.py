@@ -63,6 +63,7 @@ import math
 from collections import defaultdict, Counter
 from pathlib import Path
 from django.shortcuts import render, redirect
+from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.cache import never_cache
@@ -118,6 +119,8 @@ from .models import (
     MaxBotQuestionOption, 
     MaxBotRequest, 
     MaxBotRequestAnswer,
+    UkmRotationRun,
+    UkmRotationRunItem,
 
     # для НОВЫЙ_БОТ
     MaxBotChecklistDepartment,
@@ -422,7 +425,7 @@ def _oracle_connect(*, user: str, password: str, dsn: str, **kwargs):
         raise
 
 INACTIVE_REPORT_TOKEN="wc3wow"
-UKM5_FULL_XML_STORE_IDS: set[int] = _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", "2013,9016,1003")
+# UKM5_FULL_XML_STORE_IDS: set[int] = _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", "2013,9016,1003")
 TRM_ID_MAX = 2147483647
 _TELEGRAM_SESSION = requests.Session()
 BADGE_REQ_TTL_MINUTES = int(os.getenv("BADGE_REQ_TTL_MINUTES", "10"))
@@ -5049,6 +5052,7 @@ def _fetch_ukm5_user_and_cards(
             FROM `user`
             WHERE `store_id` = %s
               AND `inn` = %s
+              AND COALESCE(`deleted`, 0) = 0
         """
         if cashier_id is not None:
             sql += " AND `id` = %s"
@@ -5087,6 +5091,100 @@ def _fetch_ukm5_user_and_cards(
                 conn.close()
         except Exception:
             pass
+
+
+def get_ukm5_employee_id(
+    store_id: int,
+    plain_inn: str,
+) -> int | None:
+    """
+    Возвращает существующий id пользователя в УКМ-5
+    без каких-либо изменений.
+    """
+    binding = _resolve_ukm5_store_binding(int(store_id))
+
+    state = _fetch_ukm5_user_and_cards(
+        internal_store_id=int(binding["internal_store_id"]),
+        plain_inn=plain_inn,
+        cashier_id=None,
+    )
+
+    user_row = state.get("user") or {}
+
+    if not user_row or user_row.get("id") is None:
+        return None
+
+    if _ukm5_is_active(user_row.get("deleted")):
+        return None
+
+    return int(user_row["id"])
+
+
+def get_next_ukm5_employee_id(store_id: int) -> int:
+    """
+    Находит свободный id пользователя внутри конкретного
+    магазина УКМ-5.
+    """
+    binding = _resolve_ukm5_store_binding(int(store_id))
+    internal_store_id = int(binding["internal_store_id"])
+
+    conn = cur = None
+
+    try:
+        conn = connect_ukm5_srvdata()
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT COALESCE(MAX(`id`), 0) AS max_id "
+            "FROM `user` "
+            "WHERE `store_id` = %s AND `id` BETWEEN %s AND %s",
+            (
+                internal_store_id,
+                TRM_SMALL_MIN,
+                TRM_SMALL_MAX,
+            ),
+        )
+
+        row = cur.fetchone() or {}
+        candidate = max(
+            TRM_SMALL_MIN,
+            int(row.get("max_id") or 0) + 1,
+        )
+
+        while candidate <= TRM_SMALL_MAX:
+            cur.execute(
+                "SELECT 1 AS x FROM `user` "
+                "WHERE `store_id` = %s AND `id` = %s LIMIT 1",
+                (
+                    internal_store_id,
+                    candidate,
+                ),
+            )
+
+            if not cur.fetchone():
+                return int(candidate)
+
+            candidate += 1
+
+        raise RuntimeError(
+            f"В УКМ-5 исчерпан диапазон id "
+            f"[{TRM_SMALL_MIN}..{TRM_SMALL_MAX}] "
+            f"для storeid={store_id}"
+        )
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+
+
 
 
 def _poll_ukm5_user_state(
@@ -5557,7 +5655,56 @@ def _sync_user_to_ukm5(
     }
 
 
+def _submit_user_to_ukm5(
+    *,
+    store_id: int,
+    cashier_id: int,
+    role_id: int,
+    plain_inn: str,
+    fio: str,
+    password_plain: str,
+) -> dict:
+    """
+    Быстрый режим: один POST в УКМ-5
+    без ожидания появления результата в srvdata.
+    """
+    binding = _resolve_ukm5_store_binding(int(store_id))
+    date_from, date_till = _make_ukm5_card_dates()
 
+    payload = _build_ukm5_user_payload(
+        cashier_id=int(cashier_id),
+        fio=fio,
+        plain_inn=plain_inn,
+        password_plain=password_plain,
+        role_id=int(role_id),
+        card_number=password_plain,
+        card_active=True,
+        date_from=date_from,
+        date_till=date_till,
+    )
+
+    api_result = _import_user_to_ukm5(
+        external_store_id=int(binding["external_store_id"]),
+        payload=payload,
+    )
+
+    logger.info(
+        "[UKM5][SUBMIT_ONLY] storeid=%s "
+        "internal_store_id=%s "
+        "external_store_id=%s "
+        "cashier_id=%s http_status=%s",
+        store_id,
+        binding["internal_store_id"],
+        binding["external_store_id"],
+        cashier_id,
+        api_result.get("status_code"),
+    )
+
+    return {
+        "binding": binding,
+        "active_import_status_code": api_result.get("status_code"),
+        "verification": {},
+    }
 
 
 
@@ -5601,7 +5748,10 @@ def _update_store_mysql_and_xml_for_single_store(
     role_id: int,
     plain_inn: str,
     fio: str,
-    password_plain: str
+    password_plain: str,
+    *,
+    target_system: str = "both",
+    ukm5_submit_only: bool = False,
 ) -> dict:
     """
     Обновляет кассира по одному магазину:
@@ -5610,6 +5760,13 @@ def _update_store_mysql_and_xml_for_single_store(
 
     Возвращает подробный результат для логов.
     """
+
+    target_system = str(target_system or "").strip().lower()
+
+    if target_system not in {"ukm4", "ukm5", "both"}:
+        raise ValueError(
+            f"Неизвестный target_system={target_system!r}"
+        )
     logger.info(
         f"[QR/EMP] Обновление UKM4/UKM5 для storeid={store_id}, "
         f"cashier_id={cashier_id}, role_id={role_id}"
@@ -5620,13 +5777,13 @@ def _update_store_mysql_and_xml_for_single_store(
         "cashier_id": int(cashier_id),
         "role_id": int(role_id),
         "ukm4": {
-            "status": "skipped",
+            "status": "skipped_not_requested",
             "host": None,
             "version": None,
             "error": "",
         },
         "ukm5": {
-            "status": "skipped_not_ukm5",
+            "status": "skipped_not_requested",
             "error": "",
         },
     }
@@ -5637,7 +5794,7 @@ def _update_store_mysql_and_xml_for_single_store(
     logger.info(f"[QR/EMP] Store {store_id}: ukm4ip={ukm4ip!r}, is_ukm5={is_ukm5}")
 
     # ---- UKM4 / MySQL import4 ----
-    if ukm4ip:
+    if target_system in {"ukm4", "both"} and ukm4ip:
         conv = cur = None
         try:
             conv = connect_store_mysql(ukm4ip)
@@ -5782,10 +5939,36 @@ def _update_store_mysql_and_xml_for_single_store(
         }
 
     # ---- UKM5 / API вместо XML ----
+
+    if target_system == "ukm4":
+        return result
+        
     if not is_ukm5:
+        result["ukm5"] = {
+            "status": "skipped_not_ukm5",
+            "error": "Магазин не относится к УКМ-5",
+        }
         return result
 
     try:
+        if ukm5_submit_only:
+            ukm5_res = _submit_user_to_ukm5(
+                store_id=int(store_id),
+                cashier_id=int(cashier_id),
+                role_id=int(role_id),
+                plain_inn=plain_inn,
+                fio=fio,
+                password_plain=password_plain,
+            )
+        
+            result["ukm5"] = {
+                "status": "submitted",
+                "error": "",
+                **ukm5_res,
+            }
+        
+            return result
+            
         ukm5_res = _sync_user_to_ukm5(
             store_id=int(store_id),
             cashier_id=int(cashier_id),
@@ -8597,6 +8780,195 @@ def _set_password_pg(user, new_password: str) -> None:
             status=True
         )
         logger.info(f"[PG] OpenInSystem created (system_id=9) for user_id={user.id}")
+
+@staff_member_required
+@require_GET
+def ukm_rotation_dashboard(request):
+    active_run = (
+        UkmRotationRun.objects
+        .filter(status__in=["pending", "running"])
+        .order_by("created_at")
+        .first()
+    )
+
+    recent_runs = (
+        UkmRotationRun.objects
+        .order_by("-created_at")[:30]
+    )
+
+    return render(
+        request,
+        "frostapp/ukm_rotation_dashboard.html",
+        {
+            "active_run": active_run,
+            "recent_runs": recent_runs,
+        },
+    )
+
+
+@staff_member_required
+@require_POST
+def ukm_rotation_start(request):
+    target_system = str(
+        request.POST.get("system") or ""
+    ).strip().lower()
+
+    if target_system not in {"ukm4", "ukm5"}:
+        messages.error(request, "Неизвестный режим запуска.")
+        return redirect("ukm_rotation_dashboard")
+
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                [741852963],
+            )
+
+        active_run = (
+            UkmRotationRun.objects
+            .select_for_update()
+            .filter(status__in=["pending", "running"])
+            .order_by("created_at")
+            .first()
+        )
+
+        if active_run:
+            messages.warning(
+                request,
+                "Уже есть незавершённый запуск. "
+                "Дождитесь его окончания.",
+            )
+
+            return redirect(
+                "ukm_rotation_run_detail",
+                run_id=active_run.id,
+            )
+
+        run = UkmRotationRun.objects.create(
+            target_system=target_system,
+            status="pending",
+            requested_by=request.user.get_username(),
+            options={
+                "only_active": (
+                    request.POST.get("only_active") == "1"
+                ),
+                "only_with_qr": (
+                    request.POST.get("only_with_qr") == "1"
+                ),
+                "ukm5_verify": (
+                    target_system == "ukm5"
+                    and request.POST.get("ukm5_verify") == "1"
+                ),
+            },
+        )
+
+    messages.success(
+        request,
+        f"Запуск {target_system.upper()} поставлен в очередь.",
+    )
+
+    return redirect(
+        "ukm_rotation_run_detail",
+        run_id=run.id,
+    )
+
+
+@staff_member_required
+@require_GET
+def ukm_rotation_run_detail(request, run_id):
+    run = get_object_or_404(
+        UkmRotationRun,
+        id=run_id,
+    )
+
+    items = UkmRotationRunItem.objects.filter(run=run)
+
+    store_values = list(
+        items
+        .exclude(store_id__isnull=True)
+        .order_by("store_id")
+        .values_list("store_id", flat=True)
+        .distinct()
+    )
+
+    selected_store = str(
+        request.GET.get("store") or ""
+    ).strip()
+
+    selected_status = str(
+        request.GET.get("status") or ""
+    ).strip()
+
+    if selected_store.isdigit():
+        items = items.filter(
+            store_id=int(selected_store)
+        )
+
+    if selected_status in {"ok", "warning", "error"}:
+        items = items.filter(status=selected_status)
+
+    paginator = Paginator(
+        items.order_by("store_id", "fio", "id"),
+        100,
+    )
+
+    page_obj = paginator.get_page(
+        request.GET.get("page")
+    )
+
+    return render(
+        request,
+        "frostapp/ukm_rotation_run.html",
+        {
+            "run": run,
+            "page_obj": page_obj,
+            "store_values": store_values,
+            "selected_store": selected_store,
+            "selected_status": selected_status,
+        },
+    )
+
+
+@staff_member_required
+@require_GET
+def ukm_rotation_run_status(request, run_id):
+    run = get_object_or_404(
+        UkmRotationRun,
+        id=run_id,
+    )
+
+    total = int(run.total_users or 0)
+    processed = int(run.processed_users or 0)
+
+    percent = (
+        round(processed * 100 / total, 1)
+        if total
+        else 0.0
+    )
+
+    return JsonResponse({
+        "id": str(run.id),
+        "target_system": run.target_system,
+        "status": run.status,
+        "total_users": total,
+        "processed_users": processed,
+        "percent": percent,
+        "rotated_users": run.rotated_users,
+        "partial_users": run.partial_users,
+        "skipped_users": run.skipped_users,
+        "failed_users": run.failed_users,
+        "error": run.error,
+        "finished": run.status in {
+            "success",
+            "partial",
+            "failed",
+        },
+    })
+
+
+
+
+
 
 
 def _mask_phone(phone: str) -> str:
