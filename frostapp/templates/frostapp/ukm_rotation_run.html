@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Журнал {{ run.target_system|upper }}</title>
+  <style>
+    body { margin: 0; padding: 24px; background: #f3f6fb; color: #172033; font-family: Arial, sans-serif; }
+    .container { max-width: 1450px; margin: 0 auto; }
+    .card { background: #fff; border-radius: 15px; padding: 20px; margin-bottom: 17px; box-shadow: 0 7px 22px rgba(28,45,75,.08); }
+    h1, h2 { margin-top: 0; }
+    a { color: #1d4ed8; text-decoration: none; font-weight: 700; }
+    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+    .summary > div { background: #f7f9fd; border: 1px solid #e3e9f3; border-radius: 11px; padding: 12px; }
+    .value { font-size: 23px; font-weight: 800; margin-top: 5px; }
+    .muted { color: #64748b; font-size: 13px; }
+    .progress { height: 13px; background: #e6ebf3; border-radius: 999px; overflow: hidden; margin-top: 12px; }
+    .progress > div { height: 100%; background: #2563eb; transition: width .3s; }
+    .error { background: #fee2e2; color: #991b1b; border-radius: 10px; padding: 12px; margin-top: 12px; }
+    .filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+    label { display: grid; gap: 5px; color: #526078; font-size: 13px; }
+    select, button { border: 1px solid #ccd5e3; border-radius: 9px; padding: 9px 11px; background: #fff; }
+    button { background: #1d4ed8; color: #fff; border: 0; cursor: pointer; font-weight: 700; }
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 1050px; }
+    th, td { text-align: left; vertical-align: top; padding: 10px; border-bottom: 1px solid #e5eaf2; font-size: 14px; }
+    th { color: #526078; font-size: 13px; background: #f8fafc; position: sticky; top: 0; }
+    .badge { display: inline-block; padding: 5px 9px; border-radius: 999px; font-size: 12px; font-weight: 800; }
+    .ok { background: #dcfce7; color: #166534; }
+    .warning { background: #fef3c7; color: #92400e; }
+    .error-badge, .failed { background: #fee2e2; color: #991b1b; }
+    .other { background: #e8edf5; color: #3e4b61; }
+    .pager { display: flex; justify-content: flex-end; gap: 12px; margin-top: 14px; }
+    @media (max-width: 700px) { body { padding: 10px; } .card { padding: 14px; } }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <p><a href="{% url 'ukm_rotation_dashboard' %}">← Все запуски</a></p>
+    <h1>{{ run.target_system|upper }} — {{ run.created_at|date:"d.m.Y H:i:s" }}</h1>
+    <p>Статус: <strong>{{ run.get_status_display }}</strong>. Запустил: {{ run.requested_by|default:"—" }}.</p>
+    <div class="summary">
+      <div><span class="muted">Обработано</span><div class="value" id="processed">{{ run.processed_users }} / {{ run.total_users }}</div></div>
+      <div><span class="muted">Успешно</span><div class="value">{{ run.rotated_users }}</div></div>
+      <div><span class="muted">Частично</span><div class="value">{{ run.partial_users }}</div></div>
+      <div><span class="muted">Пропущено</span><div class="value">{{ run.skipped_users }}</div></div>
+      <div><span class="muted">Ошибок</span><div class="value">{{ run.failed_users }}</div></div>
+    </div>
+    <div class="progress"><div id="progress-bar" style="width:{% widthratio run.processed_users run.total_users 100 %}%"></div></div>
+    {% if run.error %}<div class="error">{{ run.error }}</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <form method="get" class="filters">
+      <label>Магазин
+        <select name="store">
+          <option value="">Все</option>
+          {% for store_id in store_values %}<option value="{{ store_id }}" {% if selected_store == store_id|stringformat:"s" %}selected{% endif %}>{{ store_id }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Результат
+        <select name="status">
+          <option value="">Все</option>
+          <option value="ok" {% if selected_status == "ok" %}selected{% endif %}>OK</option>
+          <option value="warning" {% if selected_status == "warning" %}selected{% endif %}>Предупреждение</option>
+          <option value="error" {% if selected_status == "error" %}selected{% endif %}>Ошибка</option>
+        </select>
+      </label>
+      <button type="submit">Применить</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Журнал по магазинам</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Магазин</th><th>Сотрудник</th><th>ИНН</th><th>Роль</th><th>cashier_id</th><th>Результат</th><th>Сообщение</th></tr></thead>
+        <tbody>
+        {% for item in page_obj %}
+          <tr>
+            <td>{{ item.store_id|default:"—" }}</td>
+            <td>{{ item.fio|default:"—" }}<div class="muted">user_id={{ item.user_id|default:"—" }}</div></td>
+            <td>{{ item.inn|default:"—" }}</td>
+            <td>{{ item.role_id|default:"—" }}</td>
+            <td>{{ item.cashier_id|default:"—" }}</td>
+            <td>
+              {% if item.status == "ok" %}<span class="badge ok">OK</span>
+              {% elif item.status == "warning" %}<span class="badge warning">WARN</span>
+              {% elif item.status == "error" or item.status == "failed" %}<span class="badge error-badge">ERR</span>
+              {% else %}<span class="badge other">{{ item.status }}</span>{% endif %}
+            </td>
+            <td>{{ item.message|default:"—" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="7" class="muted">Записи ещё не появились.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="pager">
+      {% if page_obj.has_previous %}<a href="?page={{ page_obj.previous_page_number }}&store={{ selected_store }}&status={{ selected_status }}">← Назад</a>{% endif %}
+      <span>Страница {{ page_obj.number }} из {{ page_obj.paginator.num_pages }}</span>
+      {% if page_obj.has_next %}<a href="?page={{ page_obj.next_page_number }}&store={{ selected_store }}&status={{ selected_status }}">Вперёд →</a>{% endif %}
+    </div>
+  </div>
+</div>
+
+{% if run.status == "pending" or run.status == "running" %}
+<script>
+  let lastProcessed = {{ run.processed_users }};
+  const statusUrl = "{% url 'ukm_rotation_run_status' run.id %}";
+  setInterval(async () => {
+    try {
+      const response = await fetch(statusUrl, {headers: {"X-Requested-With": "XMLHttpRequest"}});
+      if (!response.ok) return;
+      const data = await response.json();
+      document.getElementById("processed").textContent = `${data.processed_users} / ${data.total_users}`;
+      document.getElementById("progress-bar").style.width = `${data.percent}%`;
+      if (data.finished || data.processed_users !== lastProcessed) window.location.reload();
+      lastProcessed = data.processed_users;
+    } catch (_) {}
+  }, 5000);
+</script>
+{% endif %}
+</body>
+</html>
