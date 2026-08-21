@@ -149,6 +149,28 @@ urlpatterns = [
     path("api/maxbot/process/", maxbot_process_update, name="maxbot_process_update"),
 
 
+    path(
+        "ui/ukm-rotation/",
+        views.ukm_rotation_dashboard,
+        name="ukm_rotation_dashboard",
+    ),
+    path(
+        "ui/ukm-rotation/start/",
+        views.ukm_rotation_start,
+        name="ukm_rotation_start",
+    ),
+    path(
+        "ui/ukm-rotation/<uuid:run_id>/",
+        views.ukm_rotation_run_detail,
+        name="ukm_rotation_run_detail",
+    ),
+    path(
+        "ui/ukm-rotation/<uuid:run_id>/status/",
+        views.ukm_rotation_run_status,
+        name="ukm_rotation_run_status",
+    ),
+
+
 
 
 
