@@ -2,7 +2,6 @@ import json
 import uuid
 from typing import Any
 
-from django.db import close_old_connections
 from django.utils import timezone
 
 from frostapp.models import UkmRotationRun, UkmRotationRunItem
@@ -26,8 +25,10 @@ class UkmRotationRunRecorder:
     def _update(self, **values) -> None:
         if not self.enabled:
             return
-        close_old_connections()
-        UkmRotationRun.objects.filter(id=self.run_id).update(**values)
+    
+        UkmRotationRun.objects.filter(
+            id=self.run_id
+        ).update(**values)
 
     def start(self, *, total_users: int, target_store_ids: list[int], options: dict) -> None:
         if not self.enabled:
