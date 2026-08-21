@@ -121,19 +121,29 @@ ROTATION_ONEC_TIMEOUT = _read_env_int(
 
 
 def batched(qs, size):
-
     """
-    Итерация по queryset-у кусками фиксированного размера.
+    Итерация по queryset кусками без долгоживущего
+    серверного PostgreSQL-курсора.
     """
-
-    it = qs.iterator()
+    size = max(1, int(size))
+    last_user_id = None
 
     while True:
-        chunk = list(islice(it, size))
+        page_qs = qs
+
+        if last_user_id is not None:
+            page_qs = page_qs.filter(id__gt=last_user_id)
+
+        chunk = list(
+            page_qs
+            .order_by("id")[:size]
+        )
 
         if not chunk:
             break
+
         yield chunk
+        last_user_id = int(chunk[-1].id)
 
 
 
