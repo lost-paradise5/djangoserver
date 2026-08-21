@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Обновление паролей УКМ</title>
+  <style>
+    body { margin: 0; padding: 28px; background: #f3f6fb; color: #172033; font-family: Arial, sans-serif; }
+    .container { max-width: 1180px; margin: 0 auto; }
+    .card { background: #fff; border-radius: 16px; padding: 22px; margin-bottom: 18px; box-shadow: 0 8px 24px rgba(28,45,75,.08); }
+    h1, h2 { margin-top: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 18px; }
+    .system-card { border: 1px solid #dce4f2; border-radius: 14px; padding: 20px; }
+    .system-card.ukm4 { border-top: 5px solid #2563eb; }
+    .system-card.ukm5 { border-top: 5px solid #7c3aed; }
+    button { border: 0; border-radius: 10px; padding: 13px 18px; color: #fff; font-size: 15px; font-weight: 700; cursor: pointer; }
+    button.ukm4 { background: #2563eb; }
+    button.ukm5 { background: #7c3aed; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .hint { color: #5b677d; line-height: 1.5; }
+    .option { display: block; margin: 12px 0; }
+    .alert { border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+    .alert-success { background: #dcfce7; color: #166534; }
+    .alert-warning { background: #fef3c7; color: #92400e; }
+    .alert-error { background: #fee2e2; color: #991b1b; }
+    .active { background: #eff6ff; border: 1px solid #bfdbfe; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 11px 10px; border-bottom: 1px solid #e5eaf2; text-align: left; }
+    th { color: #526078; font-size: 13px; }
+    a { color: #1d4ed8; text-decoration: none; font-weight: 700; }
+    .badge { display: inline-block; padding: 5px 9px; border-radius: 999px; background: #e8edf5; font-size: 12px; font-weight: 700; }
+    .muted { color: #68758a; font-size: 13px; }
+    @media (max-width: 700px) { body { padding: 12px; } .card { padding: 16px; } .table-wrap { overflow-x: auto; } }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <h1>Обновление паролей УКМ</h1>
+    <p class="hint">Сначала запускайте УКМ‑4: он создаёт новый пароль, QR и сохраняет пароль в <code>open_in_system</code>. Затем запускайте УКМ‑5: он использует сохранённый пароль без его изменения.</p>
+
+    {% for message in messages %}
+      <div class="alert alert-{{ message.tags|default:'warning' }}">{{ message }}</div>
+    {% endfor %}
+
+    {% if active_run %}
+      <div class="alert active">
+        Сейчас выполняется или ожидает запуска <strong>{{ active_run.target_system|upper }}</strong>:
+        <a href="{% url 'ukm_rotation_run_detail' active_run.id %}">открыть журнал</a>.
+        Пока он не завершится, новый прогон создать нельзя.
+      </div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <form method="post" action="{% url 'ukm_rotation_start' %}" class="system-card ukm4">
+        {% csrf_token %}
+        <input type="hidden" name="system" value="ukm4">
+        <h2>УКМ‑4</h2>
+        <p class="hint">Полный прогон: генерирует новый пароль, пересоздаёт QR, записывает пароль в <code>open_in_system</code> и обновляет только <code>import4.users/signal</code>. УКМ‑5 не изменяется.</p>
+        <label class="option"><input type="checkbox" name="only_active" value="1"> Только активные сотрудники</label>
+        <label class="option"><input type="checkbox" name="only_with_qr" value="1"> Только сотрудники, у которых уже есть QR</label>
+        <button class="ukm4" type="submit" {% if active_run %}disabled{% endif %}>Обновить в УКМ‑4</button>
+      </form>
+
+      <form method="post" action="{% url 'ukm_rotation_start' %}" class="system-card ukm5">
+        {% csrf_token %}
+        <input type="hidden" name="system" value="ukm5">
+        <h2>УКМ‑5</h2>
+        <p class="hint">Берёт пароль из <code>open_in_system.password</code>, использует его и как пароль, и как номер активной карты. QR и PostgreSQL не изменяются; УКМ‑4 не изменяется.</p>
+        <label class="option"><input type="checkbox" name="only_active" value="1"> Только активные сотрудники</label>
+        <label class="option"><input type="checkbox" name="only_with_qr" value="1"> Только сотрудники, у которых уже есть QR</label>
+        <label class="option"><input type="checkbox" name="ukm5_verify" value="1"> Дождаться проверки в <code>srvdata</code> (медленно)</label>
+        <button class="ukm5" type="submit" {% if active_run %}disabled{% endif %}>Обновить в УКМ‑5</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Последние запуски</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Дата</th><th>Система</th><th>Статус</th><th>Прогресс</th><th>Результат</th><th>Запустил</th></tr></thead>
+        <tbody>
+        {% for run in recent_runs %}
+          <tr>
+            <td><a href="{% url 'ukm_rotation_run_detail' run.id %}">{{ run.created_at|date:"d.m.Y H:i:s" }}</a></td>
+            <td>{{ run.target_system|upper }}</td>
+            <td><span class="badge">{{ run.get_status_display }}</span></td>
+            <td>{{ run.processed_users }} / {{ run.total_users }}</td>
+            <td>OK {{ run.rotated_users }}, частично {{ run.partial_users }}, пропущено {{ run.skipped_users }}, ошибок {{ run.failed_users }}</td>
+            <td>{{ run.requested_by|default:"—" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6" class="muted">Запусков пока нет.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</body>
+</html>
