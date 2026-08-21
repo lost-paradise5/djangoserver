@@ -1057,3 +1057,127 @@ class MaxBotChecklistAnswerPhoto(models.Model):
 
 
 
+
+
+
+
+
+
+
+
+
+
+class UkmRotationRun(models.Model):
+    """Один ручной или плановый прогон обновления УКМ."""
+
+    TARGET_CHOICES = [
+        ("ukm4", "УКМ-4"),
+        ("ukm5", "УКМ-5"),
+    ]
+    STATUS_CHOICES = [
+        ("pending", "Ожидает"),
+        ("running", "Выполняется"),
+        ("success", "Завершён"),
+        ("partial", "Завершён частично"),
+        ("failed", "Ошибка"),
+    ]
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+    target_system = models.CharField(
+        max_length=4,
+        choices=TARGET_CHOICES,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default="pending",
+    )
+    requested_by = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+    )
+    options = models.JSONField(default=dict, blank=True)
+    target_store_ids = models.JSONField(default=list, blank=True)
+
+    total_users = models.IntegerField(default=0)
+    processed_users = models.IntegerField(default=0)
+    rotated_users = models.IntegerField(default=0)
+    partial_users = models.IntegerField(default=0)
+    skipped_users = models.IntegerField(default=0)
+    failed_users = models.IntegerField(default=0)
+
+    summary = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "ukm_rotation_runs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["status", "created_at"],
+                name="ukm_rot_run_status_idx",
+            ),
+        ]
+
+
+class UkmRotationRunItem(models.Model):
+    """Результат обработки одного сотрудника в одном магазине."""
+
+    id = models.BigAutoField(primary_key=True)
+
+    run = models.ForeignKey(
+        UkmRotationRun,
+        db_column="run_id",
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+
+    user_id = models.IntegerField(null=True, blank=True)
+    fio = models.TextField(blank=True, default="")
+    inn = models.CharField(max_length=20, blank=True, default="")
+    store_id = models.IntegerField(null=True, blank=True)
+    role_id = models.IntegerField(null=True, blank=True)
+    cashier_id = models.IntegerField(null=True, blank=True)
+
+    status = models.CharField(max_length=32)
+    message = models.TextField(blank=True, default="")
+    details = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "ukm_rotation_run_items"
+        ordering = ["store_id", "fio", "id"]
+        indexes = [
+            models.Index(
+                fields=["run", "store_id"],
+                name="ukm_rot_item_store_idx",
+            ),
+            models.Index(
+                fields=["run", "status"],
+                name="ukm_rot_item_status_idx",
+            ),
+        ]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
