@@ -3387,8 +3387,18 @@ def get_store_info(storeid: int | str) -> dict:
                 storeloc_id = int(row[0])
                 logger.info(f"[Oracle] Маппинг UKM4STORE={sid_raw} → STORELOC={storeloc_id}")
             else:
-                logger.warning(f"[Oracle] Не найден STORELOC по UKM4STORE={sid_raw}")
-                return {"is_ukm5": False, "ukm4ip": None}
+                logger.warning(
+                    f"[Oracle] Не найден STORELOC по UKM4STORE={sid_raw}"
+                )
+            
+                return {
+                    "oracle_ok": True,
+                    "found": False,
+                    "error": "",
+                    "is_ukm5": False,
+                    "ukm4ip": None,
+                    "smstore": None,
+                }
 
         # Шаг 3. Тянем все свойства по найденному STORELOC
         cur.execute("""
@@ -3420,16 +3430,33 @@ def get_store_info(storeid: int | str) -> dict:
                     break
 
         result = {
+            "oracle_ok": True,
+            "found": True,
+            "error": "",
             "is_ukm5": bool(ukm5val),
-            "ukm4ip": ukm4ip.strip() if isinstance(ukm4ip, str) else ukm4ip,
-            "smstore": storeloc_id, 
+            "ukm4ip": (
+                ukm4ip.strip()
+                if isinstance(ukm4ip, str)
+                else ukm4ip
+            ),
+            "smstore": storeloc_id,
         }
         logger.info(f"[Oracle] Результат для входного {sid_raw}: {result}")
         return result
 
     except Exception as e:
-        logger.exception(f"[Oracle] Ошибка в get_store_info(storeid={sid_raw}): {e}")
-        return {"is_ukm5": False, "ukm4ip": None}
+        logger.exception(
+            f"[Oracle] Ошибка в get_store_info(storeid={sid_raw}): {e}"
+        )
+    
+        return {
+            "oracle_ok": False,
+            "found": False,
+            "error": str(e),
+            "is_ukm5": None,
+            "ukm4ip": None,
+            "smstore": None,
+        }
     finally:
         try:
             if cur:
@@ -3480,6 +3507,26 @@ SSH_UKM5_PASSWORD      = os.getenv("SSH_UKM5_PASSWORD", "xxxxxx")
 
 POS_SSH_PORT = int(os.getenv("POS_SSH_PORT", "22"))
 POS_REBOOT_ALLOWED_NETS_RAW = os.getenv("POS_REBOOT_ALLOWED_NETS", "10.0.0.0/8,192.168.0.0/16") 
+
+
+POS_STORE_INFO_MODE = (
+    os.getenv("POS_STORE_INFO_MODE", "hybrid")
+    .strip()
+    .lower()
+)
+
+if POS_STORE_INFO_MODE not in {
+    "postgres",
+    "oracle",
+    "hybrid",
+}:
+    logger.warning(
+        "[POS] Некорректный POS_STORE_INFO_MODE=%r. "
+        "Использую hybrid.",
+        POS_STORE_INFO_MODE,
+    )
+    POS_STORE_INFO_MODE = "hybrid"
+
 
 INN_SYNC_LOCK_FILE = os.path.join(LOG_DIR, "inn_sync.lock")
 
@@ -12852,6 +12899,274 @@ def _get_store_name_from_pg_by_smstore(smstore) -> str:
 
 
 
+def _pos_int_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pos_optional_bool(value):
+    """
+    True  — явно УКМ-5.
+    False — явно не УКМ-5.
+    None  — данных нет.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    normalized = str(value).strip().lower()
+
+    if not normalized:
+        return None
+
+    if normalized in {
+        "0",
+        "false",
+        "no",
+        "none",
+        "null",
+        "нет",
+    }:
+        return False
+
+    # Если ukm5store содержит ID, любое непустое
+    # значение означает принадлежность к УКМ-5.
+    return True
+
+
+def _resolve_pos_store_meta(
+    ukm_store_id: int,
+) -> tuple[dict, list[str]]:
+    """
+    Получает метаданные магазина для перезагрузки касс.
+
+    hybrid:
+      PostgreSQL в приоритете;
+      Oracle заполняет отсутствующие поля.
+
+    oracle:
+      Oracle в приоритете;
+      PostgreSQL используется при ошибке Oracle.
+
+    postgres:
+      Oracle не вызывается.
+    """
+    ukm_store_id = int(ukm_store_id)
+    warnings: list[str] = []
+
+    store = (
+        Store.objects
+        .filter(ukm4store=ukm_store_id)
+        .only(
+            "ukm4store",
+            "smstore",
+            "name",
+            "dbname",
+            "ukm4ip",
+            "ukm5store",
+        )
+        .first()
+    )
+
+    pg_meta = {
+        "smstore": (
+            _pos_int_or_none(store.smstore)
+            if store
+            else None
+        ),
+        "store_name": (
+            str(store.name or "").strip()
+            if store
+            else ""
+        ),
+        "ukm4ip": (
+            str(store.ukm4ip or "").strip()
+            if store
+            else ""
+        ),
+        "is_ukm5": (
+            _pos_optional_bool(store.ukm5store)
+            if store
+            else None
+        ),
+    }
+
+    if not store:
+        warnings.append(
+            "Магазин отсутствует в PostgreSQL stores: "
+            f"ukm4store={ukm_store_id}"
+        )
+
+    need_oracle = (
+        POS_STORE_INFO_MODE == "oracle"
+        or (
+            POS_STORE_INFO_MODE == "hybrid"
+            and (
+                pg_meta["smstore"] is None
+                or not pg_meta["ukm4ip"]
+                or pg_meta["is_ukm5"] is None
+            )
+        )
+    )
+
+    oracle_meta = {
+        "smstore": None,
+        "ukm4ip": "",
+        "is_ukm5": None,
+    }
+
+    oracle_ok = False
+
+    if need_oracle:
+        oracle_lookup_id = (
+            pg_meta["smstore"]
+            if pg_meta["smstore"] is not None
+            else ukm_store_id
+        )
+
+        logger.info(
+            "[POS][META] Запрашиваю Oracle: "
+            f"mode={POS_STORE_INFO_MODE}, "
+            f"ukm4store={ukm_store_id}, "
+            f"lookup_id={oracle_lookup_id}"
+        )
+
+        raw_oracle = (
+            get_store_info(oracle_lookup_id)
+            or {}
+        )
+
+        oracle_ok = (
+            raw_oracle.get("oracle_ok") is not False
+        )
+
+        if oracle_ok:
+            oracle_meta = {
+                "smstore": _pos_int_or_none(
+                    raw_oracle.get("smstore")
+                ),
+                "ukm4ip": str(
+                    raw_oracle.get("ukm4ip")
+                    or ""
+                ).strip(),
+                "is_ukm5": _pos_optional_bool(
+                    raw_oracle.get("is_ukm5")
+                ),
+            }
+        else:
+            oracle_error = str(
+                raw_oracle.get("error")
+                or "неизвестная ошибка Oracle"
+            ).strip()
+
+            warnings.append(
+                "Oracle временно недоступен; "
+                "использованы данные PostgreSQL: "
+                f"{oracle_error}"
+            )
+
+            logger.warning(
+                "[POS][META] Oracle недоступен: "
+                f"ukm4store={ukm_store_id}, "
+                f"lookup_id={oracle_lookup_id}, "
+                f"error={oracle_error}"
+            )
+
+    def prefer(primary, fallback):
+        if primary is None:
+            return fallback
+
+        if isinstance(primary, str) and not primary.strip():
+            return fallback
+
+        return primary
+
+    if POS_STORE_INFO_MODE == "oracle" and oracle_ok:
+        smstore = prefer(
+            oracle_meta["smstore"],
+            pg_meta["smstore"],
+        )
+
+        ukm4ip = prefer(
+            oracle_meta["ukm4ip"],
+            pg_meta["ukm4ip"],
+        )
+
+        is_ukm5 = (
+            oracle_meta["is_ukm5"]
+            if oracle_meta["is_ukm5"] is not None
+            else pg_meta["is_ukm5"]
+        )
+
+        source = "oracle+postgres"
+
+    else:
+        smstore = prefer(
+            pg_meta["smstore"],
+            oracle_meta["smstore"],
+        )
+
+        ukm4ip = prefer(
+            pg_meta["ukm4ip"],
+            oracle_meta["ukm4ip"],
+        )
+
+        is_ukm5 = (
+            pg_meta["is_ukm5"]
+            if pg_meta["is_ukm5"] is not None
+            else oracle_meta["is_ukm5"]
+        )
+
+        if need_oracle and oracle_ok:
+            source = "postgres+oracle"
+        elif need_oracle:
+            source = "postgres-fallback"
+        else:
+            source = "postgres"
+
+    result = {
+        "ukm_store_id": ukm_store_id,
+        "smstore": _pos_int_or_none(smstore),
+        "store_name": (
+            pg_meta["store_name"]
+            or f"Магазин {ukm_store_id}"
+        ),
+        "ukm4ip": str(ukm4ip or "").strip(),
+
+        # Здесь специально сохраняем None.
+        # None означает: неизвестно, нужно попробовать SRVDATA.
+        "is_ukm5": is_ukm5,
+
+        "source": source,
+    }
+
+    logger.info(
+        "[POS][META] resolved: "
+        f"mode={POS_STORE_INFO_MODE}, "
+        f"source={source}, "
+        f"ukm4store={ukm_store_id}, "
+        f"smstore={result['smstore']}, "
+        f"ukm4ip={result['ukm4ip'] or '—'}, "
+        f"is_ukm5={result['is_ukm5']!r}"
+    )
+
+    return result, warnings
+
+
+
+
+
+
+
 
 
 
@@ -12870,7 +13185,10 @@ def get_reboot_stores_for_user(user: User) -> list[dict]:
 
     links = list(
         UKMUser.objects
-        .filter(user_id=user.id)
+        .filter(
+            user_id=user.id,
+            roleid=13,
+        )
         .values("storeid", "roleid")
     )
 
@@ -12955,95 +13273,76 @@ def get_devices_for_user_store(
     ukm_store_id: int,
 ) -> tuple[list[dict], list[str]]:
     """
-    Загружает кассы только одного выбранного магазина.
+    Получает кассы только одного выбранного магазина.
 
-    Одновременно проверяет, что магазин действительно привязан
-    к пользователю через ukm_users.
+    PostgreSQL и Oracle используются для метаданных.
+    Сами кассы берутся напрямую из УКМ-4/УКМ-5.
     """
     try:
         ukm_store_id = int(ukm_store_id)
     except (TypeError, ValueError):
         raise ValueError("Некорректный ukm_store_id")
 
-    link = (
+    role_values = list(
         UKMUser.objects
         .filter(
             user_id=user.id,
             storeid=ukm_store_id,
         )
-        .values("roleid")
-        .first()
+        .values_list("roleid", flat=True)
     )
 
-    if not link:
+    if not role_values:
         raise PermissionError(
             f"Магазин {ukm_store_id} не привязан к пользователю"
         )
 
-    try:
-        role_id = int(link.get("roleid"))
-    except (TypeError, ValueError):
-        role_id = None
+    role_ids: set[int] = set()
 
-    store = (
-        Store.objects
-        .filter(ukm4store=ukm_store_id)
-        .only(
-            "ukm4store",
-            "smstore",
-            "name",
-            "ukm4ip",
-            "ukm5store",
-        )
-        .first()
-    )
-
-    smstore = (
-        int(store.smstore)
-        if store and store.smstore is not None
-        else None
-    )
-
-    store_name = (
-        str(store.name or "").strip()
-        if store
-        else ""
-    )
-
-    # Один вызов Oracle на выбранный магазин.
-    # Раньше get_store_info() вызывался дважды для каждого магазина.
-    if smstore is not None:
-        store_info = get_store_info(smstore)
-    else:
-        store_info = get_store_info(ukm_store_id)
-        smstore_raw = store_info.get("smstore")
-
+    for value in role_values:
         try:
-            smstore = int(smstore_raw)
+            role_ids.add(int(value))
         except (TypeError, ValueError):
-            smstore = None
+            continue
+
+    if 13 not in role_ids:
+        raise PermissionError(
+            f"Нет прав администратора на магазин {ukm_store_id}"
+        )
+
+    role_id = 13
+
+    store_info, warnings = (
+        _resolve_pos_store_meta(ukm_store_id)
+    )
+
+    smstore = store_info.get("smstore")
 
     if smstore is None:
-        return [], [
-            (
-                f"Не удалось определить smstore "
-                f"для магазина UKM4={ukm_store_id}"
-            )
-        ]
+        warnings.append(
+            "Не удалось определить smstore: "
+            f"ukm4store={ukm_store_id}"
+        )
 
-    if not store_name:
-        store_name = _get_store_name_from_pg_by_smstore(smstore)
+        return [], warnings
 
-    if not store_name:
-        store_name = f"Магазин {ukm_store_id}"
+    smstore = int(smstore)
 
-    devices: list[dict] = []
-    warnings: list[str] = []
-
-    ukm4_host = str(
-        store_info.get("ukm4ip") or ""
+    store_name = str(
+        store_info.get("store_name")
+        or f"Магазин {ukm_store_id}"
     ).strip()
 
+    ukm4_host = str(
+        store_info.get("ukm4ip")
+        or ""
+    ).strip()
+
+    ukm5_state = store_info.get("is_ukm5")
+
+    devices: list[dict] = []
+
+    # УКМ-4
     if ukm4_host:
         try:
             devices.extend(
@@ -13052,6 +13351,9 @@ def get_devices_for_user_store(
                     smstore=smstore,
                     role_id=role_id,
                     store_name=store_name,
+
+                    # Обязательно передаём готовые данные,
+                    # чтобы fetch_ukm4_pos_list сам не вызвал Oracle.
                     store_info=store_info,
                 )
             )
@@ -13068,19 +13370,35 @@ def get_devices_for_user_store(
             )
     else:
         warnings.append(
-            "Для магазина не найден адрес сервера УКМ-4"
+            "Не найден адрес сервера УКМ-4: "
+            f"ukm4store={ukm_store_id}, "
+            f"smstore={smstore}"
         )
 
-    if store_info.get("is_ukm5", False):
+    # УКМ-5:
+    # True — магазин точно УКМ-5.
+    # None — неизвестно, всё равно проверяем SRVDATA.
+    #
+    # Только при явном False запрос в SRVDATA не выполняется.
+    if ukm5_state is not False:
         try:
-            devices.extend(
-                fetch_ukm5_pos_list(
-                    smstore=smstore,
-                    ukm4_storeid=ukm_store_id,
-                    role_id=role_id,
-                    store_name=store_name,
-                )
+            ukm5_devices = fetch_ukm5_pos_list(
+                smstore=smstore,
+                ukm4_storeid=ukm_store_id,
+                role_id=role_id,
+                store_name=store_name,
             )
+
+            devices.extend(ukm5_devices)
+
+            if ukm5_state is None:
+                logger.info(
+                    "[POS] Признак УКМ-5 не был известен; "
+                    f"проверено через SRVDATA: "
+                    f"smstore={smstore}, "
+                    f"devices={len(ukm5_devices)}"
+                )
+
         except Exception as exc:
             logger.exception(
                 "[POS] UKM5 list error "
@@ -13092,7 +13410,25 @@ def get_devices_for_user_store(
                 f"УКМ-5: {exc}"
             )
 
-    return devices, warnings
+    # Убираем возможные дубли.
+    unique_devices: list[dict] = []
+    seen: set[tuple] = set()
+
+    for device in devices:
+        key = (
+            bool(device.get("ukm4")),
+            bool(device.get("ukm5")),
+            str(device.get("cash_id") or ""),
+            str(device.get("ip") or "").strip(),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_devices.append(device)
+
+    return unique_devices, warnings
 
 
 
@@ -13129,120 +13465,48 @@ def get_devices_for_user_store(
 
 
 
-def get_devices_for_user(user: User) -> tuple[Optional[User], list[dict]]:
+def get_devices_for_user(
+    user: User,
+) -> tuple[Optional[User], list[dict]]:
+    """
+    Старый режим action=all.
+
+    Новый MAX-бот его не использует, но оставляем
+    для обратной совместимости.
+    """
     if not user:
         return None, []
 
-    ukm_links = list(
-        UKMUser.objects.filter(user_id=user.id).values("storeid", "roleid")
-    )
-
-    if not ukm_links:
-        return user, []
-
-    # storeid -> roleid
-    roles_by_store: dict[int, int | None] = {}
-    store_ids: list[int] = []
-
-    for x in ukm_links:
-        sid_raw = x.get("storeid")
-        rid_raw = x.get("roleid")
-
-        if str(sid_raw).isdigit():
-            sid = int(sid_raw)
-            store_ids.append(sid)
-
-            if sid not in roles_by_store:
-                roles_by_store[sid] = int(rid_raw) if str(rid_raw).isdigit() else None
-
-    store_ids = sorted(set(store_ids))
-
-    if not store_ids:
-        return user, []
-
-    # ukm4store -> Store из PostgreSQL
-    store_map = {}
-
-    try:
-        qs = (
-            Store.objects
-            .filter(ukm4store__in=store_ids)
-            .only("ukm4store", "smstore", "name")
-        )
-
-        for s in qs:
-            try:
-                if s.ukm4store is not None:
-                    store_map[int(s.ukm4store)] = s
-            except Exception:
-                continue
-
-    except Exception as e:
-        logger.exception(f"[POS] Ошибка загрузки stores по ukm4store: {e}")
-        store_map = {}
-
+    stores = get_reboot_stores_for_user(user)
     devices: list[dict] = []
 
-    for ukm4_storeid in store_ids:
-        role_id = roles_by_store.get(ukm4_storeid)
+    for store in stores:
+        ukm_store_id = store.get("ukm_store_id")
 
-        # 1. Пытаемся взять магазин из PostgreSQL stores по ukm4store
-        s_obj = store_map.get(int(ukm4_storeid))
-
-        smstore = getattr(s_obj, "smstore", None) if s_obj else None
-        store_name = str(getattr(s_obj, "name", "") or "").strip() if s_obj else ""
-
-        # 2. Если smstore не нашли в PostgreSQL — пробуем достать через Oracle
-        if smstore is None:
-            try:
-                info_by_ukm = get_store_info(ukm4_storeid)
-                smstore = info_by_ukm.get("smstore")
-            except Exception:
-                smstore = None
-
-        if smstore is None:
-            logger.warning(f"[POS] smstore not resolved for ukm4store={ukm4_storeid}")
+        if ukm_store_id is None:
             continue
 
-        # 3. Главное исправление:
-        # если имя магазина ещё не нашли, берём его из PostgreSQL stores по smstore
-        if not store_name:
-            store_name = _get_store_name_from_pg_by_smstore(smstore)
-
-        # 4. UKM4 кассы
         try:
-            devices.extend(
-                fetch_ukm4_pos_list(
-                    ukm4_storeid=int(ukm4_storeid),
-                    smstore=int(smstore),
-                    role_id=role_id,
-                    store_name=store_name,
+            store_devices, warnings = (
+                get_devices_for_user_store(
+                    user,
+                    int(ukm_store_id),
                 )
             )
-        except Exception as e:
-            logger.exception(
-                f"[POS] UKM4 list error ukm4store={ukm4_storeid}, "
-                f"smstore={smstore}, store_name={store_name!r}: {e}"
-            )
 
-        # 5. UKM5 кассы — только если Oracle магазин помечен как UKM5
-        try:
-            info = get_store_info(int(smstore))
+            devices.extend(store_devices)
 
-            if info.get("is_ukm5", False):
-                devices.extend(
-                    fetch_ukm5_pos_list(
-                        smstore=int(smstore),
-                        ukm4_storeid=int(ukm4_storeid),
-                        role_id=role_id,
-                        store_name=store_name,
-                    )
+            if warnings:
+                logger.warning(
+                    "[POS] action=all warnings "
+                    f"ukm4store={ukm_store_id}: "
+                    f"{'; '.join(warnings)}"
                 )
 
-        except Exception as e:
+        except Exception as exc:
             logger.exception(
-                f"[POS] UKM5 list error smstore={smstore}, "
-                f"store_name={store_name!r}: {e}"
+                "[POS] action=all error "
+                f"ukm4store={ukm_store_id}: {exc}"
             )
 
     return user, devices
@@ -13427,8 +13691,17 @@ def fetch_ukm5_pos_list(
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT id FROM store_external_params WHERE external_id=%s LIMIT 1",
-            (int(smstore),)
+            """
+            SELECT sep.id
+            FROM store_external_params sep
+            INNER JOIN store s
+                ON s.id = sep.id
+            WHERE sep.external_id = %s
+              AND COALESCE(s.deleted, 0) = 0
+            ORDER BY s.id DESC
+            LIMIT 1
+            """,
+            (int(smstore),),
         )
         r = cur.fetchone()
         if not r or not r.get("id"):
