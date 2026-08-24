@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Синхронизация должностей</title>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 30px;
+            background: #f4f6f9;
+            color: #1f2937;
+            font-family: Arial, sans-serif;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
+        .card {
+            margin-bottom: 20px;
+            padding: 24px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 3px 14px rgba(0, 0, 0, 0.08);
+        }
+
+        h1, h2 {
+            margin-top: 0;
+        }
+
+        .description {
+            color: #4b5563;
+            line-height: 1.5;
+        }
+
+        .buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 20px;
+        }
+
+        button, .download-button {
+            display: inline-block;
+            padding: 12px 20px;
+            border: 0;
+            border-radius: 8px;
+            color: white;
+            font-size: 15px;
+            font-weight: bold;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .test-button {
+            background: #2563eb;
+        }
+
+        .apply-button {
+            background: #dc2626;
+        }
+
+        .download-button {
+            background: #15803d;
+        }
+
+        .message {
+            margin-bottom: 15px;
+            padding: 14px 18px;
+            border-radius: 8px;
+            background: #e0f2fe;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 12px;
+            margin: 20px 0;
+        }
+
+        .summary-item {
+            padding: 15px;
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+        }
+
+        .summary-value {
+            margin-top: 6px;
+            font-size: 25px;
+            font-weight: bold;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 10px;
+            border-bottom: 1px solid #e5e7eb;
+            text-align: left;
+        }
+
+        th {
+            background: #f8fafc;
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+    <div class="card">
+        <h1>Синхронизация должностей сотрудников</h1>
+
+        <div class="description">
+            Данные загружаются из 1С и сопоставляются с пользователями
+            PostgreSQL по ИНН. Тестовый запуск формирует отчёт без
+            изменений. Обычный запуск создаёт отсутствующие должности
+            и обновляет users.position_id.
+        </div>
+
+        {% if messages %}
+            <div style="margin-top: 20px;">
+                {% for message in messages %}
+                    <div class="message">{{ message }}</div>
+                {% endfor %}
+            </div>
+        {% endif %}
+
+        <form
+            method="post"
+            action="{% url 'working_employees_positions_sync_run' %}"
+        >
+            {% csrf_token %}
+
+            <div class="buttons">
+                <button
+                    class="test-button"
+                    type="submit"
+                    name="mode"
+                    value="test"
+                >
+                    Тестовый запуск
+                </button>
+
+                <button
+                    class="apply-button"
+                    type="submit"
+                    name="mode"
+                    value="apply"
+                    onclick="return confirm(
+                        'Запустить реальное обновление должностей?'
+                    );"
+                >
+                    Запуск
+                </button>
+            </div>
+        </form>
+    </div>
+
+    {% if selected_report %}
+        <div class="card">
+            <h2>Результат: {{ selected_report.mode_label }}</h2>
+
+            <div>
+                Дата: {{ selected_report.created_at_display }}
+            </div>
+
+            <div class="summary-grid">
+                <div class="summary-item">
+                    Получено из 1С
+                    <div class="summary-value">
+                        {{ selected_report.summary.source_total }}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    Пользователей найдено
+                    <div class="summary-value">
+                        {{ selected_report.summary.users_found }}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    Без изменений
+                    <div class="summary-value">
+                        {{ selected_report.summary.unchanged }}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    {% if selected_report.mode == "test" %}
+                        Будет изменено
+                    {% else %}
+                        Изменено
+                    {% endif %}
+
+                    <div class="summary-value">
+                        {{ selected_report.summary.changes }}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    Пользователей не найдено
+                    <div class="summary-value">
+                        {{ selected_report.summary.users_not_found }}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    Дубликатов ИНН
+                    <div class="summary-value">
+                        {{ selected_report.summary.duplicate_users }}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    Новых должностей
+                    <div class="summary-value">
+                        {{ selected_report.summary.positions_to_create }}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    Конфликтов в 1С
+                    <div class="summary-value">
+                        {{ selected_report.summary.source_conflicts }}
+                    </div>
+                </div>
+            </div>
+
+            <a
+                class="download-button"
+                href="{% url 'working_employees_positions_sync_download' selected_report.report_id %}"
+            >
+                Скачать Excel-отчёт
+            </a>
+        </div>
+    {% endif %}
+
+    {% if recent_reports %}
+        <div class="card">
+            <h2>Последние отчёты</h2>
+
+            <table>
+                <thead>
+                <tr>
+                    <th>Дата</th>
+                    <th>Режим</th>
+                    <th>Изменений</th>
+                    <th>Отчёт</th>
+                </tr>
+                </thead>
+
+                <tbody>
+                {% for report in recent_reports %}
+                    <tr>
+                        <td>{{ report.created_at_display }}</td>
+                        <td>{{ report.mode_label }}</td>
+                        <td>{{ report.summary.changes }}</td>
+                        <td>
+                            <a href="{% url 'working_employees_positions_sync_download' report.report_id %}">
+                                Скачать Excel
+                            </a>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% endif %}
+</div>
+</body>
+</html>
