@@ -482,6 +482,22 @@ ALLOWED_WORKING_EMPLOYEE_POSITIONS = {
 
 ONEC_WORKING_EMPLOYEES_TIMEOUT = int(os.getenv("ONEC_WORKING_EMPLOYEES_TIMEOUT", "180"))
 
+
+POSITION_SYNC_REPORT_DIR = Path(
+    os.getenv(
+        "POSITION_SYNC_REPORT_DIR",
+        "/app/reports/position_sync",
+    )
+)
+
+POSITION_SYNC_LOCK_KEY = int(
+    os.getenv("POSITION_SYNC_LOCK_KEY", "7246391021")
+)
+
+POSITION_SYNC_LOCK_TIMEOUT = int(
+    os.getenv("POSITION_SYNC_LOCK_TIMEOUT", "600")
+)
+
 ORACLE_SERVICES_ALL = [
     "BINUU00","BINUU01","BINUU02","BINUU03","BINUU04","BINUU5","BINUU05","BINUU06","BINUU07","BINUU08","BINUU09",
     "BINUU10","BINUU011","BINUU11","BINUU12","BINUU14","BINUU15","BINUU16","BINUU17","BINUU18","BINUU21","BINUU22",
@@ -31757,6 +31773,1205 @@ def trm_users_export_download(request, token: str):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Это для обновления должностей в БД
+
+class PositionSyncAlreadyRunning(Exception):
+    pass
+
+
+def _position_sync_clean_text(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _position_sync_position_key(value) -> str:
+    """
+    Ключ для сравнения должностей.
+
+    Разный регистр, лишние пробелы и различие Е/Ё
+    не считаются изменением должности.
+    """
+    text = _position_sync_clean_text(value).casefold()
+    return text.replace("ё", "е")
+
+
+def _position_sync_normalize_inn(value) -> str:
+    """
+    Для сотрудников ожидается ИНН физического лица из 12 цифр.
+    """
+    digits = re.sub(r"\D+", "", str(value or ""))
+
+    if len(digits) != 12:
+        return ""
+
+    return digits
+
+
+def _position_sync_onec_fio(item: dict) -> str:
+    return " ".join(
+        part
+        for part in [
+            _position_sync_clean_text(item.get("Фамилия")),
+            _position_sync_clean_text(item.get("Имя")),
+            _position_sync_clean_text(item.get("Отчество")),
+        ]
+        if part
+    )
+
+
+def _position_sync_empty_report_row(
+    *,
+    source_index=None,
+    inn="",
+    fio_1c="",
+    position_1c="",
+    status="",
+    comment="",
+):
+    return {
+        "source_index": source_index,
+        "status": status,
+        "inn": inn,
+        "fio_1c": fio_1c,
+        "user_id": None,
+        "fio_db": "",
+        "position_1c": position_1c,
+        "old_position_id": None,
+        "old_position": "",
+        "new_position_id": None,
+        "new_position": "",
+        "comment": comment,
+    }
+
+
+def _fetch_onec_working_employees() -> list[dict]:
+    """
+    Получает список работающих сотрудников из 1С.
+    Поддерживает:
+      - обычный JSON-массив;
+      - объект с массивом в data/items/employees/result/Сотрудники.
+    """
+    auth_user = str(ONEC_WORKING_EMPLOYEES_AUTH_USER or "").strip()
+    auth_password = str(ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD or "").strip()
+
+    if bool(auth_user) != bool(auth_password):
+        raise RuntimeError(
+            "Для 1С должны быть указаны сразу обе переменные: "
+            "ONEC_WORKING_EMPLOYEES_AUTH_USER и "
+            "ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD"
+        )
+
+    auth = (auth_user, auth_password) if auth_user else None
+
+    try:
+        response = requests.get(
+            ONEC_WORKING_EMPLOYEES_URL,
+            auth=auth,
+            headers={
+                "Accept": "application/json",
+            },
+            timeout=(10, ONEC_WORKING_EMPLOYEES_TIMEOUT),
+        )
+    except RequestException as exc:
+        raise RuntimeError(
+            f"Не удалось подключиться к 1С: {exc}"
+        ) from exc
+
+    if not 200 <= response.status_code < 300:
+        body = (response.text or "")[:1000]
+
+        raise RuntimeError(
+            f"1С вернула HTTP {response.status_code}: {body}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        body = (response.text or "")[:1000]
+
+        raise RuntimeError(
+            f"1С вернула не JSON: {body}"
+        ) from exc
+
+    if isinstance(payload, list):
+        employees = payload
+
+    elif isinstance(payload, dict):
+        employees = None
+
+        for key in (
+            "data",
+            "items",
+            "employees",
+            "result",
+            "Сотрудники",
+        ):
+            candidate = payload.get(key)
+
+            if isinstance(candidate, list):
+                employees = candidate
+                break
+
+        if employees is None:
+            raise RuntimeError(
+                "В ответе 1С не найден массив сотрудников"
+            )
+
+    else:
+        raise RuntimeError(
+            "Некорректная структура ответа 1С: ожидался массив или объект"
+        )
+
+    return employees
+
+
+@contextmanager
+def _position_sync_database_lock():
+    """
+    Не позволяет одновременно запускать две синхронизации.
+
+    Для PostgreSQL используется transaction-level advisory lock.
+    """
+    if connection.vendor == "postgresql":
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_try_advisory_xact_lock(%s)",
+                    [POSITION_SYNC_LOCK_KEY],
+                )
+                acquired = bool(cursor.fetchone()[0])
+
+            if not acquired:
+                raise PositionSyncAlreadyRunning(
+                    "Синхронизация должностей уже выполняется"
+                )
+
+            yield
+
+        return
+
+    lock_token = uuid.uuid4().hex
+    lock_name = "working_employees_position_sync"
+
+    acquired = cache.add(
+        lock_name,
+        lock_token,
+        timeout=POSITION_SYNC_LOCK_TIMEOUT,
+    )
+
+    if not acquired:
+        raise PositionSyncAlreadyRunning(
+            "Синхронизация должностей уже выполняется"
+        )
+
+    try:
+        with transaction.atomic():
+            yield
+    finally:
+        if cache.get(lock_name) == lock_token:
+            cache.delete(lock_name)
+
+
+def _prepare_onec_position_sync_data(source_items):
+    """
+    Подготавливает данные 1С и обнаруживает:
+      - некорректные ИНН;
+      - пустые должности;
+      - повторяющиеся записи;
+      - разные должности для одного ИНН.
+    """
+    employees_by_inn = {}
+    position_conflicts = defaultdict(set)
+    report_rows = []
+    duplicate_same_count = 0
+
+    for source_index, item in enumerate(source_items, start=1):
+        if not isinstance(item, dict):
+            report_rows.append(
+                _position_sync_empty_report_row(
+                    source_index=source_index,
+                    status="НЕКОРРЕКТНАЯ ЗАПИСЬ 1С",
+                    comment="Элемент ответа 1С не является объектом",
+                )
+            )
+            continue
+
+        raw_inn = _position_sync_clean_text(item.get("ИНН"))
+        inn = _position_sync_normalize_inn(raw_inn)
+        fio_1c = _position_sync_onec_fio(item)
+        position_1c = _position_sync_clean_text(item.get("Должность"))
+
+        if not inn:
+            report_rows.append(
+                _position_sync_empty_report_row(
+                    source_index=source_index,
+                    inn=raw_inn,
+                    fio_1c=fio_1c,
+                    position_1c=position_1c,
+                    status="НЕКОРРЕКТНЫЙ ИНН",
+                    comment="Ожидался ИНН сотрудника из 12 цифр",
+                )
+            )
+            continue
+
+        if not position_1c:
+            report_rows.append(
+                _position_sync_empty_report_row(
+                    source_index=source_index,
+                    inn=inn,
+                    fio_1c=fio_1c,
+                    status="ПУСТАЯ ДОЛЖНОСТЬ",
+                    comment="В ответе 1С не заполнено поле «Должность»",
+                )
+            )
+            continue
+
+        if len(position_1c) > 255:
+            report_rows.append(
+                _position_sync_empty_report_row(
+                    source_index=source_index,
+                    inn=inn,
+                    fio_1c=fio_1c,
+                    position_1c=position_1c,
+                    status="СЛИШКОМ ДЛИННАЯ ДОЛЖНОСТЬ",
+                    comment="Название должности длиннее 255 символов",
+                )
+            )
+            continue
+
+        record = {
+            "source_index": source_index,
+            "inn": inn,
+            "fio_1c": fio_1c,
+            "position_1c": position_1c,
+            "position_key": _position_sync_position_key(position_1c),
+        }
+
+        existing = employees_by_inn.get(inn)
+
+        if existing is None:
+            employees_by_inn[inn] = record
+            continue
+
+        if existing["position_key"] == record["position_key"]:
+            duplicate_same_count += 1
+            continue
+
+        position_conflicts[inn].add(existing["position_1c"])
+        position_conflicts[inn].add(record["position_1c"])
+
+    return {
+        "employees_by_inn": employees_by_inn,
+        "position_conflicts": position_conflicts,
+        "initial_report_rows": report_rows,
+        "duplicate_same_count": duplicate_same_count,
+    }
+
+
+def _analyze_and_apply_position_sync(source_items, *, apply_changes: bool):
+    prepared = _prepare_onec_position_sync_data(source_items)
+
+    employees_by_inn = prepared["employees_by_inn"]
+    position_conflicts = prepared["position_conflicts"]
+    report_rows = list(prepared["initial_report_rows"])
+
+    positions = list(
+        Position.objects
+        .only("id", "name")
+        .order_by("id")
+    )
+
+    positions_by_id = {
+        position.id: position
+        for position in positions
+    }
+
+    positions_by_key = {}
+    position_ids_by_key = defaultdict(list)
+
+    for position in positions:
+        key = _position_sync_position_key(position.name)
+
+        if not key:
+            continue
+
+        position_ids_by_key[key].append(position.id)
+        positions_by_key.setdefault(key, position)
+
+    duplicate_position_names = sum(
+        1
+        for ids in position_ids_by_key.values()
+        if len(ids) > 1
+    )
+
+    users_by_inn = defaultdict(list)
+
+    # Здесь намеренно читаются все users:
+    # так находятся ИНН даже при наличии пробелов или разделителей.
+    users_queryset = (
+        User.objects
+        .only(
+            "id",
+            "employee_id",
+            "full_name",
+            "position_id",
+            "updated_at",
+        )
+        .order_by("id")
+    )
+
+    for user in users_queryset.iterator(chunk_size=2000):
+        normalized_inn = _position_sync_normalize_inn(user.employee_id)
+
+        if normalized_inn:
+            users_by_inn[normalized_inn].append(user)
+
+    planned_changes = []
+    users_found = 0
+
+    sorted_employees = sorted(
+        employees_by_inn.values(),
+        key=lambda item: item["source_index"],
+    )
+
+    for employee in sorted_employees:
+        inn = employee["inn"]
+        fio_1c = employee["fio_1c"]
+        position_1c = employee["position_1c"]
+        position_key = employee["position_key"]
+        source_index = employee["source_index"]
+
+        if inn in position_conflicts:
+            conflict_positions = sorted(
+                position_conflicts[inn],
+                key=str.casefold,
+            )
+
+            report_rows.append(
+                _position_sync_empty_report_row(
+                    source_index=source_index,
+                    inn=inn,
+                    fio_1c=fio_1c,
+                    position_1c=" / ".join(conflict_positions),
+                    status="КОНФЛИКТ В 1С",
+                    comment=(
+                        "Для одного ИНН в ответе 1С указаны разные должности. "
+                        "Пользователь не изменён"
+                    ),
+                )
+            )
+            continue
+
+        db_users = users_by_inn.get(inn, [])
+
+        if not db_users:
+            report_rows.append(
+                _position_sync_empty_report_row(
+                    source_index=source_index,
+                    inn=inn,
+                    fio_1c=fio_1c,
+                    position_1c=position_1c,
+                    status="ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН",
+                    comment="ИНН не найден в users.employee_id",
+                )
+            )
+            continue
+
+        if len(db_users) > 1:
+            report_rows.append(
+                _position_sync_empty_report_row(
+                    source_index=source_index,
+                    inn=inn,
+                    fio_1c=fio_1c,
+                    position_1c=position_1c,
+                    status="ДУБЛИКАТ ИНН В USERS",
+                    comment=(
+                        "Найдено несколько пользователей: "
+                        + ", ".join(str(user.id) for user in db_users)
+                        + ". Изменения не выполнялись"
+                    ),
+                )
+            )
+            continue
+
+        user = db_users[0]
+        users_found += 1
+
+        old_position = positions_by_id.get(user.position_id)
+        old_position_name = (
+            _position_sync_clean_text(old_position.name)
+            if old_position
+            else ""
+        )
+        old_position_key = _position_sync_position_key(
+            old_position_name
+        )
+
+        row = _position_sync_empty_report_row(
+            source_index=source_index,
+            inn=inn,
+            fio_1c=fio_1c,
+            position_1c=position_1c,
+        )
+
+        row.update({
+            "user_id": user.id,
+            "fio_db": user.full_name or "",
+            "old_position_id": user.position_id,
+            "old_position": old_position_name,
+        })
+
+        if old_position_key == position_key:
+            row.update({
+                "status": "БЕЗ ИЗМЕНЕНИЙ",
+                "new_position_id": user.position_id,
+                "new_position": old_position_name,
+                "comment": "Должность пользователя соответствует данным 1С",
+            })
+
+            report_rows.append(row)
+            continue
+
+        target_position = positions_by_key.get(position_key)
+
+        row.update({
+            "status": (
+                "ИЗМЕНЕНО"
+                if apply_changes
+                else "БУДЕТ ИЗМЕНЕНО"
+            ),
+            "new_position_id": (
+                target_position.id
+                if target_position
+                else None
+            ),
+            "new_position": position_1c,
+        })
+
+        planned_changes.append({
+            "user": user,
+            "position_key": position_key,
+            "position_name": position_1c,
+            "target_position": target_position,
+            "row": row,
+        })
+
+        report_rows.append(row)
+
+    missing_positions = {}
+
+    for change in planned_changes:
+        if change["target_position"] is None:
+            missing_positions.setdefault(
+                change["position_key"],
+                change["position_name"],
+            )
+
+    created_positions = []
+    created_position_keys = set()
+
+    if apply_changes:
+        for position_key, position_name in sorted(
+            missing_positions.items(),
+            key=lambda item: item[1].casefold(),
+        ):
+            # Повторная проверка выполняется внутри транзакции и блокировки.
+            target_position = positions_by_key.get(position_key)
+
+            if target_position is None:
+                target_position = Position.objects.create(
+                    name=position_name
+                )
+
+                positions_by_key[position_key] = target_position
+                positions_by_id[target_position.id] = target_position
+                created_position_keys.add(position_key)
+
+                created_positions.append({
+                    "id": target_position.id,
+                    "name": target_position.name,
+                    "action": "Создана",
+                })
+
+        users_to_update = []
+        update_time = timezone.now()
+
+        for change in planned_changes:
+            target_position = positions_by_key[
+                change["position_key"]
+            ]
+            user = change["user"]
+            row = change["row"]
+
+            user.position_id = target_position.id
+            user.updated_at = update_time
+            users_to_update.append(user)
+
+            row["new_position_id"] = target_position.id
+
+            if change["position_key"] in created_position_keys:
+                row["comment"] = (
+                    "Должность создана в positions, "
+                    "users.position_id обновлён"
+                )
+            else:
+                row["comment"] = (
+                    "users.position_id обновлён на существующую должность"
+                )
+
+        if users_to_update:
+            User.objects.bulk_update(
+                users_to_update,
+                fields=[
+                    "position_id",
+                    "updated_at",
+                ],
+                batch_size=500,
+            )
+
+    else:
+        for position_key, position_name in sorted(
+            missing_positions.items(),
+            key=lambda item: item[1].casefold(),
+        ):
+            created_positions.append({
+                "id": None,
+                "name": position_name,
+                "action": "Будет создана",
+            })
+
+        for change in planned_changes:
+            row = change["row"]
+
+            if change["target_position"] is None:
+                row["comment"] = (
+                    "Будет создана новая должность, "
+                    "после чего users.position_id будет обновлён"
+                )
+            else:
+                row["comment"] = (
+                    "users.position_id будет обновлён "
+                    "на существующую должность"
+                )
+
+    report_rows.sort(
+        key=lambda row: (
+            row.get("source_index") is None,
+            row.get("source_index") or 0,
+        )
+    )
+
+    status_counter = Counter(
+        row["status"]
+        for row in report_rows
+    )
+
+    summary = {
+        "source_total": len(source_items),
+        "source_unique_inn": len(employees_by_inn),
+        "source_duplicate_same": prepared["duplicate_same_count"],
+        "source_conflicts": len(position_conflicts),
+        "invalid_inn": status_counter["НЕКОРРЕКТНЫЙ ИНН"],
+        "empty_position": status_counter["ПУСТАЯ ДОЛЖНОСТЬ"],
+        "users_found": users_found,
+        "users_not_found": status_counter["ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН"],
+        "duplicate_users": status_counter["ДУБЛИКАТ ИНН В USERS"],
+        "unchanged": status_counter["БЕЗ ИЗМЕНЕНИЙ"],
+        "changes": len(planned_changes),
+        "would_update": (
+            len(planned_changes)
+            if not apply_changes
+            else 0
+        ),
+        "updated": (
+            len(planned_changes)
+            if apply_changes
+            else 0
+        ),
+        "positions_to_create": len(missing_positions),
+        "positions_created": (
+            len(created_positions)
+            if apply_changes
+            else 0
+        ),
+        "duplicate_position_names": duplicate_position_names,
+    }
+
+    return summary, report_rows, created_positions
+
+
+def _position_sync_excel_safe(value):
+    if value is None:
+        return ""
+
+    if not isinstance(value, str):
+        return value
+
+    # Защита от формул из внешнего источника.
+    if value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+
+    return value
+
+
+def _position_sync_write_rows_sheet(workbook, title, rows):
+    sheet = workbook.create_sheet(title=title)
+
+    columns = [
+        ("№ в ответе 1С", "source_index"),
+        ("Статус", "status"),
+        ("ИНН", "inn"),
+        ("ФИО из 1С", "fio_1c"),
+        ("ID пользователя", "user_id"),
+        ("ФИО в PostgreSQL", "fio_db"),
+        ("Должность из 1С", "position_1c"),
+        ("Старый position_id", "old_position_id"),
+        ("Старая должность", "old_position"),
+        ("Новый position_id", "new_position_id"),
+        ("Новая должность", "new_position"),
+        ("Комментарий", "comment"),
+    ]
+
+    sheet.append([column[0] for column in columns])
+
+    header_fill = PatternFill(
+        fill_type="solid",
+        fgColor="1F4E78",
+    )
+    header_font = Font(
+        color="FFFFFF",
+        bold=True,
+    )
+
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+
+    status_fills = {
+        "ИЗМЕНЕНО": PatternFill(
+            fill_type="solid",
+            fgColor="C6EFCE",
+        ),
+        "БУДЕТ ИЗМЕНЕНО": PatternFill(
+            fill_type="solid",
+            fgColor="FFEB9C",
+        ),
+        "БЕЗ ИЗМЕНЕНИЙ": PatternFill(
+            fill_type="solid",
+            fgColor="E7E6E6",
+        ),
+    }
+
+    error_fill = PatternFill(
+        fill_type="solid",
+        fgColor="FFC7CE",
+    )
+
+    for row in rows:
+        sheet.append([
+            _position_sync_excel_safe(row.get(field_name))
+            for _, field_name in columns
+        ])
+
+        status_cell = sheet.cell(
+            row=sheet.max_row,
+            column=2,
+        )
+        status = str(status_cell.value or "")
+
+        if status in status_fills:
+            status_cell.fill = status_fills[status]
+        elif status not in {
+            "ИЗМЕНЕНО",
+            "БУДЕТ ИЗМЕНЕНО",
+            "БЕЗ ИЗМЕНЕНИЙ",
+        }:
+            status_cell.fill = error_fill
+
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+
+    widths = {
+        "A": 16,
+        "B": 28,
+        "C": 18,
+        "D": 34,
+        "E": 18,
+        "F": 34,
+        "G": 38,
+        "H": 20,
+        "I": 38,
+        "J": 20,
+        "K": 38,
+        "L": 65,
+    }
+
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+
+    return sheet
+
+
+def _save_position_sync_report(
+    *,
+    report_id,
+    mode,
+    summary,
+    report_rows,
+    created_positions,
+):
+    POSITION_SYNC_REPORT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    report_uuid = (
+        report_id
+        if isinstance(report_id, uuid.UUID)
+        else uuid.UUID(str(report_id))
+    )
+
+    report_base = POSITION_SYNC_REPORT_DIR / report_uuid.hex
+    xlsx_path = report_base.with_suffix(".xlsx")
+    metadata_path = report_base.with_suffix(".json")
+    metadata_tmp_path = Path(str(metadata_path) + ".tmp")
+
+    workbook = Workbook()
+    summary_sheet = workbook.active
+    summary_sheet.title = "Итоги"
+
+    mode_label = (
+        "Тестовый запуск"
+        if mode == "test"
+        else "Запуск с изменениями"
+    )
+
+    summary_rows = [
+        ("Режим", mode_label),
+        (
+            "Дата формирования",
+            timezone.localtime(timezone.now()).strftime(
+                "%d.%m.%Y %H:%M:%S"
+            ),
+        ),
+        ("Получено записей из 1С", summary["source_total"]),
+        ("Уникальных ИНН из 1С", summary["source_unique_inn"]),
+        (
+            "Повторов с одинаковой должностью",
+            summary["source_duplicate_same"],
+        ),
+        ("Конфликтов должностей в 1С", summary["source_conflicts"]),
+        ("Некорректных ИНН", summary["invalid_inn"]),
+        ("Пустых должностей", summary["empty_position"]),
+        ("Пользователей найдено", summary["users_found"]),
+        ("Пользователей не найдено", summary["users_not_found"]),
+        ("Дубликатов ИНН в users", summary["duplicate_users"]),
+        ("Без изменений", summary["unchanged"]),
+        ("Будет изменено", summary["would_update"]),
+        ("Изменено", summary["updated"]),
+        (
+            "Новых должностей требуется",
+            summary["positions_to_create"],
+        ),
+        (
+            "Новых должностей создано",
+            summary["positions_created"],
+        ),
+        (
+            "Дублирующихся названий в positions",
+            summary["duplicate_position_names"],
+        ),
+    ]
+
+    for label, value in summary_rows:
+        summary_sheet.append([label, value])
+
+    summary_sheet.column_dimensions["A"].width = 45
+    summary_sheet.column_dimensions["B"].width = 30
+    summary_sheet.freeze_panes = "A2"
+
+    for cell in summary_sheet["A"]:
+        cell.font = Font(bold=True)
+
+    changed_statuses = {
+        "ИЗМЕНЕНО",
+        "БУДЕТ ИЗМЕНЕНО",
+    }
+
+    changed_rows = [
+        row
+        for row in report_rows
+        if row["status"] in changed_statuses
+    ]
+
+    _position_sync_write_rows_sheet(
+        workbook,
+        "Изменения",
+        changed_rows,
+    )
+
+    _position_sync_write_rows_sheet(
+        workbook,
+        "Полная сверка",
+        report_rows,
+    )
+
+    positions_sheet = workbook.create_sheet(
+        title="Новые должности"
+    )
+    positions_sheet.append([
+        "ID",
+        "Название",
+        "Действие",
+    ])
+
+    for cell in positions_sheet[1]:
+        cell.fill = PatternFill(
+            fill_type="solid",
+            fgColor="1F4E78",
+        )
+        cell.font = Font(
+            color="FFFFFF",
+            bold=True,
+        )
+
+    for position in created_positions:
+        positions_sheet.append([
+            position.get("id") or "",
+            _position_sync_excel_safe(position.get("name")),
+            position.get("action") or "",
+        ])
+
+    positions_sheet.column_dimensions["A"].width = 15
+    positions_sheet.column_dimensions["B"].width = 60
+    positions_sheet.column_dimensions["C"].width = 25
+    positions_sheet.freeze_panes = "A2"
+
+    workbook.save(xlsx_path)
+
+    generated_at = timezone.localtime(timezone.now())
+    download_name = (
+        f"positions_sync_{mode}_"
+        f"{generated_at.strftime('%Y%m%d_%H%M%S')}.xlsx"
+    )
+
+    metadata = {
+        "report_id": str(report_uuid),
+        "mode": mode,
+        "mode_label": mode_label,
+        "created_at": generated_at.isoformat(),
+        "created_at_display": generated_at.strftime(
+            "%d.%m.%Y %H:%M:%S"
+        ),
+        "download_name": download_name,
+        "summary": summary,
+    }
+
+    metadata_tmp_path.write_text(
+        json.dumps(
+            metadata,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    os.replace(
+        metadata_tmp_path,
+        metadata_path,
+    )
+
+    return metadata
+
+
+def _load_position_sync_report_metadata(report_id):
+    try:
+        report_uuid = uuid.UUID(str(report_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+    metadata_path = (
+        POSITION_SYNC_REPORT_DIR
+        / f"{report_uuid.hex}.json"
+    )
+    xlsx_path = (
+        POSITION_SYNC_REPORT_DIR
+        / f"{report_uuid.hex}.xlsx"
+    )
+
+    if not metadata_path.is_file() or not xlsx_path.is_file():
+        return None
+
+    try:
+        metadata = json.loads(
+            metadata_path.read_text(encoding="utf-8")
+        )
+    except Exception:
+        logger.exception(
+            "[POSITION_SYNC] Не удалось прочитать metadata %s",
+            metadata_path,
+        )
+        return None
+
+    return metadata
+
+
+def _list_recent_position_sync_reports(limit=20):
+    if not POSITION_SYNC_REPORT_DIR.exists():
+        return []
+
+    result = []
+
+    metadata_files = sorted(
+        POSITION_SYNC_REPORT_DIR.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    for metadata_path in metadata_files[:limit]:
+        try:
+            report_uuid = uuid.UUID(hex=metadata_path.stem)
+            metadata = _load_position_sync_report_metadata(
+                report_uuid
+            )
+
+            if metadata:
+                result.append(metadata)
+
+        except Exception:
+            logger.exception(
+                "[POSITION_SYNC] Ошибка чтения отчёта %s",
+                metadata_path,
+            )
+
+    return result
+
+
+def _execute_working_employees_position_sync(mode: str):
+    if mode not in {"test", "apply"}:
+        raise ValueError("Некорректный режим запуска")
+
+    source_items = _fetch_onec_working_employees()
+    apply_changes = mode == "apply"
+    report_id = uuid.uuid4()
+
+    xlsx_path = (
+        POSITION_SYNC_REPORT_DIR
+        / f"{report_id.hex}.xlsx"
+    )
+    metadata_path = (
+        POSITION_SYNC_REPORT_DIR
+        / f"{report_id.hex}.json"
+    )
+    metadata_tmp_path = Path(str(metadata_path) + ".tmp")
+
+    try:
+        # Excel создаётся внутри той же транзакции.
+        # Если отчёт создать не удалось, изменения PostgreSQL откатятся.
+        with _position_sync_database_lock():
+            summary, report_rows, created_positions = (
+                _analyze_and_apply_position_sync(
+                    source_items,
+                    apply_changes=apply_changes,
+                )
+            )
+
+            metadata = _save_position_sync_report(
+                report_id=report_id,
+                mode=mode,
+                summary=summary,
+                report_rows=report_rows,
+                created_positions=created_positions,
+            )
+
+        return metadata
+
+    except Exception:
+        # Если транзакция откатилась, незавершённый отчёт тоже удаляем.
+        for path in (
+            xlsx_path,
+            metadata_path,
+            metadata_tmp_path,
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logger.exception(
+                    "[POSITION_SYNC] Не удалось удалить %s",
+                    path,
+                )
+
+        raise
+
+
+@staff_member_required
+@never_cache
+@require_GET
+def working_employees_positions_sync_page(request):
+    selected_report = None
+    report_id = str(
+        request.GET.get("report") or ""
+    ).strip()
+
+    if report_id:
+        selected_report = (
+            _load_position_sync_report_metadata(report_id)
+        )
+
+    return render(
+        request,
+        "frostapp/working_employees_positions_sync.html",
+        {
+            "selected_report": selected_report,
+            "recent_reports": (
+                _list_recent_position_sync_reports(limit=20)
+            ),
+        },
+    )
+
+
+@staff_member_required
+@require_POST
+@csrf_protect
+def working_employees_positions_sync_run(request):
+    mode = str(
+        request.POST.get("mode") or ""
+    ).strip().lower()
+
+    if mode not in {"test", "apply"}:
+        messages.error(
+            request,
+            "Неизвестный режим синхронизации",
+        )
+        return redirect(
+            "working_employees_positions_sync_page"
+        )
+
+    try:
+        metadata = (
+            _execute_working_employees_position_sync(mode)
+        )
+
+        summary = metadata["summary"]
+
+        if mode == "test":
+            messages.success(
+                request,
+                (
+                    "Тестовый запуск завершён. "
+                    f"Будет изменено пользователей: "
+                    f"{summary['would_update']}. "
+                    f"Новых должностей потребуется: "
+                    f"{summary['positions_to_create']}."
+                ),
+            )
+        else:
+            messages.success(
+                request,
+                (
+                    "Синхронизация завершена. "
+                    f"Изменено пользователей: "
+                    f"{summary['updated']}. "
+                    f"Создано должностей: "
+                    f"{summary['positions_created']}."
+                ),
+            )
+
+        page_url = reverse(
+            "working_employees_positions_sync_page"
+        )
+
+        return redirect(
+            f"{page_url}?{urlencode({'report': metadata['report_id']})}"
+        )
+
+    except PositionSyncAlreadyRunning as exc:
+        messages.warning(request, str(exc))
+
+    except Exception as exc:
+        logger.exception(
+            "[POSITION_SYNC] Ошибка синхронизации должностей: %s",
+            exc,
+        )
+        messages.error(
+            request,
+            f"Ошибка синхронизации: {exc}",
+        )
+
+    return redirect(
+        "working_employees_positions_sync_page"
+    )
+
+
+@staff_member_required
+@require_GET
+def working_employees_positions_sync_download(
+    request,
+    report_id,
+):
+    report_uuid = (
+        report_id
+        if isinstance(report_id, uuid.UUID)
+        else uuid.UUID(str(report_id))
+    )
+
+    metadata = _load_position_sync_report_metadata(
+        report_uuid
+    )
+
+    if not metadata:
+        return HttpResponse(
+            "Отчёт не найден",
+            status=404,
+            content_type="text/plain; charset=utf-8",
+        )
+
+    xlsx_path = (
+        POSITION_SYNC_REPORT_DIR
+        / f"{report_uuid.hex}.xlsx"
+    )
+
+    return FileResponse(
+        xlsx_path.open("rb"),
+        as_attachment=True,
+        filename=metadata.get("download_name")
+        or f"positions_sync_{report_uuid.hex}.xlsx",
+        content_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
 
 
 
