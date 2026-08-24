@@ -202,6 +202,22 @@ urlpatterns = [
         name="bitrix_cash_reboot_execute",
     ),
 
+    path(
+        "ui/working-employees-position-sync/",
+        views.working_employees_positions_sync_page,
+        name="working_employees_positions_sync_page",
+    ),
+    path(
+        "ui/working-employees-position-sync/run/",
+        views.working_employees_positions_sync_run,
+        name="working_employees_positions_sync_run",
+    ),
+    path(
+        "ui/working-employees-position-sync/report/<uuid:report_id>/",
+        views.working_employees_positions_sync_download,
+        name="working_employees_positions_sync_download",
+    ),
+
 
 
 
