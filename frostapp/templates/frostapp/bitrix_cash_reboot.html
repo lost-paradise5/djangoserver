@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+    <title>Перезагрузка касс</title>
+
+    <style>
+        :root {
+            color-scheme: light;
+            font-family: Arial, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px;
+            background: #f3f6f9;
+            color: #172033;
+        }
+
+        .container {
+            max-width: 1080px;
+            margin: 0 auto;
+        }
+
+        .card {
+            margin-bottom: 18px;
+            padding: 22px;
+            background: #ffffff;
+            border-radius: 14px;
+            box-shadow: 0 7px 24px rgba(27, 43, 75, .09);
+        }
+
+        h1,
+        h2 {
+            margin-top: 0;
+        }
+
+        .hint {
+            color: #64748b;
+            line-height: 1.5;
+        }
+
+        .row {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        input {
+            flex: 1 1 400px;
+            min-width: 0;
+            padding: 13px 15px;
+            border: 1px solid #cbd5e1;
+            border-radius: 10px;
+            font-size: 16px;
+        }
+
+        button {
+            padding: 12px 17px;
+            border: 0;
+            border-radius: 10px;
+            background: #2563eb;
+            color: white;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #1d4ed8;
+        }
+
+        button:disabled {
+            opacity: .55;
+            cursor: wait;
+        }
+
+        .store-grid,
+        .device-grid {
+            display: grid;
+            grid-template-columns:
+                repeat(auto-fit, minmax(280px, 1fr));
+            gap: 12px;
+        }
+
+        .store,
+        .device {
+            padding: 16px;
+            border: 1px solid #dce4ef;
+            border-radius: 12px;
+            background: #ffffff;
+        }
+
+        .store button,
+        .device button {
+            width: 100%;
+            margin-top: 12px;
+        }
+
+        .device button {
+            background: #dc2626;
+        }
+
+        .device button:hover {
+            background: #b91c1c;
+        }
+
+        .title {
+            margin-bottom: 7px;
+            font-size: 17px;
+            font-weight: 800;
+        }
+
+        .meta {
+            margin-top: 4px;
+            color: #64748b;
+            font-size: 13px;
+            overflow-wrap: anywhere;
+        }
+
+        .message {
+            display: none;
+            margin-bottom: 16px;
+            padding: 13px 15px;
+            border-radius: 10px;
+            white-space: pre-wrap;
+        }
+
+        .message.visible {
+            display: block;
+        }
+
+        .message.info {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+
+        .message.success {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .message.warning {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .message.error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .user-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .secondary {
+            background: #64748b;
+        }
+
+        .secondary:hover {
+            background: #475569;
+        }
+
+        .loader {
+            color: #64748b;
+            font-weight: 700;
+        }
+
+        @media (max-width: 650px) {
+            body {
+                padding: 10px;
+            }
+
+            .card {
+                padding: 16px;
+            }
+
+            .row button {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+    <div class="card">
+        <h1>Перезагрузка касс</h1>
+
+        <p class="hint">
+            Введите ФИО точно так же, как оно указано
+            в системе сотрудников. После этого будут
+            показаны магазины, в которых у вас есть
+            права администратора.
+        </p>
+
+        <div
+            id="message"
+            class="message"
+        ></div>
+
+        <div id="identify-block">
+            <form id="identify-form">
+                <div class="row">
+                    <input
+                        id="fio"
+                        name="fio"
+                        type="text"
+                        autocomplete="name"
+                        maxlength="255"
+                        placeholder="Например: Иванов Иван Иванович"
+                        required
+                    >
+
+                    <button
+                        id="identify-button"
+                        type="submit"
+                    >
+                        Продолжить
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <div
+            id="user-block"
+            class="hidden"
+        >
+            <div class="user-bar">
+                <div>
+                    Пользователь:
+                    <strong id="user-name"></strong>
+                </div>
+
+                <button
+                    id="change-user"
+                    class="secondary"
+                    type="button"
+                >
+                    Ввести другое ФИО
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div
+        id="stores-card"
+        class="card hidden"
+    >
+        <h2>Выберите магазин</h2>
+        <div
+            id="stores"
+            class="store-grid"
+        ></div>
+    </div>
+
+    <div
+        id="devices-card"
+        class="card hidden"
+    >
+        <h2 id="devices-title">Кассы магазина</h2>
+
+        <div
+            id="devices-loader"
+            class="loader hidden"
+        >
+            Получаем список касс…
+        </div>
+
+        <div
+            id="devices"
+            class="device-grid"
+        ></div>
+    </div>
+</div>
+
+<script>
+    const identifyUrl =
+        "{% url 'bitrix_cash_reboot_identify' %}";
+
+    const devicesUrl =
+        "{% url 'bitrix_cash_reboot_devices' %}";
+
+    const rebootUrl =
+        "{% url 'bitrix_cash_reboot_execute' %}";
+
+    let sessionToken = "";
+    let selectedStore = null;
+
+    const messageBox =
+        document.getElementById("message");
+
+    const identifyForm =
+        document.getElementById("identify-form");
+
+    const identifyButton =
+        document.getElementById("identify-button");
+
+    const fioInput =
+        document.getElementById("fio");
+
+    const identifyBlock =
+        document.getElementById("identify-block");
+
+    const userBlock =
+        document.getElementById("user-block");
+
+    const userName =
+        document.getElementById("user-name");
+
+    const storesCard =
+        document.getElementById("stores-card");
+
+    const storesContainer =
+        document.getElementById("stores");
+
+    const devicesCard =
+        document.getElementById("devices-card");
+
+    const devicesContainer =
+        document.getElementById("devices");
+
+    const devicesLoader =
+        document.getElementById("devices-loader");
+
+    const devicesTitle =
+        document.getElementById("devices-title");
+
+    const changeUserButton =
+        document.getElementById("change-user");
+
+
+    function showMessage(text, type = "info") {
+        messageBox.textContent = text || "";
+        messageBox.className =
+            `message visible ${type}`;
+    }
+
+
+    function hideMessage() {
+        messageBox.textContent = "";
+        messageBox.className = "message";
+    }
+
+
+    async function apiRequest(
+        url,
+        body,
+        useSession = true,
+    ) {
+        const headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        };
+
+        if (useSession && sessionToken) {
+            headers["X-Cash-Reboot-Token"] =
+                sessionToken;
+        }
+
+        const response = await fetch(
+            url,
+            {
+                method: "POST",
+                headers,
+                body: JSON.stringify(body || {}),
+                credentials: "omit",
+            },
+        );
+
+        let data;
+
+        try {
+            data = await response.json();
+        } catch (_) {
+            data = {
+                status: "error",
+                message:
+                    `Сервер вернул HTTP ${response.status}`,
+            };
+        }
+
+        if (!response.ok || data.status !== "ok") {
+            const error = new Error(
+                data.message || "Ошибка запроса"
+            );
+
+            error.status = response.status;
+            error.code = data.code || "error";
+
+            throw error;
+        }
+
+        return data;
+    }
+
+
+    function resetApplication() {
+        sessionToken = "";
+        selectedStore = null;
+
+        userName.textContent = "";
+
+        storesContainer.replaceChildren();
+        devicesContainer.replaceChildren();
+
+        identifyBlock.classList.remove("hidden");
+        userBlock.classList.add("hidden");
+        storesCard.classList.add("hidden");
+        devicesCard.classList.add("hidden");
+
+        identifyButton.disabled = false;
+        fioInput.disabled = false;
+
+        fioInput.value = "";
+        fioInput.focus();
+
+        hideMessage();
+    }
+
+
+    function renderStores(stores) {
+        storesContainer.replaceChildren();
+
+        if (!stores.length) {
+            showMessage(
+                "У пользователя нет доступных магазинов",
+                "warning",
+            );
+            return;
+        }
+
+        for (const store of stores) {
+            const card =
+                document.createElement("div");
+
+            card.className = "store";
+
+            const title =
+                document.createElement("div");
+
+            title.className = "title";
+            title.textContent =
+                store.store_name
+                || `Магазин ${store.ukm_store_id}`;
+
+            const ukmMeta =
+                document.createElement("div");
+
+            ukmMeta.className = "meta";
+            ukmMeta.textContent =
+                `UKM store: ${store.ukm_store_id}`;
+
+            const smMeta =
+                document.createElement("div");
+
+            smMeta.className = "meta";
+            smMeta.textContent =
+                `SM store: ${store.sm_store_id ?? "—"}`;
+
+            const button =
+                document.createElement("button");
+
+            button.type = "button";
+            button.textContent = "Показать кассы";
+
+            button.addEventListener(
+                "click",
+                () => loadDevices(store),
+            );
+
+            card.append(
+                title,
+                ukmMeta,
+                smMeta,
+                button,
+            );
+
+            storesContainer.appendChild(card);
+        }
+    }
+
+
+    function deviceKind(device) {
+        if (device.ukm5) {
+            return "КСО / касса УКМ-5";
+        }
+
+        if (device.ukm4 && device.is_kso) {
+            return "КСО УКМ-4";
+        }
+
+        if (device.ukm4) {
+            return "Касса УКМ-4";
+        }
+
+        return "Неизвестный тип";
+    }
+
+
+    function renderDevices(devices) {
+        devicesContainer.replaceChildren();
+
+        if (!devices.length) {
+            const empty =
+                document.createElement("div");
+
+            empty.className = "hint";
+            empty.textContent =
+                "В этом магазине не найдено доступных касс.";
+
+            devicesContainer.appendChild(empty);
+            return;
+        }
+
+        for (const device of devices) {
+            const card =
+                document.createElement("div");
+
+            card.className = "device";
+
+            const title =
+                document.createElement("div");
+
+            title.className = "title";
+            title.textContent =
+                device.name || "Касса без названия";
+
+            const kind =
+                document.createElement("div");
+
+            kind.className = "meta";
+            kind.textContent =
+                `Тип: ${deviceKind(device)}`;
+
+            const ip =
+                document.createElement("div");
+
+            ip.className = "meta";
+            ip.textContent =
+                `IP: ${device.ip || "—"}`;
+
+            const cashId =
+                document.createElement("div");
+
+            cashId.className = "meta";
+            cashId.textContent =
+                `cash_id: ${device.cash_id || "—"}`;
+
+            const button =
+                document.createElement("button");
+
+            button.type = "button";
+            button.textContent = "Перезагрузить";
+
+            button.addEventListener(
+                "click",
+                () => rebootDevice(
+                    device,
+                    button,
+                ),
+            );
+
+            card.append(
+                title,
+                kind,
+                ip,
+                cashId,
+                button,
+            );
+
+            devicesContainer.appendChild(card);
+        }
+    }
+
+
+    async function loadDevices(store) {
+        selectedStore = store;
+
+        devicesCard.classList.remove("hidden");
+        devicesLoader.classList.remove("hidden");
+
+        devicesContainer.replaceChildren();
+
+        devicesTitle.textContent =
+            `Кассы: ${
+                store.store_name
+                || `магазин ${store.ukm_store_id}`
+            }`;
+
+        hideMessage();
+
+        try {
+            const data = await apiRequest(
+                devicesUrl,
+                {
+                    ukm_store_id:
+                        store.ukm_store_id,
+                },
+            );
+
+            renderDevices(
+                data.devices || [],
+            );
+
+            const warnings =
+                data.warnings || [];
+
+            if (warnings.length) {
+                showMessage(
+                    warnings.join("\n"),
+                    "warning",
+                );
+            }
+
+        } catch (error) {
+            if (
+                error.status === 401
+                || error.code === "session_error"
+            ) {
+                resetApplication();
+            }
+
+            showMessage(
+                error.message,
+                "error",
+            );
+
+        } finally {
+            devicesLoader.classList.add("hidden");
+        }
+    }
+
+
+    async function rebootDevice(
+        device,
+        button,
+    ) {
+        if (!selectedStore) {
+            showMessage(
+                "Сначала выберите магазин",
+                "error",
+            );
+            return;
+        }
+
+        const confirmed = window.confirm(
+            "Перезагрузить кассу?\n\n"
+            + `Магазин: ${
+                selectedStore.store_name
+                || selectedStore.ukm_store_id
+            }\n`
+            + `Касса: ${
+                device.name || "без названия"
+            }\n`
+            + `IP: ${device.ip}\n`
+            + `Тип: ${deviceKind(device)}\n\n`
+            + "Работа кассы будет прервана."
+        );
+
+        if (!confirmed) {
+            return;
+        }
+
+        button.disabled = true;
+        button.textContent =
+            "Отправляем команду…";
+
+        hideMessage();
+
+        try {
+            const data = await apiRequest(
+                rebootUrl,
+                {
+                    ukm_store_id:
+                        selectedStore.ukm_store_id,
+                    cash_id:
+                        device.cash_id,
+                    ip:
+                        device.ip,
+                },
+            );
+
+            showMessage(
+                data.message
+                || "Команда перезагрузки отправлена",
+                "success",
+            );
+
+            button.textContent =
+                "Команда отправлена";
+
+        } catch (error) {
+            if (
+                error.status === 401
+                || error.code === "session_error"
+            ) {
+                resetApplication();
+            }
+
+            showMessage(
+                error.message,
+                "error",
+            );
+
+            button.disabled = false;
+            button.textContent =
+                "Перезагрузить";
+        }
+    }
+
+
+    identifyForm.addEventListener(
+        "submit",
+        async (event) => {
+            event.preventDefault();
+
+            hideMessage();
+
+            const fio =
+                fioInput.value.trim();
+
+            if (!fio) {
+                showMessage(
+                    "Введите ФИО",
+                    "error",
+                );
+                return;
+            }
+
+            identifyButton.disabled = true;
+            fioInput.disabled = true;
+
+            identifyButton.textContent =
+                "Ищем пользователя…";
+
+            try {
+                const data = await apiRequest(
+                    identifyUrl,
+                    {fio},
+                    false,
+                );
+
+                sessionToken =
+                    data.session_token || "";
+
+                userName.textContent =
+                    data.user?.full_name || fio;
+
+                identifyBlock.classList.add("hidden");
+                userBlock.classList.remove("hidden");
+                storesCard.classList.remove("hidden");
+                devicesCard.classList.add("hidden");
+
+                renderStores(
+                    data.stores || [],
+                );
+
+                showMessage(
+                    "Пользователь найден. "
+                    + "Выберите магазин.",
+                    "success",
+                );
+
+            } catch (error) {
+                showMessage(
+                    error.message,
+                    "error",
+                );
+
+                identifyButton.disabled = false;
+                fioInput.disabled = false;
+                fioInput.focus();
+
+            } finally {
+                identifyButton.textContent =
+                    "Продолжить";
+            }
+        },
+    );
+
+
+    changeUserButton.addEventListener(
+        "click",
+        resetApplication,
+    );
+
+
+    fioInput.focus();
+</script>
+</body>
+</html>
