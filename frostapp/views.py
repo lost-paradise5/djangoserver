@@ -87,6 +87,21 @@ from django.db import connection
 from django.core.files.base import ContentFile
 from django.utils.html import escape
 
+from django.core.cache import cache
+from django.views.decorators.clickjacking import xframe_options_exempt
+
+from frostapp.services.bitrix_cash_reboot import (
+    CashRebootIdentityError,
+    CashRebootUserNotFound,
+    CashRebootUserAmbiguous,
+    CashRebootSessionError,
+    create_user_token,
+    find_active_user_by_fio,
+    get_session_ttl_seconds,
+    get_user_from_token,
+    normalize_fio,
+)
+
 
 from frostapp.services.trm_users_export import (
     build_trm_users_export,
@@ -14521,6 +14536,1015 @@ def pos_reboot(request):
         _send_telegram_log_async("\n".join(msg_lines))
 
         return JsonResponse({"status": "error", "message": str(e)}, status=500, json_dumps_params={"ensure_ascii": False})
+
+
+
+# ============================================================
+# Bitrix24: локальное приложение перезагрузки касс
+# Идентификация выполняется по введённому ФИО.
+# ============================================================
+
+BITRIX_CASH_REBOOT_ENABLED = (
+    os.getenv(
+        "BITRIX24_CASH_REBOOT_ENABLED",
+        "0",
+    )
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+
+try:
+    BITRIX_CASH_REBOOT_RATE_LIMIT_SEC = max(
+        5,
+        int(
+            os.getenv(
+                "BITRIX24_CASH_REBOOT_RATE_LIMIT_SEC",
+                "30",
+            )
+        ),
+    )
+except (TypeError, ValueError):
+    BITRIX_CASH_REBOOT_RATE_LIMIT_SEC = 30
+
+
+def _bitrix_cash_reboot_error(
+    message: str,
+    *,
+    status: int = 400,
+    code: str = "error",
+) -> JsonResponse:
+    return JsonResponse(
+        {
+            "status": "error",
+            "code": code,
+            "message": str(message or "Неизвестная ошибка"),
+        },
+        status=status,
+        json_dumps_params={
+            "ensure_ascii": False,
+        },
+    )
+
+
+def _bitrix_cash_reboot_json_body(request) -> dict:
+    try:
+        raw_body = (
+            request.body.decode(
+                "utf-8",
+                errors="replace",
+            )
+            if request.body
+            else "{}"
+        )
+
+        body = json.loads(raw_body)
+
+        if not isinstance(body, dict):
+            raise ValueError(
+                "JSON должен быть объектом"
+            )
+
+        return body
+
+    except Exception as exc:
+        raise ValueError(
+            f"Некорректный JSON: {exc}"
+        ) from exc
+
+
+def _bitrix_cash_reboot_token(request) -> str:
+    return str(
+        request.headers.get(
+            "X-Cash-Reboot-Token",
+            "",
+        )
+        or ""
+    ).strip()
+
+
+def _bitrix_cash_reboot_user(request) -> User:
+    return get_user_from_token(
+        _bitrix_cash_reboot_token(request)
+    )
+
+
+def _bitrix_public_device(device: dict) -> dict:
+    """
+    Возвращает браузеру только необходимые поля.
+    SSH-логины и пароли никогда не отправляются.
+    """
+    return {
+        "cash_id": str(
+            device.get("cash_id") or ""
+        ),
+        "name": str(
+            device.get("name") or ""
+        ).strip(),
+        "ip": str(
+            device.get("ip") or ""
+        ).strip(),
+        "ukm4": bool(
+            device.get("ukm4")
+        ),
+        "ukm5": bool(
+            device.get("ukm5")
+        ),
+        "is_kso": bool(
+            device.get("is_kso")
+        ),
+        "ukm_store_id": (
+            int(device["ukm_store_id"])
+            if device.get("ukm_store_id") is not None
+            else None
+        ),
+        "sm_store_id": (
+            int(device["sm_store_id"])
+            if device.get("sm_store_id") is not None
+            else None
+        ),
+        "store_name": str(
+            device.get("store_name") or ""
+        ).strip(),
+        "role_id": (
+            int(device["role_id"])
+            if device.get("role_id") is not None
+            else None
+        ),
+    }
+
+
+def _bitrix_write_reboot_log(
+    *,
+    user: Optional[User],
+    status: str,
+    body: Optional[dict] = None,
+    device: Optional[dict] = None,
+    error_message: str = "",
+    extra: Optional[dict] = None,
+) -> None:
+    """
+    Записывает действие Bitrix-приложения
+    в существующую таблицу qr_issue_logs.
+    """
+    body = body or {}
+    device = device or {}
+    extra = extra or {}
+
+    def safe_int(value):
+        try:
+            if value in (None, ""):
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    employee_inn = ""
+    employee_fio = ""
+    phone_raw = ""
+    tg_id = ""
+
+    if user:
+        employee_inn = str(
+            getattr(user, "employee_id", "")
+            or ""
+        ).strip()
+
+        employee_fio = normalize_fio(
+            getattr(user, "full_name", "")
+        )
+
+        phone_raw = str(
+            getattr(user, "phone", "")
+            or ""
+        ).strip()
+
+        tg_id = str(
+            getattr(user, "tg_id", "")
+            or ""
+        ).strip()
+
+    try:
+        log_qr_issue(
+            endpoint="bitrix_cash_reboot",
+            method="POS_REBOOT",
+            status=status,
+            user=user,
+            employee_inn=employee_inn,
+            employee_fio=employee_fio,
+            tg_id=tg_id,
+            phone_raw=phone_raw,
+            phone_normalized=(
+                normalize_phone_ru(phone_raw)
+                if phone_raw
+                else ""
+            ),
+            sm_store_id=safe_int(
+                device.get("sm_store_id")
+                or body.get("sm_store_id")
+            ),
+            ukm_store_id=safe_int(
+                device.get("ukm_store_id")
+                or body.get("ukm_store_id")
+            ),
+            role_id=safe_int(
+                device.get("role_id")
+                or body.get("role_id")
+            ),
+            qr_data="",
+            error_message=str(
+                error_message or ""
+            ),
+            raw_request={
+                "source": "bitrix24_fio",
+                "request": {
+                    "ukm_store_id": body.get(
+                        "ukm_store_id"
+                    ),
+                    "cash_id": body.get(
+                        "cash_id"
+                    ),
+                    "ip": body.get("ip"),
+                },
+                "device": _bitrix_public_device(device)
+                if device
+                else {},
+                "extra": extra,
+            },
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[BITRIX/POS] Не удалось записать аудит: %s",
+            exc,
+        )
+
+
+@require_GET
+def bitrix_cash_reboot_health(request):
+    return JsonResponse(
+        {
+            "status": "ok",
+            "service": "bitrix-cash-reboot",
+            "enabled": BITRIX_CASH_REBOOT_ENABLED,
+        },
+        json_dumps_params={
+            "ensure_ascii": False,
+        },
+    )
+
+
+@csrf_exempt
+@xframe_options_exempt
+@never_cache
+@require_http_methods(["GET", "POST"])
+def bitrix_cash_reboot_app(request):
+    """
+    Главная страница приложения.
+
+    При открытии через Bitrix24 обычно приходит POST.
+    GET оставлен для проверки через обычный браузер.
+    """
+    if not BITRIX_CASH_REBOOT_ENABLED:
+        return HttpResponse(
+            "Приложение временно отключено",
+            status=503,
+        )
+
+    return render(
+        request,
+        "frostapp/bitrix_cash_reboot.html",
+        {
+            "session_ttl_seconds": (
+                get_session_ttl_seconds()
+            ),
+        },
+    )
+
+
+@csrf_exempt
+@xframe_options_exempt
+@never_cache
+@require_http_methods(["GET", "POST"])
+def bitrix_cash_reboot_install(request):
+    """
+    Страница первоначальной установки Bitrix24.
+    """
+    if not BITRIX_CASH_REBOOT_ENABLED:
+        return HttpResponse(
+            "Приложение временно отключено",
+            status=503,
+        )
+
+    return render(
+        request,
+        "frostapp/bitrix_cash_reboot_install.html",
+    )
+
+
+@csrf_exempt
+@require_POST
+def bitrix_cash_reboot_identify(request):
+    """
+    Получает ФИО, находит единственного активного
+    пользователя и возвращает его магазины.
+    """
+    if not BITRIX_CASH_REBOOT_ENABLED:
+        return _bitrix_cash_reboot_error(
+            "Приложение отключено",
+            status=503,
+            code="disabled",
+        )
+
+    try:
+        body = _bitrix_cash_reboot_json_body(
+            request
+        )
+    except ValueError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=400,
+            code="bad_json",
+        )
+
+    raw_fio = str(
+        body.get("fio") or ""
+    ).strip()
+
+    try:
+        user = find_active_user_by_fio(
+            raw_fio
+        )
+
+    except CashRebootUserNotFound as exc:
+        logger.warning(
+            "[BITRIX/POS] Пользователь не найден: fio=%r",
+            normalize_fio(raw_fio),
+        )
+
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=404,
+            code="user_not_found",
+        )
+
+    except CashRebootUserAmbiguous as exc:
+        logger.warning(
+            "[BITRIX/POS] Неоднозначное ФИО: fio=%r",
+            normalize_fio(raw_fio),
+        )
+
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=409,
+            code="ambiguous_fio",
+        )
+
+    except CashRebootIdentityError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=400,
+            code="bad_fio",
+        )
+
+    stores = get_reboot_stores_for_user(
+        user
+    )
+
+    if not stores:
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            error_message=(
+                "Нет доступных магазинов с roleid=13"
+            ),
+            extra={
+                "stage": "identify",
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            "У пользователя нет магазинов, "
+            "доступных для перезагрузки касс",
+            status=403,
+            code="no_stores",
+        )
+
+    token = create_user_token(user)
+
+    logger.info(
+        "[BITRIX/POS] Пользователь определён: "
+        "user_id=%s fio=%r stores=%s",
+        user.id,
+        user.full_name,
+        len(stores),
+    )
+
+    return JsonResponse(
+        {
+            "status": "ok",
+            "session_token": token,
+            "session_ttl_seconds": (
+                get_session_ttl_seconds()
+            ),
+            "user": {
+                "full_name": normalize_fio(
+                    user.full_name
+                ),
+            },
+            "stores": stores,
+        },
+        json_dumps_params={
+            "ensure_ascii": False,
+        },
+    )
+
+
+@csrf_exempt
+@require_POST
+def bitrix_cash_reboot_devices(request):
+    """
+    Возвращает кассы только выбранного магазина.
+    """
+    if not BITRIX_CASH_REBOOT_ENABLED:
+        return _bitrix_cash_reboot_error(
+            "Приложение отключено",
+            status=503,
+            code="disabled",
+        )
+
+    try:
+        user = _bitrix_cash_reboot_user(
+            request
+        )
+    except CashRebootSessionError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=401,
+            code="session_error",
+        )
+
+    try:
+        body = _bitrix_cash_reboot_json_body(
+            request
+        )
+
+        ukm_store_id = int(
+            body.get("ukm_store_id")
+        )
+
+    except (ValueError, TypeError):
+        return _bitrix_cash_reboot_error(
+            "Не указан корректный ukm_store_id",
+            status=400,
+            code="bad_store_id",
+        )
+
+    try:
+        devices, warnings = (
+            get_devices_for_user_store(
+                user,
+                ukm_store_id,
+            )
+        )
+
+    except PermissionError as exc:
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            error_message=str(exc),
+            extra={
+                "stage": "devices_access_check",
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=403,
+            code="store_forbidden",
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[BITRIX/POS] Ошибка загрузки касс: "
+            "user_id=%s store=%s error=%s",
+            user.id,
+            ukm_store_id,
+            exc,
+        )
+
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            error_message=str(exc),
+            extra={
+                "stage": "load_devices",
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            "Не удалось получить кассы выбранного магазина",
+            status=502,
+            code="devices_error",
+        )
+
+    public_devices = [
+        _bitrix_public_device(device)
+        for device in devices
+    ]
+
+    return JsonResponse(
+        {
+            "status": "ok",
+            "devices": public_devices,
+            "warnings": [
+                str(warning)
+                for warning in warnings
+                if warning
+            ],
+        },
+        json_dumps_params={
+            "ensure_ascii": False,
+        },
+    )
+
+
+@csrf_exempt
+@require_POST
+def bitrix_cash_reboot_execute(request):
+    """
+    Повторно проверяет магазин и кассу,
+    затем выполняет SSH reboot.
+    """
+    if not BITRIX_CASH_REBOOT_ENABLED:
+        return _bitrix_cash_reboot_error(
+            "Приложение отключено",
+            status=503,
+            code="disabled",
+        )
+
+    try:
+        user = _bitrix_cash_reboot_user(
+            request
+        )
+    except CashRebootSessionError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=401,
+            code="session_error",
+        )
+
+    try:
+        body = _bitrix_cash_reboot_json_body(
+            request
+        )
+    except ValueError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=400,
+            code="bad_json",
+        )
+
+    try:
+        ukm_store_id = int(
+            body.get("ukm_store_id")
+        )
+    except (TypeError, ValueError):
+        return _bitrix_cash_reboot_error(
+            "Не указан корректный ukm_store_id",
+            status=400,
+            code="bad_store_id",
+        )
+
+    requested_cash_id = str(
+        body.get("cash_id") or ""
+    ).strip()
+
+    requested_ip = str(
+        body.get("ip") or ""
+    ).strip()
+
+    if not requested_cash_id:
+        return _bitrix_cash_reboot_error(
+            "Не указан cash_id кассы",
+            status=400,
+            code="cash_id_required",
+        )
+
+    if not requested_ip:
+        return _bitrix_cash_reboot_error(
+            "Не указан IP кассы",
+            status=400,
+            code="ip_required",
+        )
+
+    if not _ip_allowed(requested_ip):
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            error_message=(
+                f"IP {requested_ip} запрещён allowlist"
+            ),
+            extra={
+                "stage": "ip_allowlist",
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            f"IP {requested_ip} запрещён",
+            status=403,
+            code="ip_forbidden",
+        )
+
+    try:
+        # Критически важно: список касс загружается повторно.
+        # Нельзя доверять данным из браузера.
+        devices, warnings = (
+            get_devices_for_user_store(
+                user,
+                ukm_store_id,
+            )
+        )
+
+    except PermissionError as exc:
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            error_message=str(exc),
+            extra={
+                "stage": "reboot_store_access",
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=403,
+            code="store_forbidden",
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[BITRIX/POS] Повторная загрузка касс "
+            "завершилась ошибкой: %s",
+            exc,
+        )
+
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            error_message=str(exc),
+            extra={
+                "stage": "reboot_load_devices",
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            "Не удалось повторно проверить кассу",
+            status=502,
+            code="device_check_error",
+        )
+
+    device = next(
+        (
+            item
+            for item in devices
+            if (
+                str(
+                    item.get("cash_id") or ""
+                ).strip()
+                == requested_cash_id
+                and str(
+                    item.get("ip") or ""
+                ).strip()
+                == requested_ip
+            )
+        ),
+        None,
+    )
+
+    if not device:
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            error_message=(
+                "Касса не найдена среди доступных "
+                "касс пользователя"
+            ),
+            extra={
+                "stage": "device_access_check",
+                "warnings": warnings,
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            "Эта касса не найдена среди доступных "
+            "касс пользователя",
+            status=403,
+            code="device_forbidden",
+        )
+
+    ukm4 = bool(
+        device.get("ukm4")
+    )
+    ukm5 = bool(
+        device.get("ukm5")
+    )
+    is_kso = bool(
+        device.get("is_kso")
+    )
+
+    if ukm4 == ukm5:
+        return _bitrix_cash_reboot_error(
+            "Некорректный тип кассы",
+            status=500,
+            code="bad_device_type",
+        )
+
+    if ukm5:
+        username = "ukm5"
+        password = SSH_UKM5_PASSWORD
+        use_sudo = True
+    elif is_kso:
+        username = "ukmclient"
+        password = SSH_UKM4_KSO_PASSWORD
+        use_sudo = True
+    else:
+        username = "root"
+        password = SSH_UKM4_ROOT_PASSWORD
+        use_sudo = False
+
+    if not password:
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            device=device,
+            error_message=(
+                f"Не задан SSH-пароль для {username}"
+            ),
+            extra={
+                "stage": "ssh_password",
+            },
+        )
+
+        return _bitrix_cash_reboot_error(
+            "Для этого типа кассы не настроен SSH-пароль",
+            status=500,
+            code="ssh_password_missing",
+        )
+
+    rate_key_raw = (
+        f"bitrix-pos-reboot:"
+        f"{user.id}:"
+        f"{ukm_store_id}:"
+        f"{requested_cash_id}:"
+        f"{requested_ip}"
+    )
+
+    rate_key = (
+        "bitrix-pos-reboot:"
+        + hashlib.sha256(
+            rate_key_raw.encode("utf-8")
+        ).hexdigest()
+    )
+
+    if not cache.add(
+        rate_key,
+        "1",
+        timeout=(
+            BITRIX_CASH_REBOOT_RATE_LIMIT_SEC
+        ),
+    ):
+        return _bitrix_cash_reboot_error(
+            "Эта касса уже отправлена на перезагрузку. "
+            "Подождите немного",
+            status=429,
+            code="rate_limited",
+        )
+
+    kind = _pos_kind_label(
+        ukm4=ukm4,
+        ukm5=ukm5,
+        is_kso=is_kso,
+    )
+
+    cmd_hint, _ = _device_cmd_hint(
+        ukm4=ukm4,
+        ukm5=ukm5,
+        is_kso=is_kso,
+    )
+
+    initiator_name = _human_user_name(
+        user
+    )
+
+    logger.info(
+        "[BITRIX/POS/REBOOT] start "
+        "user_id=%s initiator=%r "
+        "store=%s cash_id=%s ip=%s "
+        "kind=%s ssh_user=%s",
+        user.id,
+        initiator_name,
+        ukm_store_id,
+        requested_cash_id,
+        requested_ip,
+        kind,
+        username,
+    )
+
+    try:
+        result = _ssh_reboot(
+            requested_ip,
+            username=username,
+            password=password,
+            use_sudo=use_sudo,
+        )
+
+        _bitrix_write_reboot_log(
+            user=user,
+            status="ok",
+            body=body,
+            device=device,
+            extra={
+                "stage": "ssh_reboot",
+                "source": "bitrix24_fio",
+                "ssh_user": username,
+                "ssh_port": POS_SSH_PORT,
+                "cmd": cmd_hint,
+                "result": result,
+            },
+        )
+
+        message_lines = [
+            "🔁 Перезагрузка кассы из Bitrix24",
+            "",
+            "👤 Инициатор:",
+            f"  • {initiator_name}",
+            f"  • user_id: {user.id}",
+            "",
+            "🏬 Магазин:",
+            f"  • ukm_store_id: {device.get('ukm_store_id')}",
+            f"  • sm_store_id: {device.get('sm_store_id')}",
+            "",
+            "💻 Касса:",
+            f"  • Тип: {kind}",
+            f"  • name: {device.get('name') or '—'}",
+            f"  • cash_id: {requested_cash_id}",
+            f"  • ip: {requested_ip}",
+            "",
+            "✅ Команда отправлена",
+        ]
+
+        _send_telegram_log_async(
+            "\n".join(message_lines)
+        )
+
+        return JsonResponse(
+            {
+                "status": "ok",
+                "message": (
+                    "Команда перезагрузки отправлена"
+                ),
+                "result": {
+                    "ok": bool(
+                        result.get("ok")
+                    ),
+                    "stdout": str(
+                        result.get("stdout") or ""
+                    ),
+                    "stderr": str(
+                        result.get("stderr") or ""
+                    ),
+                },
+            },
+            json_dumps_params={
+                "ensure_ascii": False,
+            },
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[BITRIX/POS/REBOOT] error "
+            "user_id=%s store=%s cash_id=%s "
+            "ip=%s error=%s",
+            user.id,
+            ukm_store_id,
+            requested_cash_id,
+            requested_ip,
+            exc,
+        )
+
+        _bitrix_write_reboot_log(
+            user=user,
+            status="error",
+            body=body,
+            device=device,
+            error_message=str(exc),
+            extra={
+                "stage": "ssh_reboot",
+                "source": "bitrix24_fio",
+                "ssh_user": username,
+                "ssh_port": POS_SSH_PORT,
+                "cmd": cmd_hint,
+            },
+        )
+
+        message_lines = [
+            "❌ Ошибка перезагрузки кассы из Bitrix24",
+            "",
+            "👤 Инициатор:",
+            f"  • {initiator_name}",
+            f"  • user_id: {user.id}",
+            "",
+            "🏬 Магазин:",
+            f"  • ukm_store_id: {device.get('ukm_store_id')}",
+            f"  • sm_store_id: {device.get('sm_store_id')}",
+            "",
+            "💻 Касса:",
+            f"  • Тип: {kind}",
+            f"  • name: {device.get('name') or '—'}",
+            f"  • cash_id: {requested_cash_id}",
+            f"  • ip: {requested_ip}",
+            "",
+            f"🧨 Ошибка: {exc}",
+        ]
+
+        _send_telegram_log_async(
+            "\n".join(message_lines)
+        )
+
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=500,
+            code="ssh_error",
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
