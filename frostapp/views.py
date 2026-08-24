@@ -10665,6 +10665,29 @@ def _log_agent_auth_to_qr_table(
 
 
 
+def _get_agent_user_position(user) -> dict:
+    position_id = getattr(user, "position_id", None)
+
+    if not position_id:
+        return {
+            "position_id": None,
+            "position": "",
+        }
+
+    position_name = (
+        Position.objects
+        .filter(id=position_id)
+        .values_list("name", flat=True)
+        .first()
+    )
+
+    return {
+        "position_id": position_id,
+        "position": str(position_name or "").strip(),
+    }
+
+
+
 
 
 ##
@@ -10723,11 +10746,26 @@ def agent_auth_start(request):
         if phone_norm:
             phone_candidates.add(phone_norm)
 
+        # users = list(
+        #     User.objects
+        #     .filter(phone__in=list(phone_candidates))
+        #     .only('id', 'full_name', 'tg_id', 'max_id', 'mail', 'employee_id', 'department_id')
+        #     .order_by('id')[:2]
+        # )
         users = list(
             User.objects
             .filter(phone__in=list(phone_candidates))
-            .only('id', 'full_name', 'tg_id', 'max_id', 'mail', 'employee_id', 'department_id')
-            .order_by('id')[:2]
+            .only(
+                "id",
+                "full_name",
+                "tg_id",
+                "max_id",
+                "mail",
+                "employee_id",
+                "department_id",
+                "position_id",
+            )
+            .order_by("id")[:2]
         )
 
         if not users:
@@ -10820,16 +10858,35 @@ def agent_auth_start(request):
             )
 
             user_inn = str(getattr(user, 'employee_id', '') or '').strip()
+
+            user_inn = str(
+                getattr(user, "employee_id", "") or ""
+            ).strip()
             
+            user_position = _get_agent_user_position(user)
+            
+            # response_payload = {
+            #     'user': {
+            #         'id': user.id,
+            #         'fio': user.full_name,
+            #         'user_inn': user_inn,
+            #     },
+            #     'stores': stores_response,
+            #     'isnot2fa': True,
+            #     'pin_required': False,
+            # }
+
             response_payload = {
-                'user': {
-                    'id': user.id,
-                    'fio': user.full_name,
-                    'user_inn': user_inn,
+                "user": {
+                    "id": user.id,
+                    "fio": user.full_name,
+                    "user_inn": user_inn,
+                    "position_id": user_position["position_id"],
+                    "position": user_position["position"],
                 },
-                'stores': stores_response,
-                'isnot2fa': True,
-                'pin_required': False,
+                "stores": stores_response,
+                "isnot2fa": True,
+                "pin_required": False,
             }
 
             return _agent_audit_json_response(
@@ -11151,13 +11208,30 @@ def agent_auth_verify_pin(request):
 
         user_inn = str(getattr(sess.user, 'employee_id', '') or '').strip()
 
+        user_inn = str(
+            getattr(sess.user, "employee_id", "") or ""
+        ).strip()
+        
+        user_position = _get_agent_user_position(sess.user)
+
+        # response = {
+        #     'user': {
+        #         'id': sess.user.id,
+        #         'fio': sess.user.full_name,
+        #         'user_inn': user_inn,
+        #     },
+        #     'stores': stores_response,
+        # }
+
         response = {
-            'user': {
-                'id': sess.user.id,
-                'fio': sess.user.full_name,
-                'user_inn': user_inn,
+            "user": {
+                "id": sess.user.id,
+                "fio": sess.user.full_name,
+                "user_inn": user_inn,
+                "position_id": user_position["position_id"],
+                "position": user_position["position"],
             },
-            'stores': stores_response,
+            "stores": stores_response,
         }
 
         return _agent_audit_json_response(
