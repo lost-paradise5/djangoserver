@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+    <title>Установка приложения</title>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 30px;
+            background: #f3f6f9;
+            color: #172033;
+            font-family: Arial, sans-serif;
+        }
+
+        .card {
+            max-width: 700px;
+            margin: 40px auto;
+            padding: 24px;
+            background: white;
+            border-radius: 14px;
+            box-shadow:
+                0 7px 24px rgba(27, 43, 75, .09);
+        }
+
+        .status {
+            color: #64748b;
+            line-height: 1.5;
+        }
+
+        .error {
+            color: #991b1b;
+        }
+    </style>
+
+    <script src="https://api.bitrix24.com/api/v1/"></script>
+</head>
+
+<body>
+<div class="card">
+    <h1>Перезагрузка касс</h1>
+
+    <p
+        id="status"
+        class="status"
+    >
+        Завершаем установку приложения…
+    </p>
+</div>
+
+<script>
+    const statusElement =
+        document.getElementById("status");
+
+    function showError(message) {
+        statusElement.textContent = message;
+        statusElement.className =
+            "status error";
+    }
+
+    if (!window.BX24) {
+        showError(
+            "Библиотека Bitrix24 не загрузилась. "
+            + "Обновите страницу установки."
+        );
+    } else {
+        BX24.init(function () {
+            try {
+                BX24.installFinish();
+
+                statusElement.textContent =
+                    "Приложение установлено. "
+                    + "Окно можно закрыть.";
+            } catch (error) {
+                showError(
+                    "Не удалось завершить установку: "
+                    + error
+                );
+            }
+        });
+    }
+</script>
+</body>
+</html>
