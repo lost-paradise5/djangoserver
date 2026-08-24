@@ -26,7 +26,7 @@ SECRET_KEY = 'django-insecure--v0nm^n4w3re(ol$=n-w@czmoi)tuk8b*ox(%wif42ygp3vj1b
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['79.137.192.186', '192.168.17.70', 'example.com', 'localhost']
+ALLOWED_HOSTS = ['79.137.192.186', '192.168.17.70', 'example.com', 'cash-reboot.nikolaevskiy.info', 'localhost']
 
 
 # Application definition
@@ -149,12 +149,17 @@ MAX_BOT_INTERNAL_TOKEN = os.getenv("MAX_BOT_INTERNAL_TOKEN", "wc3wow")
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+CSRF_TRUSTED_ORIGINS = [
+    "https://cash-reboot.nikolaevskiy.info",
+]
+
+SECURE_PROXY_SSL_HEADER = (
+    "HTTP_X_FORWARDED_PROTO",
+    "https",
+)
 
 
-
-# =========================
 # EMAIL / SMTP (Mail.ru)
-# =========================
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 
