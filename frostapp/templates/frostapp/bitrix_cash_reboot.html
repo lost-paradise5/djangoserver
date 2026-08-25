@@ -2,10 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="utf-8">
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1"
-    >
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Перезагрузка касс</title>
 
     <style>
@@ -33,7 +30,7 @@
         .card {
             margin-bottom: 18px;
             padding: 22px;
-            background: #ffffff;
+            background: #fff;
             border-radius: 14px;
             box-shadow: 0 7px 24px rgba(27, 43, 75, .09);
         }
@@ -43,15 +40,28 @@
             margin-top: 0;
         }
 
-        .hint {
+        .hint,
+        .meta {
             color: #64748b;
             line-height: 1.5;
         }
 
-        .row {
+        .meta {
+            margin-top: 4px;
+            font-size: 13px;
+            overflow-wrap: anywhere;
+        }
+
+        .row,
+        .user-bar {
             display: flex;
             gap: 12px;
             flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .user-bar {
+            justify-content: space-between;
         }
 
         input {
@@ -68,7 +78,7 @@
             border: 0;
             border-radius: 10px;
             background: #2563eb;
-            color: white;
+            color: #fff;
             font-size: 15px;
             font-weight: 700;
             cursor: pointer;
@@ -83,11 +93,18 @@
             cursor: wait;
         }
 
+        .secondary {
+            background: #64748b;
+        }
+
+        .secondary:hover {
+            background: #475569;
+        }
+
         .store-grid,
         .device-grid {
             display: grid;
-            grid-template-columns:
-                repeat(auto-fit, minmax(280px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 12px;
         }
 
@@ -96,7 +113,7 @@
             padding: 16px;
             border: 1px solid #dce4ef;
             border-radius: 12px;
-            background: #ffffff;
+            background: #fff;
         }
 
         .store button,
@@ -117,13 +134,6 @@
             margin-bottom: 7px;
             font-size: 17px;
             font-weight: 800;
-        }
-
-        .meta {
-            margin-top: 4px;
-            color: #64748b;
-            font-size: 13px;
-            overflow-wrap: anywhere;
         }
 
         .message {
@@ -162,22 +172,6 @@
             display: none;
         }
 
-        .user-bar {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-
-        .secondary {
-            background: #64748b;
-        }
-
-        .secondary:hover {
-            background: #475569;
-        }
-
         .loader {
             color: #64748b;
             font-weight: 700;
@@ -205,57 +199,70 @@
         <h1>Перезагрузка касс</h1>
 
         <p class="hint">
-            Пользователь подтверждён через Bitrix24.
-            Показаны только магазины, в которых у этого
-            сотрудника есть права администратора.
+            Вход через Bitrix24 подтверждён. Укажите ФИО фактического
+            сотрудника, который выполняет перезагрузку кассы.
         </p>
-
-        <div
-            id="message"
-            class="message"
-        ></div>
 
         <div class="user-bar">
             <div>
-                Пользователь:
-                <strong id="user-name"></strong>
-
-                <div
-                    id="bitrix-user-id"
-                    class="meta"
-                ></div>
+                Учётная запись Bitrix24:
+                <strong id="bitrix-account-name">—</strong>
+                <div id="bitrix-user-id" class="meta">Bitrix24 ID: —</div>
             </div>
         </div>
     </div>
 
-    <div
-        id="stores-card"
-        class="card"
-    >
-        <h2>Выберите магазин</h2>
-        <div
-            id="stores"
-            class="store-grid"
-        ></div>
+    <div id="message" class="message"></div>
+
+    <div id="identify-card" class="card">
+        <h2>Кто фактически выполняет действие?</h2>
+
+        <p class="hint">
+            Введите полное ФИО сотрудника. Оно используется для проверки
+            доступных магазинов и записи в журнал действий.
+        </p>
+
+        <form id="identify-form" class="row">
+            <input
+                id="fio"
+                name="fio"
+                type="text"
+                placeholder="Фамилия Имя Отчество"
+                autocomplete="name"
+                maxlength="255"
+                required
+            >
+
+            <button id="identify-button" type="submit">
+                Продолжить
+            </button>
+        </form>
     </div>
 
-    <div
-        id="devices-card"
-        class="card hidden"
-    >
-        <h2 id="devices-title">Кассы магазина</h2>
+    <div id="user-card" class="card hidden">
+        <div class="user-bar">
+            <div>
+                Фактический сотрудник:
+                <strong id="user-name">—</strong>
+            </div>
 
-        <div
-            id="devices-loader"
-            class="loader hidden"
-        >
+            <button id="change-user-button" class="secondary" type="button">
+                Изменить сотрудника
+            </button>
+        </div>
+    </div>
+
+    <div id="stores-card" class="card hidden">
+        <h2>Выберите магазин</h2>
+        <div id="stores" class="store-grid"></div>
+    </div>
+
+    <div id="devices-card" class="card hidden">
+        <h2 id="devices-title">Кассы магазина</h2>
+        <div id="devices-loader" class="loader hidden">
             Получаем список касс…
         </div>
-
-        <div
-            id="devices"
-            class="device-grid"
-        ></div>
+        <div id="devices" class="device-grid"></div>
     </div>
 </div>
 
@@ -263,86 +270,60 @@
 
 <script>
     const bootstrap = JSON.parse(
-        document.getElementById(
-            "cash-reboot-bootstrap"
-        ).textContent,
+        document.getElementById("cash-reboot-bootstrap").textContent,
     );
 
-    const devicesUrl =
-        "{% url 'bitrix_cash_reboot_devices' %}";
+    const identifyUrl = "{% url 'bitrix_cash_reboot_identify' %}";
+    const devicesUrl = "{% url 'bitrix_cash_reboot_devices' %}";
+    const rebootUrl = "{% url 'bitrix_cash_reboot_execute' %}";
 
-    const rebootUrl =
-        "{% url 'bitrix_cash_reboot_execute' %}";
-
-    const sessionToken =
-        bootstrap.session_token || "";
-
+    const launchToken = String(bootstrap.launch_token || "");
+    let sessionToken = launchToken;
     let selectedStore = null;
 
-    const messageBox =
-        document.getElementById("message");
-
-    const userName =
-        document.getElementById("user-name");
-
-    const bitrixUserId =
-        document.getElementById("bitrix-user-id");
-
-    const storesCard =
-        document.getElementById("stores-card");
-
-    const storesContainer =
-        document.getElementById("stores");
-
-    const devicesCard =
-        document.getElementById("devices-card");
-
-    const devicesContainer =
-        document.getElementById("devices");
-
-    const devicesLoader =
-        document.getElementById("devices-loader");
-
-    const devicesTitle =
-        document.getElementById("devices-title");
+    const messageBox = document.getElementById("message");
+    const identifyCard = document.getElementById("identify-card");
+    const identifyForm = document.getElementById("identify-form");
+    const identifyButton = document.getElementById("identify-button");
+    const fioInput = document.getElementById("fio");
+    const userCard = document.getElementById("user-card");
+    const userName = document.getElementById("user-name");
+    const changeUserButton = document.getElementById("change-user-button");
+    const bitrixAccountName = document.getElementById("bitrix-account-name");
+    const bitrixUserId = document.getElementById("bitrix-user-id");
+    const storesCard = document.getElementById("stores-card");
+    const storesContainer = document.getElementById("stores");
+    const devicesCard = document.getElementById("devices-card");
+    const devicesContainer = document.getElementById("devices");
+    const devicesLoader = document.getElementById("devices-loader");
+    const devicesTitle = document.getElementById("devices-title");
 
     function showMessage(text, type = "info") {
         messageBox.textContent = text || "";
-        messageBox.className =
-            `message visible ${type}`;
+        messageBox.className = `message visible ${type}`;
     }
-
 
     function hideMessage() {
         messageBox.textContent = "";
         messageBox.className = "message";
     }
 
-
-    async function apiRequest(
-        url,
-        body,
-        useSession = true,
-    ) {
+    async function apiRequest(url, body) {
         const headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
         };
 
-        if (useSession && sessionToken) {
-            headers["X-Cash-Reboot-Token"] =
-                sessionToken;
+        if (sessionToken) {
+            headers["X-Cash-Reboot-Token"] = sessionToken;
         }
 
-        const response = await fetch(
-            url,
-            {
-                method: "POST",
-                headers,
-                body: JSON.stringify(body || {}),
-                credentials: "omit",
-            },
-        );
+        const response = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body || {}),
+            credentials: "omit",
+        });
 
         let data;
 
@@ -351,98 +332,76 @@
         } catch (_) {
             data = {
                 status: "error",
-                message:
-                    `Сервер вернул HTTP ${response.status}`,
+                message: `Сервер вернул HTTP ${response.status}`,
             };
         }
 
         if (!response.ok || data.status !== "ok") {
-            const error = new Error(
-                data.message || "Ошибка запроса"
-            );
-
+            const error = new Error(data.message || "Ошибка запроса");
             error.status = response.status;
             error.code = data.code || "error";
-
             throw error;
         }
 
         return data;
     }
 
-
-    function resetApplication() {
+    function resetStoreSelection() {
         selectedStore = null;
-
         storesContainer.replaceChildren();
         devicesContainer.replaceChildren();
-
         storesCard.classList.add("hidden");
         devicesCard.classList.add("hidden");
     }
 
+    function returnToIdentification() {
+        sessionToken = launchToken;
+        resetStoreSelection();
+        userCard.classList.add("hidden");
+        identifyCard.classList.remove("hidden");
+        fioInput.disabled = false;
+        identifyButton.disabled = false;
+        identifyButton.textContent = "Продолжить";
+        fioInput.focus();
+    }
 
     function renderStores(stores) {
         storesContainer.replaceChildren();
 
         if (!stores.length) {
-            showMessage(
-                "У пользователя нет доступных магазинов",
-                "warning",
-            );
+            storesCard.classList.add("hidden");
+            showMessage("У пользователя нет доступных магазинов", "warning");
             return;
         }
 
         for (const store of stores) {
-            const card =
-                document.createElement("div");
-
+            const card = document.createElement("div");
             card.className = "store";
 
-            const title =
-                document.createElement("div");
-
+            const title = document.createElement("div");
             title.className = "title";
             title.textContent =
-                store.store_name
-                || `Магазин ${store.ukm_store_id}`;
+                store.store_name || `Магазин ${store.ukm_store_id}`;
 
-            const ukmMeta =
-                document.createElement("div");
-
+            const ukmMeta = document.createElement("div");
             ukmMeta.className = "meta";
-            ukmMeta.textContent =
-                `UKM store: ${store.ukm_store_id}`;
+            ukmMeta.textContent = `UKM store: ${store.ukm_store_id}`;
 
-            const smMeta =
-                document.createElement("div");
-
+            const smMeta = document.createElement("div");
             smMeta.className = "meta";
-            smMeta.textContent =
-                `SM store: ${store.sm_store_id ?? "—"}`;
+            smMeta.textContent = `SM store: ${store.sm_store_id ?? "—"}`;
 
-            const button =
-                document.createElement("button");
-
+            const button = document.createElement("button");
             button.type = "button";
             button.textContent = "Показать кассы";
+            button.addEventListener("click", () => loadDevices(store));
 
-            button.addEventListener(
-                "click",
-                () => loadDevices(store),
-            );
-
-            card.append(
-                title,
-                ukmMeta,
-                smMeta,
-                button,
-            );
-
+            card.append(title, ukmMeta, smMeta, button);
             storesContainer.appendChild(card);
         }
-    }
 
+        storesCard.classList.remove("hidden");
+    }
 
     function deviceKind(device) {
         if (device.ukm5) {
@@ -460,165 +419,94 @@
         return "Неизвестный тип";
     }
 
-
     function renderDevices(devices) {
         devicesContainer.replaceChildren();
 
         if (!devices.length) {
-            const empty =
-                document.createElement("div");
-
+            const empty = document.createElement("div");
             empty.className = "hint";
-            empty.textContent =
-                "В этом магазине не найдено доступных касс.";
-
+            empty.textContent = "В этом магазине не найдено доступных касс.";
             devicesContainer.appendChild(empty);
             return;
         }
 
         for (const device of devices) {
-            const card =
-                document.createElement("div");
-
+            const card = document.createElement("div");
             card.className = "device";
 
-            const title =
-                document.createElement("div");
-
+            const title = document.createElement("div");
             title.className = "title";
-            title.textContent =
-                device.name || "Касса без названия";
+            title.textContent = device.name || "Касса без названия";
 
-            const kind =
-                document.createElement("div");
-
+            const kind = document.createElement("div");
             kind.className = "meta";
-            kind.textContent =
-                `Тип: ${deviceKind(device)}`;
+            kind.textContent = `Тип: ${deviceKind(device)}`;
 
-            const ip =
-                document.createElement("div");
-
+            const ip = document.createElement("div");
             ip.className = "meta";
-            ip.textContent =
-                `IP: ${device.ip || "—"}`;
+            ip.textContent = `IP: ${device.ip || "—"}`;
 
-            const cashId =
-                document.createElement("div");
-
+            const cashId = document.createElement("div");
             cashId.className = "meta";
-            cashId.textContent =
-                `cash_id: ${device.cash_id || "—"}`;
+            cashId.textContent = `cash_id: ${device.cash_id || "—"}`;
 
-            const button =
-                document.createElement("button");
-
+            const button = document.createElement("button");
             button.type = "button";
             button.textContent = "Перезагрузить";
-
             button.addEventListener(
                 "click",
-                () => rebootDevice(
-                    device,
-                    button,
-                ),
+                () => rebootDevice(device, button),
             );
 
-            card.append(
-                title,
-                kind,
-                ip,
-                cashId,
-                button,
-            );
-
+            card.append(title, kind, ip, cashId, button);
             devicesContainer.appendChild(card);
         }
     }
 
-
     async function loadDevices(store) {
         selectedStore = store;
-
         devicesCard.classList.remove("hidden");
         devicesLoader.classList.remove("hidden");
-
         devicesContainer.replaceChildren();
-
         devicesTitle.textContent =
-            `Кассы: ${
-                store.store_name
-                || `магазин ${store.ukm_store_id}`
-            }`;
-
+            `Кассы: ${store.store_name || `магазин ${store.ukm_store_id}`}`;
         hideMessage();
 
         try {
-            const data = await apiRequest(
-                devicesUrl,
-                {
-                    ukm_store_id:
-                        store.ukm_store_id,
-                },
-            );
+            const data = await apiRequest(devicesUrl, {
+                ukm_store_id: store.ukm_store_id,
+            });
 
-            renderDevices(
-                data.devices || [],
-            );
+            renderDevices(data.devices || []);
 
-            const warnings =
-                data.warnings || [];
-
+            const warnings = data.warnings || [];
             if (warnings.length) {
-                showMessage(
-                    warnings.join("\n"),
-                    "warning",
-                );
+                showMessage(warnings.join("\n"), "warning");
             }
-
         } catch (error) {
-            if (
-                error.status === 401
-                || error.code === "session_error"
-            ) {
-                resetApplication();
+            if (error.status === 401 || error.code === "session_error") {
+                returnToIdentification();
             }
 
-            showMessage(
-                error.message,
-                "error",
-            );
-
+            showMessage(error.message, "error");
         } finally {
             devicesLoader.classList.add("hidden");
         }
     }
 
-
-    async function rebootDevice(
-        device,
-        button,
-    ) {
+    async function rebootDevice(device, button) {
         if (!selectedStore) {
-            showMessage(
-                "Сначала выберите магазин",
-                "error",
-            );
+            showMessage("Сначала выберите магазин", "error");
             return;
         }
 
         const confirmed = window.confirm(
             "Перезагрузить кассу?\n\n"
-            + `Магазин: ${
-                selectedStore.store_name
-                || selectedStore.ukm_store_id
-            }\n`
-            + `Касса: ${
-                device.name || "без названия"
-            }\n`
+            + `Магазин: ${selectedStore.store_name || selectedStore.ukm_store_id}\n`
+            + `Касса: ${device.name || "без названия"}\n`
             + `IP: ${device.ip}\n`
             + `Тип: ${deviceKind(device)}\n\n`
-            + "Работа кассы будет прервана."
+            + "Работа кассы будет прервана.",
         );
 
         if (!confirmed) {
@@ -626,70 +514,87 @@
         }
 
         button.disabled = true;
-        button.textContent =
-            "Отправляем команду…";
-
+        button.textContent = "Отправляем команду…";
         hideMessage();
 
         try {
-            const data = await apiRequest(
-                rebootUrl,
-                {
-                    ukm_store_id:
-                        selectedStore.ukm_store_id,
-                    cash_id:
-                        device.cash_id,
-                    ip:
-                        device.ip,
-                },
-            );
+            const data = await apiRequest(rebootUrl, {
+                ukm_store_id: selectedStore.ukm_store_id,
+                cash_id: device.cash_id,
+                ip: device.ip,
+            });
 
             showMessage(
-                data.message
-                || "Команда перезагрузки отправлена",
+                data.message || "Команда перезагрузки отправлена",
                 "success",
             );
-
-            button.textContent =
-                "Команда отправлена";
-
+            button.textContent = "Команда отправлена";
         } catch (error) {
-            if (
-                error.status === 401
-                || error.code === "session_error"
-            ) {
-                resetApplication();
+            if (error.status === 401 || error.code === "session_error") {
+                returnToIdentification();
             }
 
-            showMessage(
-                error.message,
-                "error",
-            );
-
+            showMessage(error.message, "error");
             button.disabled = false;
-            button.textContent =
-                "Перезагрузить";
+            button.textContent = "Перезагрузить";
         }
     }
 
+    identifyForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        hideMessage();
 
-    userName.textContent =
-        bootstrap.user?.full_name || "—";
+        const fio = String(fioInput.value || "").trim();
+        if (!fio) {
+            showMessage("Введите ФИО сотрудника", "error");
+            return;
+        }
+
+        identifyButton.disabled = true;
+        identifyButton.textContent = "Проверяем…";
+        fioInput.disabled = true;
+
+        try {
+            sessionToken = launchToken;
+            const data = await apiRequest(identifyUrl, {fio});
+            sessionToken = String(data.session_token || "");
+
+            if (!sessionToken) {
+                throw new Error("Сервер не вернул сессию пользователя");
+            }
+
+            userName.textContent = data.user?.full_name || fio;
+            identifyCard.classList.add("hidden");
+            userCard.classList.remove("hidden");
+            renderStores(data.stores || []);
+            showMessage("Сотрудник подтверждён. Выберите магазин.", "success");
+        } catch (error) {
+            sessionToken = launchToken;
+            showMessage(error.message, "error");
+            fioInput.disabled = false;
+            identifyButton.disabled = false;
+            identifyButton.textContent = "Продолжить";
+        }
+    });
+
+    changeUserButton.addEventListener("click", () => {
+        fioInput.value = "";
+        returnToIdentification();
+        hideMessage();
+    });
+
+    bitrixAccountName.textContent =
+        bootstrap.bitrix_user?.full_name || "—";
 
     bitrixUserId.textContent =
-        `Bitrix24 ID: ${
-            bootstrap.user?.bitrix_user_id ?? "—"
-        }`;
-
-    renderStores(
-        bootstrap.stores || [],
-    );
+        `Bitrix24 ID: ${bootstrap.bitrix_user?.bitrix_user_id ?? "—"}`;
 
     showMessage(
-        "Авторизация Bitrix24 подтверждена. "
-        + "Выберите магазин.",
+        "Авторизация Bitrix24 подтверждена. Введите ФИО фактического сотрудника.",
         "success",
     );
+
+    fioInput.focus();
 </script>
 </body>
 </html>
