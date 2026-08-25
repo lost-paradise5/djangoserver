@@ -35,6 +35,17 @@
         .error {
             color: #991b1b;
         }
+
+        .details {
+            margin: 18px 0;
+            padding: 14px;
+            border-radius: 10px;
+            background: #f8fafc;
+            color: #475569;
+            font-size: 14px;
+            line-height: 1.55;
+            overflow-wrap: anywhere;
+        }
     </style>
 
     <script src="https://api.bitrix24.com/api/v1/"></script>
@@ -50,6 +61,15 @@
     >
         Завершаем установку приложения…
     </p>
+
+    <div class="details">
+        Портал: {{ bitrix_identity.domain }}<br>
+        member_id: {{ bitrix_identity.member_id|default:"—" }}<br>
+        ID приложения: {{ bitrix_identity.app_id|default:"—" }}<br>
+        Код приложения: {{ bitrix_identity.app_code|default:"—" }}<br>
+        Установил: {{ bitrix_identity.full_name }}
+        (Bitrix24 ID {{ bitrix_identity.bitrix_user_id }})
+    </div>
 </div>
 
 <script>
