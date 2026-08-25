@@ -205,10 +205,9 @@
         <h1>Перезагрузка касс</h1>
 
         <p class="hint">
-            Введите ФИО точно так же, как оно указано
-            в системе сотрудников. После этого будут
-            показаны магазины, в которых у вас есть
-            права администратора.
+            Пользователь подтверждён через Bitrix24.
+            Показаны только магазины, в которых у этого
+            сотрудника есть права администратора.
         </p>
 
         <div
@@ -216,53 +215,22 @@
             class="message"
         ></div>
 
-        <div id="identify-block">
-            <form id="identify-form">
-                <div class="row">
-                    <input
-                        id="fio"
-                        name="fio"
-                        type="text"
-                        autocomplete="name"
-                        maxlength="255"
-                        placeholder="Например: Иванов Иван Иванович"
-                        required
-                    >
+        <div class="user-bar">
+            <div>
+                Пользователь:
+                <strong id="user-name"></strong>
 
-                    <button
-                        id="identify-button"
-                        type="submit"
-                    >
-                        Продолжить
-                    </button>
-                </div>
-            </form>
-        </div>
-
-        <div
-            id="user-block"
-            class="hidden"
-        >
-            <div class="user-bar">
-                <div>
-                    Пользователь:
-                    <strong id="user-name"></strong>
-                </div>
-
-                <button
-                    id="change-user"
-                    class="secondary"
-                    type="button"
-                >
-                    Ввести другое ФИО
-                </button>
+                <div
+                    id="bitrix-user-id"
+                    class="meta"
+                ></div>
             </div>
         </div>
     </div>
 
     <div
         id="stores-card"
-        class="card hidden"
+        class="card"
     >
         <h2>Выберите магазин</h2>
         <div
@@ -291,9 +259,14 @@
     </div>
 </div>
 
+{{ bootstrap|json_script:"cash-reboot-bootstrap" }}
+
 <script>
-    const identifyUrl =
-        "{% url 'bitrix_cash_reboot_identify' %}";
+    const bootstrap = JSON.parse(
+        document.getElementById(
+            "cash-reboot-bootstrap"
+        ).textContent,
+    );
 
     const devicesUrl =
         "{% url 'bitrix_cash_reboot_devices' %}";
@@ -301,29 +274,19 @@
     const rebootUrl =
         "{% url 'bitrix_cash_reboot_execute' %}";
 
-    let sessionToken = "";
+    const sessionToken =
+        bootstrap.session_token || "";
+
     let selectedStore = null;
 
     const messageBox =
         document.getElementById("message");
 
-    const identifyForm =
-        document.getElementById("identify-form");
-
-    const identifyButton =
-        document.getElementById("identify-button");
-
-    const fioInput =
-        document.getElementById("fio");
-
-    const identifyBlock =
-        document.getElementById("identify-block");
-
-    const userBlock =
-        document.getElementById("user-block");
-
     const userName =
         document.getElementById("user-name");
+
+    const bitrixUserId =
+        document.getElementById("bitrix-user-id");
 
     const storesCard =
         document.getElementById("stores-card");
@@ -342,10 +305,6 @@
 
     const devicesTitle =
         document.getElementById("devices-title");
-
-    const changeUserButton =
-        document.getElementById("change-user");
-
 
     function showMessage(text, type = "info") {
         messageBox.textContent = text || "";
@@ -413,26 +372,13 @@
 
 
     function resetApplication() {
-        sessionToken = "";
         selectedStore = null;
-
-        userName.textContent = "";
 
         storesContainer.replaceChildren();
         devicesContainer.replaceChildren();
 
-        identifyBlock.classList.remove("hidden");
-        userBlock.classList.add("hidden");
         storesCard.classList.add("hidden");
         devicesCard.classList.add("hidden");
-
-        identifyButton.disabled = false;
-        fioInput.disabled = false;
-
-        fioInput.value = "";
-        fioInput.focus();
-
-        hideMessage();
     }
 
 
@@ -727,83 +673,23 @@
     }
 
 
-    identifyForm.addEventListener(
-        "submit",
-        async (event) => {
-            event.preventDefault();
+    userName.textContent =
+        bootstrap.user?.full_name || "—";
 
-            hideMessage();
+    bitrixUserId.textContent =
+        `Bitrix24 ID: ${
+            bootstrap.user?.bitrix_user_id ?? "—"
+        }`;
 
-            const fio =
-                fioInput.value.trim();
-
-            if (!fio) {
-                showMessage(
-                    "Введите ФИО",
-                    "error",
-                );
-                return;
-            }
-
-            identifyButton.disabled = true;
-            fioInput.disabled = true;
-
-            identifyButton.textContent =
-                "Ищем пользователя…";
-
-            try {
-                const data = await apiRequest(
-                    identifyUrl,
-                    {fio},
-                    false,
-                );
-
-                sessionToken =
-                    data.session_token || "";
-
-                userName.textContent =
-                    data.user?.full_name || fio;
-
-                identifyBlock.classList.add("hidden");
-                userBlock.classList.remove("hidden");
-                storesCard.classList.remove("hidden");
-                devicesCard.classList.add("hidden");
-
-                renderStores(
-                    data.stores || [],
-                );
-
-                showMessage(
-                    "Пользователь найден. "
-                    + "Выберите магазин.",
-                    "success",
-                );
-
-            } catch (error) {
-                showMessage(
-                    error.message,
-                    "error",
-                );
-
-                identifyButton.disabled = false;
-                fioInput.disabled = false;
-                fioInput.focus();
-
-            } finally {
-                identifyButton.textContent =
-                    "Продолжить";
-            }
-        },
+    renderStores(
+        bootstrap.stores || [],
     );
 
-
-    changeUserButton.addEventListener(
-        "click",
-        resetApplication,
+    showMessage(
+        "Авторизация Bitrix24 подтверждена. "
+        + "Выберите магазин.",
+        "success",
     );
-
-
-    fioInput.focus();
 </script>
 </body>
 </html>
