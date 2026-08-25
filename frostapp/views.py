@@ -91,15 +91,22 @@ from django.core.cache import cache
 from django.views.decorators.clickjacking import xframe_options_exempt
 
 from frostapp.services.bitrix_cash_reboot import (
+    BitrixLaunchIdentity,
+    CashRebootBitrixAuthError,
+    CashRebootBitrixUnavailable,
     CashRebootIdentityError,
+    CashRebootUserSession,
     CashRebootUserNotFound,
     CashRebootUserAmbiguous,
     CashRebootSessionError,
+    create_launch_token,
     create_user_token,
     find_active_user_by_fio,
+    get_bitrix_identity_from_launch_token,
     get_session_ttl_seconds,
-    get_user_from_token,
+    get_user_session_from_token,
     normalize_fio,
+    verify_bitrix_launch,
 )
 
 
@@ -14713,8 +14720,10 @@ def _bitrix_cash_reboot_token(request) -> str:
     ).strip()
 
 
-def _bitrix_cash_reboot_user(request) -> User:
-    return get_user_from_token(
+def _bitrix_cash_reboot_session(
+    request,
+) -> CashRebootUserSession:
+    return get_user_session_from_token(
         _bitrix_cash_reboot_token(request)
     )
 
@@ -14772,6 +14781,9 @@ def _bitrix_write_reboot_log(
     device: Optional[dict] = None,
     error_message: str = "",
     extra: Optional[dict] = None,
+    bitrix_identity: Optional[
+        BitrixLaunchIdentity
+    ] = None,
 ) -> None:
     """
     Записывает действие Bitrix-приложения
@@ -14780,6 +14792,17 @@ def _bitrix_write_reboot_log(
     body = body or {}
     device = device or {}
     extra = extra or {}
+
+    bitrix_context = {}
+
+    if bitrix_identity:
+        bitrix_context = {
+            "user_id": bitrix_identity.bitrix_user_id,
+            "full_name": bitrix_identity.full_name,
+            "domain": bitrix_identity.domain,
+            "member_id": bitrix_identity.member_id,
+            "app_id": bitrix_identity.app_id,
+        }
 
     def safe_int(value):
         try:
@@ -14846,7 +14869,8 @@ def _bitrix_write_reboot_log(
                 error_message or ""
             ),
             raw_request={
-                "source": "bitrix24_fio",
+                "source": "bitrix24_verified_manual_fio",
+                "bitrix": bitrix_context,
                 "request": {
                     "ukm_store_id": body.get(
                         "ukm_store_id"
@@ -14889,25 +14913,76 @@ def bitrix_cash_reboot_health(request):
 @never_cache
 @require_http_methods(["GET", "POST"])
 def bitrix_cash_reboot_app(request):
-    """
-    Главная страница приложения.
-
-    При открытии через Bitrix24 обычно приходит POST.
-    GET оставлен для проверки через обычный браузер.
-    """
     if not BITRIX_CASH_REBOOT_ENABLED:
         return HttpResponse(
             "Приложение временно отключено",
             status=503,
         )
 
+    try:
+        bitrix_identity = verify_bitrix_launch(
+            request,
+            require_installed=True,
+        )
+    except CashRebootBitrixUnavailable as exc:
+        logger.warning(
+            "[BITRIX/POS/AUTH] Bitrix24 unavailable: %s",
+            exc,
+        )
+
+        return render(
+            request,
+            "frostapp/bitrix_cash_reboot_denied.html",
+            {"message": str(exc)},
+            status=502,
+        )
+    except CashRebootBitrixAuthError as exc:
+        logger.warning(
+            "[BITRIX/POS/AUTH] launch rejected: %s",
+            exc,
+        )
+
+        return render(
+            request,
+            "frostapp/bitrix_cash_reboot_denied.html",
+            {"message": str(exc)},
+            status=403,
+        )
+
+    launch_token = create_launch_token(
+        bitrix_identity
+    )
+
+    logger.info(
+        "[BITRIX/POS/AUTH] launch verified: "
+        "domain=%s member_id=%s app_id=%s app_code=%r "
+        "bitrix_user_id=%s bitrix_fio=%r",
+        bitrix_identity.domain,
+        bitrix_identity.member_id,
+        bitrix_identity.app_id,
+        bitrix_identity.app_code,
+        bitrix_identity.bitrix_user_id,
+        bitrix_identity.full_name,
+    )
+
     return render(
         request,
         "frostapp/bitrix_cash_reboot.html",
         {
-            "session_ttl_seconds": (
-                get_session_ttl_seconds()
-            ),
+            "bootstrap": {
+                "launch_token": launch_token,
+                "session_ttl_seconds": (
+                    get_session_ttl_seconds()
+                ),
+                "bitrix_user": {
+                    "full_name": normalize_fio(
+                        bitrix_identity.full_name
+                    ),
+                    "bitrix_user_id": (
+                        bitrix_identity.bitrix_user_id
+                    ),
+                },
+            },
         },
     )
 
@@ -14917,18 +14992,56 @@ def bitrix_cash_reboot_app(request):
 @never_cache
 @require_http_methods(["GET", "POST"])
 def bitrix_cash_reboot_install(request):
-    """
-    Страница первоначальной установки Bitrix24.
-    """
     if not BITRIX_CASH_REBOOT_ENABLED:
         return HttpResponse(
             "Приложение временно отключено",
             status=503,
         )
 
+    try:
+        bitrix_identity = verify_bitrix_launch(
+            request,
+            require_installed=False,
+        )
+    except CashRebootBitrixUnavailable as exc:
+        return render(
+            request,
+            "frostapp/bitrix_cash_reboot_denied.html",
+            {"message": str(exc)},
+            status=502,
+        )
+    except CashRebootBitrixAuthError as exc:
+        logger.warning(
+            "[BITRIX/POS/INSTALL] rejected: %s",
+            exc,
+        )
+
+        return render(
+            request,
+            "frostapp/bitrix_cash_reboot_denied.html",
+            {"message": str(exc)},
+            status=403,
+        )
+
+    logger.info(
+        "[BITRIX/POS/INSTALL] verified: "
+        "domain=%s member_id=%s app_id=%s app_code=%r "
+        "bitrix_user_id=%s fio=%r installed=%s",
+        bitrix_identity.domain,
+        bitrix_identity.member_id,
+        bitrix_identity.app_id,
+        bitrix_identity.app_code,
+        bitrix_identity.bitrix_user_id,
+        bitrix_identity.full_name,
+        bitrix_identity.app_installed,
+    )
+
     return render(
         request,
         "frostapp/bitrix_cash_reboot_install.html",
+        {
+            "bitrix_identity": bitrix_identity,
+        },
     )
 
 
@@ -14944,6 +15057,19 @@ def bitrix_cash_reboot_identify(request):
             "Приложение отключено",
             status=503,
             code="disabled",
+        )
+
+    try:
+        bitrix_identity = (
+            get_bitrix_identity_from_launch_token(
+                _bitrix_cash_reboot_token(request)
+            )
+        )
+    except CashRebootSessionError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=401,
+            code="session_error",
         )
 
     try:
@@ -15011,6 +15137,7 @@ def bitrix_cash_reboot_identify(request):
             extra={
                 "stage": "identify",
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15020,7 +15147,10 @@ def bitrix_cash_reboot_identify(request):
             code="no_stores",
         )
 
-    token = create_user_token(user)
+    token = create_user_token(
+        user,
+        bitrix_identity,
+    )
 
     logger.info(
         "[BITRIX/POS] Пользователь определён: "
@@ -15064,9 +15194,11 @@ def bitrix_cash_reboot_devices(request):
         )
 
     try:
-        user = _bitrix_cash_reboot_user(
+        user_session = _bitrix_cash_reboot_session(
             request
         )
+        user = user_session.user
+        bitrix_identity = user_session.bitrix_identity
     except CashRebootSessionError as exc:
         return _bitrix_cash_reboot_error(
             str(exc),
@@ -15107,6 +15239,7 @@ def bitrix_cash_reboot_devices(request):
             extra={
                 "stage": "devices_access_check",
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15132,6 +15265,7 @@ def bitrix_cash_reboot_devices(request):
             extra={
                 "stage": "load_devices",
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15176,9 +15310,11 @@ def bitrix_cash_reboot_execute(request):
         )
 
     try:
-        user = _bitrix_cash_reboot_user(
+        user_session = _bitrix_cash_reboot_session(
             request
         )
+        user = user_session.user
+        bitrix_identity = user_session.bitrix_identity
     except CashRebootSessionError as exc:
         return _bitrix_cash_reboot_error(
             str(exc),
@@ -15241,6 +15377,7 @@ def bitrix_cash_reboot_execute(request):
             extra={
                 "stage": "ip_allowlist",
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15268,6 +15405,7 @@ def bitrix_cash_reboot_execute(request):
             extra={
                 "stage": "reboot_store_access",
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15291,6 +15429,7 @@ def bitrix_cash_reboot_execute(request):
             extra={
                 "stage": "reboot_load_devices",
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15330,6 +15469,7 @@ def bitrix_cash_reboot_execute(request):
                 "stage": "device_access_check",
                 "warnings": warnings,
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15381,6 +15521,7 @@ def bitrix_cash_reboot_execute(request):
             extra={
                 "stage": "ssh_password",
             },
+            bitrix_identity=bitrix_identity,
         )
 
         return _bitrix_cash_reboot_error(
@@ -15463,20 +15604,25 @@ def bitrix_cash_reboot_execute(request):
             device=device,
             extra={
                 "stage": "ssh_reboot",
-                "source": "bitrix24_fio",
+                "source": "bitrix24_verified_manual_fio",
                 "ssh_user": username,
                 "ssh_port": POS_SSH_PORT,
                 "cmd": cmd_hint,
                 "result": result,
             },
+            bitrix_identity=bitrix_identity,
         )
 
         message_lines = [
             "🔁 Перезагрузка кассы из Bitrix24",
             "",
-            "👤 Инициатор:",
+            "🔐 Учётная запись Bitrix24:",
+            f"  • {bitrix_identity.full_name}",
+            f"  • Bitrix24 ID: {bitrix_identity.bitrix_user_id}",
+            "",
+            "👤 Фактический сотрудник:",
             f"  • {initiator_name}",
-            f"  • user_id: {user.id}",
+            f"  • local user_id: {user.id}",
             "",
             "🏬 Магазин:",
             f"  • ukm_store_id: {device.get('ukm_store_id')}",
@@ -15491,8 +15637,13 @@ def bitrix_cash_reboot_execute(request):
             "✅ Команда отправлена",
         ]
 
-        _send_telegram_log_async(
-            "\n".join(message_lines)
+        message_text = "\n".join(
+            message_lines
+        )
+        
+        
+        _send_max_log_async(
+            message_text
         )
 
         return JsonResponse(
@@ -15538,19 +15689,24 @@ def bitrix_cash_reboot_execute(request):
             error_message=str(exc),
             extra={
                 "stage": "ssh_reboot",
-                "source": "bitrix24_fio",
+                "source": "bitrix24_verified_manual_fio",
                 "ssh_user": username,
                 "ssh_port": POS_SSH_PORT,
                 "cmd": cmd_hint,
             },
+            bitrix_identity=bitrix_identity,
         )
 
         message_lines = [
             "❌ Ошибка перезагрузки кассы из Bitrix24",
             "",
-            "👤 Инициатор:",
+            "🔐 Учётная запись Bitrix24:",
+            f"  • {bitrix_identity.full_name}",
+            f"  • Bitrix24 ID: {bitrix_identity.bitrix_user_id}",
+            "",
+            "👤 Фактический сотрудник:",
             f"  • {initiator_name}",
-            f"  • user_id: {user.id}",
+            f"  • local user_id: {user.id}",
             "",
             "🏬 Магазин:",
             f"  • ukm_store_id: {device.get('ukm_store_id')}",
@@ -15565,8 +15721,13 @@ def bitrix_cash_reboot_execute(request):
             f"🧨 Ошибка: {exc}",
         ]
 
-        _send_telegram_log_async(
-            "\n".join(message_lines)
+        message_text = "\n".join(
+            message_lines
+        )
+        
+        
+        _send_max_log_async(
+            message_text
         )
 
         return _bitrix_cash_reboot_error(
