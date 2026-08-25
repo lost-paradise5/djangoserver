@@ -1,19 +1,3 @@
-"""
-URL configuration for frostproject project.
-
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/5.1/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
-"""
 from django.contrib import admin
 from django.urls import path, re_path
 from django.conf import settings
@@ -170,38 +154,6 @@ urlpatterns = [
         name="ukm_rotation_run_status",
     ),
 
-
-    path(
-        "bitrix/cash-reboot/",
-        views.bitrix_cash_reboot_app,
-        name="bitrix_cash_reboot_app",
-    ),
-    path(
-        "bitrix/cash-reboot/install/",
-        views.bitrix_cash_reboot_install,
-        name="bitrix_cash_reboot_install",
-    ),
-    path(
-        "bitrix/cash-reboot/health/",
-        views.bitrix_cash_reboot_health,
-        name="bitrix_cash_reboot_health",
-    ),
-    path(
-        "bitrix/cash-reboot/api/identify/",
-        views.bitrix_cash_reboot_identify,
-        name="bitrix_cash_reboot_identify",
-    ),
-    path(
-        "bitrix/cash-reboot/api/devices/",
-        views.bitrix_cash_reboot_devices,
-        name="bitrix_cash_reboot_devices",
-    ),
-    path(
-        "bitrix/cash-reboot/api/reboot/",
-        views.bitrix_cash_reboot_execute,
-        name="bitrix_cash_reboot_execute",
-    ),
-
     path(
         "ui/working-employees-position-sync/",
         views.working_employees_positions_sync_page,
@@ -217,19 +169,7 @@ urlpatterns = [
         views.working_employees_positions_sync_download,
         name="working_employees_positions_sync_download",
     ),
-
-
-
-
-
-
-
-
-
-
-
-
-
+    
     path("maxbot/", views.maxbot_dashboard, name="maxbot_dashboard"),
 
     path("maxbot/roles/", views.maxbot_role_list, name="maxbot_role_list"),
