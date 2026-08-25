@@ -34,7 +34,7 @@ LOGGING = {
     },
 
     "loggers": {
-        "frostapp.views": {
+        "ukm_logger": {
             "handlers": ["bitrix_console"],
             "level": "INFO",
             "propagate": False,
