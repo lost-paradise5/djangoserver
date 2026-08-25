@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+    <title>Доступ запрещён</title>
+
+    <style>
+        :root {
+            color-scheme: light;
+            font-family: Arial, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px;
+            background: #f3f6f9;
+            color: #172033;
+        }
+
+        .card {
+            max-width: 700px;
+            margin: 40px auto;
+            padding: 24px;
+            background: #ffffff;
+            border-radius: 14px;
+            box-shadow: 0 7px 24px rgba(27, 43, 75, .09);
+        }
+
+        h1 {
+            margin-top: 0;
+            color: #991b1b;
+        }
+
+        p {
+            margin-bottom: 0;
+            color: #475569;
+            line-height: 1.55;
+        }
+    </style>
+</head>
+
+<body>
+<div class="card">
+    <h1>Доступ запрещён</h1>
+
+    <p>
+        {{ message|default:"Откройте приложение из меню Bitrix24." }}
+    </p>
+</div>
+</body>
+</html>
