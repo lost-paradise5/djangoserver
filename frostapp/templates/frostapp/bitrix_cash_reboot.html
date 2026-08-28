@@ -22,6 +22,10 @@
             color: #172033;
         }
 
+        body.modal-open {
+            overflow: hidden;
+        }
+
         .container {
             max-width: 1080px;
             margin: 0 auto;
@@ -36,7 +40,8 @@
         }
 
         h1,
-        h2 {
+        h2,
+        h3 {
             margin-top: 0;
         }
 
@@ -47,7 +52,7 @@
         }
 
         .meta {
-            margin-top: 4px;
+            margin-top: 5px;
             font-size: 13px;
             overflow-wrap: anywhere;
         }
@@ -62,6 +67,10 @@
 
         .user-bar {
             justify-content: space-between;
+        }
+
+        .account-block {
+            margin-top: 14px;
         }
 
         input {
@@ -90,7 +99,7 @@
 
         button:disabled {
             opacity: .55;
-            cursor: wait;
+            cursor: not-allowed;
         }
 
         .secondary {
@@ -101,15 +110,27 @@
             background: #475569;
         }
 
+        .reserve-button {
+            margin-top: 12px;
+            background: #7c3aed;
+        }
+
+        .reserve-button:hover {
+            background: #6d28d9;
+        }
+
         .store-grid,
-        .device-grid {
+        .device-grid,
+        .badge-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            grid-template-columns:
+                repeat(auto-fit, minmax(260px, 1fr));
             gap: 12px;
         }
 
         .store,
-        .device {
+        .device,
+        .badge-choice {
             padding: 16px;
             border: 1px solid #dce4ef;
             border-radius: 12px;
@@ -168,13 +189,134 @@
             color: #991b1b;
         }
 
-        .hidden {
-            display: none;
-        }
-
         .loader {
+            padding: 20px 0;
             color: #64748b;
             font-weight: 700;
+            text-align: center;
+        }
+
+        .modal {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+            display: grid;
+            place-items: center;
+            padding: 16px;
+            background: rgba(15, 23, 42, .58);
+            backdrop-filter: blur(3px);
+        }
+
+        .modal-panel {
+            width: min(620px, 100%);
+            max-height: calc(100vh - 32px);
+            overflow-y: auto;
+            padding: 22px;
+            border-radius: 16px;
+            background: #fff;
+            box-shadow: 0 24px 70px rgba(15, 23, 42, .28);
+        }
+
+        .modal-panel-wide {
+            width: min(980px, 100%);
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+
+        .modal-header h2 {
+            margin: 0;
+        }
+
+        .back-button {
+            width: 44px;
+            height: 44px;
+            flex: 0 0 44px;
+            padding: 0;
+            border-radius: 50%;
+            background: #e8eef7;
+            color: #172033;
+            font-size: 24px;
+            line-height: 1;
+        }
+
+        .back-button:hover {
+            background: #d8e2ef;
+        }
+
+        .badge-choice {
+            width: 100%;
+            min-height: 94px;
+            color: #172033;
+            text-align: left;
+            background: #f8fafc;
+            transition: .15s ease;
+        }
+
+        .badge-choice:hover {
+            color: #1e40af;
+            background: #eff6ff;
+            border-color: #93c5fd;
+        }
+
+        .badge-choice strong {
+            display: block;
+            margin-bottom: 7px;
+            font-size: 17px;
+        }
+
+        .badge-choice span {
+            color: #64748b;
+            font-weight: 400;
+            line-height: 1.4;
+        }
+
+        .warning-panel {
+            padding: 16px;
+            border: 1px solid #fbbf24;
+            border-radius: 12px;
+            background: #fffbeb;
+            color: #92400e;
+            line-height: 1.55;
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 18px;
+            flex-wrap: wrap;
+        }
+
+        .qr-result {
+            text-align: center;
+        }
+
+        .qr-frame {
+            display: inline-flex;
+            justify-content: center;
+            align-items: center;
+            margin-top: 12px;
+            padding: 15px;
+            border: 1px solid #dce4ef;
+            border-radius: 16px;
+            background: #fff;
+            box-shadow: 0 8px 28px rgba(15, 23, 42, .10);
+        }
+
+        .qr-frame img {
+            display: block;
+            width: min(330px, 72vw);
+            height: auto;
+            image-rendering: pixelated;
+        }
+
+        .hidden {
+            display: none !important;
         }
 
         @media (max-width: 650px) {
@@ -182,11 +324,25 @@
                 padding: 10px;
             }
 
-            .card {
+            .card,
+            .modal-panel {
                 padding: 16px;
             }
 
-            .row button {
+            .row button,
+            .reserve-button {
+                width: 100%;
+            }
+
+            .modal {
+                padding: 8px;
+            }
+
+            .modal-panel {
+                max-height: calc(100vh - 16px);
+            }
+
+            .modal-actions button {
                 width: 100%;
             }
         }
@@ -198,16 +354,23 @@
     <div class="card">
         <h1>Перезагрузка касс</h1>
 
-        <p class="hint">
-            Вход через Bitrix24 подтверждён. Укажите ФИО фактического
-            сотрудника, который выполняет перезагрузку кассы.
-        </p>
-
-        <div class="user-bar">
+        <div class="account-block">
             <div>
                 Учётная запись Bitrix24:
                 <strong id="bitrix-account-name">—</strong>
-                <div id="bitrix-user-id" class="meta">Bitrix24 ID: —</div>
+            </div>
+
+            <button
+                id="reserve-badge-button"
+                class="reserve-button"
+                type="button"
+                disabled
+            >
+                Запросить резервный бейдж для касс
+            </button>
+
+            <div id="reserve-badge-hint" class="meta">
+                Кнопка станет доступна после подтверждения ФИО сотрудника
             </div>
         </div>
     </div>
@@ -246,7 +409,11 @@
                 <strong id="user-name">—</strong>
             </div>
 
-            <button id="change-user-button" class="secondary" type="button">
+            <button
+                id="change-user-button"
+                class="secondary"
+                type="button"
+            >
                 Изменить сотрудника
             </button>
         </div>
@@ -256,13 +423,152 @@
         <h2>Выберите магазин</h2>
         <div id="stores" class="store-grid"></div>
     </div>
+</div>
 
-    <div id="devices-card" class="card hidden">
-        <h2 id="devices-title">Кассы магазина</h2>
+<div
+    id="devices-modal"
+    class="modal hidden"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="devices-title"
+>
+    <div class="modal-panel modal-panel-wide">
+        <div class="modal-header">
+            <button
+                id="devices-back-button"
+                class="back-button"
+                type="button"
+                aria-label="Назад к магазинам"
+            >
+                ←
+            </button>
+
+            <h2 id="devices-title">Кассы магазина</h2>
+        </div>
+
+        <div id="devices-message" class="message"></div>
+
         <div id="devices-loader" class="loader hidden">
             Получаем список касс…
         </div>
+
         <div id="devices" class="device-grid"></div>
+    </div>
+</div>
+
+<div
+    id="badge-modal"
+    class="modal hidden"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="badge-modal-title"
+>
+    <div class="modal-panel">
+        <div class="modal-header">
+            <button
+                id="badge-close-button"
+                class="back-button"
+                type="button"
+                aria-label="Закрыть"
+            >
+                ←
+            </button>
+
+            <h2 id="badge-modal-title">
+                Резервный бейдж
+            </h2>
+        </div>
+
+        <div id="badge-message" class="message"></div>
+
+        <div id="badge-chooser">
+            <p class="hint">
+                Выберите необходимый тип резервного бейджа.
+            </p>
+
+            <div class="badge-grid">
+                <button
+                    class="badge-choice"
+                    type="button"
+                    data-badge-type="administrator"
+                >
+                    <strong>
+                        Резервный бейдж администратора
+                    </strong>
+                    <span>
+                        Для действий администратора магазина
+                    </span>
+                </button>
+
+                <button
+                    class="badge-choice"
+                    type="button"
+                    data-badge-type="cashier"
+                >
+                    <strong>
+                        Резервный бейдж кассира
+                    </strong>
+                    <span>
+                        Для входа кассира на кассе
+                    </span>
+                </button>
+            </div>
+        </div>
+
+        <div id="badge-confirm" class="hidden">
+            <h3 id="badge-confirm-title"></h3>
+
+            <div class="warning-panel">
+                Запрашивайте только если персональный бейдж не работает.
+                Запрос резервного бейджа попадёт в историю действий.
+            </div>
+
+            <div class="modal-actions">
+                <button
+                    id="badge-confirm-back"
+                    class="secondary"
+                    type="button"
+                >
+                    Назад
+                </button>
+
+                <button
+                    id="badge-request-button"
+                    type="button"
+                >
+                    Показать QR-код
+                </button>
+            </div>
+        </div>
+
+        <div id="badge-loader" class="loader hidden">
+            Формируем QR-код и записываем действие…
+        </div>
+
+        <div id="badge-result" class="qr-result hidden">
+            <h3 id="badge-result-title"></h3>
+
+            <div class="qr-frame">
+                <img
+                    id="badge-qr-image"
+                    src=""
+                    alt="QR-код резервного бейджа"
+                >
+            </div>
+
+            <p class="hint">
+                Используйте QR-код только для текущей необходимости.
+                Не фотографируйте и не пересылайте его.
+            </p>
+
+            <button
+                id="badge-result-close"
+                class="secondary"
+                type="button"
+            >
+                Закрыть
+            </button>
+        </div>
     </div>
 </div>
 
@@ -270,42 +576,133 @@
 
 <script>
     const bootstrap = JSON.parse(
-        document.getElementById("cash-reboot-bootstrap").textContent,
+        document.getElementById(
+            "cash-reboot-bootstrap",
+        ).textContent,
     );
 
-    const identifyUrl = "{% url 'bitrix_cash_reboot_identify' %}";
-    const devicesUrl = "{% url 'bitrix_cash_reboot_devices' %}";
-    const rebootUrl = "{% url 'bitrix_cash_reboot_execute' %}";
+    const identifyUrl =
+        "{% url 'bitrix_cash_reboot_identify' %}";
+    const devicesUrl =
+        "{% url 'bitrix_cash_reboot_devices' %}";
+    const rebootUrl =
+        "{% url 'bitrix_cash_reboot_execute' %}";
+    const reserveBadgeUrl =
+        "{% url 'bitrix_cash_reboot_reserve_badge' %}";
 
-    const launchToken = String(bootstrap.launch_token || "");
+    const launchToken = String(
+        bootstrap.launch_token || "",
+    );
+
     let sessionToken = launchToken;
     let selectedStore = null;
+    let pendingBadgeType = null;
 
     const messageBox = document.getElementById("message");
     const identifyCard = document.getElementById("identify-card");
     const identifyForm = document.getElementById("identify-form");
     const identifyButton = document.getElementById("identify-button");
     const fioInput = document.getElementById("fio");
+
     const userCard = document.getElementById("user-card");
     const userName = document.getElementById("user-name");
-    const changeUserButton = document.getElementById("change-user-button");
-    const bitrixAccountName = document.getElementById("bitrix-account-name");
-    const bitrixUserId = document.getElementById("bitrix-user-id");
+    const changeUserButton =
+        document.getElementById("change-user-button");
+
+    const bitrixAccountName =
+        document.getElementById("bitrix-account-name");
+
     const storesCard = document.getElementById("stores-card");
     const storesContainer = document.getElementById("stores");
-    const devicesCard = document.getElementById("devices-card");
-    const devicesContainer = document.getElementById("devices");
-    const devicesLoader = document.getElementById("devices-loader");
-    const devicesTitle = document.getElementById("devices-title");
+
+    const devicesModal =
+        document.getElementById("devices-modal");
+    const devicesBackButton =
+        document.getElementById("devices-back-button");
+    const devicesContainer =
+        document.getElementById("devices");
+    const devicesLoader =
+        document.getElementById("devices-loader");
+    const devicesTitle =
+        document.getElementById("devices-title");
+    const devicesMessage =
+        document.getElementById("devices-message");
+
+    const reserveBadgeButton =
+        document.getElementById("reserve-badge-button");
+    const reserveBadgeHint =
+        document.getElementById("reserve-badge-hint");
+    const badgeModal =
+        document.getElementById("badge-modal");
+    const badgeCloseButton =
+        document.getElementById("badge-close-button");
+    const badgeChooser =
+        document.getElementById("badge-chooser");
+    const badgeConfirm =
+        document.getElementById("badge-confirm");
+    const badgeConfirmTitle =
+        document.getElementById("badge-confirm-title");
+    const badgeConfirmBack =
+        document.getElementById("badge-confirm-back");
+    const badgeRequestButton =
+        document.getElementById("badge-request-button");
+    const badgeLoader =
+        document.getElementById("badge-loader");
+    const badgeResult =
+        document.getElementById("badge-result");
+    const badgeResultTitle =
+        document.getElementById("badge-result-title");
+    const badgeQrImage =
+        document.getElementById("badge-qr-image");
+    const badgeResultClose =
+        document.getElementById("badge-result-close");
+    const badgeMessage =
+        document.getElementById("badge-message");
+
+    const badgeLabels = {
+        administrator:
+            "Резервный бейдж администратора",
+        cashier:
+            "Резервный бейдж кассира",
+    };
+
+    function setMessage(element, text, type = "info") {
+        element.textContent = text || "";
+        element.className = `message visible ${type}`;
+    }
+
+    function clearMessage(element) {
+        element.textContent = "";
+        element.className = "message";
+    }
 
     function showMessage(text, type = "info") {
-        messageBox.textContent = text || "";
-        messageBox.className = `message visible ${type}`;
+        setMessage(messageBox, text, type);
     }
 
     function hideMessage() {
-        messageBox.textContent = "";
-        messageBox.className = "message";
+        clearMessage(messageBox);
+    }
+
+    function updateBodyLock() {
+        const modalOpened =
+            !devicesModal.classList.contains("hidden")
+            || !badgeModal.classList.contains("hidden");
+
+        document.body.classList.toggle(
+            "modal-open",
+            modalOpened,
+        );
+    }
+
+    function openModal(modal) {
+        modal.classList.remove("hidden");
+        updateBodyLock();
+    }
+
+    function closeModal(modal) {
+        modal.classList.add("hidden");
+        updateBodyLock();
     }
 
     async function apiRequest(url, body) {
@@ -315,7 +712,8 @@
         };
 
         if (sessionToken) {
-            headers["X-Cash-Reboot-Token"] = sessionToken;
+            headers["X-Cash-Reboot-Token"] =
+                sessionToken;
         }
 
         const response = await fetch(url, {
@@ -323,6 +721,7 @@
             headers,
             body: JSON.stringify(body || {}),
             credentials: "omit",
+            cache: "no-store",
         });
 
         let data;
@@ -332,12 +731,15 @@
         } catch (_) {
             data = {
                 status: "error",
-                message: `Сервер вернул HTTP ${response.status}`,
+                message:
+                    `Сервер вернул HTTP ${response.status}`,
             };
         }
 
         if (!response.ok || data.status !== "ok") {
-            const error = new Error(data.message || "Ошибка запроса");
+            const error = new Error(
+                data.message || "Ошибка запроса",
+            );
             error.status = response.status;
             error.code = data.code || "error";
             throw error;
@@ -346,19 +748,53 @@
         return data;
     }
 
+    function closeDevicesModal() {
+        closeModal(devicesModal);
+        clearMessage(devicesMessage);
+    }
+
+    function resetBadgeModal() {
+        pendingBadgeType = null;
+        clearMessage(badgeMessage);
+
+        badgeChooser.classList.remove("hidden");
+        badgeConfirm.classList.add("hidden");
+        badgeLoader.classList.add("hidden");
+        badgeResult.classList.add("hidden");
+
+        badgeQrImage.src = "";
+        badgeConfirmTitle.textContent = "";
+        badgeResultTitle.textContent = "";
+
+        badgeRequestButton.disabled = false;
+        badgeRequestButton.textContent =
+            "Показать QR-код";
+    }
+
+    function closeBadgeModal() {
+        closeModal(badgeModal);
+        resetBadgeModal();
+    }
+
     function resetStoreSelection() {
         selectedStore = null;
         storesContainer.replaceChildren();
         devicesContainer.replaceChildren();
         storesCard.classList.add("hidden");
-        devicesCard.classList.add("hidden");
+        closeDevicesModal();
+        closeBadgeModal();
     }
 
     function returnToIdentification() {
         sessionToken = launchToken;
         resetStoreSelection();
+
         userCard.classList.add("hidden");
         identifyCard.classList.remove("hidden");
+
+        reserveBadgeButton.disabled = true;
+        reserveBadgeHint.classList.remove("hidden");
+
         fioInput.disabled = false;
         identifyButton.disabled = false;
         identifyButton.textContent = "Продолжить";
@@ -370,7 +806,10 @@
 
         if (!stores.length) {
             storesCard.classList.add("hidden");
-            showMessage("У пользователя нет доступных магазинов", "warning");
+            showMessage(
+                "У пользователя нет доступных магазинов",
+                "warning",
+            );
             return;
         }
 
@@ -381,22 +820,18 @@
             const title = document.createElement("div");
             title.className = "title";
             title.textContent =
-                store.store_name || `Магазин ${store.ukm_store_id}`;
-
-            const ukmMeta = document.createElement("div");
-            ukmMeta.className = "meta";
-            ukmMeta.textContent = `UKM store: ${store.ukm_store_id}`;
-
-            const smMeta = document.createElement("div");
-            smMeta.className = "meta";
-            smMeta.textContent = `SM store: ${store.sm_store_id ?? "—"}`;
+                store.store_name
+                || "Магазин без названия";
 
             const button = document.createElement("button");
             button.type = "button";
             button.textContent = "Показать кассы";
-            button.addEventListener("click", () => loadDevices(store));
+            button.addEventListener(
+                "click",
+                () => loadDevices(store),
+            );
 
-            card.append(title, ukmMeta, smMeta, button);
+            card.append(title, button);
             storesContainer.appendChild(card);
         }
 
@@ -425,7 +860,8 @@
         if (!devices.length) {
             const empty = document.createElement("div");
             empty.className = "hint";
-            empty.textContent = "В этом магазине не найдено доступных касс.";
+            empty.textContent =
+                "В этом магазине не найдено доступных касс.";
             devicesContainer.appendChild(empty);
             return;
         }
@@ -436,19 +872,18 @@
 
             const title = document.createElement("div");
             title.className = "title";
-            title.textContent = device.name || "Касса без названия";
+            title.textContent =
+                device.name || "Касса без названия";
 
             const kind = document.createElement("div");
             kind.className = "meta";
-            kind.textContent = `Тип: ${deviceKind(device)}`;
+            kind.textContent =
+                `Тип: ${deviceKind(device)}`;
 
             const ip = document.createElement("div");
             ip.className = "meta";
-            ip.textContent = `IP: ${device.ip || "—"}`;
-
-            const cashId = document.createElement("div");
-            cashId.className = "meta";
-            cashId.textContent = `cash_id: ${device.cash_id || "—"}`;
+            ip.textContent =
+                `IP: ${device.ip || "—"}`;
 
             const button = document.createElement("button");
             button.type = "button";
@@ -458,37 +893,66 @@
                 () => rebootDevice(device, button),
             );
 
-            card.append(title, kind, ip, cashId, button);
+            card.append(title, kind, ip, button);
             devicesContainer.appendChild(card);
         }
     }
 
     async function loadDevices(store) {
         selectedStore = store;
-        devicesCard.classList.remove("hidden");
-        devicesLoader.classList.remove("hidden");
+
         devicesContainer.replaceChildren();
+        clearMessage(devicesMessage);
+
         devicesTitle.textContent =
-            `Кассы: ${store.store_name || `магазин ${store.ukm_store_id}`}`;
-        hideMessage();
+            `Кассы: ${
+                store.store_name
+                || "магазин без названия"
+            }`;
+
+        devicesLoader.classList.remove("hidden");
+        openModal(devicesModal);
 
         try {
-            const data = await apiRequest(devicesUrl, {
-                ukm_store_id: store.ukm_store_id,
-            });
+            const data = await apiRequest(
+                devicesUrl,
+                {
+                    ukm_store_id:
+                        store.ukm_store_id,
+                },
+            );
 
             renderDevices(data.devices || []);
 
             const warnings = data.warnings || [];
+
             if (warnings.length) {
-                showMessage(warnings.join("\n"), "warning");
-            }
-        } catch (error) {
-            if (error.status === 401 || error.code === "session_error") {
-                returnToIdentification();
+                setMessage(
+                    devicesMessage,
+                    warnings.join("\n"),
+                    "warning",
+                );
             }
 
-            showMessage(error.message, "error");
+        } catch (error) {
+            if (
+                error.status === 401
+                || error.code === "session_error"
+            ) {
+                returnToIdentification();
+                showMessage(
+                    error.message,
+                    "error",
+                );
+                return;
+            }
+
+            setMessage(
+                devicesMessage,
+                error.message,
+                "error",
+            );
+
         } finally {
             devicesLoader.classList.add("hidden");
         }
@@ -496,14 +960,23 @@
 
     async function rebootDevice(device, button) {
         if (!selectedStore) {
-            showMessage("Сначала выберите магазин", "error");
+            setMessage(
+                devicesMessage,
+                "Сначала выберите магазин",
+                "error",
+            );
             return;
         }
 
         const confirmed = window.confirm(
             "Перезагрузить кассу?\n\n"
-            + `Магазин: ${selectedStore.store_name || selectedStore.ukm_store_id}\n`
-            + `Касса: ${device.name || "без названия"}\n`
+            + `Магазин: ${
+                selectedStore.store_name
+                || "без названия"
+            }\n`
+            + `Касса: ${
+                device.name || "без названия"
+            }\n`
             + `IP: ${device.ip}\n`
             + `Тип: ${deviceKind(device)}\n\n`
             + "Работа кассы будет прервана.",
@@ -514,83 +987,323 @@
         }
 
         button.disabled = true;
-        button.textContent = "Отправляем команду…";
-        hideMessage();
+        button.textContent =
+            "Отправляем команду…";
+        clearMessage(devicesMessage);
 
         try {
-            const data = await apiRequest(rebootUrl, {
-                ukm_store_id: selectedStore.ukm_store_id,
-                cash_id: device.cash_id,
-                ip: device.ip,
-            });
+            const data = await apiRequest(
+                rebootUrl,
+                {
+                    ukm_store_id:
+                        selectedStore.ukm_store_id,
+                    cash_id:
+                        device.cash_id,
+                    ip:
+                        device.ip,
+                },
+            );
 
-            showMessage(
-                data.message || "Команда перезагрузки отправлена",
+            setMessage(
+                devicesMessage,
+                data.message
+                || "Команда перезагрузки отправлена",
                 "success",
             );
-            button.textContent = "Команда отправлена";
+
+            button.textContent =
+                "Команда отправлена";
+
         } catch (error) {
-            if (error.status === 401 || error.code === "session_error") {
+            if (
+                error.status === 401
+                || error.code === "session_error"
+            ) {
                 returnToIdentification();
+                showMessage(
+                    error.message,
+                    "error",
+                );
+                return;
             }
 
-            showMessage(error.message, "error");
+            setMessage(
+                devicesMessage,
+                error.message,
+                "error",
+            );
+
             button.disabled = false;
-            button.textContent = "Перезагрузить";
+            button.textContent =
+                "Перезагрузить";
         }
     }
 
-    identifyForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        hideMessage();
+    function selectBadge(badgeType) {
+        pendingBadgeType = badgeType;
 
-        const fio = String(fioInput.value || "").trim();
-        if (!fio) {
-            showMessage("Введите ФИО сотрудника", "error");
+        clearMessage(badgeMessage);
+
+        badgeConfirmTitle.textContent =
+            badgeLabels[badgeType]
+            || "Резервный бейдж";
+
+        badgeChooser.classList.add("hidden");
+        badgeResult.classList.add("hidden");
+        badgeConfirm.classList.remove("hidden");
+    }
+
+    async function requestReserveBadge() {
+        if (!pendingBadgeType) {
+            setMessage(
+                badgeMessage,
+                "Выберите тип резервного бейджа",
+                "error",
+            );
             return;
         }
 
-        identifyButton.disabled = true;
-        identifyButton.textContent = "Проверяем…";
-        fioInput.disabled = true;
+        clearMessage(badgeMessage);
+
+        badgeRequestButton.disabled = true;
+        badgeRequestButton.textContent =
+            "Формируем…";
+
+        badgeConfirm.classList.add("hidden");
+        badgeLoader.classList.remove("hidden");
 
         try {
-            sessionToken = launchToken;
-            const data = await apiRequest(identifyUrl, {fio});
-            sessionToken = String(data.session_token || "");
+            const data = await apiRequest(
+                reserveBadgeUrl,
+                {
+                    badge_type:
+                        pendingBadgeType,
+                },
+            );
 
-            if (!sessionToken) {
-                throw new Error("Сервер не вернул сессию пользователя");
+            const badge = data.badge || {};
+
+            if (!badge.qr_image) {
+                throw new Error(
+                    "Сервер не вернул изображение QR-кода",
+                );
             }
 
-            userName.textContent = data.user?.full_name || fio;
-            identifyCard.classList.add("hidden");
-            userCard.classList.remove("hidden");
-            renderStores(data.stores || []);
-            showMessage("Сотрудник подтверждён. Выберите магазин.", "success");
+            badgeQrImage.src = badge.qr_image;
+            badgeResultTitle.textContent =
+                badge.label || "Резервный бейдж";
+
+            badgeLoader.classList.add("hidden");
+            badgeResult.classList.remove("hidden");
+
         } catch (error) {
-            sessionToken = launchToken;
-            showMessage(error.message, "error");
-            fioInput.disabled = false;
-            identifyButton.disabled = false;
-            identifyButton.textContent = "Продолжить";
+            badgeLoader.classList.add("hidden");
+
+            if (
+                error.status === 401
+                || error.code === "session_error"
+            ) {
+                closeBadgeModal();
+                returnToIdentification();
+                showMessage(
+                    error.message,
+                    "error",
+                );
+                return;
+            }
+
+            badgeConfirm.classList.remove("hidden");
+
+            setMessage(
+                badgeMessage,
+                error.message,
+                "error",
+            );
+
+            badgeRequestButton.disabled = false;
+            badgeRequestButton.textContent =
+                "Показать QR-код";
         }
+    }
+
+    identifyForm.addEventListener(
+        "submit",
+        async (event) => {
+            event.preventDefault();
+            hideMessage();
+
+            const fio = String(
+                fioInput.value || "",
+            ).trim();
+
+            if (!fio) {
+                showMessage(
+                    "Введите ФИО сотрудника",
+                    "error",
+                );
+                return;
+            }
+
+            identifyButton.disabled = true;
+            identifyButton.textContent = "Проверяем…";
+            fioInput.disabled = true;
+
+            try {
+                sessionToken = launchToken;
+
+                const data = await apiRequest(
+                    identifyUrl,
+                    {fio},
+                );
+
+                sessionToken = String(
+                    data.session_token || "",
+                );
+
+                if (!sessionToken) {
+                    throw new Error(
+                        "Сервер не вернул сессию пользователя",
+                    );
+                }
+
+                userName.textContent =
+                    data.user?.full_name || fio;
+
+                identifyCard.classList.add("hidden");
+                userCard.classList.remove("hidden");
+
+                reserveBadgeButton.disabled = false;
+                reserveBadgeHint.classList.add("hidden");
+
+                renderStores(data.stores || []);
+
+                showMessage(
+                    "Сотрудник подтверждён. Выберите магазин.",
+                    "success",
+                );
+
+            } catch (error) {
+                sessionToken = launchToken;
+
+                showMessage(
+                    error.message,
+                    "error",
+                );
+
+                fioInput.disabled = false;
+                identifyButton.disabled = false;
+                identifyButton.textContent =
+                    "Продолжить";
+            }
+        },
+    );
+
+    changeUserButton.addEventListener(
+        "click",
+        () => {
+            fioInput.value = "";
+            returnToIdentification();
+            hideMessage();
+        },
+    );
+
+    devicesBackButton.addEventListener(
+        "click",
+        closeDevicesModal,
+    );
+
+    reserveBadgeButton.addEventListener(
+        "click",
+        () => {
+            resetBadgeModal();
+            openModal(badgeModal);
+        },
+    );
+
+    badgeCloseButton.addEventListener(
+        "click",
+        closeBadgeModal,
+    );
+
+    badgeConfirmBack.addEventListener(
+        "click",
+        () => {
+            pendingBadgeType = null;
+            clearMessage(badgeMessage);
+            badgeConfirm.classList.add("hidden");
+            badgeChooser.classList.remove("hidden");
+        },
+    );
+
+    badgeRequestButton.addEventListener(
+        "click",
+        requestReserveBadge,
+    );
+
+    badgeResultClose.addEventListener(
+        "click",
+        closeBadgeModal,
+    );
+
+    document.querySelectorAll(
+        "[data-badge-type]",
+    ).forEach((button) => {
+        button.addEventListener(
+            "click",
+            () => {
+                selectBadge(
+                    button.dataset.badgeType,
+                );
+            },
+        );
     });
 
-    changeUserButton.addEventListener("click", () => {
-        fioInput.value = "";
-        returnToIdentification();
-        hideMessage();
-    });
+    devicesModal.addEventListener(
+        "click",
+        (event) => {
+            if (event.target === devicesModal) {
+                closeDevicesModal();
+            }
+        },
+    );
+
+    badgeModal.addEventListener(
+        "click",
+        (event) => {
+            if (event.target === badgeModal) {
+                closeBadgeModal();
+            }
+        },
+    );
+
+    document.addEventListener(
+        "keydown",
+        (event) => {
+            if (event.key !== "Escape") {
+                return;
+            }
+
+            if (
+                !badgeModal.classList.contains("hidden")
+            ) {
+                closeBadgeModal();
+                return;
+            }
+
+            if (
+                !devicesModal.classList.contains("hidden")
+            ) {
+                closeDevicesModal();
+            }
+        },
+    );
 
     bitrixAccountName.textContent =
         bootstrap.bitrix_user?.full_name || "—";
 
-    bitrixUserId.textContent =
-        `Bitrix24 ID: ${bootstrap.bitrix_user?.bitrix_user_id ?? "—"}`;
-
     showMessage(
-        "Авторизация Bitrix24 подтверждена. Введите ФИО фактического сотрудника.",
+        "Авторизация Bitrix24 подтверждена. "
+        + "Введите ФИО фактического сотрудника",
         "success",
     );
 
