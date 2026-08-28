@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import requests
+import qrcode
 from io import BytesIO
 from requests.exceptions import RequestException
 from contextlib import contextmanager
@@ -14651,6 +14652,37 @@ BITRIX_CASH_REBOOT_ENABLED = (
     in {"1", "true", "yes", "on"}
 )
 
+
+
+
+BITRIX_RESERVE_BADGES = {
+    "administrator": {
+        "label": "Резервный бейдж администратора",
+        "role_id": 13,
+        "value": str(
+            os.getenv(
+                "BITRIX24_RESERVE_BADGE_ADMIN",
+                "",
+            )
+            or ""
+        ).strip(),
+    },
+    "cashier": {
+        "label": "Резервный бейдж кассира",
+        "role_id": 1,
+        "value": str(
+            os.getenv(
+                "BITRIX24_RESERVE_BADGE_CASHIER",
+                "",
+            )
+            or ""
+        ).strip(),
+    },
+}
+
+
+
+
 try:
     BITRIX_CASH_REBOOT_RATE_LIMIT_SEC = max(
         5,
@@ -14894,6 +14926,234 @@ def _bitrix_write_reboot_log(
         )
 
 
+def _bitrix_reserve_badge_qr_data_url(
+    badge_value: str,
+) -> str:
+    """
+    Формирует QR-код без сохранения файла на диске.
+    """
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=(
+            qrcode.constants.ERROR_CORRECT_M
+        ),
+        box_size=12,
+        border=4,
+    )
+
+    qr.add_data(badge_value)
+    qr.make(fit=True)
+
+    image = qr.make_image(
+        fill_color="black",
+        back_color="white",
+    )
+
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+
+    encoded = base64.b64encode(
+        buffer.getvalue()
+    ).decode("ascii")
+
+    return f"data:image/png;base64,{encoded}"
+
+
+def _bitrix_write_reserve_badge_log(
+    *,
+    request,
+    user: User,
+    bitrix_identity: BitrixLaunchIdentity,
+    badge_type: str,
+    badge_label: str,
+    role_id: Optional[int],
+    status: str,
+    error_message: str = "",
+) -> None:
+    """
+    Пишет запрос резервного бейджа в qr_issue_logs.
+
+    Сам пароль бейджа намеренно не сохраняется.
+    """
+    employee_inn = str(
+        getattr(user, "employee_id", "")
+        or ""
+    ).strip()
+
+    employee_fio = normalize_fio(
+        getattr(user, "full_name", "")
+    )
+
+    phone_raw = str(
+        getattr(user, "phone", "")
+        or ""
+    ).strip()
+
+    tg_id = str(
+        getattr(user, "tg_id", "")
+        or ""
+    ).strip()
+
+    forwarded_for = str(
+        request.META.get(
+            "HTTP_X_FORWARDED_FOR",
+            "",
+        )
+        or ""
+    ).strip()
+
+    request_ip = (
+        forwarded_for.split(",")[0].strip()
+        if forwarded_for
+        else str(
+            request.META.get(
+                "REMOTE_ADDR",
+                "",
+            )
+            or ""
+        ).strip()
+    )
+
+    try:
+        log_qr_issue(
+            endpoint="bitrix_cash_reserve_badge",
+            method="RESERVE_BADGE",
+            status=status,
+            user=user,
+            employee_inn=employee_inn,
+            employee_fio=employee_fio,
+            tg_id=tg_id,
+            phone_raw=phone_raw,
+            phone_normalized=(
+                normalize_phone_ru(phone_raw)
+                if phone_raw
+                else ""
+            ),
+            sm_store_id=None,
+            ukm_store_id=None,
+            role_id=role_id,
+            # Не сохраняем значение общего бейджа.
+            qr_data="",
+            error_message=str(
+                error_message or ""
+            ),
+            raw_request={
+                "source": (
+                    "bitrix24_verified_manual_fio"
+                ),
+                "action": "reserve_badge_request",
+                "badge_type": badge_type,
+                "badge_label": badge_label,
+                "bitrix": {
+                    "user_id": (
+                        bitrix_identity.bitrix_user_id
+                    ),
+                    "full_name": (
+                        bitrix_identity.full_name
+                    ),
+                    "domain": (
+                        bitrix_identity.domain
+                    ),
+                    "member_id": (
+                        bitrix_identity.member_id
+                    ),
+                    "app_id": (
+                        bitrix_identity.app_id
+                    ),
+                },
+                "request": {
+                    "ip": request_ip,
+                    "user_agent": str(
+                        request.META.get(
+                            "HTTP_USER_AGENT",
+                            "",
+                        )
+                        or ""
+                    )[:500],
+                },
+            },
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[BITRIX/POS/BADGE] "
+            "Не удалось записать аудит: %s",
+            exc,
+        )
+
+
+def _bitrix_send_reserve_badge_max_log(
+    *,
+    user: User,
+    bitrix_identity: BitrixLaunchIdentity,
+    badge_label: str,
+    status: str,
+    error_message: str = "",
+) -> None:
+    """
+    Асинхронное уведомление администратору в MAX.
+    Значение бейджа в сообщение не включается.
+    """
+    employee_fio = (
+        normalize_fio(user.full_name)
+        or "—"
+    )
+
+    if status == "ok":
+        heading = (
+            "⚠️ Запрошен резервный бейдж "
+            "через Bitrix24"
+        )
+        result_line = "✅ QR-код показан сотруднику"
+    else:
+        heading = (
+            "❌ Ошибка запроса резервного "
+            "бейджа через Bitrix24"
+        )
+        result_line = (
+            f"Причина: {error_message or 'неизвестная ошибка'}"
+        )
+
+    message_lines = [
+        heading,
+        "",
+        "🔐 Учётная запись Bitrix24:",
+        f"  • {bitrix_identity.full_name}",
+        (
+            "  • Bitrix24 ID: "
+            f"{bitrix_identity.bitrix_user_id}"
+        ),
+        "",
+        "👤 Фактический сотрудник:",
+        f"  • {employee_fio}",
+        f"  • local user_id: {user.id}",
+        "",
+        "🎫 Тип бейджа:",
+        f"  • {badge_label or 'не определён'}",
+        "",
+        result_line,
+    ]
+
+    _send_max_log_async(
+        "\n".join(message_lines)
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @require_GET
 def bitrix_cash_reboot_health(request):
     return JsonResponse(
@@ -14977,9 +15237,6 @@ def bitrix_cash_reboot_app(request):
                 "bitrix_user": {
                     "full_name": normalize_fio(
                         bitrix_identity.full_name
-                    ),
-                    "bitrix_user_id": (
-                        bitrix_identity.bitrix_user_id
                     ),
                 },
             },
@@ -15293,6 +15550,242 @@ def bitrix_cash_reboot_devices(request):
             "ensure_ascii": False,
         },
     )
+
+
+
+
+
+
+@csrf_exempt
+@never_cache
+@require_POST
+def bitrix_cash_reboot_reserve_badge(request):
+    """
+    Возвращает резервный бейдж только после:
+    1. Авторизации через Bitrix24.
+    2. Ввода и проверки ФИО фактического сотрудника.
+    """
+    if not BITRIX_CASH_REBOOT_ENABLED:
+        return _bitrix_cash_reboot_error(
+            "Приложение отключено",
+            status=503,
+            code="disabled",
+        )
+
+    try:
+        user_session = _bitrix_cash_reboot_session(
+            request
+        )
+        user = user_session.user
+        bitrix_identity = (
+            user_session.bitrix_identity
+        )
+
+    except CashRebootSessionError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=401,
+            code="session_error",
+        )
+
+    try:
+        body = _bitrix_cash_reboot_json_body(
+            request
+        )
+
+    except ValueError as exc:
+        return _bitrix_cash_reboot_error(
+            str(exc),
+            status=400,
+            code="bad_json",
+        )
+
+    badge_type = str(
+        body.get("badge_type") or ""
+    ).strip().lower()
+
+    badge_config = BITRIX_RESERVE_BADGES.get(
+        badge_type
+    )
+
+    if not badge_config:
+        error_message = (
+            "Указан неизвестный тип резервного бейджа"
+        )
+
+        _bitrix_write_reserve_badge_log(
+            request=request,
+            user=user,
+            bitrix_identity=bitrix_identity,
+            badge_type=badge_type,
+            badge_label="Неизвестный тип",
+            role_id=None,
+            status="error",
+            error_message=error_message,
+        )
+
+        _bitrix_send_reserve_badge_max_log(
+            user=user,
+            bitrix_identity=bitrix_identity,
+            badge_label=(
+                badge_type or "Не указан"
+            ),
+            status="error",
+            error_message=error_message,
+        )
+
+        return _bitrix_cash_reboot_error(
+            "Выберите корректный тип бейджа",
+            status=400,
+            code="bad_badge_type",
+        )
+
+    badge_label = str(
+        badge_config["label"]
+    )
+
+    role_id = int(
+        badge_config["role_id"]
+    )
+
+    badge_value = str(
+        badge_config["value"] or ""
+    ).strip()
+
+    if not badge_value:
+        error_message = (
+            f"Не настроено значение: {badge_label}"
+        )
+
+        _bitrix_write_reserve_badge_log(
+            request=request,
+            user=user,
+            bitrix_identity=bitrix_identity,
+            badge_type=badge_type,
+            badge_label=badge_label,
+            role_id=role_id,
+            status="error",
+            error_message=error_message,
+        )
+
+        _bitrix_send_reserve_badge_max_log(
+            user=user,
+            bitrix_identity=bitrix_identity,
+            badge_label=badge_label,
+            status="error",
+            error_message=error_message,
+        )
+
+        return _bitrix_cash_reboot_error(
+            "Резервный бейдж не настроен",
+            status=503,
+            code="badge_not_configured",
+        )
+
+    try:
+        qr_image = (
+            _bitrix_reserve_badge_qr_data_url(
+                badge_value
+            )
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[BITRIX/POS/BADGE] "
+            "Ошибка формирования QR: %s",
+            exc,
+        )
+
+        _bitrix_write_reserve_badge_log(
+            request=request,
+            user=user,
+            bitrix_identity=bitrix_identity,
+            badge_type=badge_type,
+            badge_label=badge_label,
+            role_id=role_id,
+            status="error",
+            error_message=str(exc),
+        )
+
+        _bitrix_send_reserve_badge_max_log(
+            user=user,
+            bitrix_identity=bitrix_identity,
+            badge_label=badge_label,
+            status="error",
+            error_message=str(exc),
+        )
+
+        return _bitrix_cash_reboot_error(
+            "Не удалось сформировать QR-код",
+            status=500,
+            code="qr_generation_error",
+        )
+
+    _bitrix_write_reserve_badge_log(
+        request=request,
+        user=user,
+        bitrix_identity=bitrix_identity,
+        badge_type=badge_type,
+        badge_label=badge_label,
+        role_id=role_id,
+        status="ok",
+    )
+
+    _bitrix_send_reserve_badge_max_log(
+        user=user,
+        bitrix_identity=bitrix_identity,
+        badge_label=badge_label,
+        status="ok",
+    )
+
+    logger.info(
+        "[BITRIX/POS/BADGE] issued "
+        "bitrix_user_id=%s user_id=%s "
+        "badge_type=%s role_id=%s",
+        bitrix_identity.bitrix_user_id,
+        user.id,
+        badge_type,
+        role_id,
+    )
+
+    response = JsonResponse(
+        {
+            "status": "ok",
+            "message": (
+                "Резервный бейдж сформирован"
+            ),
+            "badge": {
+                "type": badge_type,
+                "label": badge_label,
+                "qr_image": qr_image,
+            },
+        },
+        json_dumps_params={
+            "ensure_ascii": False,
+        },
+    )
+
+    response["Cache-Control"] = (
+        "no-store, no-cache, must-revalidate, "
+        "max-age=0, private"
+    )
+    response["Pragma"] = "no-cache"
+
+    return response
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @csrf_exempt
