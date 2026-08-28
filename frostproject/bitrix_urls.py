@@ -40,6 +40,13 @@ urlpatterns = [
         views.bitrix_cash_reboot_devices,
         name="bitrix_cash_reboot_devices",
     ),
+
+
+    path(
+        "bitrix/cash-reboot/api/reserve-badge/",
+        views.bitrix_cash_reboot_reserve_badge,
+        name="bitrix_cash_reboot_reserve_badge",
+    ),
     path(
         "bitrix/cash-reboot/api/reboot/",
         views.bitrix_cash_reboot_execute,
