@@ -22,6 +22,7 @@ from frostapp.views import (
     get_ukm5_employee_id,
     get_next_ukm5_employee_id,
     is_ukm5_store,
+    clear_ukm_store_runtime_caches,
     TRM_SMALL_MAX,
 )
 
@@ -247,17 +248,41 @@ class Command(BaseCommand):
 
 
 
+            # anchor_store_ids = sorted(
+            #     int(x)
+            #     for x in (get_ukm5_full_xml_store_ids() or {2013})
+            # )
+
+            # if target_system == "ukm5":
+            #     target_store_ids = [
+            #         store_id
+            #         for store_id in anchor_store_ids
+            #         if is_ukm5_store(store_id)
+            #     ]
+            # else:
+            #     target_store_ids = list(anchor_store_ids)
+            # ukm-rotation-worker работает постоянно, поэтому перед каждым новым
+            # запуском сбрасываем сведения, оставшиеся от предыдущего прогона.
+            clear_ukm_store_runtime_caches()
+            
             anchor_store_ids = sorted(
                 int(x)
                 for x in (get_ukm5_full_xml_store_ids() or {2013})
             )
-
+            
             if target_system == "ukm5":
                 target_store_ids = [
                     store_id
                     for store_id in anchor_store_ids
                     if is_ukm5_store(store_id)
                 ]
+            
+                logger.info(
+                    "[ROTATE][UKM5][STORE_DISCOVERY] checked=%s ukm5=%s not_ukm5=%s",
+                    anchor_store_ids,
+                    target_store_ids,
+                    sorted(set(anchor_store_ids) - set(target_store_ids)),
+                )
             else:
                 target_store_ids = list(anchor_store_ids)
 
