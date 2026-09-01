@@ -5038,6 +5038,30 @@ def _resolve_ukm5_store_binding(store_id: int) -> dict:
     }
 
 
+
+
+
+#02.09 dobavil
+def clear_ukm_store_runtime_caches() -> None:
+    """
+    Сбрасывает сохранённые в памяти сведения о магазинах.
+
+    Это необходимо для ukm-rotation-worker, который выполняет несколько
+    ручных запусков в одном Python-процессе. Если магазин между запусками
+    перевели с УКМ-4 на УКМ-5, следующий запуск должен заново получить
+    актуальные данные из Oracle и srvdata.
+    """
+    _get_store_info_cached_tuple.cache_clear()
+    _resolve_ukm5_store_binding_cached.cache_clear()
+
+    logger.info(
+        "[UKM][CACHE] Кэш классификации и привязок магазинов "
+        "сброшен перед новым запуском"
+    )
+
+
+
+
 def _make_ukm5_card_dates() -> tuple[str, str]:
     """
     dateFrom  = текущий локальный день 00:00:00
