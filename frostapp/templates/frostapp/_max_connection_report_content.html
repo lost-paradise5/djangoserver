@@ -1,0 +1,335 @@
+{% load tz %}
+
+<p class="updated">
+    Обновлено:
+    {{ report_updated_at|date:"d.m.Y H:i:s" }}
+</p>
+
+<section class="panel">
+    <h2 class="section-title">Общая сводка</h2>
+
+    <p class="section-description">
+        Подключёнными считаются только активные сотрудники
+        с заполненным MAX ID.
+    </p>
+
+    <div class="cards">
+        <div class="card">
+            <div class="card-label">
+                Активных сотрудников
+            </div>
+
+            <div class="card-value">
+                {{ max_stats.active_count }}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">
+                Подключили MAX
+            </div>
+
+            <div class="card-value">
+                {{ max_stats.connected_count }}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">
+                Не подключили MAX
+            </div>
+
+            <div class="card-value">
+                {{ max_stats.not_connected_count }}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">
+                Процент подключения
+            </div>
+
+            <div class="card-value">
+                {{ max_stats.connected_percent }}%
+            </div>
+        </div>
+    </div>
+
+    <form method="get" class="filters">
+        <div class="field">
+            <label for="max-q">
+                Поиск сотрудника
+            </label>
+
+            <input
+                id="max-q"
+                type="search"
+                name="max_q"
+                value="{{ max_filters.q }}"
+                placeholder="ФИО, ИНН, телефон, MAX ID"
+            >
+        </div>
+
+        <div class="field">
+            <label for="max-store">
+                Магазин
+            </label>
+
+            <select
+                id="max-store"
+                name="max_store"
+            >
+                <option value="">
+                    Все магазины
+                </option>
+
+                {% for store in store_options %}
+                    <option
+                        value="{{ store.id }}"
+                        {% if max_filters.store == store.id %}selected{% endif %}
+                    >
+                        {{ store.name }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="max-connection">
+                Подключение
+            </label>
+
+            <select
+                id="max-connection"
+                name="max_connection"
+            >
+                <option
+                    value="connected"
+                    {% if max_filters.connection == "connected" %}selected{% endif %}
+                >
+                    MAX подключён
+                </option>
+
+                <option
+                    value="not_connected"
+                    {% if max_filters.connection == "not_connected" %}selected{% endif %}
+                >
+                    MAX не подключён
+                </option>
+
+                <option
+                    value="all"
+                    {% if max_filters.connection == "all" %}selected{% endif %}
+                >
+                    Все активные
+                </option>
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="max-page-size">
+                Строк на странице
+            </label>
+
+            <select
+                id="max-page-size"
+                name="max_page_size"
+            >
+                <option
+                    value="25"
+                    {% if max_filters.page_size == 25 %}selected{% endif %}
+                >
+                    25
+                </option>
+
+                <option
+                    value="50"
+                    {% if max_filters.page_size == 50 %}selected{% endif %}
+                >
+                    50
+                </option>
+
+                <option
+                    value="100"
+                    {% if max_filters.page_size == 100 %}selected{% endif %}
+                >
+                    100
+                </option>
+
+                <option
+                    value="200"
+                    {% if max_filters.page_size == 200 %}selected{% endif %}
+                >
+                    200
+                </option>
+            </select>
+        </div>
+
+        <div class="filter-actions">
+            <button type="submit">
+                Применить
+            </button>
+
+            <a
+                class="button-link"
+                href="{% url 'max_connection_report' %}"
+            >
+                Сбросить
+            </a>
+        </div>
+    </form>
+
+    <h2 class="section-title">
+        Подключение по магазинам
+    </h2>
+
+    <p class="section-description">
+        Один сотрудник учитывается в каждом магазине,
+        к которому у него есть доступ в ukm_users.
+    </p>
+
+    <div class="table-wrap summary-scroll">
+        <table>
+            <thead>
+            <tr>
+                <th>Магазин</th>
+                <th>Активных</th>
+                <th>Подключили</th>
+                <th>Не подключили</th>
+                <th>Процент</th>
+            </tr>
+            </thead>
+
+            <tbody>
+            {% for item in store_summary %}
+                <tr>
+                    <td>
+                        {{ item.store_name }}
+                    </td>
+
+                    <td>
+                        {{ item.active_count }}
+                    </td>
+
+                    <td>
+                        {{ item.connected_count }}
+                    </td>
+
+                    <td>
+                        {{ item.not_connected_count }}
+                    </td>
+
+                    <td>
+                        <div class="coverage">
+                            <progress
+                                value="{{ item.connected_percent }}"
+                                max="100"
+                            ></progress>
+
+                            <strong>
+                                {{ item.connected_percent }}%
+                            </strong>
+                        </div>
+                    </td>
+                </tr>
+            {% empty %}
+                <tr>
+                    <td colspan="5" class="empty">
+                        По выбранному магазину
+                        сотрудники не найдены.
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <h2 class="section-title">
+        Сотрудники
+    </h2>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+            <tr>
+                <th>ФИО</th>
+                <th>Магазин</th>
+                <th>Должность</th>
+                <th>Подразделение</th>
+                <th>MAX</th>
+                <th>MAX ID</th>
+            </tr>
+            </thead>
+
+            <tbody>
+            {% for user in max_page %}
+                <tr>
+                    <td>
+                        {{ user.full_name|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ user.report_stores|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ user.report_position|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ user.report_department|default:"—" }}
+                    </td>
+
+                    <td>
+                        {% if user.report_max_connected %}
+                            <span class="badge result-ok">
+                                Подключён
+                            </span>
+                        {% else %}
+                            <span class="badge result-error">
+                                Не подключён
+                            </span>
+                        {% endif %}
+                    </td>
+
+                    <td>
+                        {% if user.max_id %}
+                            {{ user.max_id }}
+                        {% else %}
+                            <span class="muted">—</span>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% empty %}
+                <tr>
+                    <td colspan="6" class="empty">
+                        Сотрудники по выбранным фильтрам
+                        не найдены.
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if max_page.paginator.num_pages > 1 %}
+        <nav class="pagination">
+            {% if max_page.has_previous %}
+                <a href="?{% if max_query_without_page %}{{ max_query_without_page }}&{% endif %}max_page={{ max_page.previous_page_number }}">
+                    Назад
+                </a>
+            {% endif %}
+
+            <span>
+                Страница {{ max_page.number }}
+                из {{ max_page.paginator.num_pages }}
+            </span>
+
+            {% if max_page.has_next %}
+                <a href="?{% if max_query_without_page %}{{ max_query_without_page }}&{% endif %}max_page={{ max_page.next_page_number }}">
+                    Вперёд
+                </a>
+            {% endif %}
+        </nav>
+    {% endif %}
+</section>
