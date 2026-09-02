@@ -26294,14 +26294,17 @@ def activity_report(request):
 
     max_stats = User.objects.aggregate(
         total=Count("id"),
-        active=Count(
+    
+        active_count=Count(
             "id",
             filter=Q(active=True),
         ),
+    
         active_connected=Count(
             "id",
             filter=Q(active=True) & connected_q,
         ),
+    
         active_not_connected=Count(
             "id",
             filter=Q(active=True) & not_connected_q,
