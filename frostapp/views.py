@@ -11450,8 +11450,8 @@ def get_qr_code_by_tg(request):
         tg_id = str(data.get("tg_id") or "").strip()
         max_id = str(data.get("max_id") or "").strip()
 
-        if not tg_id and not max_id:
-            msg = "Не указан tg_id или max_id"
+        if not max_id:
+            msg = "Не указан max_id"
             _drop_qr_tg_admin_log(
                 f"❌ Ошибка (READ-ONLY) при выдаче QR\nЭтап: Валидация\nПричина: {msg}"
             )
@@ -11471,7 +11471,10 @@ def get_qr_code_by_tg(request):
             )
             return JsonResponse({"status": "error", "message": msg}, status=400)
 
-        user, err = _resolve_user_by_ids(tg_id=tg_id, max_id=max_id)
+        user, err = _resolve_user_by_ids(
+            tg_id="",
+            max_id=max_id,
+        )
         if not user:
             msg = f"Пользователь не найден: {err} (tg_id={tg_id!r}, max_id={max_id!r})"
             _drop_qr_tg_admin_log(
