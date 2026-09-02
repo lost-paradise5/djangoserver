@@ -144,6 +144,12 @@ urlpatterns = [
         name="activity_report",
     ),
 
+    path(
+        "ui/max-report/",
+        views.max_connection_report,
+        name="max_connection_report",
+    ),
+
 
     path(
         "ui/ukm-rotation/",
