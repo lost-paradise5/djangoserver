@@ -7,7 +7,7 @@
         content="width=device-width, initial-scale=1"
     >
 
-    <title>Отчёт по MAX и использованию сервисов</title>
+    <title>Использование сервисов</title>
 
     <style>
         :root {
@@ -180,6 +180,13 @@
             gap: 8px;
         }
 
+        .report-nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 14px;
+        }
+
         .table-wrap {
             overflow-x: auto;
             border: 1px solid var(--border);
@@ -304,13 +311,31 @@
 <div class="page">
     <div class="topbar">
         <div>
-            <h1>MAX и использование сервисов</h1>
+            <h1>Использование сервисов</h1>
+    
             <p>
-                Актуальные данные из users, qr_issue_logs,
-                stores, positions и departments.
+                Запросы бейджей, отметки смен,
+                перезагрузки касс, входы в агента
+                и управление удалённым доступом.
             </p>
+    
+            <nav class="report-nav">
+                <a
+                    class="button-link"
+                    href="{% url 'max_connection_report' %}"
+                >
+                    Подключение к MAX
+                </a>
+    
+                <a
+                    class="button-link"
+                    href="{% url 'activity_report' %}"
+                >
+                    Использование сервисов
+                </a>
+            </nav>
         </div>
-
+    
         <div class="refresh-controls">
             <label>
                 <input
@@ -321,7 +346,7 @@
                 >
                 обновлять каждые 30 секунд
             </label>
-
+    
             <button id="refresh-now" type="button">
                 Обновить
             </button>
