@@ -1,0 +1,489 @@
+{% load tz %}
+
+<p class="updated">
+    Обновлено:
+    {{ report_updated_at|date:"d.m.Y H:i:s" }}
+</p>
+
+<section class="panel">
+    <h2 class="section-title">Подключение сотрудников к MAX</h2>
+
+    <p class="section-description">
+        Сотрудник считается подключённым, если поле users.max_id
+        заполнено и не равно нулю.
+    </p>
+
+    <div class="cards">
+        <div class="card">
+            <div class="card-label">Всего записей сотрудников</div>
+            <div class="card-value">{{ max_stats.total }}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">Активных сотрудников</div>
+            <div class="card-value">{{ max_stats.active }}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">Активных с MAX</div>
+            <div class="card-value">
+                {{ max_stats.active_connected }}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">Активных без MAX</div>
+            <div class="card-value">
+                {{ max_stats.active_not_connected }}
+            </div>
+        </div>
+    </div>
+
+    <form method="get" class="filters">
+        {% for name, value in usage_hidden %}
+            <input
+                type="hidden"
+                name="{{ name }}"
+                value="{{ value }}"
+            >
+        {% endfor %}
+
+        <div class="field">
+            <label for="max-q">Поиск сотрудника</label>
+            <input
+                id="max-q"
+                type="search"
+                name="max_q"
+                value="{{ max_filters.q }}"
+                placeholder="ФИО, ИНН, телефон, MAX ID"
+            >
+        </div>
+
+        <div class="field">
+            <label for="max-connection">Подключение</label>
+            <select id="max-connection" name="max_connection">
+                <option
+                    value="connected"
+                    {% if max_filters.connection == "connected" %}selected{% endif %}
+                >
+                    MAX подключён
+                </option>
+
+                <option
+                    value="not_connected"
+                    {% if max_filters.connection == "not_connected" %}selected{% endif %}
+                >
+                    MAX не подключён
+                </option>
+
+                <option
+                    value="all"
+                    {% if max_filters.connection == "all" %}selected{% endif %}
+                >
+                    Все
+                </option>
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="max-active">Состояние сотрудника</label>
+            <select id="max-active" name="max_active">
+                <option
+                    value="active"
+                    {% if max_filters.active == "active" %}selected{% endif %}
+                >
+                    Только активные
+                </option>
+
+                <option
+                    value="inactive"
+                    {% if max_filters.active == "inactive" %}selected{% endif %}
+                >
+                    Только неактивные
+                </option>
+
+                <option
+                    value="all"
+                    {% if max_filters.active == "all" %}selected{% endif %}
+                >
+                    Все
+                </option>
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="max-page-size">Строк на странице</label>
+            <select id="max-page-size" name="max_page_size">
+                <option value="25" {% if max_filters.page_size == 25 %}selected{% endif %}>25</option>
+                <option value="50" {% if max_filters.page_size == 50 %}selected{% endif %}>50</option>
+                <option value="100" {% if max_filters.page_size == 100 %}selected{% endif %}>100</option>
+                <option value="200" {% if max_filters.page_size == 200 %}selected{% endif %}>200</option>
+            </select>
+        </div>
+
+        <div class="filter-actions">
+            <button type="submit">Применить</button>
+
+            <a
+                class="button-link"
+                href="?{{ max_reset_query }}"
+            >
+                Сбросить
+            </a>
+        </div>
+    </form>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+            <tr>
+                <th>ФИО</th>
+                <th>Должность</th>
+                <th>Подразделение</th>
+                <th>Сотрудник</th>
+                <th>MAX</th>
+                <th>MAX ID</th>
+            </tr>
+            </thead>
+
+            <tbody>
+            {% for user in max_page %}
+                <tr>
+                    <td>
+                        {{ user.full_name|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ user.report_position|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ user.report_department|default:"—" }}
+                    </td>
+
+                    <td>
+                        {% if user.active %}
+                            <span class="badge result-ok">
+                                Активен
+                            </span>
+                        {% else %}
+                            <span class="badge result-other">
+                                Неактивен
+                            </span>
+                        {% endif %}
+                    </td>
+
+                    <td>
+                        {% if user.report_max_connected %}
+                            <span class="badge result-ok">
+                                Подключён
+                            </span>
+                        {% else %}
+                            <span class="badge result-error">
+                                Не подключён
+                            </span>
+                        {% endif %}
+                    </td>
+
+                    <td>
+                        {% if user.max_id %}
+                            {{ user.max_id }}
+                        {% else %}
+                            <span class="muted">—</span>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% empty %}
+                <tr>
+                    <td colspan="6" class="empty">
+                        Сотрудники по выбранным фильтрам не найдены.
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if max_page.paginator.num_pages > 1 %}
+        <nav class="pagination">
+            {% if max_page.has_previous %}
+                <a href="?{% if max_query_without_page %}{{ max_query_without_page }}&{% endif %}max_page={{ max_page.previous_page_number }}">
+                    Назад
+                </a>
+            {% endif %}
+
+            <span>
+                Страница {{ max_page.number }}
+                из {{ max_page.paginator.num_pages }}
+            </span>
+
+            {% if max_page.has_next %}
+                <a href="?{% if max_query_without_page %}{{ max_query_without_page }}&{% endif %}max_page={{ max_page.next_page_number }}">
+                    Вперёд
+                </a>
+            {% endif %}
+        </nav>
+    {% endif %}
+</section>
+
+<section class="panel">
+    <h2 class="section-title">Использование сервисов</h2>
+
+    <p class="section-description">
+        Все подходящие записи из qr_issue_logs.
+        QR-коды, PIN-коды, телефоны и сырой JSON не выводятся.
+    </p>
+
+    <div class="cards">
+        <div class="card">
+            <div class="card-label">Записей по фильтру</div>
+            <div class="card-value">{{ usage_stats.total }}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">Успешно</div>
+            <div class="card-value">{{ usage_stats.success }}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">Ошибок</div>
+            <div class="card-value">{{ usage_stats.error }}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-label">В очереди</div>
+            <div class="card-value">{{ usage_stats.queued }}</div>
+        </div>
+    </div>
+
+    <form method="get" class="filters">
+        {% for name, value in max_hidden %}
+            <input
+                type="hidden"
+                name="{{ name }}"
+                value="{{ value }}"
+            >
+        {% endfor %}
+
+        <div class="field">
+            <label for="usage-q">Поиск</label>
+            <input
+                id="usage-q"
+                type="search"
+                name="q"
+                value="{{ usage_filters.q }}"
+                placeholder="ФИО, ИНН, магазин, действие"
+            >
+        </div>
+
+        <div class="field">
+            <label for="endpoint">Действие</label>
+            <select id="endpoint" name="endpoint">
+                <option value="">Все действия</option>
+
+                {% for item in endpoint_options %}
+                    <option
+                        value="{{ item.value }}"
+                        {% if usage_filters.endpoint == item.value %}selected{% endif %}
+                    >
+                        {{ item.label }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="source">Источник</label>
+            <select id="source" name="source">
+                <option value="">Все источники</option>
+
+                {% for value, label in source_options %}
+                    <option
+                        value="{{ value }}"
+                        {% if usage_filters.source == value %}selected{% endif %}
+                    >
+                        {{ label }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="status">Результат</label>
+            <select id="status" name="status">
+                <option value="">Все результаты</option>
+
+                {% for item in status_options %}
+                    <option
+                        value="{{ item.value }}"
+                        {% if usage_filters.status == item.value %}selected{% endif %}
+                    >
+                        {{ item.label }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="store">Магазин</label>
+            <select id="store" name="store">
+                <option value="">Все магазины</option>
+
+                {% for store in store_options %}
+                    <option
+                        value="{{ store.id }}"
+                        {% if usage_filters.store == store.id %}selected{% endif %}
+                    >
+                        {{ store.label }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="position">Должность</label>
+            <select id="position" name="position">
+                <option value="">Все должности</option>
+
+                {% for position in position_options %}
+                    <option
+                        value="{{ position.id }}"
+                        {% if usage_filters.position == position.id %}selected{% endif %}
+                    >
+                        {{ position.name }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="date-from">Дата от</label>
+            <input
+                id="date-from"
+                type="date"
+                name="date_from"
+                value="{{ usage_filters.date_from }}"
+            >
+        </div>
+
+        <div class="field">
+            <label for="date-to">Дата до</label>
+            <input
+                id="date-to"
+                type="date"
+                name="date_to"
+                value="{{ usage_filters.date_to }}"
+            >
+        </div>
+
+        <div class="field">
+            <label for="page-size">Строк на странице</label>
+            <select id="page-size" name="page_size">
+                <option value="25" {% if usage_filters.page_size == 25 %}selected{% endif %}>25</option>
+                <option value="50" {% if usage_filters.page_size == 50 %}selected{% endif %}>50</option>
+                <option value="100" {% if usage_filters.page_size == 100 %}selected{% endif %}>100</option>
+                <option value="200" {% if usage_filters.page_size == 200 %}selected{% endif %}>200</option>
+            </select>
+        </div>
+
+        <div class="filter-actions">
+            <button type="submit">Применить</button>
+
+            <a
+                class="button-link"
+                href="?{{ usage_reset_query }}"
+            >
+                Сбросить
+            </a>
+        </div>
+    </form>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+            <tr>
+                <th>Дата и время</th>
+                <th>ФИО</th>
+                <th>Должность</th>
+                <th>Подразделение</th>
+                <th>Магазин</th>
+                <th>Действие</th>
+                <th>Объект</th>
+                <th>Источник</th>
+                <th>Результат</th>
+            </tr>
+            </thead>
+
+            <tbody>
+            {% for row in usage_page %}
+                <tr>
+                    <td class="nowrap">
+                        {{ row.created_at|localtime|date:"d.m.Y H:i:s" }}
+                    </td>
+
+                    <td>
+                        {{ row.report_fio|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ row.report_position|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ row.report_department|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ row.report_store|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ row.report_action }}
+                    </td>
+
+                    <td>
+                        {{ row.report_object|default:"—" }}
+                    </td>
+
+                    <td>
+                        {{ row.report_source }}
+                    </td>
+
+                    <td>
+                        <span class="badge {{ row.report_result_class }}">
+                            {{ row.report_result }}
+                        </span>
+                    </td>
+                </tr>
+            {% empty %}
+                <tr>
+                    <td colspan="9" class="empty">
+                        Записи по выбранным фильтрам не найдены.
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if usage_page.paginator.num_pages > 1 %}
+        <nav class="pagination">
+            {% if usage_page.has_previous %}
+                <a href="?{% if usage_query_without_page %}{{ usage_query_without_page }}&{% endif %}page={{ usage_page.previous_page_number }}">
+                    Назад
+                </a>
+            {% endif %}
+
+            <span>
+                Страница {{ usage_page.number }}
+                из {{ usage_page.paginator.num_pages }}
+            </span>
+
+            {% if usage_page.has_next %}
+                <a href="?{% if usage_query_without_page %}{{ usage_query_without_page }}&{% endif %}page={{ usage_page.next_page_number }}">
+                    Вперёд
+                </a>
+            {% endif %}
+        </nav>
+    {% endif %}
+</section>
