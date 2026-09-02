@@ -85,6 +85,46 @@ class User(models.Model):
         managed = False
 
 
+
+class EmployeePhoneChangeLog(models.Model):
+    """
+    История изменения телефонных номеров сотрудников через API.
+
+    Таблица создаётся вручную в PostgreSQL.
+    Django не создаёт и не изменяет её.
+    """
+    id = models.BigAutoField(primary_key=True)
+
+    # Оставляем IntegerField, а не ForeignKey.
+    # Благодаря этому история сохранится, даже если сотрудника удалят.
+    user_id = models.IntegerField()
+
+    employee_inn = models.CharField(max_length=20)
+    full_name = models.CharField(max_length=255)
+
+    old_phone = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+    )
+    new_phone = models.CharField(max_length=50)
+
+    changed_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "employee_phone_change_log"
+        managed = False
+        ordering = ["-changed_at", "-id"]
+
+    def __str__(self):
+        return (
+            f"{self.full_name}: "
+            f"{self.old_phone} → {self.new_phone}"
+        )
+
+
+
+
 class UKMUser(models.Model):
     id = models.AutoField(primary_key=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
