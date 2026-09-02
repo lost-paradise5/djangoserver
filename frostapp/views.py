@@ -26207,38 +26207,35 @@ def _apply_report_source_filter(queryset, source):
     return queryset
 
 
-def _report_store_label(log_row, stores_by_sm, stores_by_ukm):
+def _report_store_label(
+    log_row,
+    stores_by_sm,
+    stores_by_ukm,
+):
+    """
+    Возвращает только название магазина.
+
+    Внутренние номера SM/UKM в интерфейсе не показываются.
+    """
     store_obj = None
 
     if log_row.sm_store_id is not None:
-        store_obj = stores_by_sm.get(log_row.sm_store_id)
+        store_obj = stores_by_sm.get(
+            log_row.sm_store_id
+        )
 
-    if store_obj is None and log_row.ukm_store_id is not None:
-        store_obj = stores_by_ukm.get(log_row.ukm_store_id)
+    if (
+        store_obj is None
+        and log_row.ukm_store_id is not None
+    ):
+        store_obj = stores_by_ukm.get(
+            log_row.ukm_store_id
+        )
 
-    name = ""
+    if store_obj is None:
+        return ""
 
-    if store_obj is not None:
-        name = str(store_obj.name or "").strip()
-
-    codes = []
-
-    if log_row.sm_store_id is not None:
-        codes.append(f"SM {log_row.sm_store_id}")
-
-    if log_row.ukm_store_id is not None:
-        codes.append(f"UKM {log_row.ukm_store_id}")
-
-    if name and codes:
-        return f"{name} ({', '.join(codes)})"
-
-    if name:
-        return name
-
-    if codes:
-        return ", ".join(codes)
-
-    return ""
+    return str(store_obj.name or "").strip()
 
 
 def _report_page_size(request, parameter, default=50):
@@ -26887,11 +26884,7 @@ def activity_report(request):
 
         store_options.append({
             "id": store["id"],
-            "label": (
-                f"{name} — "
-                f"SM {store['smstore'] if store['smstore'] is not None else '—'}, "
-                f"UKM {store['ukm4store'] if store['ukm4store'] is not None else '—'}"
-            ),
+            "label": name,
         })
 
     position_options = list(
@@ -26995,7 +26988,564 @@ def activity_report(request):
     )
 
 
+@staff_member_required(login_url="/admin/login/")
+@require_GET
+@never_cache
+def max_connection_report(request):
+    """
+    Отдельный отчёт по подключению активных сотрудников к MAX.
 
+    Подключённый сотрудник:
+      • users.active = True;
+      • users.max_id заполнен;
+      • users.max_id != 0.
+
+    Магазин сотрудника:
+      • ukm_users.user_id = users.id;
+      • ukm_users.storeid = stores.ukm4store.
+    """
+    search_query = str(
+        request.GET.get("max_q") or ""
+    ).strip()
+
+    connection_filter = str(
+        request.GET.get("max_connection")
+        or "connected"
+    ).strip()
+
+    if connection_filter not in {
+        "all",
+        "connected",
+        "not_connected",
+    }:
+        connection_filter = "connected"
+
+    selected_store_id = _report_int_or_none(
+        request.GET.get("max_store")
+    )
+
+    selected_store = None
+
+    if selected_store_id is not None:
+        selected_store = (
+            Store.objects
+            .filter(id=selected_store_id)
+            .only(
+                "id",
+                "name",
+                "ukm4store",
+            )
+            .first()
+        )
+
+    connected_q = (
+        Q(max_id__isnull=False)
+        & ~Q(max_id=0)
+    )
+
+    not_connected_q = (
+        Q(max_id__isnull=True)
+        | Q(max_id=0)
+    )
+
+    # --------------------------------------------------------
+    # Активные сотрудники, попадающие в текущий магазин
+    # --------------------------------------------------------
+
+    active_users_qs = User.objects.filter(
+        active=True
+    )
+
+    if selected_store_id is not None:
+        if (
+            selected_store is not None
+            and selected_store.ukm4store is not None
+        ):
+            selected_store_user_ids = (
+                UKMUser.objects
+                .filter(
+                    storeid=selected_store.ukm4store
+                )
+                .values_list(
+                    "user_id",
+                    flat=True,
+                )
+                .distinct()
+            )
+
+            active_users_qs = active_users_qs.filter(
+                id__in=selected_store_user_ids
+            )
+        else:
+            active_users_qs = active_users_qs.none()
+
+    # --------------------------------------------------------
+    # Общая сводка
+    # --------------------------------------------------------
+
+    max_stats = active_users_qs.aggregate(
+        active_count=Count("id"),
+
+        connected_count=Count(
+            "id",
+            filter=connected_q,
+        ),
+
+        not_connected_count=Count(
+            "id",
+            filter=not_connected_q,
+        ),
+    )
+
+    active_count = int(
+        max_stats.get("active_count") or 0
+    )
+
+    connected_count = int(
+        max_stats.get("connected_count") or 0
+    )
+
+    max_stats["connected_percent"] = (
+        round(
+            connected_count * 100 / active_count,
+            1,
+        )
+        if active_count
+        else 0
+    )
+
+    # --------------------------------------------------------
+    # Сводка по каждому магазину
+    # --------------------------------------------------------
+
+    store_summary_qs = UKMUser.objects.filter(
+        user__active=True
+    )
+
+    if (
+        selected_store is not None
+        and selected_store.ukm4store is not None
+    ):
+        store_summary_qs = store_summary_qs.filter(
+            storeid=selected_store.ukm4store
+        )
+    elif selected_store_id is not None:
+        store_summary_qs = store_summary_qs.none()
+
+    store_summary_raw = list(
+        store_summary_qs
+        .values("storeid")
+        .annotate(
+            active_count=Count(
+                "user_id",
+                distinct=True,
+            ),
+
+            connected_count=Count(
+                "user_id",
+                filter=(
+                    Q(user__max_id__isnull=False)
+                    & ~Q(user__max_id=0)
+                ),
+                distinct=True,
+            ),
+        )
+    )
+
+    summary_ukm_store_ids = {
+        row["storeid"]
+        for row in store_summary_raw
+        if row["storeid"] is not None
+    }
+
+    summary_store_map = {}
+
+    for store in (
+        Store.objects
+        .filter(
+            ukm4store__in=summary_ukm_store_ids
+        )
+        .only(
+            "id",
+            "name",
+            "ukm4store",
+        )
+        .order_by(
+            "name",
+            "id",
+        )
+    ):
+        if store.ukm4store not in summary_store_map:
+            summary_store_map[store.ukm4store] = store
+
+    store_summary = []
+
+    for row in store_summary_raw:
+        store_obj = summary_store_map.get(
+            row["storeid"]
+        )
+
+        if store_obj is None:
+            continue
+
+        store_active_count = int(
+            row["active_count"] or 0
+        )
+
+        store_connected_count = int(
+            row["connected_count"] or 0
+        )
+
+        store_not_connected_count = max(
+            0,
+            store_active_count
+            - store_connected_count,
+        )
+
+        connected_percent = (
+            round(
+                store_connected_count
+                * 100
+                / store_active_count,
+                1,
+            )
+            if store_active_count
+            else 0
+        )
+
+        store_summary.append({
+            "store_id": store_obj.id,
+            "store_name": str(
+                store_obj.name or ""
+            ).strip() or "Без названия",
+            "active_count": store_active_count,
+            "connected_count": (
+                store_connected_count
+            ),
+            "not_connected_count": (
+                store_not_connected_count
+            ),
+            "connected_percent": (
+                connected_percent
+            ),
+        })
+
+    store_summary.sort(
+        key=lambda item: (
+            item["store_name"].casefold()
+        )
+    )
+
+    # --------------------------------------------------------
+    # Фильтрация таблицы сотрудников
+    # --------------------------------------------------------
+
+    max_users_qs = active_users_qs
+
+    if connection_filter == "connected":
+        max_users_qs = max_users_qs.filter(
+            connected_q
+        )
+
+    elif connection_filter == "not_connected":
+        max_users_qs = max_users_qs.filter(
+            not_connected_q
+        )
+
+    if search_query:
+        search_filter = (
+            Q(full_name__icontains=search_query)
+            | Q(employee_id__icontains=search_query)
+            | Q(mail__icontains=search_query)
+            | Q(phone__icontains=search_query)
+        )
+
+        matching_position_ids = list(
+            Position.objects
+            .filter(
+                name__icontains=search_query
+            )
+            .values_list(
+                "id",
+                flat=True,
+            )[:500]
+        )
+
+        matching_department_ids = list(
+            Department.objects
+            .filter(
+                name__icontains=search_query
+            )
+            .values_list(
+                "id",
+                flat=True,
+            )[:500]
+        )
+
+        if matching_position_ids:
+            search_filter |= Q(
+                position_id__in=(
+                    matching_position_ids
+                )
+            )
+
+        if matching_department_ids:
+            search_filter |= Q(
+                department_id__in=(
+                    matching_department_ids
+                )
+            )
+
+        numeric_query = _report_int_or_none(
+            search_query
+        )
+
+        if numeric_query is not None:
+            search_filter |= (
+                Q(id=numeric_query)
+                | Q(max_id=numeric_query)
+            )
+
+        max_users_qs = max_users_qs.filter(
+            search_filter
+        )
+
+    max_users_qs = max_users_qs.order_by(
+        "full_name",
+        "id",
+    )
+
+    page_size = _report_page_size(
+        request,
+        "max_page_size",
+        50,
+    )
+
+    paginator = Paginator(
+        max_users_qs,
+        page_size,
+    )
+
+    max_page = paginator.get_page(
+        request.GET.get("max_page")
+    )
+
+    max_rows = list(max_page.object_list)
+    max_page.object_list = max_rows
+
+    # --------------------------------------------------------
+    # Должности и подразделения
+    # --------------------------------------------------------
+
+    position_ids = {
+        row.position_id
+        for row in max_rows
+        if row.position_id
+    }
+
+    department_ids = {
+        row.department_id
+        for row in max_rows
+        if row.department_id
+    }
+
+    position_map = dict(
+        Position.objects
+        .filter(id__in=position_ids)
+        .values_list(
+            "id",
+            "name",
+        )
+    )
+
+    department_map = dict(
+        Department.objects
+        .filter(id__in=department_ids)
+        .values_list(
+            "id",
+            "name",
+        )
+    )
+
+    # --------------------------------------------------------
+    # Магазины сотрудников текущей страницы
+    # --------------------------------------------------------
+
+    page_user_ids = [
+        row.id
+        for row in max_rows
+    ]
+
+    page_user_store_links = list(
+        UKMUser.objects
+        .filter(user_id__in=page_user_ids)
+        .values(
+            "user_id",
+            "storeid",
+        )
+        .distinct()
+    )
+
+    page_ukm_store_ids = {
+        row["storeid"]
+        for row in page_user_store_links
+        if row["storeid"] is not None
+    }
+
+    page_store_map = {}
+
+    for store in (
+        Store.objects
+        .filter(
+            ukm4store__in=page_ukm_store_ids
+        )
+        .only(
+            "name",
+            "ukm4store",
+        )
+        .order_by("name")
+    ):
+        if store.ukm4store not in page_store_map:
+            page_store_map[store.ukm4store] = str(
+                store.name or ""
+            ).strip()
+
+    stores_by_user = defaultdict(list)
+
+    for link in page_user_store_links:
+        store_name = page_store_map.get(
+            link["storeid"],
+            "",
+        )
+
+        if (
+            store_name
+            and store_name
+            not in stores_by_user[link["user_id"]]
+        ):
+            stores_by_user[
+                link["user_id"]
+            ].append(store_name)
+
+    for user_row in max_rows:
+        user_row.report_position = str(
+            position_map.get(
+                user_row.position_id,
+                "",
+            )
+            or ""
+        ).strip()
+
+        user_row.report_department = str(
+            department_map.get(
+                user_row.department_id,
+                "",
+            )
+            or ""
+        ).strip()
+
+        user_row.report_stores = ", ".join(
+            sorted(
+                stores_by_user.get(
+                    user_row.id,
+                    [],
+                ),
+                key=str.casefold,
+            )
+        )
+
+        user_row.report_max_connected = bool(
+            user_row.active
+            and user_row.max_id
+        )
+
+    # --------------------------------------------------------
+    # Магазины для фильтра
+    # --------------------------------------------------------
+
+    assigned_ukm_store_ids = (
+        UKMUser.objects
+        .filter(user__active=True)
+        .values_list(
+            "storeid",
+            flat=True,
+        )
+        .distinct()
+    )
+
+    store_options = []
+    seen_ukm_store_ids = set()
+
+    for store in (
+        Store.objects
+        .filter(
+            ukm4store__in=assigned_ukm_store_ids
+        )
+        .exclude(name__isnull=True)
+        .exclude(name="")
+        .only(
+            "id",
+            "name",
+            "ukm4store",
+        )
+        .order_by(
+            "name",
+            "id",
+        )
+    ):
+        if store.ukm4store in seen_ukm_store_ids:
+            continue
+
+        seen_ukm_store_ids.add(
+            store.ukm4store
+        )
+
+        store_options.append({
+            "id": store.id,
+            "name": str(
+                store.name or ""
+            ).strip(),
+        })
+
+    context = {
+        "max_stats": max_stats,
+        "store_summary": store_summary,
+        "store_options": store_options,
+        "max_page": max_page,
+        "max_filters": {
+            "q": search_query,
+            "connection": connection_filter,
+            "store": selected_store_id,
+            "page_size": page_size,
+        },
+        "max_query_without_page": (
+            _report_query_without(
+                request,
+                "max_page",
+            )
+        ),
+        "report_updated_at": timezone.localtime(
+            timezone.now()
+        ),
+    }
+
+    if (
+        request.headers.get(
+            "X-Requested-With"
+        )
+        == "XMLHttpRequest"
+    ):
+        return render(
+            request,
+            "frostapp/_max_connection_report_content.html",
+            context,
+        )
+
+    return render(
+        request,
+        "frostapp/max_connection_report.html",
+        context,
+    )
 
 
 
