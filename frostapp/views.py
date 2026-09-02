@@ -169,6 +169,7 @@ from .forms import (
 _HEX = set("0123456789abcdefABCDEF")
 logger = logging.getLogger(__name__)
 AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "zDFbCQWRzL7pKYxzpfSSLVdqCrAYsHiN7FORRUDt1hE")
+EMPLOYEE_PHONE_UPDATE_API_TOKEN = "6q0w4e1r3t6y"
 
 UKM5_FULL_XML_STORE_ID = 2013
 
@@ -34490,3 +34491,408 @@ def working_employees_positions_sync_download(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Для обновления номера телефона из 1С
+
+def _employee_phone_api_clean_name(
+    value,
+    field_label: str,
+    *,
+    required: bool = True,
+) -> str:
+    """
+    Проверяет и нормализует часть ФИО.
+    Отчество может быть пустым.
+    """
+    if value is None:
+        value = ""
+
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Поле «{field_label}» должно быть строкой"
+        )
+
+    value = re.sub(r"\s+", " ", value.strip())
+
+    if required and not value:
+        raise ValueError(
+            f"Поле «{field_label}» обязательно"
+        )
+
+    if len(value) > 100:
+        raise ValueError(
+            f"Поле «{field_label}» слишком длинное"
+        )
+
+    if any(character.isdigit() for character in value):
+        raise ValueError(
+            f"Поле «{field_label}» не должно содержать цифры"
+        )
+
+    return value
+
+
+def _employee_phone_api_normalize_fio(value: str) -> str:
+    """
+    Нормализация ФИО для сравнения:
+      - убирает лишние пробелы;
+      - не учитывает регистр;
+      - считает «ё» и «е» одинаковыми.
+    """
+    return (
+        re.sub(r"\s+", " ", str(value or "").strip())
+        .casefold()
+        .replace("ё", "е")
+    )
+
+
+def _employee_phone_api_normalize_phone(value) -> str:
+    """
+    Принимает российский номер в форматах:
+
+      +7 902 123-45-67
+      8 (902) 123-45-67
+      79021234567
+      9021234567
+
+    Сохраняет в едином формате:
+
+      +79021234567
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            "Поле «Номер телефона» должно быть строкой"
+        )
+
+    raw_phone = value.strip()
+
+    if not raw_phone:
+        raise ValueError(
+            "Поле «Номер телефона» обязательно"
+        )
+
+    # Разрешаем цифры, пробелы, скобки, дефисы и один знак +.
+    if not re.fullmatch(r"[0-9+\-()\s]+", raw_phone):
+        raise ValueError(
+            "Номер телефона содержит недопустимые символы"
+        )
+
+    if raw_phone.count("+") > 1 or (
+        "+" in raw_phone and not raw_phone.startswith("+")
+    ):
+        raise ValueError(
+            "Знак + разрешён только в начале номера"
+        )
+
+    digits = re.sub(r"\D", "", raw_phone)
+
+    # Номер без кода страны: 9021234567
+    if len(digits) == 10:
+        digits = "7" + digits
+
+    # Российский номер через 8: 89021234567
+    elif len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+
+    # Российский номер через 7: 79021234567
+    elif len(digits) == 11 and digits.startswith("7"):
+        pass
+
+    else:
+        raise ValueError(
+            "Некорректный номер телефона. "
+            "Ожидается российский номер из 10 цифр "
+            "либо 11 цифр, начинающийся с 7 или 8"
+        )
+
+    return "+" + digits
+
+
+@csrf_exempt
+@require_POST
+def update_employee_phone_api(request):
+    """
+    Обновляет номер телефона сотрудника по ИНН.
+
+    Защита:
+      X-API-Token: 6q0w4e1r3t6y
+
+    JSON:
+      {
+        "inn": "032614541004",
+        "last_name": "Иванов",
+        "first_name": "Иван",
+        "middle_name": "Иванович",
+        "phone": "+79021234567"
+      }
+    """
+    received_token = str(
+        request.headers.get("X-API-Token") or ""
+    )
+
+    if not hmac.compare_digest(
+        received_token,
+        EMPLOYEE_PHONE_UPDATE_API_TOKEN,
+    ):
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Неверный или отсутствующий API-токен",
+            },
+            status=401,
+        )
+
+    try:
+        raw_body = request.body.decode("utf-8")
+        payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Тело запроса должно содержать корректный JSON",
+            },
+            status=400,
+        )
+
+    if not isinstance(payload, dict):
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Корнем JSON должен быть объект",
+            },
+            status=400,
+        )
+
+    try:
+        inn_value = payload.get("inn")
+
+        # ИНН обязательно передавать строкой, иначе может потеряться
+        # ведущий ноль.
+        if not isinstance(inn_value, str):
+            raise ValueError(
+                "Поле «ИНН» должно быть строкой"
+            )
+
+        inn = inn_value.strip()
+
+        if not inn.isdigit() or len(inn) not in (10, 12):
+            raise ValueError(
+                "ИНН должен содержать 10 или 12 цифр"
+            )
+
+        last_name = _employee_phone_api_clean_name(
+            payload.get("last_name"),
+            "Фамилия",
+        )
+        first_name = _employee_phone_api_clean_name(
+            payload.get("first_name"),
+            "Имя",
+        )
+        middle_name = _employee_phone_api_clean_name(
+            payload.get("middle_name"),
+            "Отчество",
+            required=False,
+        )
+
+        requested_full_name = " ".join(
+            part
+            for part in (
+                last_name,
+                first_name,
+                middle_name,
+            )
+            if part
+        )
+
+        new_phone = _employee_phone_api_normalize_phone(
+            payload.get("phone")
+        )
+
+    except ValueError as exc:
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status=400,
+        )
+
+    try:
+        with transaction.atomic():
+            # Блокируем найденную запись до окончания обновления,
+            # чтобы два одновременных запроса не испортили историю.
+            employees = list(
+                User.objects
+                .select_for_update()
+                .filter(employee_id=inn)
+                .order_by("id")[:2]
+            )
+
+            if not employees:
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "error": "Сотрудник с таким ИНН не найден",
+                    },
+                    status=404,
+                )
+
+            if len(employees) > 1:
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "error": (
+                            "В базе найдено несколько сотрудников "
+                            "с таким ИНН. Обновление отменено"
+                        ),
+                    },
+                    status=409,
+                )
+
+            employee = employees[0]
+
+            database_full_name = re.sub(
+                r"\s+",
+                " ",
+                str(employee.full_name or "").strip(),
+            )
+
+            # ФИО используется как дополнительная защита от обновления
+            # телефона не того сотрудника.
+            if (
+                _employee_phone_api_normalize_fio(database_full_name)
+                !=
+                _employee_phone_api_normalize_fio(requested_full_name)
+            ):
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "error": (
+                            "Переданное ФИО не совпадает с ФИО "
+                            "сотрудника в базе"
+                        ),
+                    },
+                    status=409,
+                )
+
+            old_phone = str(employee.phone or "").strip()
+
+            # Повторный запрос с тем же номером ничего не меняет
+            # и не создаёт повторную запись в журнале.
+            if old_phone == new_phone:
+                return JsonResponse(
+                    {
+                        "ok": True,
+                        "changed": False,
+                        "message": "У сотрудника уже указан этот номер",
+                        "user_id": employee.id,
+                        "inn": inn,
+                        "full_name": database_full_name,
+                        "phone": new_phone,
+                    },
+                    status=200,
+                )
+
+            changed_at = timezone.now()
+
+            employee.phone = new_phone
+            employee.updated_at = changed_at
+            employee.save(
+                update_fields=[
+                    "phone",
+                    "updated_at",
+                ]
+            )
+
+            # Журнал записывается в той же транзакции.
+            # Если INSERT завершится ошибкой, изменение phone
+            # также будет отменено.
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO public.employee_phone_change_log (
+                        user_id,
+                        employee_inn,
+                        full_name,
+                        old_phone,
+                        new_phone,
+                        changed_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        employee.id,
+                        inn,
+                        database_full_name,
+                        old_phone,
+                        new_phone,
+                        changed_at,
+                    ],
+                )
+
+        logger.info(
+            "[EMPLOYEE_PHONE_API] Телефон обновлён user_id=%s",
+            employee.id,
+        )
+
+        return JsonResponse(
+            {
+                "ok": True,
+                "changed": True,
+                "message": "Номер телефона успешно обновлён",
+                "user_id": employee.id,
+                "inn": inn,
+                "full_name": database_full_name,
+                "old_phone": old_phone,
+                "new_phone": new_phone,
+                "changed_at": changed_at.isoformat(),
+            },
+            status=200,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[EMPLOYEE_PHONE_API] Ошибка обновления телефона: %s",
+            exc,
+        )
+
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Внутренняя ошибка сервера",
+            },
+            status=500,
+        )
