@@ -138,6 +138,12 @@ urlpatterns = [
         name="update_employee_phone_api",
     ),
 
+    path(
+        "ui/activity-report/",
+        views.activity_report,
+        name="activity_report",
+    ),
+
 
     path(
         "ui/ukm-rotation/",
