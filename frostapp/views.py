@@ -59,7 +59,8 @@ import csv
 from django.core.paginator import Paginator
 from django.shortcuts import get_object_or_404
 
-from django.db.models import Q
+from django.db.models import Q, Count
+from django.utils.dateparse import parse_date
 import math
 from collections import defaultdict, Counter
 from pathlib import Path
@@ -25812,6 +25813,1225 @@ def admin_badge_transfer_report_excel(request, period: str):
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
 
     return response
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# Единый отчёт:
+#   1. Подключение сотрудников к MAX.
+#   2. Использование сервисов из qr_issue_logs.
+# ============================================================
+
+REPORT_ENDPOINT_LABELS = {
+    "get_qr_code_by_employee_id": "Запрос бейджа из 1С",
+    "get_qr_code_by_tg": "Запрос бейджа из бота",
+    "employee_identification": "Отметка смены",
+    "pos_reboot": "Перезагрузка кассы из бота",
+    "bitrix_cash_reboot": "Перезагрузка кассы из Bitrix24",
+    "bitrix_cash_reserve_badge": "Запрос резервного бейджа",
+    "agent_auth_start": "Начало входа в агента",
+    "agent_auth_verify_pin": "Вход в агента",
+    "vpn_ui_pin": "Вход в управление удалённым доступом",
+    "vpn_access_toggle": "Изменение удалённого доступа",
+    "admin_badge_transfer": "Передача бейджа администратора",
+}
+
+
+REPORT_SOURCE_OPTIONS = [
+    ("max", "MAX"),
+    ("telegram", "Telegram"),
+    ("onec", "1С / терминал"),
+    ("bitrix", "Bitrix24"),
+    ("agent", "Агент"),
+    ("web", "Веб-интерфейс"),
+]
+
+
+REPORT_STATUS_LABELS = {
+    "ok": "Успешно",
+    "success": "Успешно",
+    "queued": "В очереди",
+    "pending": "В обработке",
+    "error": "Ошибка",
+    "failed": "Ошибка",
+}
+
+
+def _report_int_or_none(value):
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _report_payload_value(raw_request, *paths):
+    """
+    Ищет первое непустое значение по нескольким JSON-путям.
+
+    Пример:
+        _report_payload_value(
+            raw,
+            ("max_id",),
+            ("request", "max_id"),
+        )
+    """
+    if not isinstance(raw_request, dict):
+        return ""
+
+    for path in paths:
+        current = raw_request
+
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+
+            current = current.get(key)
+
+        if current not in (None, ""):
+            return current
+
+    return ""
+
+
+def _report_action_label(log_row):
+    endpoint = str(log_row.endpoint or "").strip()
+    method = str(log_row.method or "").strip().upper()
+
+    if endpoint == "employee_identification":
+        if method in {"IN", "ENTER", "START", "OPEN"}:
+            return "Начало смены"
+
+        if method in {"OUT", "EXIT", "END", "CLOSE"}:
+            return "Окончание смены"
+
+        return "Отметка смены"
+
+    if endpoint == "agent_auth_start":
+        if method == "AGENT_DIRECT":
+            return "Вход в агента без PIN"
+
+        return "Запрос PIN для входа в агента"
+
+    if endpoint == "agent_auth_verify_pin":
+        return "Вход в агента"
+
+    if endpoint == "vpn_ui_pin":
+        return "Вход в управление удалённым доступом"
+
+    if endpoint == "vpn_access_toggle":
+        if method == "VPN_OPEN":
+            return "Открытие удалённого доступа"
+
+        if method == "VPN_CLOSE":
+            return "Закрытие удалённого доступа"
+
+        return "Изменение удалённого доступа"
+
+    if endpoint == "admin_badge_transfer":
+        if method == "ADMIN_BADGE_REQUEST":
+            return "Запрос передачи бейджа администратора"
+
+        if method == "ADMIN_BADGE_TRANSFER":
+            return "Передача бейджа администратора"
+
+        if method == "ADMIN_BADGE_REJECT":
+            return "Отклонение передачи бейджа"
+
+        if method == "ADMIN_BADGE_EXPIRE":
+            return "Истечение запроса передачи бейджа"
+
+    return (
+        REPORT_ENDPOINT_LABELS.get(endpoint)
+        or endpoint.replace("_", " ").strip().capitalize()
+        or "Неизвестное действие"
+    )
+
+
+def _report_source_label(log_row):
+    """
+    Определяет фактический источник действия.
+
+    Важно: сначала проверяем содержимое raw_request, потому что старые
+    get_qr_code_by_tg могли ошибочно иметь method=BY_MAX даже при Telegram.
+    """
+    endpoint = str(log_row.endpoint or "").strip()
+    method = str(log_row.method or "").strip().upper()
+
+    raw = (
+        log_row.raw_request
+        if isinstance(log_row.raw_request, dict)
+        else {}
+    )
+
+    raw_source = str(
+        _report_payload_value(
+            raw,
+            ("source",),
+            ("extra", "source"),
+        )
+        or ""
+    ).strip().lower()
+
+    if raw_source in {"max", "max_bot"}:
+        return "MAX"
+
+    if raw_source in {"telegram", "telegram_bot", "tg"}:
+        return "Telegram"
+
+    if endpoint.startswith("bitrix_"):
+        return "Bitrix24"
+
+    if endpoint.startswith("agent_auth"):
+        return "Агент"
+
+    if endpoint.startswith("vpn_") or endpoint == "ad_ui_lookup_vpn_toggle":
+        return "Веб-интерфейс"
+
+    if endpoint == "get_qr_code_by_employee_id":
+        return "1С"
+
+    if endpoint == "employee_identification":
+        return "1С / терминал"
+
+    if endpoint in {
+        "get_qr_code_by_tg",
+        "pos_reboot",
+        "admin_badge_transfer",
+    }:
+        incoming_max_id = _report_payload_value(
+            raw,
+            ("max_id",),
+            ("request", "max_id"),
+        )
+
+        incoming_tg_id = _report_payload_value(
+            raw,
+            ("tg_id",),
+            ("request", "tg_id"),
+        )
+
+        if incoming_max_id and incoming_tg_id:
+            return "MAX + Telegram"
+
+        if incoming_max_id:
+            return "MAX"
+
+        if incoming_tg_id:
+            return "Telegram"
+
+        if method == "BY_MAX":
+            return "MAX"
+
+        if method == "BY_TG":
+            return "Telegram"
+
+    return "Не определён"
+
+
+def _report_result(log_row):
+    status = str(log_row.status or "").strip().lower()
+
+    label = REPORT_STATUS_LABELS.get(
+        status,
+        status.capitalize() if status else "Не определён",
+    )
+
+    if status in {"ok", "success"}:
+        css_class = "result-ok"
+    elif status in {"queued", "pending"}:
+        css_class = "result-queued"
+    elif status in {"error", "failed"}:
+        css_class = "result-error"
+    else:
+        css_class = "result-other"
+
+    return label, css_class
+
+
+def _report_object_label(log_row):
+    """
+    Возвращает только полезный объект действия:
+      • кассу для перезагрузки;
+      • сотрудника для VPN;
+      • получателя при передаче бейджа.
+
+    Сырой запрос и технические параметры не показываются.
+    """
+    endpoint = str(log_row.endpoint or "").strip()
+
+    raw = (
+        log_row.raw_request
+        if isinstance(log_row.raw_request, dict)
+        else {}
+    )
+
+    if endpoint in {"pos_reboot", "bitrix_cash_reboot"}:
+        device = raw.get("device")
+
+        if not isinstance(device, dict):
+            device = {}
+
+        cash_name = str(
+            device.get("name")
+            or ""
+        ).strip()
+
+        cash_id = str(
+            device.get("cash_id")
+            or ""
+        ).strip()
+
+        if cash_name:
+            return f"Касса {cash_name}"
+
+        if cash_id:
+            return f"Касса {cash_id}"
+
+    if endpoint.startswith("vpn_") or endpoint == "ad_ui_lookup_vpn_toggle":
+        target_fio = str(
+            raw.get("target_fio")
+            or ""
+        ).strip()
+
+        if target_fio:
+            return target_fio
+
+    if endpoint == "admin_badge_transfer":
+        target_fio = str(
+            raw.get("target_fio")
+            or raw.get("cashier_full_name")
+            or ""
+        ).strip()
+
+        if target_fio:
+            return target_fio
+
+    return ""
+
+
+def _report_json_nonempty_q(*path):
+    lookup = "__".join(("raw_request",) + tuple(path))
+
+    return (
+        Q(**{f"{lookup}__isnull": False})
+        & ~Q(**{lookup: ""})
+    )
+
+
+def _apply_report_source_filter(queryset, source):
+    source = str(source or "").strip().lower()
+
+    max_in_request = (
+        _report_json_nonempty_q("max_id")
+        | _report_json_nonempty_q("request", "max_id")
+    )
+
+    tg_in_request = (
+        _report_json_nonempty_q("tg_id")
+        | _report_json_nonempty_q("request", "tg_id")
+    )
+
+    bot_endpoints = (
+        Q(
+            endpoint__in=[
+                "get_qr_code_by_tg",
+                "pos_reboot",
+                "admin_badge_transfer",
+            ]
+        )
+        | Q(endpoint__icontains="admin_badge")
+    )
+
+    if source == "max":
+        return queryset.filter(
+            bot_endpoints
+            & (
+                max_in_request
+                | Q(raw_request__source__in=["max", "max_bot"])
+            )
+        )
+
+    if source == "telegram":
+        return queryset.filter(
+            bot_endpoints
+            & (
+                tg_in_request
+                | Q(
+                    raw_request__source__in=[
+                        "telegram",
+                        "telegram_bot",
+                        "tg",
+                    ]
+                )
+            )
+        )
+
+    if source == "onec":
+        return queryset.filter(
+            endpoint__in=[
+                "get_qr_code_by_employee_id",
+                "employee_identification",
+            ]
+        )
+
+    if source == "bitrix":
+        return queryset.filter(endpoint__startswith="bitrix_")
+
+    if source == "agent":
+        return queryset.filter(endpoint__startswith="agent_auth")
+
+    if source == "web":
+        return queryset.filter(
+            Q(endpoint__startswith="vpn_")
+            | Q(endpoint="ad_ui_lookup_vpn_toggle")
+        )
+
+    return queryset
+
+
+def _report_store_label(log_row, stores_by_sm, stores_by_ukm):
+    store_obj = None
+
+    if log_row.sm_store_id is not None:
+        store_obj = stores_by_sm.get(log_row.sm_store_id)
+
+    if store_obj is None and log_row.ukm_store_id is not None:
+        store_obj = stores_by_ukm.get(log_row.ukm_store_id)
+
+    name = ""
+
+    if store_obj is not None:
+        name = str(store_obj.name or "").strip()
+
+    codes = []
+
+    if log_row.sm_store_id is not None:
+        codes.append(f"SM {log_row.sm_store_id}")
+
+    if log_row.ukm_store_id is not None:
+        codes.append(f"UKM {log_row.ukm_store_id}")
+
+    if name and codes:
+        return f"{name} ({', '.join(codes)})"
+
+    if name:
+        return name
+
+    if codes:
+        return ", ".join(codes)
+
+    return ""
+
+
+def _report_page_size(request, parameter, default=50):
+    value = _report_int_or_none(request.GET.get(parameter))
+
+    if value in {25, 50, 100, 200}:
+        return value
+
+    return default
+
+
+def _report_query_without(request, *keys):
+    query = request.GET.copy()
+
+    for key in keys:
+        query.pop(key, None)
+
+    return query.urlencode()
+
+
+@staff_member_required(login_url="/admin/login/")
+@require_GET
+@never_cache
+def activity_report(request):
+    # --------------------------------------------------------
+    # 1. Отчёт по подключению к MAX
+    # --------------------------------------------------------
+
+    max_q = str(request.GET.get("max_q") or "").strip()
+    max_connection = str(
+        request.GET.get("max_connection") or "connected"
+    ).strip()
+
+    max_active = str(
+        request.GET.get("max_active") or "active"
+    ).strip()
+
+    if max_connection not in {"all", "connected", "not_connected"}:
+        max_connection = "connected"
+
+    if max_active not in {"all", "active", "inactive"}:
+        max_active = "active"
+
+    connected_q = (
+        Q(max_id__isnull=False)
+        & ~Q(max_id=0)
+    )
+
+    not_connected_q = (
+        Q(max_id__isnull=True)
+        | Q(max_id=0)
+    )
+
+    max_stats = User.objects.aggregate(
+        total=Count("id"),
+        active=Count(
+            "id",
+            filter=Q(active=True),
+        ),
+        active_connected=Count(
+            "id",
+            filter=Q(active=True) & connected_q,
+        ),
+        active_not_connected=Count(
+            "id",
+            filter=Q(active=True) & not_connected_q,
+        ),
+    )
+
+    max_users_qs = User.objects.all()
+
+    if max_active == "active":
+        max_users_qs = max_users_qs.filter(active=True)
+    elif max_active == "inactive":
+        max_users_qs = max_users_qs.filter(active=False)
+
+    if max_connection == "connected":
+        max_users_qs = max_users_qs.filter(connected_q)
+    elif max_connection == "not_connected":
+        max_users_qs = max_users_qs.filter(not_connected_q)
+
+    if max_q:
+        max_search = (
+            Q(full_name__icontains=max_q)
+            | Q(employee_id__icontains=max_q)
+            | Q(mail__icontains=max_q)
+            | Q(phone__icontains=max_q)
+        )
+
+        matching_position_ids = list(
+            Position.objects
+            .filter(name__icontains=max_q)
+            .values_list("id", flat=True)[:500]
+        )
+
+        matching_department_ids = list(
+            Department.objects
+            .filter(name__icontains=max_q)
+            .values_list("id", flat=True)[:500]
+        )
+
+        if matching_position_ids:
+            max_search |= Q(
+                position_id__in=matching_position_ids
+            )
+
+        if matching_department_ids:
+            max_search |= Q(
+                department_id__in=matching_department_ids
+            )
+
+        numeric_q = _report_int_or_none(max_q)
+
+        if numeric_q is not None:
+            max_search |= Q(id=numeric_q) | Q(max_id=numeric_q)
+
+        max_users_qs = max_users_qs.filter(max_search)
+
+    max_users_qs = max_users_qs.order_by(
+        "full_name",
+        "id",
+    )
+
+    max_page_size = _report_page_size(
+        request,
+        "max_page_size",
+        50,
+    )
+
+    max_paginator = Paginator(
+        max_users_qs,
+        max_page_size,
+    )
+
+    max_page = max_paginator.get_page(
+        request.GET.get("max_page")
+    )
+
+    max_rows = list(max_page.object_list)
+    max_page.object_list = max_rows
+
+    max_position_ids = {
+        row.position_id
+        for row in max_rows
+        if row.position_id
+    }
+
+    max_department_ids = {
+        row.department_id
+        for row in max_rows
+        if row.department_id
+    }
+
+    max_position_map = dict(
+        Position.objects
+        .filter(id__in=max_position_ids)
+        .values_list("id", "name")
+    )
+
+    max_department_map = dict(
+        Department.objects
+        .filter(id__in=max_department_ids)
+        .values_list("id", "name")
+    )
+
+    for user_row in max_rows:
+        user_row.report_position = str(
+            max_position_map.get(
+                user_row.position_id,
+                "",
+            )
+            or ""
+        ).strip()
+
+        user_row.report_department = str(
+            max_department_map.get(
+                user_row.department_id,
+                "",
+            )
+            or ""
+        ).strip()
+
+        user_row.report_max_connected = bool(
+            user_row.max_id
+        )
+
+    # --------------------------------------------------------
+    # 2. Отчёт по qr_issue_logs
+    # --------------------------------------------------------
+
+    usage_q = str(request.GET.get("q") or "").strip()
+    endpoint_filter = str(
+        request.GET.get("endpoint") or ""
+    ).strip()
+
+    status_filter = str(
+        request.GET.get("status") or ""
+    ).strip()
+
+    source_filter = str(
+        request.GET.get("source") or ""
+    ).strip()
+
+    position_filter = _report_int_or_none(
+        request.GET.get("position")
+    )
+
+    store_filter = _report_int_or_none(
+        request.GET.get("store")
+    )
+
+    date_from_raw = str(
+        request.GET.get("date_from") or ""
+    ).strip()
+
+    date_to_raw = str(
+        request.GET.get("date_to") or ""
+    ).strip()
+
+    usage_qs = (
+        QRIssueLog.objects
+        .select_related("user")
+        .all()
+    )
+
+    if endpoint_filter:
+        usage_qs = usage_qs.filter(
+            endpoint=endpoint_filter
+        )
+
+    if status_filter:
+        usage_qs = usage_qs.filter(
+            status=status_filter
+        )
+
+    if position_filter is not None:
+        usage_qs = usage_qs.filter(
+            user__position_id=position_filter
+        )
+
+    if store_filter is not None:
+        selected_store = (
+            Store.objects
+            .filter(id=store_filter)
+            .only(
+                "id",
+                "smstore",
+                "ukm4store",
+            )
+            .first()
+        )
+
+        if selected_store:
+            store_q = Q()
+
+            if selected_store.smstore is not None:
+                store_q |= Q(
+                    sm_store_id=selected_store.smstore
+                )
+
+            if selected_store.ukm4store is not None:
+                store_q |= Q(
+                    ukm_store_id=selected_store.ukm4store
+                )
+
+            usage_qs = usage_qs.filter(store_q)
+        else:
+            usage_qs = usage_qs.none()
+
+    date_from = parse_date(date_from_raw) if date_from_raw else None
+    date_to = parse_date(date_to_raw) if date_to_raw else None
+
+    current_tz = timezone.get_current_timezone()
+
+    if date_from:
+        date_from_dt = timezone.make_aware(
+            datetime.datetime.combine(
+                date_from,
+                datetime.time.min,
+            ),
+            current_tz,
+        )
+
+        usage_qs = usage_qs.filter(
+            created_at__gte=date_from_dt
+        )
+
+    if date_to:
+        date_to_dt = timezone.make_aware(
+            datetime.datetime.combine(
+                date_to + datetime.timedelta(days=1),
+                datetime.time.min,
+            ),
+            current_tz,
+        )
+
+        usage_qs = usage_qs.filter(
+            created_at__lt=date_to_dt
+        )
+
+    usage_qs = _apply_report_source_filter(
+        usage_qs,
+        source_filter,
+    )
+
+    if usage_q:
+        usage_search = (
+            Q(employee_fio__icontains=usage_q)
+            | Q(user__full_name__icontains=usage_q)
+            | Q(employee_inn__icontains=usage_q)
+            | Q(phone_normalized__icontains=usage_q)
+            | Q(tg_id__icontains=usage_q)
+            | Q(endpoint__icontains=usage_q)
+            | Q(method__icontains=usage_q)
+        )
+
+        matching_positions = list(
+            Position.objects
+            .filter(name__icontains=usage_q)
+            .values_list("id", flat=True)[:500]
+        )
+
+        if matching_positions:
+            usage_search |= Q(
+                user__position_id__in=matching_positions
+            )
+
+        matching_stores = list(
+            Store.objects
+            .filter(
+                Q(name__icontains=usage_q)
+                | Q(address__icontains=usage_q)
+            )
+            .values(
+                "smstore",
+                "ukm4store",
+            )[:500]
+        )
+
+        matching_smstores = {
+            row["smstore"]
+            for row in matching_stores
+            if row["smstore"] is not None
+        }
+
+        matching_ukmstores = {
+            row["ukm4store"]
+            for row in matching_stores
+            if row["ukm4store"] is not None
+        }
+
+        if matching_smstores:
+            usage_search |= Q(
+                sm_store_id__in=matching_smstores
+            )
+
+        if matching_ukmstores:
+            usage_search |= Q(
+                ukm_store_id__in=matching_ukmstores
+            )
+
+        numeric_usage_q = _report_int_or_none(usage_q)
+
+        if numeric_usage_q is not None:
+            usage_search |= (
+                Q(id=numeric_usage_q)
+                | Q(user_id=numeric_usage_q)
+                | Q(sm_store_id=numeric_usage_q)
+                | Q(ukm_store_id=numeric_usage_q)
+            )
+
+        usage_qs = usage_qs.filter(usage_search)
+
+    usage_stats = usage_qs.aggregate(
+        total=Count("id"),
+        success=Count(
+            "id",
+            filter=(
+                Q(status__iexact="ok")
+                | Q(status__iexact="success")
+            ),
+        ),
+        error=Count(
+            "id",
+            filter=(
+                Q(status__iexact="error")
+                | Q(status__iexact="failed")
+            ),
+        ),
+        queued=Count(
+            "id",
+            filter=(
+                Q(status__iexact="queued")
+                | Q(status__iexact="pending")
+            ),
+        ),
+    )
+
+    usage_qs = usage_qs.order_by(
+        "-created_at",
+        "-id",
+    )
+
+    usage_page_size = _report_page_size(
+        request,
+        "page_size",
+        50,
+    )
+
+    usage_paginator = Paginator(
+        usage_qs,
+        usage_page_size,
+    )
+
+    usage_page = usage_paginator.get_page(
+        request.GET.get("page")
+    )
+
+    usage_rows = list(usage_page.object_list)
+    usage_page.object_list = usage_rows
+
+    # Если старый лог не связан по user_id, пробуем найти пользователя
+    # по сохранённому ИНН.
+    missing_user_inns = {
+        str(row.employee_inn or "").strip()
+        for row in usage_rows
+        if not row.user_id and str(row.employee_inn or "").strip()
+    }
+
+    fallback_users_by_inn = {
+        str(user.employee_id or "").strip(): user
+        for user in User.objects.filter(
+            employee_id__in=missing_user_inns
+        ).only(
+            "id",
+            "employee_id",
+            "full_name",
+            "position_id",
+            "department_id",
+        )
+    }
+
+    resolved_users = []
+
+    for row in usage_rows:
+        user_obj = None
+
+        if row.user_id:
+            try:
+                user_obj = row.user
+            except User.DoesNotExist:
+                user_obj = None
+
+        if user_obj is None:
+            user_obj = fallback_users_by_inn.get(
+                str(row.employee_inn or "").strip()
+            )
+
+        row.report_user = user_obj
+
+        if user_obj is not None:
+            resolved_users.append(user_obj)
+
+    usage_position_ids = {
+        user.position_id
+        for user in resolved_users
+        if user.position_id
+    }
+
+    usage_department_ids = {
+        user.department_id
+        for user in resolved_users
+        if user.department_id
+    }
+
+    usage_position_map = dict(
+        Position.objects
+        .filter(id__in=usage_position_ids)
+        .values_list("id", "name")
+    )
+
+    usage_department_map = dict(
+        Department.objects
+        .filter(id__in=usage_department_ids)
+        .values_list("id", "name")
+    )
+
+    usage_smstore_ids = {
+        row.sm_store_id
+        for row in usage_rows
+        if row.sm_store_id is not None
+    }
+
+    usage_ukmstore_ids = {
+        row.ukm_store_id
+        for row in usage_rows
+        if row.ukm_store_id is not None
+    }
+
+    stores_by_sm = {}
+    stores_by_ukm = {}
+
+    store_lookup_q = Q()
+
+    if usage_smstore_ids:
+        store_lookup_q |= Q(
+            smstore__in=usage_smstore_ids
+        )
+
+    if usage_ukmstore_ids:
+        store_lookup_q |= Q(
+            ukm4store__in=usage_ukmstore_ids
+        )
+
+    if usage_smstore_ids or usage_ukmstore_ids:
+        report_stores = Store.objects.filter(store_lookup_q)
+
+        for store in report_stores:
+            if store.smstore is not None:
+                stores_by_sm[store.smstore] = store
+
+            if store.ukm4store is not None:
+                stores_by_ukm[store.ukm4store] = store
+
+    for row in usage_rows:
+        user_obj = row.report_user
+
+        row.report_fio = (
+            str(row.employee_fio or "").strip()
+            or (
+                str(user_obj.full_name or "").strip()
+                if user_obj
+                else ""
+            )
+        )
+
+        row.report_position = (
+            str(
+                usage_position_map.get(
+                    user_obj.position_id,
+                    "",
+                )
+                or ""
+            ).strip()
+            if user_obj
+            else ""
+        )
+
+        row.report_department = (
+            str(
+                usage_department_map.get(
+                    user_obj.department_id,
+                    "",
+                )
+                or ""
+            ).strip()
+            if user_obj
+            else ""
+        )
+
+        row.report_store = _report_store_label(
+            row,
+            stores_by_sm,
+            stores_by_ukm,
+        )
+
+        row.report_action = _report_action_label(row)
+        row.report_source = _report_source_label(row)
+        row.report_object = _report_object_label(row)
+
+        (
+            row.report_result,
+            row.report_result_class,
+        ) = _report_result(row)
+
+    # --------------------------------------------------------
+    # Варианты фильтров
+    # --------------------------------------------------------
+
+    endpoint_values = list(
+        QRIssueLog.objects
+        .exclude(endpoint__isnull=True)
+        .exclude(endpoint="")
+        .values_list("endpoint", flat=True)
+        .distinct()
+        .order_by("endpoint")
+    )
+
+    endpoint_options = [
+        {
+            "value": endpoint,
+            "label": (
+                REPORT_ENDPOINT_LABELS.get(endpoint)
+                or endpoint.replace("_", " ").capitalize()
+            ),
+        }
+        for endpoint in endpoint_values
+    ]
+
+    status_values = list(
+        QRIssueLog.objects
+        .exclude(status__isnull=True)
+        .exclude(status="")
+        .values_list("status", flat=True)
+        .distinct()
+        .order_by("status")
+    )
+
+    status_options = [
+        {
+            "value": status,
+            "label": REPORT_STATUS_LABELS.get(
+                str(status).lower(),
+                str(status).capitalize(),
+            ),
+        }
+        for status in status_values
+    ]
+
+    store_options = []
+
+    stores_for_filter = (
+        Store.objects
+        .exclude(
+            Q(smstore__isnull=True)
+            & Q(ukm4store__isnull=True)
+        )
+        .order_by(
+            "name",
+            "smstore",
+            "ukm4store",
+        )
+        .values(
+            "id",
+            "name",
+            "smstore",
+            "ukm4store",
+        )
+    )
+
+    for store in stores_for_filter:
+        name = str(store["name"] or "").strip() or "Без названия"
+
+        store_options.append({
+            "id": store["id"],
+            "label": (
+                f"{name} — "
+                f"SM {store['smstore'] if store['smstore'] is not None else '—'}, "
+                f"UKM {store['ukm4store'] if store['ukm4store'] is not None else '—'}"
+            ),
+        })
+
+    position_options = list(
+        Position.objects
+        .order_by("name")
+        .values(
+            "id",
+            "name",
+        )
+    )
+
+    usage_hidden = [
+        ("q", usage_q),
+        ("endpoint", endpoint_filter),
+        ("status", status_filter),
+        ("source", source_filter),
+        ("position", position_filter),
+        ("store", store_filter),
+        ("date_from", date_from_raw),
+        ("date_to", date_to_raw),
+        ("page_size", usage_page_size),
+    ]
+
+    usage_hidden = [
+        (name, value)
+        for name, value in usage_hidden
+        if value not in (None, "")
+    ]
+
+    max_hidden = [
+        ("max_q", max_q),
+        ("max_connection", max_connection),
+        ("max_active", max_active),
+        ("max_page_size", max_page_size),
+    ]
+
+    max_hidden = [
+        (name, value)
+        for name, value in max_hidden
+        if value not in (None, "")
+    ]
+
+    context = {
+        "max_stats": max_stats,
+        "max_page": max_page,
+        "max_filters": {
+            "q": max_q,
+            "connection": max_connection,
+            "active": max_active,
+            "page_size": max_page_size,
+        },
+        "usage_stats": usage_stats,
+        "usage_page": usage_page,
+        "usage_filters": {
+            "q": usage_q,
+            "endpoint": endpoint_filter,
+            "status": status_filter,
+            "source": source_filter,
+            "position": position_filter,
+            "store": store_filter,
+            "date_from": date_from_raw,
+            "date_to": date_to_raw,
+            "page_size": usage_page_size,
+        },
+        "endpoint_options": endpoint_options,
+        "status_options": status_options,
+        "source_options": REPORT_SOURCE_OPTIONS,
+        "store_options": store_options,
+        "position_options": position_options,
+        "usage_hidden": usage_hidden,
+        "max_hidden": max_hidden,
+        "usage_query_without_page": _report_query_without(
+            request,
+            "page",
+        ),
+        "max_query_without_page": _report_query_without(
+            request,
+            "max_page",
+        ),
+        "usage_reset_query": urlencode(max_hidden),
+        "max_reset_query": urlencode(usage_hidden),
+        "report_updated_at": timezone.localtime(
+            timezone.now()
+        ),
+    }
+
+    if (
+        request.headers.get("X-Requested-With")
+        == "XMLHttpRequest"
+    ):
+        return render(
+            request,
+            "frostapp/_activity_report_content.html",
+            context,
+        )
+
+    return render(
+        request,
+        "frostapp/activity_report.html",
+        context,
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
