@@ -132,6 +132,12 @@ urlpatterns = [
 
     path("api/maxbot/process/", maxbot_process_update, name="maxbot_process_update"),
 
+    path(
+        "api/employees/update-phone/",
+        views.update_employee_phone_api,
+        name="update_employee_phone_api",
+    ),
+
 
     path(
         "ui/ukm-rotation/",
