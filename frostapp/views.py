@@ -121,6 +121,7 @@ from .models import (
     Queue, 
     MODUL_logs, 
     User, 
+    EmployeePhoneChangeLog,
     UKMUser, 
     OpenInSystem, 
     QRCode, 
@@ -34837,31 +34838,14 @@ def update_employee_phone_api(request):
                 ]
             )
 
-            # Журнал записывается в той же транзакции.
-            # Если INSERT завершится ошибкой, изменение phone
-            # также будет отменено.
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO public.employee_phone_change_log (
-                        user_id,
-                        employee_inn,
-                        full_name,
-                        old_phone,
-                        new_phone,
-                        changed_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    [
-                        employee.id,
-                        inn,
-                        database_full_name,
-                        old_phone,
-                        new_phone,
-                        changed_at,
-                    ],
-                )
+            EmployeePhoneChangeLog.objects.create(
+                user_id=employee.id,
+                employee_inn=inn,
+                full_name=database_full_name,
+                old_phone=old_phone,
+                new_phone=new_phone,
+                changed_at=changed_at,
+            )
 
         logger.info(
             "[EMPLOYEE_PHONE_API] Телефон обновлён user_id=%s",
