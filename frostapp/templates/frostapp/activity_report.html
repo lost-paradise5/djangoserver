@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+
+    <title>Отчёт по MAX и использованию сервисов</title>
+
+    <style>
+        :root {
+            --background: #f4f6f9;
+            --surface: #ffffff;
+            --border: #dfe4ea;
+            --text: #172033;
+            --muted: #697386;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --success: #137333;
+            --success-bg: #e6f4ea;
+            --warning: #8a5a00;
+            --warning-bg: #fff4ce;
+            --danger: #b42318;
+            --danger-bg: #fee4e2;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: var(--background);
+            color: var(--text);
+            font-family:
+                Inter,
+                Arial,
+                sans-serif;
+        }
+
+        .page {
+            width: min(1600px, calc(100% - 32px));
+            margin: 24px auto 50px;
+        }
+
+        .topbar {
+            display: flex;
+            gap: 16px;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 20px;
+        }
+
+        .topbar h1 {
+            margin: 0 0 6px;
+            font-size: 26px;
+        }
+
+        .topbar p {
+            margin: 0;
+            color: var(--muted);
+        }
+
+        .refresh-controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            white-space: nowrap;
+        }
+
+        .panel {
+            margin-bottom: 24px;
+            padding: 20px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            box-shadow: 0 4px 16px rgba(15, 23, 42, 0.04);
+        }
+
+        .section-title {
+            margin: 0 0 6px;
+            font-size: 21px;
+        }
+
+        .section-description {
+            margin: 0 0 18px;
+            color: var(--muted);
+        }
+
+        .cards {
+            display: grid;
+            grid-template-columns:
+                repeat(auto-fit, minmax(190px, 1fr));
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+
+        .card {
+            padding: 14px;
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            background: #fbfcfe;
+        }
+
+        .card-label {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .card-value {
+            margin-top: 5px;
+            font-size: 25px;
+            font-weight: 700;
+        }
+
+        .filters {
+            display: grid;
+            grid-template-columns:
+                repeat(auto-fit, minmax(190px, 1fr));
+            gap: 12px;
+            align-items: end;
+            margin-bottom: 18px;
+        }
+
+        .field label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        input,
+        select,
+        button,
+        .button-link {
+            min-height: 40px;
+            border-radius: 8px;
+            font: inherit;
+        }
+
+        input,
+        select {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #cbd3df;
+            background: #fff;
+            color: var(--text);
+        }
+
+        button,
+        .button-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px 16px;
+            border: 0;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        button {
+            color: #fff;
+            background: var(--primary);
+        }
+
+        button:hover {
+            background: var(--primary-hover);
+        }
+
+        .button-link {
+            color: var(--text);
+            border: 1px solid var(--border);
+            background: #fff;
+        }
+
+        .filter-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .table-wrap {
+            overflow-x: auto;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 1050px;
+        }
+
+        th,
+        td {
+            padding: 11px 12px;
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+            vertical-align: top;
+        }
+
+        th {
+            position: sticky;
+            top: 0;
+            background: #f8fafc;
+            color: #475467;
+            font-size: 13px;
+        }
+
+        tbody tr:hover {
+            background: #f8fbff;
+        }
+
+        tbody tr:last-child td {
+            border-bottom: 0;
+        }
+
+        .muted {
+            color: var(--muted);
+        }
+
+        .nowrap {
+            white-space: nowrap;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .result-ok {
+            color: var(--success);
+            background: var(--success-bg);
+        }
+
+        .result-queued {
+            color: var(--warning);
+            background: var(--warning-bg);
+        }
+
+        .result-error {
+            color: var(--danger);
+            background: var(--danger-bg);
+        }
+
+        .result-other {
+            color: #344054;
+            background: #eef2f6;
+        }
+
+        .pagination {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            justify-content: center;
+            margin-top: 16px;
+        }
+
+        .pagination a {
+            padding: 7px 11px;
+            color: var(--primary);
+            text-decoration: none;
+            border: 1px solid var(--border);
+            border-radius: 7px;
+            background: #fff;
+        }
+
+        .empty {
+            padding: 30px;
+            text-align: center;
+            color: var(--muted);
+        }
+
+        .updated {
+            margin: 0 0 12px;
+            color: var(--muted);
+            font-size: 13px;
+            text-align: right;
+        }
+
+        @media (max-width: 700px) {
+            .page {
+                width: min(100% - 16px, 1600px);
+                margin-top: 12px;
+            }
+
+            .topbar {
+                flex-direction: column;
+            }
+
+            .refresh-controls {
+                white-space: normal;
+            }
+        }
+    </style>
+</head>
+
+<body>
+<div class="page">
+    <div class="topbar">
+        <div>
+            <h1>MAX и использование сервисов</h1>
+            <p>
+                Актуальные данные из users, qr_issue_logs,
+                stores, positions и departments.
+            </p>
+        </div>
+
+        <div class="refresh-controls">
+            <label>
+                <input
+                    id="auto-refresh"
+                    type="checkbox"
+                    checked
+                    style="width:auto; min-height:auto;"
+                >
+                обновлять каждые 30 секунд
+            </label>
+
+            <button id="refresh-now" type="button">
+                Обновить
+            </button>
+        </div>
+    </div>
+
+    <main id="report-content">
+        {% include "frostapp/_activity_report_content.html" %}
+    </main>
+</div>
+
+<script>
+(function () {
+    const content = document.getElementById("report-content");
+    const autoRefresh = document.getElementById("auto-refresh");
+    const refreshButton = document.getElementById("refresh-now");
+
+    let requestRunning = false;
+
+    async function refreshReport() {
+        if (requestRunning) {
+            return;
+        }
+
+        requestRunning = true;
+        refreshButton.disabled = true;
+        refreshButton.textContent = "Обновление...";
+
+        try {
+            const response = await fetch(window.location.href, {
+                method: "GET",
+                credentials: "same-origin",
+                cache: "no-store",
+                headers: {
+                    "X-Requested-With": "XMLHttpRequest"
+                }
+            });
+
+            if (response.redirected) {
+                window.location.href = response.url;
+                return;
+            }
+
+            if (!response.ok) {
+                throw new Error("HTTP " + response.status);
+            }
+
+            content.innerHTML = await response.text();
+        } catch (error) {
+            console.error("Ошибка обновления отчёта:", error);
+        } finally {
+            requestRunning = false;
+            refreshButton.disabled = false;
+            refreshButton.textContent = "Обновить";
+        }
+    }
+
+    refreshButton.addEventListener("click", refreshReport);
+
+    window.setInterval(function () {
+        if (autoRefresh.checked && !document.hidden) {
+            refreshReport();
+        }
+    }, 30000);
+})();
+</script>
+</body>
+</html>
