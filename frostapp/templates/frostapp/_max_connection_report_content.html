@@ -28,14 +28,15 @@
     <h2 class="section-title">Общая сводка</h2>
 
     <p class="section-description">
-        Подключёнными считаются только активные сотрудники
-        с заполненным MAX ID.
+        Работающим считается сотрудник, присутствующий
+        в актуальном ответе 1С. Подключённым считается сотрудник,
+        найденный по ИНН в users и имеющий заполненный MAX ID.
     </p>
 
     <div class="cards">
         <div class="card">
             <div class="card-label">
-                Активных сотрудников
+                Работающих сотрудников
             </div>
 
             <div class="card-value">
@@ -123,24 +124,24 @@
                 name="max_connection"
             >
                 <option
+                    value="all"
+                    {% if max_filters.connection == "all" %}selected{% endif %}
+                >
+                    Все работающие
+                </option>
+            
+                <option
                     value="connected"
                     {% if max_filters.connection == "connected" %}selected{% endif %}
                 >
                     MAX подключён
                 </option>
-
+            
                 <option
                     value="not_connected"
                     {% if max_filters.connection == "not_connected" %}selected{% endif %}
                 >
                     MAX не подключён
-                </option>
-
-                <option
-                    value="all"
-                    {% if max_filters.connection == "all" %}selected{% endif %}
-                >
-                    Все активные
                 </option>
             </select>
         </div>
@@ -203,8 +204,10 @@
     </h2>
 
     <p class="section-description">
-        Один сотрудник учитывается в каждом магазине,
-        к которому у него есть доступ в ukm_users.
+        Привязка сотрудника к магазину берётся из поля
+        «ИдМагазина» ответа 1С. Оно сопоставляется
+        с полем stores.smstore. Таблица ukm_users
+        в этом отчёте не используется.
     </p>
 
     <div class="table-wrap summary-scroll">
@@ -212,7 +215,7 @@
             <thead>
             <tr>
                 <th>Магазин</th>
-                <th>Активных</th>
+                <th>Работающих</th>
                 <th>Подключили</th>
                 <th>Не подключили</th>
                 <th>Процент</th>
