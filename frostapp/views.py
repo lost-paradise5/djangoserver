@@ -494,6 +494,56 @@ ALLOWED_WORKING_EMPLOYEE_POSITIONS = {
 ONEC_WORKING_EMPLOYEES_TIMEOUT = int(os.getenv("ONEC_WORKING_EMPLOYEES_TIMEOUT", "180"))
 
 
+
+
+
+# Успешный ответ 1С используем 24 часа.
+MAX_REPORT_ONEC_CACHE_SECONDS = max(
+    0,
+    int(
+        os.getenv(
+            "MAX_REPORT_ONEC_CACHE_SECONDS",
+            "86400",
+        )
+    ),
+)
+
+# Последний успешный ответ сохраняем ещё 7 дней
+# на случай временной недоступности 1С.
+MAX_REPORT_ONEC_STALE_SECONDS = max(
+    0,
+    int(
+        os.getenv(
+            "MAX_REPORT_ONEC_STALE_SECONDS",
+            "604800",
+        )
+    ),
+)
+
+# После ошибки 1С не повторяем долгий запрос
+# каждые 30 секунд.
+MAX_REPORT_ONEC_FAILURE_RETRY_SECONDS = max(
+    60,
+    int(
+        os.getenv(
+            "MAX_REPORT_ONEC_FAILURE_RETRY_SECONDS",
+            "900",
+        )
+    ),
+)
+
+MAX_REPORT_ONEC_CACHE_KEY = (
+    "max_connection_report:"
+    "working_employees:fresh:v2"
+)
+
+MAX_REPORT_ONEC_STALE_CACHE_KEY = (
+    "max_connection_report:"
+    "working_employees:stale:v2"
+)
+
+
+
 POSITION_SYNC_REPORT_DIR = Path(
     os.getenv(
         "POSITION_SYNC_REPORT_DIR",
@@ -26988,21 +27038,429 @@ def activity_report(request):
     )
 
 
+
+
+
+
+
+
+
+def _max_report_extract_employee_list(payload):
+    """
+    Получает список сотрудников из ответа 1С.
+
+    Поддерживает:
+      • обычный JSON-массив;
+      • объект с ключом data/result/items/value/employees/Сотрудники.
+    """
+    if isinstance(payload, list):
+        return payload
+
+    if isinstance(payload, dict):
+        for key in (
+            "data",
+            "result",
+            "items",
+            "value",
+            "employees",
+            "Сотрудники",
+        ):
+            value = payload.get(key)
+
+            if isinstance(value, list):
+                return value
+
+            if isinstance(value, dict):
+                try:
+                    return _max_report_extract_employee_list(value)
+                except ValueError:
+                    pass
+
+        # На случай ответа с числовыми ключами.
+        values = list(payload.values())
+
+        if values and all(
+            isinstance(item, dict)
+            for item in values
+        ):
+            return values
+
+    raise ValueError(
+        "1С вернула JSON в неизвестном формате: "
+        "не найден список сотрудников"
+    )
+
+
+def _max_report_get_cache(key):
+    try:
+        value = cache.get(key)
+    except Exception:
+        logger.exception(
+            "[MAX REPORT] Не удалось прочитать Django cache"
+        )
+        return None
+
+    if not isinstance(value, dict):
+        return None
+
+    if not isinstance(value.get("rows"), list):
+        return None
+
+    return value
+
+
+def _max_report_set_cache(key, value, timeout):
+    if timeout <= 0:
+        return
+
+    try:
+        cache.set(
+            key,
+            value,
+            timeout=timeout,
+        )
+    except Exception:
+        logger.exception(
+            "[MAX REPORT] Не удалось сохранить ответ 1С в cache"
+        )
+
+
+def _max_report_fetch_working_employees(
+    *,
+    force_refresh=False,
+):
+    """
+    Возвращает:
+        rows,
+        loaded_at,
+        problem_message,
+        is_stale
+
+    Обычное открытие страницы:
+        использует ответ 1С до 24 часов.
+
+    force_refresh=True:
+        принудительно обращается к 1С.
+
+    max_id не кэшируется — он читается из PostgreSQL
+    заново при каждом обновлении страницы.
+    """
+    if not force_refresh:
+        cached = _max_report_get_cache(
+            MAX_REPORT_ONEC_CACHE_KEY
+        )
+
+        if cached is not None:
+            return (
+                cached.get("rows") or [],
+                cached.get("loaded_at"),
+                str(
+                    cached.get("problem") or ""
+                ),
+                bool(
+                    cached.get("is_stale", False)
+                ),
+            )
+
+    request_kwargs = {
+        "headers": {
+            "Accept": "application/json",
+        },
+        "timeout": (
+            10,
+            ONEC_WORKING_EMPLOYEES_TIMEOUT,
+        ),
+    }
+
+    if (
+        ONEC_WORKING_EMPLOYEES_AUTH_USER
+        or ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD
+    ):
+        request_kwargs["auth"] = (
+            ONEC_WORKING_EMPLOYEES_AUTH_USER,
+            ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD,
+        )
+
+    try:
+        logger.info(
+            "[MAX REPORT] Запрашиваю работающих "
+            "сотрудников из 1С; force_refresh=%s",
+            force_refresh,
+        )
+
+        response = requests.get(
+            ONEC_WORKING_EMPLOYEES_URL,
+            **request_kwargs,
+        )
+
+        response.raise_for_status()
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ValueError(
+                "1С вернула невалидный JSON"
+            ) from exc
+
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        rows = _max_report_extract_employee_list(
+            payload
+        )
+
+        rows = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+        ]
+
+        loaded_at = timezone.now()
+
+        successful_snapshot = {
+            "rows": rows,
+            "loaded_at": loaded_at,
+            "problem": "",
+            "is_stale": False,
+        }
+
+        # Основной суточный кэш.
+        _max_report_set_cache(
+            MAX_REPORT_ONEC_CACHE_KEY,
+            successful_snapshot,
+            MAX_REPORT_ONEC_CACHE_SECONDS,
+        )
+
+        # Резервная копия на случай недоступности 1С.
+        _max_report_set_cache(
+            MAX_REPORT_ONEC_STALE_CACHE_KEY,
+            successful_snapshot,
+            MAX_REPORT_ONEC_STALE_SECONDS,
+        )
+
+        logger.info(
+            "[MAX REPORT] Получено сотрудников из 1С: %s",
+            len(rows),
+        )
+
+        return (
+            rows,
+            loaded_at,
+            "",
+            False,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "[MAX REPORT] Ошибка получения "
+            "сотрудников из 1С"
+        )
+
+        problem = (
+            str(exc)
+            or exc.__class__.__name__
+        )
+
+        stale = _max_report_get_cache(
+            MAX_REPORT_ONEC_STALE_CACHE_KEY
+        )
+
+        if stale is not None:
+            retry_snapshot = {
+                "rows": stale.get("rows") or [],
+                "loaded_at": stale.get("loaded_at"),
+                "problem": problem,
+                "is_stale": True,
+            }
+
+            # В течение следующих 15 минут автоматические
+            # обновления не будут снова ждать ответ 1С.
+            _max_report_set_cache(
+                MAX_REPORT_ONEC_CACHE_KEY,
+                retry_snapshot,
+                MAX_REPORT_ONEC_FAILURE_RETRY_SECONDS,
+            )
+
+            return (
+                retry_snapshot["rows"],
+                retry_snapshot["loaded_at"],
+                problem,
+                True,
+            )
+
+        # Если успешного ответа раньше вообще не было,
+        # тоже ненадолго запоминаем ошибку.
+        failure_snapshot = {
+            "rows": [],
+            "loaded_at": None,
+            "problem": problem,
+            "is_stale": False,
+        }
+
+        _max_report_set_cache(
+            MAX_REPORT_ONEC_CACHE_KEY,
+            failure_snapshot,
+            MAX_REPORT_ONEC_FAILURE_RETRY_SECONDS,
+        )
+
+        return (
+            [],
+            None,
+            problem,
+            False,
+        )
+
+
+def _max_report_has_max_id(value):
+    """
+    Подключённым считается сотрудник,
+    у которого max_id заполнен и не равен нулю.
+    """
+    if value in (None, ""):
+        return False
+
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return bool(str(value).strip())
+
+
+def _max_report_normalize_inn(value):
+    return re.sub(
+        r"\D+",
+        "",
+        str(value or ""),
+    )
+
+
+def _max_report_build_user_map(inn_values):
+    """
+    Сопоставляет ИНН из 1С с users.
+
+    Поддерживает форматы, которые уже используются в проекте:
+      • обычный ИНН;
+      • SHA-256;
+      • первые 20 символов SHA-256.
+
+    Если для одного ИНН найдено несколько users,
+    выбирается запись с заполненным max_id.
+    """
+    result = {}
+    inn_values = sorted({
+        inn
+        for inn in inn_values
+        if inn
+    })
+
+    chunk_size = 500
+
+    for start in range(0, len(inn_values), chunk_size):
+        inn_chunk = inn_values[
+            start:start + chunk_size
+        ]
+
+        value_to_inn = {}
+
+        for inn in inn_chunk:
+            inn_hash = hashlib.sha256(
+                inn.encode("utf-8")
+            ).hexdigest()
+
+            value_to_inn[inn] = inn
+            value_to_inn[inn_hash] = inn
+            value_to_inn[inn_hash[:20]] = inn
+
+        lookup_values = list(value_to_inn)
+
+        users = (
+            User.objects
+            .filter(
+                Q(employee_id__in=lookup_values)
+                | Q(encrypted_inn__in=lookup_values)
+            )
+            .only(
+                "id",
+                "employee_id",
+                "encrypted_inn",
+                "max_id",
+                "full_name",
+            )
+            .order_by("id")
+        )
+
+        for user in users:
+            employee_id_value = str(
+                user.employee_id or ""
+            ).strip()
+
+            encrypted_inn_value = str(
+                user.encrypted_inn or ""
+            ).strip()
+
+            inn = (
+                value_to_inn.get(employee_id_value)
+                or value_to_inn.get(encrypted_inn_value)
+            )
+
+            if not inn:
+                continue
+
+            current = result.get(inn)
+
+            if current is None:
+                result[inn] = user
+                continue
+
+            if (
+                not _max_report_has_max_id(
+                    current.max_id
+                )
+                and _max_report_has_max_id(
+                    user.max_id
+                )
+            ):
+                result[inn] = user
+
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @staff_member_required(login_url="/admin/login/")
 @require_GET
 @never_cache
 def max_connection_report(request):
     """
-    Отдельный отчёт по подключению активных сотрудников к MAX.
+    Отчёт по подключению работающих сотрудников к MAX.
 
-    Подключённый сотрудник:
-      • users.active = True;
-      • users.max_id заполнен;
-      • users.max_id != 0.
+    Источник работающих сотрудников и привязки к магазинам:
+        1С Get_WorkingEmployees.
 
-    Магазин сотрудника:
-      • ukm_users.user_id = users.id;
-      • ukm_users.storeid = stores.ukm4store.
+    Сопоставление:
+        ИНН из 1С -> users.employee_id / users.encrypted_inn.
+
+    Подключение:
+        users.max_id заполнен и не равен 0.
+
+    Таблица ukm_users в этом отчёте не используется.
+    Поле users.active также не используется:
+    актуальность сотрудника определяет ответ 1С.
     """
     search_query = str(
         request.GET.get("max_q") or ""
@@ -27010,7 +27468,7 @@ def max_connection_report(request):
 
     connection_filter = str(
         request.GET.get("max_connection")
-        or "connected"
+        or "all"
     ).strip()
 
     if connection_filter not in {
@@ -27018,301 +27476,10 @@ def max_connection_report(request):
         "connected",
         "not_connected",
     }:
-        connection_filter = "connected"
+        connection_filter = "all"
 
-    selected_store_id = _report_int_or_none(
+    selected_sm_store_id = _report_int_or_none(
         request.GET.get("max_store")
-    )
-
-    selected_store = None
-
-    if selected_store_id is not None:
-        selected_store = (
-            Store.objects
-            .filter(id=selected_store_id)
-            .only(
-                "id",
-                "name",
-                "ukm4store",
-            )
-            .first()
-        )
-
-    connected_q = (
-        Q(max_id__isnull=False)
-        & ~Q(max_id=0)
-    )
-
-    not_connected_q = (
-        Q(max_id__isnull=True)
-        | Q(max_id=0)
-    )
-
-    # --------------------------------------------------------
-    # Активные сотрудники, попадающие в текущий магазин
-    # --------------------------------------------------------
-
-    active_users_qs = User.objects.filter(
-        active=True
-    )
-
-    if selected_store_id is not None:
-        if (
-            selected_store is not None
-            and selected_store.ukm4store is not None
-        ):
-            selected_store_user_ids = (
-                UKMUser.objects
-                .filter(
-                    storeid=selected_store.ukm4store
-                )
-                .values_list(
-                    "user_id",
-                    flat=True,
-                )
-                .distinct()
-            )
-
-            active_users_qs = active_users_qs.filter(
-                id__in=selected_store_user_ids
-            )
-        else:
-            active_users_qs = active_users_qs.none()
-
-    # --------------------------------------------------------
-    # Общая сводка
-    # --------------------------------------------------------
-
-    max_stats = active_users_qs.aggregate(
-        active_count=Count("id"),
-
-        connected_count=Count(
-            "id",
-            filter=connected_q,
-        ),
-
-        not_connected_count=Count(
-            "id",
-            filter=not_connected_q,
-        ),
-    )
-
-    active_count = int(
-        max_stats.get("active_count") or 0
-    )
-
-    connected_count = int(
-        max_stats.get("connected_count") or 0
-    )
-
-    max_stats["connected_percent"] = (
-        round(
-            connected_count * 100 / active_count,
-            1,
-        )
-        if active_count
-        else 0
-    )
-
-    # --------------------------------------------------------
-    # Сводка по каждому магазину
-    # --------------------------------------------------------
-
-    store_summary_qs = UKMUser.objects.filter(
-        user__active=True
-    )
-
-    if (
-        selected_store is not None
-        and selected_store.ukm4store is not None
-    ):
-        store_summary_qs = store_summary_qs.filter(
-            storeid=selected_store.ukm4store
-        )
-    elif selected_store_id is not None:
-        store_summary_qs = store_summary_qs.none()
-
-    store_summary_raw = list(
-        store_summary_qs
-        .values("storeid")
-        .annotate(
-            active_count=Count(
-                "user_id",
-                distinct=True,
-            ),
-
-            connected_count=Count(
-                "user_id",
-                filter=(
-                    Q(user__max_id__isnull=False)
-                    & ~Q(user__max_id=0)
-                ),
-                distinct=True,
-            ),
-        )
-    )
-
-    summary_ukm_store_ids = {
-        row["storeid"]
-        for row in store_summary_raw
-        if row["storeid"] is not None
-    }
-
-    summary_store_map = {}
-
-    for store in (
-        Store.objects
-        .filter(
-            ukm4store__in=summary_ukm_store_ids
-        )
-        .only(
-            "id",
-            "name",
-            "ukm4store",
-        )
-        .order_by(
-            "name",
-            "id",
-        )
-    ):
-        if store.ukm4store not in summary_store_map:
-            summary_store_map[store.ukm4store] = store
-
-    store_summary = []
-
-    for row in store_summary_raw:
-        store_obj = summary_store_map.get(
-            row["storeid"]
-        )
-
-        if store_obj is None:
-            continue
-
-        store_active_count = int(
-            row["active_count"] or 0
-        )
-
-        store_connected_count = int(
-            row["connected_count"] or 0
-        )
-
-        store_not_connected_count = max(
-            0,
-            store_active_count
-            - store_connected_count,
-        )
-
-        connected_percent = (
-            round(
-                store_connected_count
-                * 100
-                / store_active_count,
-                1,
-            )
-            if store_active_count
-            else 0
-        )
-
-        store_summary.append({
-            "store_id": store_obj.id,
-            "store_name": str(
-                store_obj.name or ""
-            ).strip() or "Без названия",
-            "active_count": store_active_count,
-            "connected_count": (
-                store_connected_count
-            ),
-            "not_connected_count": (
-                store_not_connected_count
-            ),
-            "connected_percent": (
-                connected_percent
-            ),
-        })
-
-    store_summary.sort(
-        key=lambda item: (
-            item["store_name"].casefold()
-        )
-    )
-
-    # --------------------------------------------------------
-    # Фильтрация таблицы сотрудников
-    # --------------------------------------------------------
-
-    max_users_qs = active_users_qs
-
-    if connection_filter == "connected":
-        max_users_qs = max_users_qs.filter(
-            connected_q
-        )
-
-    elif connection_filter == "not_connected":
-        max_users_qs = max_users_qs.filter(
-            not_connected_q
-        )
-
-    if search_query:
-        search_filter = (
-            Q(full_name__icontains=search_query)
-            | Q(employee_id__icontains=search_query)
-            | Q(mail__icontains=search_query)
-            | Q(phone__icontains=search_query)
-        )
-
-        matching_position_ids = list(
-            Position.objects
-            .filter(
-                name__icontains=search_query
-            )
-            .values_list(
-                "id",
-                flat=True,
-            )[:500]
-        )
-
-        matching_department_ids = list(
-            Department.objects
-            .filter(
-                name__icontains=search_query
-            )
-            .values_list(
-                "id",
-                flat=True,
-            )[:500]
-        )
-
-        if matching_position_ids:
-            search_filter |= Q(
-                position_id__in=(
-                    matching_position_ids
-                )
-            )
-
-        if matching_department_ids:
-            search_filter |= Q(
-                department_id__in=(
-                    matching_department_ids
-                )
-            )
-
-        numeric_query = _report_int_or_none(
-            search_query
-        )
-
-        if numeric_query is not None:
-            search_filter |= (
-                Q(id=numeric_query)
-                | Q(max_id=numeric_query)
-            )
-
-        max_users_qs = max_users_qs.filter(
-            search_filter
-        )
-
-    max_users_qs = max_users_qs.order_by(
-        "full_name",
-        "id",
     )
 
     page_size = _report_page_size(
@@ -27321,191 +27488,622 @@ def max_connection_report(request):
         50,
     )
 
+    force_onec_refresh = (
+        str(
+            request.GET.get("refresh_onec")
+            or ""
+        ).strip().lower()
+        in {
+            "1",
+            "true",
+            "yes",
+        }
+    )
+
+    (
+        api_rows,
+        onec_loaded_at,
+        onec_problem,
+        onec_is_stale,
+    ) = _max_report_fetch_working_employees(
+        force_refresh=force_onec_refresh,
+    )
+
+    onec_data_available = (
+        onec_loaded_at is not None
+    )
+
+    # --------------------------------------------------------
+    # Нормализация ответа 1С
+    # --------------------------------------------------------
+
+    assignments_by_key = {}
+    skipped_rows = 0
+
+    for raw_row in api_rows:
+        if not isinstance(raw_row, dict):
+            skipped_rows += 1
+            continue
+
+        inn = _max_report_normalize_inn(
+            raw_row.get("ИНН")
+        )
+
+        if not inn:
+            skipped_rows += 1
+            continue
+
+        sm_store_id = _report_int_or_none(
+            raw_row.get("ИдМагазина")
+        )
+
+        last_name = str(
+            raw_row.get("Фамилия") or ""
+        ).strip()
+
+        first_name = str(
+            raw_row.get("Имя") or ""
+        ).strip()
+
+        middle_name = str(
+            raw_row.get("Отчество") or ""
+        ).strip()
+
+        full_name = " ".join(
+            value
+            for value in (
+                last_name,
+                first_name,
+                middle_name,
+            )
+            if value
+        ).strip()
+
+        position_name = str(
+            raw_row.get("Должность") or ""
+        ).strip()
+
+        subdivision_name = str(
+            raw_row.get("Подразделение") or ""
+        ).strip()
+
+        department_name = str(
+            raw_row.get("Отдел") or ""
+        ).strip()
+
+        phone = str(
+            raw_row.get("НомерТелефона") or ""
+        ).strip()
+
+        mail = str(
+            raw_row.get("Почта") or ""
+        ).strip()
+
+        organization_name = str(
+            raw_row.get(
+                "ОрганизацияНаименование"
+            )
+            or ""
+        ).strip()
+
+        # Одинакового сотрудника в одном магазине
+        # не считаем несколько раз.
+        assignment_key = (
+            inn,
+            sm_store_id,
+        )
+
+        current = assignments_by_key.get(
+            assignment_key
+        )
+
+        normalized_row = {
+            "inn": inn,
+            "sm_store_id": sm_store_id,
+            "full_name": full_name,
+            "position": position_name,
+            "subdivision": subdivision_name,
+            "department": department_name,
+            "phone": phone,
+            "mail": mail,
+            "organization": organization_name,
+        }
+
+        if current is None:
+            assignments_by_key[
+                assignment_key
+            ] = normalized_row
+            continue
+
+        # Если дубль содержит более полные сведения,
+        # заполняем отсутствующие значения.
+        for field_name, field_value in (
+            normalized_row.items()
+        ):
+            if (
+                field_name not in {
+                    "inn",
+                    "sm_store_id",
+                }
+                and not current.get(field_name)
+                and field_value
+            ):
+                current[field_name] = field_value
+
+    assignments = list(
+        assignments_by_key.values()
+    )
+
+    all_inns = {
+        row["inn"]
+        for row in assignments
+    }
+
+    all_sm_store_ids = {
+        row["sm_store_id"]
+        for row in assignments
+        if row["sm_store_id"] is not None
+    }
+
+    # --------------------------------------------------------
+    # Названия магазинов: stores.smstore = ИдМагазина из 1С
+    # --------------------------------------------------------
+
+    store_names_by_sm = {}
+
+    if all_sm_store_ids:
+        stores = (
+            Store.objects
+            .filter(
+                smstore__in=all_sm_store_ids
+            )
+            .only(
+                "id",
+                "smstore",
+                "name",
+            )
+            .order_by("id")
+        )
+
+        for store in stores:
+            if store.smstore is None:
+                continue
+
+            store_name = str(
+                store.name or ""
+            ).strip()
+
+            if (
+                store_name
+                and store.smstore
+                not in store_names_by_sm
+            ):
+                store_names_by_sm[
+                    store.smstore
+                ] = store_name
+
+    # --------------------------------------------------------
+    # Сопоставление ИНН -> users -> max_id
+    # --------------------------------------------------------
+
+    users_by_inn = _max_report_build_user_map(
+        all_inns
+    )
+
+    for assignment in assignments:
+        inn = assignment["inn"]
+        db_user = users_by_inn.get(inn)
+
+        assignment["user_id"] = (
+            db_user.id
+            if db_user is not None
+            else None
+        )
+
+        assignment["max_id"] = (
+            db_user.max_id
+            if db_user is not None
+            else None
+        )
+
+        assignment["connected"] = (
+            _max_report_has_max_id(
+                assignment["max_id"]
+            )
+        )
+
+        if (
+            not assignment["full_name"]
+            and db_user is not None
+        ):
+            assignment["full_name"] = str(
+                db_user.full_name or ""
+            ).strip()
+
+        sm_store_id = assignment[
+            "sm_store_id"
+        ]
+
+        store_name = ""
+
+        if sm_store_id is not None:
+            store_name = store_names_by_sm.get(
+                sm_store_id,
+                "",
+            )
+
+        # Это только резервный вариант, если smstore
+        # отсутствует в таблице stores.
+        if not store_name:
+            store_name = (
+                assignment["subdivision"]
+                or "Магазин не найден в справочнике"
+            )
+
+        assignment["store_name"] = store_name
+
+    # --------------------------------------------------------
+    # Магазины для фильтра — только из актуального ответа 1С
+    # --------------------------------------------------------
+
+    store_options_map = {}
+
+    for assignment in assignments:
+        sm_store_id = assignment[
+            "sm_store_id"
+        ]
+
+        if sm_store_id is None:
+            continue
+
+        if sm_store_id not in store_options_map:
+            store_options_map[sm_store_id] = (
+                assignment["store_name"]
+            )
+
+    store_options = [
+        {
+            # Здесь id — это smstore.
+            "id": sm_store_id,
+            "name": store_name,
+        }
+        for sm_store_id, store_name
+        in store_options_map.items()
+    ]
+
+    store_options.sort(
+        key=lambda item: (
+            item["name"].casefold(),
+            item["id"],
+        )
+    )
+
+    # --------------------------------------------------------
+    # Фильтр по магазину
+    # --------------------------------------------------------
+
+    if selected_sm_store_id is None:
+        selected_assignments = assignments
+    else:
+        selected_assignments = [
+            assignment
+            for assignment in assignments
+            if (
+                assignment["sm_store_id"]
+                == selected_sm_store_id
+            )
+        ]
+
+    # --------------------------------------------------------
+    # Общая статистика
+    #
+    # Один сотрудник считается один раз,
+    # даже если он работает в нескольких магазинах.
+    # --------------------------------------------------------
+
+    selected_inns = {
+        assignment["inn"]
+        for assignment in selected_assignments
+    }
+
+    connected_inns = {
+        inn
+        for inn in selected_inns
+        if _max_report_has_max_id(
+            getattr(
+                users_by_inn.get(inn),
+                "max_id",
+                None,
+            )
+        )
+    }
+
+    working_count = len(selected_inns)
+    connected_count = len(connected_inns)
+
+    max_stats = {
+        # Имя ключа оставлено для совместимости с шаблоном.
+        "active_count": working_count,
+        "connected_count": connected_count,
+        "not_connected_count": max(
+            0,
+            working_count - connected_count,
+        ),
+        "connected_percent": (
+            round(
+                connected_count
+                * 100
+                / working_count,
+                1,
+            )
+            if working_count
+            else 0
+        ),
+    }
+
+    # --------------------------------------------------------
+    # Статистика по магазинам
+    #
+    # Один ИНН в одном магазине считается один раз.
+    # Если сотрудник прикреплён в 1С к нескольким
+    # магазинам, он учитывается в каждом из них.
+    # --------------------------------------------------------
+
+    store_employee_inns = defaultdict(set)
+    summary_store_names = {}
+
+    for assignment in selected_assignments:
+        sm_store_id = assignment[
+            "sm_store_id"
+        ]
+
+        if sm_store_id is None:
+            continue
+
+        store_employee_inns[
+            sm_store_id
+        ].add(
+            assignment["inn"]
+        )
+
+        summary_store_names[
+            sm_store_id
+        ] = assignment["store_name"]
+
+    store_summary = []
+
+    for (
+        sm_store_id,
+        employee_inns,
+    ) in store_employee_inns.items():
+        store_working_count = len(
+            employee_inns
+        )
+
+        store_connected_count = sum(
+            1
+            for inn in employee_inns
+            if _max_report_has_max_id(
+                getattr(
+                    users_by_inn.get(inn),
+                    "max_id",
+                    None,
+                )
+            )
+        )
+
+        store_summary.append({
+            "store_id": sm_store_id,
+            "store_name": (
+                summary_store_names.get(
+                    sm_store_id,
+                    "",
+                )
+                or "Магазин без названия"
+            ),
+            "active_count": (
+                store_working_count
+            ),
+            "connected_count": (
+                store_connected_count
+            ),
+            "not_connected_count": max(
+                0,
+                store_working_count
+                - store_connected_count,
+            ),
+            "connected_percent": (
+                round(
+                    store_connected_count
+                    * 100
+                    / store_working_count,
+                    1,
+                )
+                if store_working_count
+                else 0
+            ),
+        })
+
+    store_summary.sort(
+        key=lambda item: (
+            item["store_name"].casefold(),
+            item["store_id"],
+        )
+    )
+
+    # --------------------------------------------------------
+    # Таблица сотрудников
+    #
+    # В общей таблице один сотрудник показывается один раз,
+    # магазины объединяются через запятую.
+    # --------------------------------------------------------
+
+    employees_by_inn = {}
+
+    for assignment in selected_assignments:
+        inn = assignment["inn"]
+
+        employee = employees_by_inn.get(
+            inn
+        )
+
+        if employee is None:
+            employee = {
+                "employee_id": inn,
+                "full_name": (
+                    assignment["full_name"]
+                ),
+                "max_id": (
+                    assignment["max_id"]
+                ),
+                "user_id": (
+                    assignment["user_id"]
+                ),
+                "report_max_connected": (
+                    assignment["connected"]
+                ),
+                "report_position": (
+                    assignment["position"]
+                ),
+                "report_department": (
+                    assignment["subdivision"]
+                    or assignment["department"]
+                ),
+                "_store_names": set(),
+                "_search_values": set(),
+            }
+
+            employees_by_inn[inn] = employee
+
+        if (
+            not employee["full_name"]
+            and assignment["full_name"]
+        ):
+            employee["full_name"] = (
+                assignment["full_name"]
+            )
+
+        if (
+            not employee["report_position"]
+            and assignment["position"]
+        ):
+            employee["report_position"] = (
+                assignment["position"]
+            )
+
+        if (
+            not employee["report_department"]
+            and (
+                assignment["subdivision"]
+                or assignment["department"]
+            )
+        ):
+            employee["report_department"] = (
+                assignment["subdivision"]
+                or assignment["department"]
+            )
+
+        if assignment["store_name"]:
+            employee["_store_names"].add(
+                assignment["store_name"]
+            )
+
+        for search_value in (
+            inn,
+            assignment["full_name"],
+            assignment["position"],
+            assignment["subdivision"],
+            assignment["department"],
+            assignment["phone"],
+            assignment["mail"],
+            assignment["organization"],
+            assignment["store_name"],
+            assignment["max_id"],
+        ):
+            if search_value not in (
+                None,
+                "",
+            ):
+                employee[
+                    "_search_values"
+                ].add(
+                    str(search_value)
+                )
+
+    employee_rows = list(
+        employees_by_inn.values()
+    )
+
+    for employee in employee_rows:
+        employee["report_stores"] = ", ".join(
+            sorted(
+                employee["_store_names"],
+                key=str.casefold,
+            )
+        )
+
+        employee["_search_text"] = " ".join(
+            employee["_search_values"]
+        ).casefold()
+
+    # --------------------------------------------------------
+    # Поиск
+    # --------------------------------------------------------
+
+    if search_query:
+        normalized_search = (
+            search_query.casefold()
+        )
+
+        employee_rows = [
+            employee
+            for employee in employee_rows
+            if normalized_search
+            in employee["_search_text"]
+        ]
+
+    # --------------------------------------------------------
+    # Фильтр подключения
+    # --------------------------------------------------------
+
+    if connection_filter == "connected":
+        employee_rows = [
+            employee
+            for employee in employee_rows
+            if employee[
+                "report_max_connected"
+            ]
+        ]
+
+    elif (
+        connection_filter
+        == "not_connected"
+    ):
+        employee_rows = [
+            employee
+            for employee in employee_rows
+            if not employee[
+                "report_max_connected"
+            ]
+        ]
+
+    employee_rows.sort(
+        key=lambda employee: (
+            str(
+                employee["full_name"] or ""
+            ).casefold(),
+            employee["employee_id"],
+        )
+    )
+
     paginator = Paginator(
-        max_users_qs,
+        employee_rows,
         page_size,
     )
 
     max_page = paginator.get_page(
         request.GET.get("max_page")
     )
-
-    max_rows = list(max_page.object_list)
-    max_page.object_list = max_rows
-
-    # --------------------------------------------------------
-    # Должности и подразделения
-    # --------------------------------------------------------
-
-    position_ids = {
-        row.position_id
-        for row in max_rows
-        if row.position_id
-    }
-
-    department_ids = {
-        row.department_id
-        for row in max_rows
-        if row.department_id
-    }
-
-    position_map = dict(
-        Position.objects
-        .filter(id__in=position_ids)
-        .values_list(
-            "id",
-            "name",
-        )
-    )
-
-    department_map = dict(
-        Department.objects
-        .filter(id__in=department_ids)
-        .values_list(
-            "id",
-            "name",
-        )
-    )
-
-    # --------------------------------------------------------
-    # Магазины сотрудников текущей страницы
-    # --------------------------------------------------------
-
-    page_user_ids = [
-        row.id
-        for row in max_rows
-    ]
-
-    page_user_store_links = list(
-        UKMUser.objects
-        .filter(user_id__in=page_user_ids)
-        .values(
-            "user_id",
-            "storeid",
-        )
-        .distinct()
-    )
-
-    page_ukm_store_ids = {
-        row["storeid"]
-        for row in page_user_store_links
-        if row["storeid"] is not None
-    }
-
-    page_store_map = {}
-
-    for store in (
-        Store.objects
-        .filter(
-            ukm4store__in=page_ukm_store_ids
-        )
-        .only(
-            "name",
-            "ukm4store",
-        )
-        .order_by("name")
-    ):
-        if store.ukm4store not in page_store_map:
-            page_store_map[store.ukm4store] = str(
-                store.name or ""
-            ).strip()
-
-    stores_by_user = defaultdict(list)
-
-    for link in page_user_store_links:
-        store_name = page_store_map.get(
-            link["storeid"],
-            "",
-        )
-
-        if (
-            store_name
-            and store_name
-            not in stores_by_user[link["user_id"]]
-        ):
-            stores_by_user[
-                link["user_id"]
-            ].append(store_name)
-
-    for user_row in max_rows:
-        user_row.report_position = str(
-            position_map.get(
-                user_row.position_id,
-                "",
-            )
-            or ""
-        ).strip()
-
-        user_row.report_department = str(
-            department_map.get(
-                user_row.department_id,
-                "",
-            )
-            or ""
-        ).strip()
-
-        user_row.report_stores = ", ".join(
-            sorted(
-                stores_by_user.get(
-                    user_row.id,
-                    [],
-                ),
-                key=str.casefold,
-            )
-        )
-
-        user_row.report_max_connected = bool(
-            user_row.active
-            and user_row.max_id
-        )
-
-    # --------------------------------------------------------
-    # Магазины для фильтра
-    # --------------------------------------------------------
-
-    assigned_ukm_store_ids = (
-        UKMUser.objects
-        .filter(user__active=True)
-        .values_list(
-            "storeid",
-            flat=True,
-        )
-        .distinct()
-    )
-
-    store_options = []
-    seen_ukm_store_ids = set()
-
-    for store in (
-        Store.objects
-        .filter(
-            ukm4store__in=assigned_ukm_store_ids
-        )
-        .exclude(name__isnull=True)
-        .exclude(name="")
-        .only(
-            "id",
-            "name",
-            "ukm4store",
-        )
-        .order_by(
-            "name",
-            "id",
-        )
-    ):
-        if store.ukm4store in seen_ukm_store_ids:
-            continue
-
-        seen_ukm_store_ids.add(
-            store.ukm4store
-        )
-
-        store_options.append({
-            "id": store.id,
-            "name": str(
-                store.name or ""
-            ).strip(),
-        })
 
     context = {
         "max_stats": max_stats,
@@ -27515,18 +28113,47 @@ def max_connection_report(request):
         "max_filters": {
             "q": search_query,
             "connection": connection_filter,
-            "store": selected_store_id,
+            # Теперь здесь находится stores.smstore,
+            # а не stores.id.
+            "store": selected_sm_store_id,
             "page_size": page_size,
         },
         "max_query_without_page": (
             _report_query_without(
                 request,
                 "max_page",
+                "refresh_onec",
             )
         ),
         "report_updated_at": timezone.localtime(
             timezone.now()
         ),
+        "onec_loaded_at": (
+            timezone.localtime(
+                onec_loaded_at
+            )
+            if onec_loaded_at
+            else None
+        ),
+        "onec_data_available": (
+            onec_data_available
+        ),
+        "onec_is_stale": onec_is_stale,
+        "onec_warning": (
+            onec_problem
+            if onec_is_stale
+            else ""
+        ),
+        "onec_error": (
+            onec_problem
+            if not onec_data_available
+            else ""
+        ),
+        "onec_received_rows": len(api_rows),
+        "onec_assignments_count": len(
+            assignments
+        ),
+        "onec_skipped_rows": skipped_rows,
     }
 
     if (
@@ -27537,13 +28164,15 @@ def max_connection_report(request):
     ):
         return render(
             request,
-            "frostapp/_max_connection_report_content.html",
+            "frostapp/"
+            "_max_connection_report_content.html",
             context,
         )
 
     return render(
         request,
-        "frostapp/max_connection_report.html",
+        "frostapp/"
+        "max_connection_report.html",
         context,
     )
 
