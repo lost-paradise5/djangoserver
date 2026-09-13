@@ -1,9 +1,28 @@
 {% load tz %}
 
 <p class="updated">
-    Обновлено:
+    Отчёт обновлён:
     {{ report_updated_at|date:"d.m.Y H:i:s" }}
+
+    {% if onec_loaded_at %}
+        · данные 1С получены:
+        {{ onec_loaded_at|date:"d.m.Y H:i:s" }}
+    {% endif %}
 </p>
+
+{% if onec_error %}
+    <div class="notice notice-error">
+        <strong>Не удалось получить сотрудников из 1С.</strong>
+        Отчёт не содержит актуальных данных.
+        Причина: {{ onec_error }}
+    </div>
+{% elif onec_warning %}
+    <div class="notice notice-warning">
+        <strong>1С временно недоступна.</strong>
+        Показан последний успешно полученный список сотрудников.
+        Причина: {{ onec_warning }}
+    </div>
+{% endif %}
 
 <section class="panel">
     <h2 class="section-title">Общая сводка</h2>
