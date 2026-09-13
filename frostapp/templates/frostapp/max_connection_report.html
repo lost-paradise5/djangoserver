@@ -407,51 +407,108 @@
 
     let requestRunning = false;
 
-    async function refreshReport() {
+    async function refreshReport(forceOnecRefresh) {
         if (requestRunning) {
             return;
         }
 
         requestRunning = true;
         refreshButton.disabled = true;
-        refreshButton.textContent = "Обновление...";
+
+        if (forceOnecRefresh) {
+            refreshButton.textContent =
+                "Получение данных из 1С...";
+        } else {
+            refreshButton.textContent =
+                "Обновление статусов...";
+        }
 
         try {
-            const response = await fetch(window.location.href, {
-                method: "GET",
-                credentials: "same-origin",
-                cache: "no-store",
-                headers: {
-                    "X-Requested-With": "XMLHttpRequest"
+            const requestUrl = new URL(
+                window.location.href
+            );
+
+            // Этот параметр никогда не должен оставаться
+            // в обычных автоматических обновлениях.
+            requestUrl.searchParams.delete(
+                "refresh_onec"
+            );
+
+            if (forceOnecRefresh) {
+                requestUrl.searchParams.set(
+                    "refresh_onec",
+                    "1"
+                );
+            }
+
+            const response = await fetch(
+                requestUrl.toString(),
+                {
+                    method: "GET",
+                    credentials: "same-origin",
+                    cache: "no-store",
+                    headers: {
+                        "X-Requested-With":
+                            "XMLHttpRequest"
+                    }
                 }
-            });
+            );
 
             if (response.redirected) {
-                window.location.href = response.url;
+                window.location.href =
+                    response.url;
                 return;
             }
 
             if (!response.ok) {
-                throw new Error("HTTP " + response.status);
+                throw new Error(
+                    "HTTP " + response.status
+                );
             }
 
-            content.innerHTML = await response.text();
+            content.innerHTML =
+                await response.text();
+
         } catch (error) {
-            console.error("Ошибка обновления отчёта:", error);
+            console.error(
+                "Ошибка обновления отчёта:",
+                error
+            );
+
+            alert(
+                "Не удалось обновить отчёт. " +
+                "Подробности находятся в логах Django."
+            );
+
         } finally {
             requestRunning = false;
             refreshButton.disabled = false;
-            refreshButton.textContent = "Обновить";
+            refreshButton.textContent =
+                "Обновить данные из 1С";
         }
     }
 
-    refreshButton.addEventListener("click", refreshReport);
-
-    window.setInterval(function () {
-        if (autoRefresh.checked && !document.hidden) {
-            refreshReport();
+    // Ручное нажатие принудительно обращается к 1С.
+    refreshButton.addEventListener(
+        "click",
+        function () {
+            refreshReport(true);
         }
-    }, 30000);
+    );
+
+    // Автоматическое обновление использует суточный
+    // список сотрудников, но заново читает max_id из БД.
+    window.setInterval(
+        function () {
+            if (
+                autoRefresh.checked
+                && !document.hidden
+            ) {
+                refreshReport(false);
+            }
+        },
+        30000
+    );
 })();
 </script>
 </body>
