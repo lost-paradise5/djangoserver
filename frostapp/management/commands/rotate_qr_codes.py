@@ -362,57 +362,67 @@ class Command(BaseCommand):
             
             # Определяем актуальный тип каждого магазина.
             # Кэш уже очищен выше.
-            store_systems = {}
+            # Все магазины работают в УКМ-4.
+            ukm4_store_ids = list(anchor_store_ids)
+            
+            # Определяем магазины, которые дополнительно
+            # работают в УКМ-5.
+            ukm5_store_ids = []
             
             for store_id in anchor_store_ids:
-                store_systems[store_id] = (
-                    "ukm5"
-                    if is_ukm5_store(store_id)
-                    else "ukm4"
+                if is_ukm5_store(store_id):
+                    ukm5_store_ids.append(store_id)
+            
+            ukm5_store_ids = sorted(
+                set(ukm5_store_ids)
+            )
+            
+            if target_system == "ukm4":
+                # Для УКМ-4 доступны все магазины.
+                discovered_store_ids = (
+                    ukm4_store_ids
+                )
+            else:
+                # Для УКМ-5 доступна только подтверждённая
+                # часть магазинов.
+                discovered_store_ids = (
+                    ukm5_store_ids
                 )
             
-            discovered_store_ids = [
-                store_id
-                for store_id in anchor_store_ids
-                if store_systems[store_id]
-                == target_system
-            ]
-            
             if selection_was_provided:
-                # Повторная fail-closed проверка.
-                # Если магазин после открытия страницы сменил тип,
-                # запуск останавливается до изменения паролей.
-                wrong_system_store_ids = [
-                    store_id
-                    for store_id in selected_store_ids
-                    if store_systems.get(store_id)
-                    != target_system
-                ]
+                # Ограничение по типу требуется только
+                # при запуске обновления УКМ-5.
+                if target_system == "ukm5":
+                    wrong_system_store_ids = sorted(
+                        set(selected_store_ids)
+                        - set(ukm5_store_ids)
+                    )
             
-                if wrong_system_store_ids:
-                    actual_values = ", ".join(
-                        (
-                            f"{store_id}="
-                            f"{store_systems.get(store_id, 'unknown').upper()}"
+                    if wrong_system_store_ids:
+                        raise CommandError(
+                            "Следующие магазины не относятся "
+                            "к УКМ-5 или уже были переведены "
+                            "обратно только на УКМ-4: "
+                            + ", ".join(
+                                map(
+                                    str,
+                                    wrong_system_store_ids,
+                                )
+                            )
+                            + ". Обновите список магазинов "
+                            "и создайте новый запуск."
                         )
-                        for store_id
-                        in wrong_system_store_ids
-                    )
             
-                    raise CommandError(
-                        "Тип выбранных магазинов изменился "
-                        "или не соответствует режиму "
-                        f"{target_system.upper()}: "
-                        f"{actual_values}. "
-                        "Обновите список магазинов "
-                        "и создайте новый запуск."
-                    )
-            
-                target_store_ids = selected_store_ids
+                # Для УКМ-4 дополнительная проверка типа
+                # не нужна: все магазины являются УКМ-4.
+                target_store_ids = (
+                    selected_store_ids
+                )
             else:
-                # Совместимость с cron и ручным CLI-запуском
-                # без параметра --store-ids.
-                target_store_ids = discovered_store_ids
+                # Совместимость с cron и CLI без --store-ids.
+                target_store_ids = (
+                    discovered_store_ids
+                )
             
             if not target_store_ids:
                 raise CommandError(
@@ -423,10 +433,12 @@ class Command(BaseCommand):
             logger.info(
                 "[ROTATE][STORE_DISCOVERY] "
                 "system=%s configured=%s "
-                "discovered=%s selected=%s explicit=%s",
+                "ukm4_all=%s ukm5_additional=%s "
+                "selected=%s explicit=%s",
                 target_system,
                 anchor_store_ids,
-                discovered_store_ids,
+                ukm4_store_ids,
+                ukm5_store_ids,
                 target_store_ids,
                 selection_was_provided,
             )
