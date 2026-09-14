@@ -8944,12 +8944,222 @@ def _set_password_pg(user, new_password: str) -> None:
         )
         logger.info(f"[PG] OpenInSystem created (system_id=9) for user_id={user.id}")
 
+
+
+
+
+
+def _parse_ukm_rotation_store_ids(
+    raw_values: Iterable[str],
+) -> list[int]:
+    """
+    Строго разбирает выбранные в интерфейсе
+    номера магазинов ukm4store.
+    """
+    store_ids: set[int] = set()
+    invalid_values: list[str] = []
+
+    for raw_value in raw_values or []:
+        for raw_part in str(
+            raw_value or ""
+        ).split(","):
+            raw_part = raw_part.strip()
+
+            if not raw_part:
+                continue
+
+            try:
+                store_id = int(raw_part)
+            except (TypeError, ValueError):
+                invalid_values.append(raw_part)
+                continue
+
+            if store_id <= 0:
+                invalid_values.append(raw_part)
+                continue
+
+            store_ids.add(store_id)
+
+    if invalid_values:
+        raise ValueError(
+            "Некорректные номера магазинов: "
+            + ", ".join(
+                sorted(set(invalid_values))
+            )
+        )
+
+    return sorted(store_ids)
+
+
+def _build_ukm_rotation_store_catalog(
+    *,
+    force_refresh: bool = False,
+) -> dict:
+    """
+    Формирует список магазинов для интерфейса.
+
+    Тип магазина определяется через is_ukm5_store().
+    Если определить тип не удалось, магазин попадает
+    в unknown и выбрать его нельзя.
+    """
+    if force_refresh:
+        clear_ukm_store_runtime_caches()
+
+    configured_store_ids = sorted({
+        int(value)
+        for value in (
+            get_ukm5_full_xml_store_ids()
+            or {2013}
+        )
+    })
+
+    store_rows_by_id: dict[int, dict] = {}
+
+    if configured_store_ids:
+        store_rows = (
+            Store.objects
+            .filter(
+                ukm4store__in=configured_store_ids
+            )
+            .values(
+                "ukm4store",
+                "smstore",
+                "name",
+                "address",
+                "close_date",
+            )
+            .order_by("id")
+        )
+
+        for row in store_rows:
+            try:
+                store_id = int(
+                    row["ukm4store"]
+                )
+            except (TypeError, ValueError):
+                continue
+
+            # Если в stores случайно есть дубликаты,
+            # используем первую запись.
+            store_rows_by_id.setdefault(
+                store_id,
+                row,
+            )
+
+    catalog = {
+        "all": [],
+        "ukm4": [],
+        "ukm5": [],
+        "unknown": [],
+        "configured_store_ids": (
+            configured_store_ids
+        ),
+        "refreshed_at": timezone.now(),
+    }
+
+    for store_id in configured_store_ids:
+        row = (
+            store_rows_by_id.get(store_id)
+            or {}
+        )
+
+        item = {
+            "store_id": store_id,
+            "smstore": row.get("smstore"),
+            "name": str(
+                row.get("name") or ""
+            ).strip(),
+            "address": str(
+                row.get("address") or ""
+            ).strip(),
+            "close_date": row.get("close_date"),
+            "system": "unknown",
+            "system_label": "Не определено",
+            "error": "",
+        }
+
+        try:
+            if is_ukm5_store(store_id):
+                item["system"] = "ukm5"
+                item["system_label"] = "УКМ-5"
+            else:
+                item["system"] = "ukm4"
+                item["system_label"] = "УКМ-4"
+
+        except Exception as exc:
+            item["error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            logger.exception(
+                "[ROTATE][DASHBOARD]"
+                "[STORE_DISCOVERY] "
+                "storeid=%s error=%s",
+                store_id,
+                exc,
+            )
+
+        catalog["all"].append(item)
+        catalog[item["system"]].append(item)
+
+    return catalog
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @staff_member_required
 @require_GET
 def ukm_rotation_dashboard(request):
+    force_refresh = (
+        str(
+            request.GET.get(
+                "refresh_stores"
+            )
+            or ""
+        ).strip()
+        == "1"
+    )
+
+    store_catalog = (
+        _build_ukm_rotation_store_catalog(
+            force_refresh=force_refresh,
+        )
+    )
+
+    if force_refresh:
+        if store_catalog["unknown"]:
+            messages.warning(
+                request,
+                "Список обновлён, но тип некоторых "
+                "магазинов определить не удалось. "
+                "Они недоступны для выбора.",
+            )
+        else:
+            messages.success(
+                request,
+                "Список и типы магазинов обновлены.",
+            )
+
     active_run = (
         UkmRotationRun.objects
-        .filter(status__in=["pending", "running"])
+        .filter(
+            status__in=["pending", "running"]
+        )
         .order_by("created_at")
         .first()
     )
@@ -8965,6 +9175,7 @@ def ukm_rotation_dashboard(request):
         {
             "active_run": active_run,
             "recent_runs": recent_runs,
+            "store_catalog": store_catalog,
         },
     )
 
@@ -8976,21 +9187,116 @@ def ukm_rotation_start(request):
         request.POST.get("system") or ""
     ).strip().lower()
 
-    if target_system not in {"ukm4", "ukm5"}:
-        messages.error(request, "Неизвестный режим запуска.")
-        return redirect("ukm_rotation_dashboard")
+    if target_system not in {
+        "ukm4",
+        "ukm5",
+    }:
+        messages.error(
+            request,
+            "Неизвестный режим запуска.",
+        )
+        return redirect(
+            "ukm_rotation_dashboard"
+        )
+
+    try:
+        selected_store_ids = (
+            _parse_ukm_rotation_store_ids(
+                request.POST.getlist(
+                    "store_ids"
+                )
+            )
+        )
+    except ValueError as exc:
+        messages.error(request, str(exc))
+        return redirect(
+            "ukm_rotation_dashboard"
+        )
+
+    if not selected_store_ids:
+        messages.error(
+            request,
+            "Выберите хотя бы один магазин "
+            "для ротации.",
+        )
+        return redirect(
+            "ukm_rotation_dashboard"
+        )
+
+    # POST может попасть в другой Gunicorn-процесс,
+    # поэтому обязательно заново очищаем кэш
+    # и определяем актуальные типы магазинов.
+    store_catalog = (
+        _build_ukm_rotation_store_catalog(
+            force_refresh=True,
+        )
+    )
+
+    current_stores = {
+        int(item["store_id"]): item
+        for item in store_catalog["all"]
+    }
+
+    invalid_selection = []
+
+    for store_id in selected_store_ids:
+        item = current_stores.get(store_id)
+
+        if not item:
+            invalid_selection.append(
+                f"{store_id}="
+                "нет в разрешённом списке"
+            )
+            continue
+
+        if item.get("system") == "unknown":
+            invalid_selection.append(
+                f"{store_id}="
+                "тип не определён"
+            )
+            continue
+
+        if item.get("system") != target_system:
+            actual_system = str(
+                item.get("system_label")
+                or "неизвестно"
+            )
+
+            invalid_selection.append(
+                f"{store_id}={actual_system}"
+            )
+
+    if invalid_selection:
+        messages.error(
+            request,
+            "Список магазинов изменился "
+            "или выбор не соответствует режиму "
+            f"{target_system.upper()}: "
+            f"{', '.join(invalid_selection)}. "
+            "Обновите список и выберите "
+            "магазины заново.",
+        )
+        return redirect(
+            "ukm_rotation_dashboard"
+        )
 
     with transaction.atomic():
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT pg_advisory_xact_lock(%s)",
+                "SELECT "
+                "pg_advisory_xact_lock(%s)",
                 [741852963],
             )
 
         active_run = (
             UkmRotationRun.objects
             .select_for_update()
-            .filter(status__in=["pending", "running"])
+            .filter(
+                status__in=[
+                    "pending",
+                    "running",
+                ]
+            )
             .order_by("created_at")
             .first()
         )
@@ -9010,24 +9316,49 @@ def ukm_rotation_start(request):
         run = UkmRotationRun.objects.create(
             target_system=target_system,
             status="pending",
-            requested_by=request.user.get_username(),
+            requested_by=(
+                request.user.get_username()
+            ),
+            target_store_ids=(
+                selected_store_ids
+            ),
             options={
                 "only_active": (
-                    request.POST.get("only_active") == "1"
+                    request.POST.get(
+                        "only_active"
+                    )
+                    == "1"
                 ),
                 "only_with_qr": (
-                    request.POST.get("only_with_qr") == "1"
+                    request.POST.get(
+                        "only_with_qr"
+                    )
+                    == "1"
                 ),
                 "ukm5_verify": (
                     target_system == "ukm5"
-                    and request.POST.get("ukm5_verify") == "1"
+                    and request.POST.get(
+                        "ukm5_verify"
+                    )
+                    == "1"
+                ),
+                "store_ids": (
+                    selected_store_ids
+                ),
+                "store_list_checked_at": (
+                    store_catalog[
+                        "refreshed_at"
+                    ].isoformat()
                 ),
             },
         )
 
     messages.success(
         request,
-        f"Запуск {target_system.upper()} поставлен в очередь.",
+        f"Запуск {target_system.upper()} "
+        "для магазинов "
+        f"{', '.join(map(str, selected_store_ids))} "
+        "поставлен в очередь.",
     )
 
     return redirect(
