@@ -8998,9 +8998,10 @@ def _build_ukm_rotation_store_catalog(
     """
     Формирует список магазинов для интерфейса.
 
-    Тип магазина определяется через is_ukm5_store().
-    Если определить тип не удалось, магазин попадает
-    в unknown и выбрать его нельзя.
+    Важно:
+      • все магазины относятся к УКМ-4;
+      • часть магазинов дополнительно относится к УКМ-5;
+      • ошибка проверки УКМ-5 не исключает магазин из УКМ-4.
     """
     if force_refresh:
         clear_ukm_store_runtime_caches()
@@ -9039,8 +9040,6 @@ def _build_ukm_rotation_store_catalog(
             except (TypeError, ValueError):
                 continue
 
-            # Если в stores случайно есть дубликаты,
-            # используем первую запись.
             store_rows_by_id.setdefault(
                 store_id,
                 row,
@@ -9073,22 +9072,42 @@ def _build_ukm_rotation_store_catalog(
                 row.get("address") or ""
             ).strip(),
             "close_date": row.get("close_date"),
-            "system": "unknown",
-            "system_label": "Не определено",
+
+            # Каждый магазин является УКМ-4.
+            "is_ukm4": True,
+
+            # Дополнительный признак УКМ-5.
+            "is_ukm5": False,
+            "ukm5_check_ok": False,
+
+            "system_label": "УКМ-4",
             "error": "",
         }
 
         try:
-            if is_ukm5_store(store_id):
-                item["system"] = "ukm5"
-                item["system_label"] = "УКМ-5"
+            is_ukm5 = bool(
+                is_ukm5_store(store_id)
+            )
+
+            item["is_ukm5"] = is_ukm5
+            item["ukm5_check_ok"] = True
+
+            if is_ukm5:
+                item["system_label"] = (
+                    "УКМ-4 + УКМ-5"
+                )
             else:
-                item["system"] = "ukm4"
-                item["system_label"] = "УКМ-4"
+                item["system_label"] = (
+                    "УКМ-4"
+                )
 
         except Exception as exc:
             item["error"] = (
                 f"{type(exc).__name__}: {exc}"
+            )
+            item["system_label"] = (
+                "УКМ-4; наличие УКМ-5 "
+                "не удалось проверить"
             )
 
             logger.exception(
@@ -9100,7 +9119,21 @@ def _build_ukm_rotation_store_catalog(
             )
 
         catalog["all"].append(item)
-        catalog[item["system"]].append(item)
+
+        # В УКМ-4 доступны абсолютно все магазины.
+        catalog["ukm4"].append(item)
+
+        # В УКМ-5 добавляем только подтверждённые
+        # магазины УКМ-5.
+        if (
+            item["ukm5_check_ok"]
+            and item["is_ukm5"]
+        ):
+            catalog["ukm5"].append(item)
+
+        # Ошибка касается только проверки УКМ-5.
+        if not item["ukm5_check_ok"]:
+            catalog["unknown"].append(item)
 
     return catalog
 
@@ -9145,14 +9178,16 @@ def ukm_rotation_dashboard(request):
         if store_catalog["unknown"]:
             messages.warning(
                 request,
-                "Список обновлён, но тип некоторых "
-                "магазинов определить не удалось. "
-                "Они недоступны для выбора.",
+                "Список обновлён, но для некоторых "
+                "магазинов не удалось проверить "
+                "наличие УКМ-5. Для обновления "
+                "УКМ-4 они по-прежнему доступны.",
             )
         else:
             messages.success(
                 request,
-                "Список и типы магазинов обновлены.",
+                "Список магазинов и наличие "
+                "УКМ-5 обновлены.",
             )
 
     active_run = (
@@ -9241,41 +9276,46 @@ def ukm_rotation_start(request):
 
     for store_id in selected_store_ids:
         item = current_stores.get(store_id)
-
+    
         if not item:
             invalid_selection.append(
                 f"{store_id}="
                 "нет в разрешённом списке"
             )
             continue
-
-        if item.get("system") == "unknown":
+    
+        # Для УКМ-4 разрешён любой магазин,
+        # потому что все магазины работают в УКМ-4.
+        if target_system == "ukm4":
+            continue
+    
+        # Для УКМ-5 проверка должна завершиться успешно.
+        if not item.get("ukm5_check_ok"):
             invalid_selection.append(
                 f"{store_id}="
-                "тип не определён"
+                "не удалось проверить наличие УКМ-5"
             )
             continue
-
-        if item.get("system") != target_system:
-            actual_system = str(
-                item.get("system_label")
-                or "неизвестно"
-            )
-
+    
+        # Для запуска УКМ-5 магазин должен
+        # действительно дополнительно работать в УКМ-5.
+        if not item.get("is_ukm5"):
             invalid_selection.append(
-                f"{store_id}={actual_system}"
+                f"{store_id}="
+                "магазин работает только в УКМ-4"
             )
 
     if invalid_selection:
         messages.error(
             request,
-            "Список магазинов изменился "
-            "или выбор не соответствует режиму "
+            "Некоторые выбранные магазины "
+            "нельзя обработать в режиме "
             f"{target_system.upper()}: "
             f"{', '.join(invalid_selection)}. "
-            "Обновите список и выберите "
-            "магазины заново.",
+            "Обновите список магазинов "
+            "и повторите выбор.",
         )
+    
         return redirect(
             "ukm_rotation_dashboard"
         )
