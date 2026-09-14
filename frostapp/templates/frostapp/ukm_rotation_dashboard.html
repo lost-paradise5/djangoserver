@@ -2,103 +2,857 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1"
+  >
   <title>Обновление паролей УКМ</title>
+
   <style>
-    body { margin: 0; padding: 28px; background: #f3f6fb; color: #172033; font-family: Arial, sans-serif; }
-    .container { max-width: 1180px; margin: 0 auto; }
-    .card { background: #fff; border-radius: 16px; padding: 22px; margin-bottom: 18px; box-shadow: 0 8px 24px rgba(28,45,75,.08); }
-    h1, h2 { margin-top: 0; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 18px; }
-    .system-card { border: 1px solid #dce4f2; border-radius: 14px; padding: 20px; }
-    .system-card.ukm4 { border-top: 5px solid #2563eb; }
-    .system-card.ukm5 { border-top: 5px solid #7c3aed; }
-    button { border: 0; border-radius: 10px; padding: 13px 18px; color: #fff; font-size: 15px; font-weight: 700; cursor: pointer; }
-    button.ukm4 { background: #2563eb; }
-    button.ukm5 { background: #7c3aed; }
-    button:disabled { opacity: .5; cursor: not-allowed; }
-    .hint { color: #5b677d; line-height: 1.5; }
-    .option { display: block; margin: 12px 0; }
-    .alert { border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
-    .alert-success { background: #dcfce7; color: #166534; }
-    .alert-warning { background: #fef3c7; color: #92400e; }
-    .alert-error { background: #fee2e2; color: #991b1b; }
-    .active { background: #eff6ff; border: 1px solid #bfdbfe; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 11px 10px; border-bottom: 1px solid #e5eaf2; text-align: left; }
-    th { color: #526078; font-size: 13px; }
-    a { color: #1d4ed8; text-decoration: none; font-weight: 700; }
-    .badge { display: inline-block; padding: 5px 9px; border-radius: 999px; background: #e8edf5; font-size: 12px; font-weight: 700; }
-    .muted { color: #68758a; font-size: 13px; }
-    @media (max-width: 700px) { body { padding: 12px; } .card { padding: 16px; } .table-wrap { overflow-x: auto; } }
+    body {
+      margin: 0;
+      padding: 28px;
+      background: #f3f6fb;
+      color: #172033;
+      font-family: Arial, sans-serif;
+    }
+
+    .container {
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 16px;
+      padding: 22px;
+      margin-bottom: 18px;
+      box-shadow:
+        0 8px 24px rgba(28, 45, 75, .08);
+    }
+
+    h1,
+    h2 {
+      margin-top: 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns:
+        repeat(auto-fit, minmax(360px, 1fr));
+      gap: 18px;
+    }
+
+    .system-card {
+      border: 1px solid #dce4f2;
+      border-radius: 14px;
+      padding: 20px;
+      min-width: 0;
+    }
+
+    .system-card.ukm4 {
+      border-top: 5px solid #2563eb;
+    }
+
+    .system-card.ukm5 {
+      border-top: 5px solid #7c3aed;
+    }
+
+    button,
+    .button-link {
+      border: 0;
+      border-radius: 10px;
+      padding: 11px 15px;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-block;
+    }
+
+    button.ukm4 {
+      background: #2563eb;
+    }
+
+    button.ukm5 {
+      background: #7c3aed;
+    }
+
+    button:disabled {
+      opacity: .5;
+      cursor: not-allowed;
+    }
+
+    .button-link {
+      background: #172033;
+      text-decoration: none;
+    }
+
+    .secondary {
+      background: #e8edf5;
+      color: #34435a;
+    }
+
+    .hint {
+      color: #5b677d;
+      line-height: 1.5;
+    }
+
+    .warning-hint {
+      color: #92400e;
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      border-radius: 10px;
+      padding: 10px 12px;
+      line-height: 1.45;
+    }
+
+    .option {
+      display: block;
+      margin: 12px 0;
+    }
+
+    .alert {
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+
+    .alert-success {
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .alert-warning {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .alert-error {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+
+    .active {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+    }
+
+    .catalog-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .catalog-counts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .store-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 14px 0 10px;
+      align-items: center;
+    }
+
+    .store-search {
+      flex: 1 1 210px;
+      min-width: 0;
+      border: 1px solid #ccd5e3;
+      border-radius: 9px;
+      padding: 10px 11px;
+      font-size: 14px;
+    }
+
+    .store-list {
+      border: 1px solid #dce4f2;
+      border-radius: 11px;
+      max-height: 330px;
+      overflow: auto;
+      background: #fbfcfe;
+    }
+
+    .store-row {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 11px 12px;
+      border-bottom: 1px solid #e5eaf2;
+      cursor: pointer;
+    }
+
+    .store-row:last-child {
+      border-bottom: 0;
+    }
+
+    .store-row:hover {
+      background: #f1f5fb;
+    }
+
+    .store-row input {
+      margin-top: 3px;
+      flex: 0 0 auto;
+    }
+
+    .store-title {
+      font-weight: 700;
+    }
+
+    .store-meta {
+      display: block;
+      color: #68758a;
+      font-size: 12px;
+      line-height: 1.4;
+      margin-top: 3px;
+    }
+
+    .selection-summary {
+      font-size: 13px;
+      font-weight: 700;
+      color: #41506a;
+      margin: 10px 0 14px;
+    }
+
+    .empty {
+      padding: 14px;
+      color: #68758a;
+    }
+
+    .unknown-list {
+      margin: 12px 0 0;
+      padding-left: 20px;
+      color: #991b1b;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 11px 10px;
+      border-bottom: 1px solid #e5eaf2;
+      text-align: left;
+    }
+
+    th {
+      color: #526078;
+      font-size: 13px;
+    }
+
+    a {
+      color: #1d4ed8;
+      text-decoration: none;
+      font-weight: 700;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: #e8edf5;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .badge.ukm4 {
+      color: #1d4ed8;
+      background: #dbeafe;
+    }
+
+    .badge.ukm5 {
+      color: #6d28d9;
+      background: #ede9fe;
+    }
+
+    .badge.unknown {
+      color: #991b1b;
+      background: #fee2e2;
+    }
+
+    .muted {
+      color: #68758a;
+      font-size: 13px;
+    }
+
+    @media (max-width: 700px) {
+      body {
+        padding: 12px;
+      }
+
+      .card {
+        padding: 16px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .table-wrap {
+        overflow-x: auto;
+      }
+    }
   </style>
 </head>
+
 <body>
 <div class="container">
+
   <div class="card">
     <h1>Обновление паролей УКМ</h1>
-    <p class="hint">Сначала запускайте УКМ‑4: он создаёт новый пароль, QR и сохраняет пароль в <code>open_in_system</code>. Затем запускайте УКМ‑5: он использует сохранённый пароль без его изменения.</p>
+
+    <p class="hint">
+      Сначала запускайте УКМ‑4: он создаёт новый
+      пароль, QR и сохраняет пароль в
+      <code>open_in_system</code>.
+      Затем запускайте УКМ‑5: он использует
+      сохранённый пароль без его изменения.
+    </p>
 
     {% for message in messages %}
-      <div class="alert alert-{{ message.tags|default:'warning' }}">{{ message }}</div>
+      <div
+        class="alert alert-{{ message.tags|default:'warning' }}"
+      >
+        {{ message }}
+      </div>
     {% endfor %}
 
     {% if active_run %}
       <div class="alert active">
-        Сейчас выполняется или ожидает запуска <strong>{{ active_run.target_system|upper }}</strong>:
-        <a href="{% url 'ukm_rotation_run_detail' active_run.id %}">открыть журнал</a>.
-        Пока он не завершится, новый прогон создать нельзя.
+        Сейчас выполняется или ожидает запуска
+        <strong>
+          {{ active_run.target_system|upper }}
+        </strong>:
+
+        <a
+          href="{% url 'ukm_rotation_run_detail' active_run.id %}"
+        >
+          открыть журнал
+        </a>.
+
+        Пока он не завершится, новый прогон
+        создать нельзя.
       </div>
+    {% endif %}
+  </div>
+
+  <div class="card" id="stores">
+    <div class="catalog-head">
+      <div>
+        <h2>Актуальные типы магазинов</h2>
+
+        <div class="muted">
+          Проверено
+          {{ store_catalog.refreshed_at|date:"d.m.Y H:i:s" }}.
+
+          Показаны магазины из
+          <code>UKM5_FULL_XML_STORE_IDS</code>.
+        </div>
+      </div>
+
+      <a
+        class="button-link"
+        href="{% url 'ukm_rotation_dashboard' %}?refresh_stores=1#stores"
+      >
+        Обновить список
+      </a>
+    </div>
+
+    <div class="catalog-counts">
+      <span class="badge ukm4">
+        УКМ‑4: {{ store_catalog.ukm4|length }}
+      </span>
+
+      <span class="badge ukm5">
+        УКМ‑5: {{ store_catalog.ukm5|length }}
+      </span>
+
+      {% if store_catalog.unknown %}
+        <span class="badge unknown">
+          Не определено:
+          {{ store_catalog.unknown|length }}
+        </span>
+      {% endif %}
+    </div>
+
+    {% if store_catalog.unknown %}
+      <ul class="unknown-list">
+        {% for store in store_catalog.unknown %}
+          <li>
+            <strong>{{ store.store_id }}</strong>
+
+            {% if store.name %}
+              — {{ store.name }}
+            {% endif %}
+
+            :
+            {{ store.error|default:"не удалось определить тип" }}
+          </li>
+        {% endfor %}
+      </ul>
     {% endif %}
   </div>
 
   <div class="card">
     <div class="grid">
-      <form method="post" action="{% url 'ukm_rotation_start' %}" class="system-card ukm4">
+
+      <!-- УКМ-4 -->
+      <form
+        method="post"
+        action="{% url 'ukm_rotation_start' %}"
+        class="system-card ukm4"
+        data-store-form
+        data-run-blocked="{% if active_run %}1{% else %}0{% endif %}"
+      >
         {% csrf_token %}
-        <input type="hidden" name="system" value="ukm4">
+
+        <input
+          type="hidden"
+          name="system"
+          value="ukm4"
+        >
+
         <h2>УКМ‑4</h2>
-        <p class="hint">Полный прогон: генерирует новый пароль, пересоздаёт QR, записывает пароль в <code>open_in_system</code> и обновляет только <code>import4.users/signal</code>. УКМ‑5 не изменяется.</p>
-        <label class="option"><input type="checkbox" name="only_active" value="1"> Только активные сотрудники</label>
-        <label class="option"><input type="checkbox" name="only_with_qr" value="1"> Только сотрудники, у которых уже есть QR</label>
-        <button class="ukm4" type="submit" {% if active_run %}disabled{% endif %}>Обновить в УКМ‑4</button>
+
+        <p class="hint">
+          Генерирует новый пароль, пересоздаёт QR,
+          сохраняет пароль в
+          <code>open_in_system</code>
+          и обновляет
+          <code>import4.users/signal</code>
+          только в выбранных магазинах.
+        </p>
+
+        <p class="warning-hint">
+          Новый QR сохраняется для сотрудника
+          глобально. Если сотрудник работает ещё
+          в невыбранном УКМ‑4-магазине, там
+          останется прежний пароль.
+        </p>
+
+        <div class="store-toolbar">
+          <input
+            class="store-search"
+            type="search"
+            placeholder="Поиск магазина"
+            data-store-search
+          >
+
+          <button
+            class="secondary"
+            type="button"
+            data-select-all
+          >
+            Выбрать все
+          </button>
+
+          <button
+            class="secondary"
+            type="button"
+            data-clear-all
+          >
+            Снять выбор
+          </button>
+        </div>
+
+        <div class="store-list">
+          {% for store in store_catalog.ukm4 %}
+            <label
+              class="store-row"
+              data-store-row
+            >
+              <input
+                type="checkbox"
+                name="store_ids"
+                value="{{ store.store_id }}"
+              >
+
+              <span>
+                <span class="store-title">
+                  {{ store.store_id }}
+
+                  {% if store.name %}
+                    — {{ store.name }}
+                  {% endif %}
+                </span>
+
+                <span class="store-meta">
+                  УКМ‑4
+
+                  {% if store.smstore %}
+                    · smstore={{ store.smstore }}
+                  {% endif %}
+
+                  {% if store.address %}
+                    <br>{{ store.address }}
+                  {% endif %}
+                </span>
+              </span>
+            </label>
+          {% empty %}
+            <div class="empty">
+              Магазины УКМ‑4 не найдены.
+            </div>
+          {% endfor %}
+        </div>
+
+        <div class="selection-summary">
+          Выбрано:
+          <span data-selected-count>0</span>
+          из {{ store_catalog.ukm4|length }}
+        </div>
+
+        <label class="option">
+          <input
+            type="checkbox"
+            name="only_active"
+            value="1"
+          >
+          Только активные сотрудники
+        </label>
+
+        <label class="option">
+          <input
+            type="checkbox"
+            name="only_with_qr"
+            value="1"
+          >
+          Только сотрудники, у которых уже есть QR
+        </label>
+
+        <button
+          class="ukm4"
+          type="submit"
+          data-submit
+          {% if active_run %}disabled{% endif %}
+        >
+          Обновить выбранные в УКМ‑4
+        </button>
       </form>
 
-      <form method="post" action="{% url 'ukm_rotation_start' %}" class="system-card ukm5">
+      <!-- УКМ-5 -->
+      <form
+        method="post"
+        action="{% url 'ukm_rotation_start' %}"
+        class="system-card ukm5"
+        data-store-form
+        data-run-blocked="{% if active_run %}1{% else %}0{% endif %}"
+      >
         {% csrf_token %}
-        <input type="hidden" name="system" value="ukm5">
+
+        <input
+          type="hidden"
+          name="system"
+          value="ukm5"
+        >
+
         <h2>УКМ‑5</h2>
-        <p class="hint">Берёт пароль из <code>open_in_system.password</code>, использует его и как пароль, и как номер активной карты. QR и PostgreSQL не изменяются; УКМ‑4 не изменяется.</p>
-        <label class="option"><input type="checkbox" name="only_active" value="1"> Только активные сотрудники</label>
-        <label class="option"><input type="checkbox" name="only_with_qr" value="1"> Только сотрудники, у которых уже есть QR</label>
-        <label class="option"><input type="checkbox" name="ukm5_verify" value="1"> Дождаться проверки в <code>srvdata</code> (медленно)</label>
-        <button class="ukm5" type="submit" {% if active_run %}disabled{% endif %}>Обновить в УКМ‑5</button>
+
+        <p class="hint">
+          Берёт пароль из
+          <code>open_in_system.password</code>,
+          использует его как пароль и номер
+          активной карты. QR, PostgreSQL и
+          УКМ‑4 не изменяются.
+        </p>
+
+        <div class="store-toolbar">
+          <input
+            class="store-search"
+            type="search"
+            placeholder="Поиск магазина"
+            data-store-search
+          >
+
+          <button
+            class="secondary"
+            type="button"
+            data-select-all
+          >
+            Выбрать все
+          </button>
+
+          <button
+            class="secondary"
+            type="button"
+            data-clear-all
+          >
+            Снять выбор
+          </button>
+        </div>
+
+        <div class="store-list">
+          {% for store in store_catalog.ukm5 %}
+            <label
+              class="store-row"
+              data-store-row
+            >
+              <input
+                type="checkbox"
+                name="store_ids"
+                value="{{ store.store_id }}"
+              >
+
+              <span>
+                <span class="store-title">
+                  {{ store.store_id }}
+
+                  {% if store.name %}
+                    — {{ store.name }}
+                  {% endif %}
+                </span>
+
+                <span class="store-meta">
+                  УКМ‑5
+
+                  {% if store.smstore %}
+                    · smstore={{ store.smstore }}
+                  {% endif %}
+
+                  {% if store.address %}
+                    <br>{{ store.address }}
+                  {% endif %}
+                </span>
+              </span>
+            </label>
+          {% empty %}
+            <div class="empty">
+              Магазины УКМ‑5 не найдены.
+            </div>
+          {% endfor %}
+        </div>
+
+        <div class="selection-summary">
+          Выбрано:
+          <span data-selected-count>0</span>
+          из {{ store_catalog.ukm5|length }}
+        </div>
+
+        <label class="option">
+          <input
+            type="checkbox"
+            name="only_active"
+            value="1"
+          >
+          Только активные сотрудники
+        </label>
+
+        <label class="option">
+          <input
+            type="checkbox"
+            name="only_with_qr"
+            value="1"
+          >
+          Только сотрудники, у которых уже есть QR
+        </label>
+
+        <label class="option">
+          <input
+            type="checkbox"
+            name="ukm5_verify"
+            value="1"
+          >
+          Дождаться проверки в
+          <code>srvdata</code> (медленно)
+        </label>
+
+        <button
+          class="ukm5"
+          type="submit"
+          data-submit
+          {% if active_run %}disabled{% endif %}
+        >
+          Обновить выбранные в УКМ‑5
+        </button>
       </form>
     </div>
   </div>
 
   <div class="card">
     <h2>Последние запуски</h2>
+
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Дата</th><th>Система</th><th>Статус</th><th>Прогресс</th><th>Результат</th><th>Запустил</th></tr></thead>
-        <tbody>
-        {% for run in recent_runs %}
+        <thead>
           <tr>
-            <td><a href="{% url 'ukm_rotation_run_detail' run.id %}">{{ run.created_at|date:"d.m.Y H:i:s" }}</a></td>
-            <td>{{ run.target_system|upper }}</td>
-            <td><span class="badge">{{ run.get_status_display }}</span></td>
-            <td>{{ run.processed_users }} / {{ run.total_users }}</td>
-            <td>OK {{ run.rotated_users }}, частично {{ run.partial_users }}, пропущено {{ run.skipped_users }}, ошибок {{ run.failed_users }}</td>
-            <td>{{ run.requested_by|default:"—" }}</td>
+            <th>Дата</th>
+            <th>Система</th>
+            <th>Магазины</th>
+            <th>Статус</th>
+            <th>Прогресс</th>
+            <th>Результат</th>
+            <th>Запустил</th>
           </tr>
-        {% empty %}
-          <tr><td colspan="6" class="muted">Запусков пока нет.</td></tr>
-        {% endfor %}
+        </thead>
+
+        <tbody>
+          {% for run in recent_runs %}
+            <tr>
+              <td>
+                <a
+                  href="{% url 'ukm_rotation_run_detail' run.id %}"
+                >
+                  {{ run.created_at|date:"d.m.Y H:i:s" }}
+                </a>
+              </td>
+
+              <td>
+                {{ run.target_system|upper }}
+              </td>
+
+              <td>
+                {% if run.target_store_ids %}
+                  {{ run.target_store_ids|join:", " }}
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+
+              <td>
+                <span class="badge">
+                  {{ run.get_status_display }}
+                </span>
+              </td>
+
+              <td>
+                {{ run.processed_users }}
+                /
+                {{ run.total_users }}
+              </td>
+
+              <td>
+                OK {{ run.rotated_users }},
+                частично {{ run.partial_users }},
+                пропущено {{ run.skipped_users }},
+                ошибок {{ run.failed_users }}
+              </td>
+
+              <td>
+                {{ run.requested_by|default:"—" }}
+              </td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="7" class="muted">
+                Запусков пока нет.
+              </td>
+            </tr>
+          {% endfor %}
         </tbody>
       </table>
     </div>
   </div>
 </div>
+
+<script>
+  document
+    .querySelectorAll("[data-store-form]")
+    .forEach((form) => {
+      const rows = Array.from(
+        form.querySelectorAll("[data-store-row]")
+      );
+
+      const checkboxes = Array.from(
+        form.querySelectorAll(
+          'input[name="store_ids"]'
+        )
+      );
+
+      const search = form.querySelector(
+        "[data-store-search]"
+      );
+
+      const countNode = form.querySelector(
+        "[data-selected-count]"
+      );
+
+      const submit = form.querySelector(
+        "[data-submit]"
+      );
+
+      const runBlocked = (
+        form.dataset.runBlocked === "1"
+      );
+
+      const updateState = () => {
+        const selected = checkboxes.filter(
+          (checkbox) => checkbox.checked
+        ).length;
+
+        countNode.textContent = String(selected);
+
+        submit.disabled = (
+          runBlocked || selected === 0
+        );
+      };
+
+      form
+        .querySelector("[data-select-all]")
+        ?.addEventListener("click", () => {
+          rows.forEach((row) => {
+            // Выбираем только магазины,
+            // отображаемые после поиска.
+            if (row.hidden) {
+              return;
+            }
+
+            const checkbox = row.querySelector(
+              'input[name="store_ids"]'
+            );
+
+            if (checkbox) {
+              checkbox.checked = true;
+            }
+          });
+
+          updateState();
+        });
+
+      form
+        .querySelector("[data-clear-all]")
+        ?.addEventListener("click", () => {
+          checkboxes.forEach((checkbox) => {
+            checkbox.checked = false;
+          });
+
+          updateState();
+        });
+
+      search?.addEventListener(
+        "input",
+        () => {
+          const query = search.value
+            .trim()
+            .toLocaleLowerCase("ru");
+
+          rows.forEach((row) => {
+            const rowText = row.textContent
+              .toLocaleLowerCase("ru");
+
+            row.hidden = (
+              Boolean(query)
+              && !rowText.includes(query)
+            );
+          });
+        }
+      );
+
+      checkboxes.forEach((checkbox) => {
+        checkbox.addEventListener(
+          "change",
+          updateState
+        );
+      });
+
+      updateState();
+    });
+</script>
 </body>
 </html>
