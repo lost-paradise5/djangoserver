@@ -40,6 +40,16 @@
     <p><a href="{% url 'ukm_rotation_dashboard' %}">← Все запуски</a></p>
     <h1>{{ run.target_system|upper }} — {{ run.created_at|date:"d.m.Y H:i:s" }}</h1>
     <p>Статус: <strong>{{ run.get_status_display }}</strong>. Запустил: {{ run.requested_by|default:"—" }}.</p>
+    <p>
+      Целевые магазины:
+      <strong>
+        {% if run.target_store_ids %}
+          {{ run.target_store_ids|join:", " }}
+        {% else %}
+          —
+        {% endif %}
+      </strong>.
+    </p>
     <div class="summary">
       <div><span class="muted">Обработано</span><div class="value" id="processed">{{ run.processed_users }} / {{ run.total_users }}</div></div>
       <div><span class="muted">Успешно</span><div class="value">{{ run.rotated_users }}</div></div>
