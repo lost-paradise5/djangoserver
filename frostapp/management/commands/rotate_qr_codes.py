@@ -178,6 +178,17 @@ class Command(BaseCommand):
         )
         parser.add_argument('--batch-size', type=int, default=100)
         parser.add_argument(
+            "--store-ids",
+            nargs="+",
+            type=int,
+            default=None,
+            help=(
+                "Ограничить ротацию одним или несколькими ukm4store. "
+                "Если параметр не передан, используются все магазины "
+                "выбранной системы из UKM5_FULL_XML_STORE_IDS."
+            ),
+        )
+        parser.add_argument(
             '--dry-run',
             action='store_true',
             help='Ничего не менять, только логировать, кого бы крутили'
@@ -261,37 +272,165 @@ class Command(BaseCommand):
             #     ]
             # else:
             #     target_store_ids = list(anchor_store_ids)
-            # ukm-rotation-worker работает постоянно, поэтому перед каждым новым
-            # запуском сбрасываем сведения, оставшиеся от предыдущего прогона.
+            # Worker работает постоянно, поэтому перед каждым запуском
+            # сбрасываем сведения о типах и привязках магазинов.
             clear_ukm_store_runtime_caches()
             
-            anchor_store_ids = sorted(
-                int(x)
-                for x in (get_ukm5_full_xml_store_ids() or {2013})
+            anchor_store_ids = sorted({
+                int(value)
+                for value in (
+                    get_ukm5_full_xml_store_ids() or {2013}
+                )
+            })
+            
+            raw_selected_store_ids = opts.get("store_ids")
+            selection_was_provided = (
+                raw_selected_store_ids is not None
             )
             
-            if target_system == "ukm5":
-                target_store_ids = [
-                    store_id
-                    for store_id in anchor_store_ids
+            if raw_selected_store_ids is None:
+                selected_store_ids = []
+            else:
+                if isinstance(
+                    raw_selected_store_ids,
+                    (str, int),
+                ):
+                    raw_selected_store_ids = [
+                        raw_selected_store_ids
+                    ]
+            
+                selected_store_ids = []
+                invalid_store_ids = []
+            
+                for raw_value in raw_selected_store_ids:
+                    # Поддерживаем как список:
+                    # [2013, 9016]
+                    #
+                    # так и строку:
+                    # "2013,9016"
+                    for raw_part in str(raw_value).split(","):
+                        raw_part = raw_part.strip()
+            
+                        if not raw_part:
+                            continue
+            
+                        try:
+                            store_id = int(raw_part)
+                        except (TypeError, ValueError):
+                            invalid_store_ids.append(raw_part)
+                            continue
+            
+                        if store_id <= 0:
+                            invalid_store_ids.append(raw_part)
+                            continue
+            
+                        selected_store_ids.append(store_id)
+            
+                if invalid_store_ids:
+                    raise CommandError(
+                        "Некорректные store_id: "
+                        + ", ".join(
+                            sorted(set(invalid_store_ids))
+                        )
+                    )
+            
+                selected_store_ids = sorted(
+                    set(selected_store_ids)
+                )
+            
+            if (
+                selection_was_provided
+                and not selected_store_ids
+            ):
+                raise CommandError(
+                    "Не выбран ни один магазин для ротации"
+                )
+            
+            # Нельзя передать магазин, которого нет в разрешённом
+            # списке UKM5_FULL_XML_STORE_IDS.
+            outside_config = sorted(
+                set(selected_store_ids)
+                - set(anchor_store_ids)
+            )
+            
+            if outside_config:
+                raise CommandError(
+                    "Магазины отсутствуют в "
+                    "UKM5_FULL_XML_STORE_IDS: "
+                    + ", ".join(map(str, outside_config))
+                )
+            
+            # Определяем актуальный тип каждого магазина.
+            # Кэш уже очищен выше.
+            store_systems = {}
+            
+            for store_id in anchor_store_ids:
+                store_systems[store_id] = (
+                    "ukm5"
                     if is_ukm5_store(store_id)
+                    else "ukm4"
+                )
+            
+            discovered_store_ids = [
+                store_id
+                for store_id in anchor_store_ids
+                if store_systems[store_id]
+                == target_system
+            ]
+            
+            if selection_was_provided:
+                # Повторная fail-closed проверка.
+                # Если магазин после открытия страницы сменил тип,
+                # запуск останавливается до изменения паролей.
+                wrong_system_store_ids = [
+                    store_id
+                    for store_id in selected_store_ids
+                    if store_systems.get(store_id)
+                    != target_system
                 ]
             
-                logger.info(
-                    "[ROTATE][UKM5][STORE_DISCOVERY] checked=%s ukm5=%s not_ukm5=%s",
-                    anchor_store_ids,
-                    target_store_ids,
-                    sorted(set(anchor_store_ids) - set(target_store_ids)),
-                )
+                if wrong_system_store_ids:
+                    actual_values = ", ".join(
+                        (
+                            f"{store_id}="
+                            f"{store_systems.get(store_id, 'unknown').upper()}"
+                        )
+                        for store_id
+                        in wrong_system_store_ids
+                    )
+            
+                    raise CommandError(
+                        "Тип выбранных магазинов изменился "
+                        "или не соответствует режиму "
+                        f"{target_system.upper()}: "
+                        f"{actual_values}. "
+                        "Обновите список магазинов "
+                        "и создайте новый запуск."
+                    )
+            
+                target_store_ids = selected_store_ids
             else:
-                target_store_ids = list(anchor_store_ids)
-
+                # Совместимость с cron и ручным CLI-запуском
+                # без параметра --store-ids.
+                target_store_ids = discovered_store_ids
+            
             if not target_store_ids:
-                raise RuntimeError(
-                    f"Для режима {target_system.upper()} не найдено ни одного "
-                    "целевого магазина"
+                raise CommandError(
+                    f"Для режима {target_system.upper()} "
+                    "не найдено ни одного целевого магазина"
                 )
-
+            
+            logger.info(
+                "[ROTATE][STORE_DISCOVERY] "
+                "system=%s configured=%s "
+                "discovered=%s selected=%s explicit=%s",
+                target_system,
+                anchor_store_ids,
+                discovered_store_ids,
+                target_store_ids,
+                selection_was_provided,
+            )
+            
             allowed_store_ids = set(target_store_ids)
 
             
@@ -363,6 +502,10 @@ class Command(BaseCommand):
                     "user_id": opts.get("user_id"),
                     "idempotent": bool(opts["idempotent"]),
                     "ukm5_verify": bool(opts.get("ukm5_verify")),
+                    "store_ids": list(target_store_ids),
+                    "store_selection_explicit": bool(
+                        selection_was_provided
+                    ),
                 },
             )
 
