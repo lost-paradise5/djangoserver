@@ -367,16 +367,18 @@
 
     <div class="catalog-counts">
       <span class="badge ukm4">
-        УКМ‑4: {{ store_catalog.ukm4|length }}
+        УКМ‑4 — все магазины:
+        {{ store_catalog.ukm4|length }}
       </span>
-
+      
       <span class="badge ukm5">
-        УКМ‑5: {{ store_catalog.ukm5|length }}
+        Дополнительно УКМ‑5:
+        {{ store_catalog.ukm5|length }}
       </span>
 
       {% if store_catalog.unknown %}
         <span class="badge unknown">
-          Не определено:
+          Ошибка проверки УКМ‑5:
           {{ store_catalog.unknown|length }}
         </span>
       {% endif %}
@@ -485,7 +487,11 @@
 
                 <span class="store-meta">
                   УКМ‑4
-
+                
+                  {% if store.is_ukm5 %}
+                    · также УКМ‑5
+                  {% endif %}
+                
                   {% if store.smstore %}
                     · smstore={{ store.smstore }}
                   {% endif %}
