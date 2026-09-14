@@ -50,6 +50,7 @@ class Command(BaseCommand):
                     ),
                     idempotent=bool(run_options.get("idempotent")),
                     ukm5_verify=bool(run_options.get("ukm5_verify")),
+                    store_ids=run_options.get("store_ids"),
                 )
             except Exception as exc:
                 now = timezone.now()
