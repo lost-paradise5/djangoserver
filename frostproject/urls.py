@@ -187,6 +187,18 @@ urlpatterns = [
         views.working_employees_positions_sync_download,
         name="working_employees_positions_sync_download",
     ),
+
+
+    path(
+        "ukm-rotation/login/",
+        views.ukm_rotation_login,
+        name="ukm_rotation_login",
+    ),
+    path(
+        "ukm-rotation/logout/",
+        views.ukm_rotation_logout,
+        name="ukm_rotation_logout",
+    ),
     
     path("maxbot/", views.maxbot_dashboard, name="maxbot_dashboard"),
 
