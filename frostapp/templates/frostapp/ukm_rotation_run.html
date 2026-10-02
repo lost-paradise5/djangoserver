@@ -38,8 +38,51 @@
 <div class="container">
   <div class="card">
     <p><a href="{% url 'ukm_rotation_dashboard' %}">← Все запуски</a></p>
+    <div style="
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    ">
+      <div class="muted">
+        Вы вошли:
+        <strong>{{ bitrix_identity.fio }}</strong>
+        · Битрикс ID {{ bitrix_identity.bitrix_user_id }}
+      </div>
+    
+      <form
+        method="post"
+        action="{% url 'ukm_rotation_logout' %}"
+      >
+        {% csrf_token %}
+    
+        <button
+          type="submit"
+          style="background: #172033; color: #fff;"
+        >
+          Выйти
+        </button>
+      </form>
+    </div>
+
+    
     <h1>{{ run.target_system|upper }} — {{ run.created_at|date:"d.m.Y H:i:s" }}</h1>
-    <p>Статус: <strong>{{ run.get_status_display }}</strong>. Запустил: {{ run.requested_by|default:"—" }}.</p>
+    <p>
+      Статус:
+      <strong>{{ run.get_status_display }}</strong>.
+    
+      Запустил:
+    
+      {% if run.options.initiator.bitrix_user_id %}
+        <strong>{{ run.options.initiator.fio }}</strong>
+        — Битрикс ID
+        {{ run.options.initiator.bitrix_user_id }}.
+      {% else %}
+        {{ run.requested_by|default:"—" }}.
+      {% endif %}
+    </p>
     <p>
       Целевые магазины:
       <strong>
@@ -119,15 +162,42 @@
 {% if run.status == "pending" or run.status == "running" %}
 <script>
   let lastProcessed = {{ run.processed_users }};
-  const statusUrl = "{% url 'ukm_rotation_run_status' run.id %}";
+  const statusUrl =
+    "{% url 'ukm_rotation_run_status' run.id %}";
+
   setInterval(async () => {
     try {
-      const response = await fetch(statusUrl, {headers: {"X-Requested-With": "XMLHttpRequest"}});
-      if (!response.ok) return;
+      const response = await fetch(statusUrl, {
+        headers: {
+          "X-Requested-With": "XMLHttpRequest"
+        }
+      });
+
+      if (response.status === 401) {
+        const data = await response.json();
+        window.location.assign(data.login_url);
+        return;
+      }
+
+      if (!response.ok) {
+        return;
+      }
+
       const data = await response.json();
-      document.getElementById("processed").textContent = `${data.processed_users} / ${data.total_users}`;
-      document.getElementById("progress-bar").style.width = `${data.percent}%`;
-      if (data.finished || data.processed_users !== lastProcessed) window.location.reload();
+
+      document.getElementById("processed").textContent =
+        `${data.processed_users} / ${data.total_users}`;
+
+      document.getElementById("progress-bar").style.width =
+        `${data.percent}%`;
+
+      if (
+        data.finished
+        || data.processed_users !== lastProcessed
+      ) {
+        window.location.reload();
+      }
+
       lastProcessed = data.processed_users;
     } catch (_) {}
   }, 5000);
