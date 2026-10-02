@@ -26,7 +26,9 @@ from frostapp.views import (
     TRM_SMALL_MAX,
 )
 
-
+from frostapp.services.ukm_rotation_bitrix_auth import (
+    rotation_actor_label,
+)
 
 from collections import defaultdict
 from itertools import islice
@@ -238,6 +240,25 @@ class Command(BaseCommand):
         target_system = str(opts["system"]).lower()
         self.target_system = target_system
         recorder = UkmRotationRunRecorder(opts.get("run_id"))
+
+        self._rotation_initiator = (
+            recorder.initiator
+        )
+
+        self._rotation_run_id = (
+            str(recorder.run_id)
+            if recorder.run_id
+            else ""
+        )
+
+        logger.info(
+            "[ROTATE][CONTEXT] run_id=%s "
+            "initiator=%s",
+            self._rotation_run_id or "CLI",
+            rotation_actor_label(
+                self._rotation_initiator
+            ),
+        )
 
         if not self._acquire_lock():
             message = "Другой запуск ротации уже идёт — выхожу."
@@ -693,7 +714,16 @@ class Command(BaseCommand):
                 exc,
             )
             _send_max_log_async(
-                f"⛔ Ротация {target_system.upper()} завершилась ошибкой\n\n"
+                f"⛔ Ротация "
+                f"{target_system.upper()} "
+                "завершилась ошибкой\n"
+
+                "Запустил: "
+                f"{rotation_actor_label(getattr(self, '_rotation_initiator', {}))}\n"
+
+                "Запуск: "
+                f"{getattr(self, '_rotation_run_id', '') or 'CLI'}\n\n"
+
                 f"{error_text}"
             )
             raise
@@ -2316,6 +2346,29 @@ class Command(BaseCommand):
             lines = [
                 header,
                 "",
+
+                (
+                    "Запустил: "
+                    + rotation_actor_label(
+                        getattr(
+                            self,
+                            "_rotation_initiator",
+                            {},
+                        )
+                    )
+                ),
+
+                (
+                    "Запуск: "
+                    + (
+                        getattr(
+                            self,
+                            "_rotation_run_id",
+                            "",
+                        )
+                        or "CLI"
+                    )
+                ),
 
                 f"Дата: {today_local.isoformat()}",
 
