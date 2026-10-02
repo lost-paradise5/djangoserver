@@ -308,6 +308,35 @@
   <div class="card">
     <h1>Обновление паролей УКМ</h1>
 
+    <div style="
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    ">
+      <div class="muted">
+        Вы вошли:
+        <strong>{{ bitrix_identity.fio }}</strong>
+        · Битрикс ID {{ bitrix_identity.bitrix_user_id }}
+      </div>
+    
+      <form
+        method="post"
+        action="{% url 'ukm_rotation_logout' %}"
+      >
+        {% csrf_token %}
+    
+        <button
+          type="submit"
+          style="background: #172033; color: #fff;"
+        >
+          Выйти
+        </button>
+      </form>
+    </div>
+
     <p class="hint">
       Сначала запускайте УКМ‑4: он создаёт новый
       пароль, QR и сохраняет пароль в
@@ -741,7 +770,16 @@
               </td>
 
               <td>
-                {{ run.requested_by|default:"—" }}
+                {% if run.options.initiator.bitrix_user_id %}
+                  {{ run.options.initiator.fio }}
+              
+                  <div class="muted">
+                    Битрикс ID
+                    {{ run.options.initiator.bitrix_user_id }}
+                  </div>
+                {% else %}
+                  {{ run.requested_by|default:"—" }}
+                {% endif %}
               </td>
             </tr>
           {% empty %}
