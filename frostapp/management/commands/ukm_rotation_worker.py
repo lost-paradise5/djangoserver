@@ -8,6 +8,12 @@ from django.db import close_old_connections, transaction
 from django.utils import timezone
 
 from frostapp.models import UkmRotationRun
+from frostapp.services.ukm_rotation_runs import (
+    UkmRotationRunRecorder,
+)
+from frostapp.services.ukm_rotation_bitrix_auth import (
+    audit_rotation,
+)
 
 
 class Command(BaseCommand):
@@ -31,7 +37,9 @@ class Command(BaseCommand):
                 continue
 
             self.stdout.write(
-                f"START run_id={run.id} system={run.target_system}"
+                f"START run_id={run.id} "
+                f"system={run.target_system} "
+                f"initiator={run.requested_by}"
             )
             try:
                 run_options = run.options or {}
@@ -53,16 +61,19 @@ class Command(BaseCommand):
                     store_ids=run_options.get("store_ids"),
                 )
             except Exception as exc:
-                now = timezone.now()
-                UkmRotationRun.objects.filter(id=run.id).update(
-                    status="failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                    heartbeat_at=now,
-                    finished_at=now,
+                error_text = (
+                    f"{type(exc).__name__}: {exc}"
                 )
+
+                UkmRotationRunRecorder(
+                    str(run.id)
+                ).fail(error_text)
+
                 self.stderr.write(
                     self.style.ERROR(
-                        f"FAILED run_id={run.id}: {type(exc).__name__}: {exc}"
+                        f"FAILED run_id={run.id} "
+                        f"initiator={run.requested_by}: "
+                        f"{error_text}"
                     )
                 )
             finally:
@@ -99,4 +110,25 @@ class Command(BaseCommand):
                 "heartbeat_at",
                 "error",
             ])
+            actor = (
+                (run.options or {}).get(
+                    "initiator"
+                )
+                or {
+                    "type": "legacy",
+                    "fio": (
+                        run.requested_by
+                        or "Автоматический запуск / CLI"
+                    ),
+                }
+            )
+
+            audit_rotation(
+                "worker.claimed",
+                identity=actor,
+                run_id=run.id,
+                details={
+                    "system": run.target_system,
+                },
+            )
             return run
