@@ -384,7 +384,109 @@ class VpnAccessSession(models.Model):
 
 
 
+class UkmRotationBitrixSession(models.Model):
+    """
+    Сначала хранит запрос одноразового ПИН.
+    После успешного ввода — подтверждённую сессию входа.
 
+    Не связана с frostapp.User:
+    здесь используются именно ID пользователей Битрикса.
+    """
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    bitrix_user_id = models.BigIntegerField()
+    fio = models.CharField(max_length=255)
+
+    # Привязка запроса ПИН к браузерной сессии.
+    binding_hash = models.CharField(max_length=64)
+
+    # Хранится HMAC ПИН, открытый ПИН в БД не записывается.
+    pin_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+    )
+
+    attempts = models.PositiveIntegerField(default=0)
+    status = models.CharField(
+        max_length=16,
+        default="sending",
+    )
+
+    ip_address = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    # Срок действия ПИН.
+    expires_at = models.DateTimeField()
+
+    # Заполняются после успешной авторизации.
+    authenticated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+    auth_expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        db_table = "ukm_rotation_bitrix_sessions"
+        managed = False
+
+
+class UkmRotationAuditLog(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    event = models.CharField(max_length=64)
+
+    bitrix_user_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+    )
+    fio = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+    )
+
+    ip_address = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+    )
+    path = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+    )
+    method = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+    )
+
+    # Без ForeignKey: история сохраняется независимо от запуска.
+    run_id = models.UUIDField(
+        null=True,
+        blank=True,
+    )
+
+    details = models.JSONField(default=dict)
+
+    class Meta:
+        db_table = "ukm_rotation_audit_logs"
+        managed = False
+        ordering = ["-created_at", "-id"]
 
 
 
