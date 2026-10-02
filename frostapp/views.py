@@ -92,6 +92,19 @@ from django.utils.html import escape
 from django.core.cache import cache
 from django.views.decorators.clickjacking import xframe_options_exempt
 
+
+from frostapp.services.ukm_rotation_bitrix_auth import (
+    RotationAuthError,
+    audit_rotation,
+    begin_rotation_login,
+    complete_rotation_login,
+    end_rotation_login,
+    get_rotation_identity,
+    pending_rotation_login,
+    rotation_client_ip,
+    ukm_rotation_bitrix_required,
+)
+
 from frostapp.services.bitrix_cash_reboot import (
     BitrixLaunchIdentity,
     CashRebootBitrixAuthError,
@@ -9155,7 +9168,8 @@ def _build_ukm_rotation_store_catalog(
 
 
 
-@staff_member_required
+@never_cache
+@ukm_rotation_bitrix_required
 @require_GET
 def ukm_rotation_dashboard(request):
     force_refresh = (
@@ -9211,12 +9225,17 @@ def ukm_rotation_dashboard(request):
             "active_run": active_run,
             "recent_runs": recent_runs,
             "store_catalog": store_catalog,
+            "bitrix_identity": (
+                request.ukm_rotation_identity
+            ),
         },
     )
 
 
-@staff_member_required
+@never_cache
+@ukm_rotation_bitrix_required
 @require_POST
+@csrf_protect
 def ukm_rotation_start(request):
     target_system = str(
         request.POST.get("system") or ""
@@ -9353,43 +9372,66 @@ def ukm_rotation_start(request):
                 run_id=active_run.id,
             )
 
+        actor = {
+            **request.ukm_rotation_identity,
+            "ip": rotation_client_ip(request),
+        }
+
         run = UkmRotationRun.objects.create(
             target_system=target_system,
             status="pending",
+
+            # Короткая стабильная метка вместо
+            # username из Django.
             requested_by=(
-                request.user.get_username()
+                f"bitrix:{actor['bitrix_user_id']}"
             ),
-            target_store_ids=(
-                selected_store_ids
-            ),
+
+            target_store_ids=selected_store_ids,
+
             options={
+                "initiator": actor,
+
                 "only_active": (
                     request.POST.get(
                         "only_active"
-                    )
-                    == "1"
+                    ) == "1"
                 ),
+
                 "only_with_qr": (
                     request.POST.get(
                         "only_with_qr"
-                    )
-                    == "1"
+                    ) == "1"
                 ),
+
                 "ukm5_verify": (
                     target_system == "ukm5"
                     and request.POST.get(
                         "ukm5_verify"
-                    )
-                    == "1"
+                    ) == "1"
                 ),
-                "store_ids": (
-                    selected_store_ids
-                ),
+
+                "store_ids": selected_store_ids,
+
                 "store_list_checked_at": (
                     store_catalog[
                         "refreshed_at"
                     ].isoformat()
                 ),
+            },
+        )
+
+        # Создание запуска и запись инициатора
+        # выполняются в одной транзакции.
+        audit_rotation(
+            "run.queued",
+            request=request,
+            identity=actor,
+            run_id=run.id,
+            details={
+                "system": target_system,
+                "store_ids": selected_store_ids,
+                "options": run.options,
             },
         )
 
@@ -9407,7 +9449,8 @@ def ukm_rotation_start(request):
     )
 
 
-@staff_member_required
+@never_cache
+@ukm_rotation_bitrix_required
 @require_GET
 def ukm_rotation_run_detail(request, run_id):
     run = get_object_or_404(
@@ -9459,11 +9502,15 @@ def ukm_rotation_run_detail(request, run_id):
             "store_values": store_values,
             "selected_store": selected_store,
             "selected_status": selected_status,
+            "bitrix_identity": (
+                request.ukm_rotation_identity
+            ),
         },
     )
 
 
-@staff_member_required
+@never_cache
+@ukm_rotation_bitrix_required
 @require_GET
 def ukm_rotation_run_status(request, run_id):
     run = get_object_or_404(
@@ -37656,3 +37703,109 @@ def update_employee_phone_api(request):
             },
             status=500,
         )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@never_cache
+@require_http_methods(["GET", "POST"])
+@csrf_protect
+def ukm_rotation_login(request):
+    if get_rotation_identity(request):
+        return redirect(
+            "ukm_rotation_dashboard"
+        )
+
+    error = ""
+    fio = str(
+        request.POST.get("fio") or ""
+    )[:255]
+
+    if request.method == "POST":
+        try:
+            action = request.POST.get(
+                "action"
+            )
+
+            if action == "send_pin":
+                begin_rotation_login(
+                    request,
+                    fio,
+                )
+
+                messages.success(
+                    request,
+                    "ПИН отправлен в "
+                    "уведомления Битрикса.",
+                )
+
+                return redirect(
+                    "ukm_rotation_login"
+                )
+
+            elif action == "verify_pin":
+                complete_rotation_login(
+                    request,
+                    request.POST.get("pin"),
+                )
+
+                return redirect(
+                    "ukm_rotation_dashboard"
+                )
+
+            else:
+                error = "Неизвестное действие."
+
+        except RotationAuthError as exc:
+            error = str(exc)
+
+    pending = pending_rotation_login(
+        request
+    )
+
+    return render(
+        request,
+        "frostapp/ukm_rotation_login.html",
+        {
+            "error": error,
+            "pending": pending,
+            "fio": (
+                pending.fio
+                if pending
+                else fio
+            ),
+        },
+    )
+
+
+@never_cache
+@require_POST
+@csrf_protect
+def ukm_rotation_logout(request):
+    end_rotation_login(request)
+
+    messages.success(
+        request,
+        "Вы вышли из системы "
+        "обновления паролей УКМ.",
+    )
+
+    return redirect(
+        "ukm_rotation_login"
+    )
