@@ -343,12 +343,11 @@
                 <th>Регион</th>
                 <th>smstore</th>
                 <th>Магазин</th>
-                <th>ФИО / должность</th>
-                <th>ИНН</th>
-                <th>Личная запись</th>
-                <th>Идентификатор магазина</th>
-                <th>Общая запись</th>
-                <th>Предупреждения</th>
+                <th>Сотрудники из 1С</th>
+                <th>Личные записи Bitrix24</th>
+                <th>Общая запись администраторов</th>
+                <th>Общая запись приемщиков</th>
+                <th>Проблемы</th>
             </tr>
             </thead>
 
@@ -372,7 +371,7 @@
     const statusFilter =
         document.getElementById("statusFilter");
 
-    let reportRows = [];
+    let reportStores = [];
 
     function escapeHtml(value) {
         return String(value ?? "").replace(
@@ -504,18 +503,19 @@
 
     function renderSummary(summary) {
         const cards = [
-            ["directors_1c", "Сотрудников из 1С"],
-            ["stores_1c", "Уникальных магазинов"],
-            ["bitrix_users", "Пользователей Bitrix24"],
+            ["target_employees", "Сотрудников из 1С"],
+            ["stores_1c", "Магазинов"],
+            ["directors_1c", "Директоров"],
+            ["administrators_1c", "Администраторов"],
+            ["receivers_1c", "Приемщиков"],
             ["personal_found", "Личные записи найдены"],
-            ["personal_ambiguous", "Несколько личных записей"],
             ["personal_possible", "Личные требуют проверки"],
             ["personal_missing", "Личные не найдены"],
-            ["shared_found", "Общие записи найдены"],
-            ["shared_possible", "Общие требуют проверки"],
-            ["shared_missing", "Общие не найдены"]
+            ["shared_admin_found", "Общие администраторов"],
+            ["shared_receiver_found", "Общие приемщиков"],
+            ["issues", "Спорных моментов"]
         ];
-
+    
         summaryBox.innerHTML = cards.map(
             ([key, label]) => `
                 <div class="summary-card">
@@ -528,8 +528,110 @@
                 </div>
             `
         ).join("");
-
+    
         summaryBox.classList.remove("hidden");
+    }
+
+
+    function renderEmployees(storeResult) {
+        if (!storeResult.employees.length) {
+            return '<span class="muted">Нет сотрудников</span>';
+        }
+    
+        return storeResult.employees.map(item => {
+            const employee = item.employee;
+    
+            return `
+                <div class="account">
+                    <div>
+                        <strong>
+                            ${escapeHtml(employee.role_group)}
+                        </strong>
+                        — ${escapeHtml(employee.fio)}
+                    </div>
+                    <div class="account-meta">
+                        ${escapeHtml(employee.position)}
+                    </div>
+                </div>
+            `;
+        }).join("");
+    }
+    
+    
+    function renderPersonalAccounts(storeResult) {
+        return storeResult.employees.map(item => {
+            return `
+                <div class="account">
+                    <div>
+                        <strong>
+                            ${escapeHtml(item.employee.fio)}
+                        </strong>
+                    </div>
+                    <div>
+                        ${statusBadge(item.personal_status)}
+                    </div>
+                    <div style="margin-top:6px">
+                        ${renderAccounts(
+                            item.personal_exact,
+                            item.personal_similar
+                        )}
+                    </div>
+                </div>
+            `;
+        }).join("");
+    }
+    
+    
+    function storeHasProblems(storeResult) {
+        if (!storeResult.store) {
+            return true;
+        }
+    
+        if (storeResult.warnings.length) {
+            return true;
+        }
+    
+        if (!storeResult.shared_admin_exact.length) {
+            return true;
+        }
+    
+        if (!storeResult.shared_receiver_exact.length) {
+            return true;
+        }
+    
+        return storeResult.employees.some(item => (
+            item.personal_status !== "Найдено"
+        ));
+    }
+    
+    
+    function rowMatchesStatus(storeResult, filter) {
+        if (filter === "all") {
+            return true;
+        }
+    
+        if (filter === "problem") {
+            return storeHasProblems(storeResult);
+        }
+    
+        if (filter === "personal_missing") {
+            return storeResult.employees.some(item => (
+                item.personal_status === "Не найдено"
+            ));
+        }
+    
+        if (filter === "shared_missing") {
+            return (
+                !storeResult.shared_admin_exact.length ||
+                !storeResult.shared_receiver_exact.length
+            );
+        }
+    
+        if (filter === "store_missing") {
+            return !storeResult.store;
+        }
+    
+        return true;
     }
 
     function rowMatchesStatus(row, filter) {
@@ -565,93 +667,121 @@
         const query = searchInput.value
             .trim()
             .toLocaleLowerCase("ru-RU");
-
+    
         const filter = statusFilter.value;
-
-        const filtered = reportRows.filter(row => {
-            if (!rowMatchesStatus(row, filter)) {
+    
+        const filtered = reportStores.filter(storeResult => {
+            if (!rowMatchesStatus(storeResult, filter)) {
                 return false;
             }
-
+    
             if (!query) {
                 return true;
             }
-
-            return JSON.stringify(row)
+    
+            return JSON.stringify(storeResult)
                 .toLocaleLowerCase("ru-RU")
                 .includes(query);
         });
-
-        resultBody.innerHTML = filtered.map(row => {
-            const employee = row.employee || {};
-            const store = row.store || {};
-
+    
+        resultBody.innerHTML = filtered.map(storeResult => {
+            const store = storeResult.store || {};
+    
             return `
                 <tr>
-                    <td>${escapeHtml(store.region || "—")}</td>
-
                     <td>
-                        ${escapeHtml(employee.smstore || "—")}
+                        ${escapeHtml(store.region || "—")}
                     </td>
-
+    
+                    <td>
+                        ${escapeHtml(
+                            storeResult.smstore || "—"
+                        )}
+                    </td>
+    
                     <td>
                         <strong>
-                            ${escapeHtml(store.name || "Не найден")}
+                            ${escapeHtml(
+                                store.name || "Не найден"
+                            )}
                         </strong>
+    
                         <div class="account-meta">
                             ${escapeHtml(store.address || "")}
                         </div>
-                    </td>
-
-                    <td>
-                        <strong>
-                            ${escapeHtml(employee.fio)}
-                        </strong>
+    
                         <div class="account-meta">
-                            ${escapeHtml(employee.position)}
-                        </div>
-                        <div class="account-meta">
-                            ${escapeHtml(employee.department)}
-                        </div>
-                    </td>
-
-                    <td>${escapeHtml(employee.inn || "—")}</td>
-
-                    <td>
-                        ${statusBadge(row.personal_status)}
-                        <div style="margin-top:8px">
-                            ${renderAccounts(
-                                row.personal_exact,
-                                row.personal_similar
+                            Идентификатор:
+                            ${escapeHtml(
+                                storeResult.store_identity
                             )}
                         </div>
                     </td>
-
+    
                     <td>
-                        ${escapeHtml(row.store_identity)}
+                        ${renderEmployees(storeResult)}
                     </td>
-
+    
                     <td>
-                        ${statusBadge(row.shared_status)}
+                        ${renderPersonalAccounts(storeResult)}
+                    </td>
+    
+                    <td>
+                        ${statusBadge(
+                            storeResult.shared_admin_status
+                        )}
+    
                         <div style="margin-top:8px">
                             ${renderAccounts(
-                                row.shared_exact,
-                                row.shared_similar
+                                storeResult.shared_admin_exact,
+                                storeResult.shared_admin_similar
                             )}
                         </div>
                     </td>
-
+    
                     <td>
-                        ${renderWarnings(row.warnings)}
+                        ${statusBadge(
+                            storeResult.shared_receiver_status
+                        )}
+    
+                        <div style="margin-top:8px">
+                            ${renderAccounts(
+                                storeResult.shared_receiver_exact,
+                                storeResult.shared_receiver_similar
+                            )}
+                        </div>
+                    </td>
+    
+                    <td>
+                        ${renderWarnings(
+                            storeResult.warnings
+                        )}
+    
+                        ${
+                            storeHasProblems(storeResult)
+                                ? `
+                                    <div class="warning">
+                                        Есть данные, требующие
+                                        проверки. Подробности —
+                                        в Excel на листе
+                                        «Спорные моменты».
+                                    </div>
+                                `
+                                : `
+                                    <span class="muted">
+                                        Спорных моментов нет
+                                    </span>
+                                `
+                        }
                     </td>
                 </tr>
             `;
         }).join("");
-
+    
         if (!filtered.length) {
             resultBody.innerHTML = `
                 <tr>
-                    <td colspan="9" class="muted">
+                    <td colspan="8" class="muted">
                         По заданным условиям ничего не найдено.
                     </td>
                 </tr>
@@ -704,7 +834,7 @@
                 );
             }
 
-            reportRows = data.rows || [];
+            reportStores = data.stores || [];
 
             renderSummary(data.summary || {});
             renderRows();
