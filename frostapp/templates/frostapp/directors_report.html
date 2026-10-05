@@ -1,0 +1,742 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+    <title>Отчёт по директорам</title>
+
+    <style>
+        :root {
+            --blue: #2563eb;
+            --blue-dark: #1d4ed8;
+            --green: #15803d;
+            --yellow: #b45309;
+            --red: #b91c1c;
+            --gray: #64748b;
+            --border: #dbe3ef;
+            --background: #f5f7fb;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px;
+            background: var(--background);
+            color: #172033;
+            font-family:
+                Inter,
+                Arial,
+                sans-serif;
+        }
+
+        .page {
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 28px;
+        }
+
+        .subtitle {
+            margin-top: 7px;
+            color: var(--gray);
+        }
+
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        button,
+        .button {
+            border: 0;
+            border-radius: 9px;
+            padding: 11px 18px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+        }
+
+        .button-primary {
+            color: #fff;
+            background: var(--blue);
+        }
+
+        .button-primary:hover {
+            background: var(--blue-dark);
+        }
+
+        .button-success {
+            color: #fff;
+            background: var(--green);
+        }
+
+        button:disabled {
+            cursor: wait;
+            opacity: 0.65;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .message {
+            margin-bottom: 16px;
+            padding: 13px 16px;
+            border-radius: 9px;
+        }
+
+        .message-info {
+            color: #1e3a8a;
+            background: #dbeafe;
+        }
+
+        .message-error {
+            color: #991b1b;
+            background: #fee2e2;
+        }
+
+        .summary {
+            display: grid;
+            grid-template-columns:
+                repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .summary-card {
+            padding: 16px;
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            box-shadow: 0 3px 12px rgba(15, 23, 42, 0.04);
+        }
+
+        .summary-value {
+            font-size: 27px;
+            font-weight: 700;
+        }
+
+        .summary-label {
+            margin-top: 6px;
+            color: var(--gray);
+            font-size: 13px;
+        }
+
+        .filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        input,
+        select {
+            min-height: 41px;
+            padding: 8px 11px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: #fff;
+            font-size: 14px;
+        }
+
+        #searchInput {
+            min-width: 320px;
+            flex: 1;
+        }
+
+        .table-container {
+            overflow: auto;
+            max-height: calc(100vh - 290px);
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 11px;
+        }
+
+        table {
+            width: 100%;
+            min-width: 1550px;
+            border-collapse: separate;
+            border-spacing: 0;
+        }
+
+        th,
+        td {
+            padding: 10px;
+            border-right: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+            vertical-align: top;
+            font-size: 13px;
+        }
+
+        th {
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            color: #fff;
+            background: #1f4e78;
+        }
+
+        tr:hover td {
+            background: #f8fafc;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .badge-success {
+            color: #166534;
+            background: #dcfce7;
+        }
+
+        .badge-warning {
+            color: #92400e;
+            background: #fef3c7;
+        }
+
+        .badge-danger {
+            color: #991b1b;
+            background: #fee2e2;
+        }
+
+        .account {
+            margin-bottom: 7px;
+            padding-bottom: 7px;
+            border-bottom: 1px dashed var(--border);
+        }
+
+        .account:last-child {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: 0;
+        }
+
+        .account-meta,
+        .muted {
+            color: var(--gray);
+            font-size: 12px;
+        }
+
+        .warning {
+            margin-bottom: 4px;
+            color: var(--red);
+        }
+
+        @media (max-width: 700px) {
+            body {
+                padding: 12px;
+            }
+
+            .header {
+                align-items: stretch;
+                flex-direction: column;
+            }
+
+            #searchInput {
+                min-width: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+<div class="page">
+    <div class="header">
+        <div>
+            <h1>Отчёт по директорам</h1>
+            <div class="subtitle">
+                Сопоставление 1С, таблицы stores и Bitrix24
+            </div>
+        </div>
+
+        <div class="actions">
+            <button
+                id="runButton"
+                class="button-primary"
+                type="button"
+            >
+                Отчёт по директорам
+            </button>
+
+            <a
+                id="downloadButton"
+                class="button button-success hidden"
+                href="#"
+            >
+                Скачать Excel
+            </a>
+        </div>
+    </div>
+
+    <div
+        id="message"
+        class="message hidden"
+    ></div>
+
+    <div
+        id="summary"
+        class="summary hidden"
+    ></div>
+
+    <div
+        id="filters"
+        class="filters hidden"
+    >
+        <input
+            id="searchInput"
+            type="search"
+            placeholder="Поиск по магазину, ФИО, ИНН, Bitrix ID..."
+        >
+
+        <select id="statusFilter">
+            <option value="all">
+                Все результаты
+            </option>
+            <option value="problem">
+                Только требующие проверки
+            </option>
+            <option value="personal_missing">
+                Не найдена личная запись
+            </option>
+            <option value="shared_missing">
+                Не найдена общая запись
+            </option>
+            <option value="store_missing">
+                Магазин не найден
+            </option>
+        </select>
+    </div>
+
+    <div
+        id="tableContainer"
+        class="table-container hidden"
+    >
+        <table>
+            <thead>
+            <tr>
+                <th>Регион</th>
+                <th>smstore</th>
+                <th>Магазин</th>
+                <th>ФИО / должность</th>
+                <th>ИНН</th>
+                <th>Личная запись</th>
+                <th>Идентификатор магазина</th>
+                <th>Общая запись</th>
+                <th>Предупреждения</th>
+            </tr>
+            </thead>
+
+            <tbody id="resultBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    const runButton = document.getElementById("runButton");
+    const downloadButton =
+        document.getElementById("downloadButton");
+    const messageBox = document.getElementById("message");
+    const summaryBox = document.getElementById("summary");
+    const filtersBox = document.getElementById("filters");
+    const tableContainer =
+        document.getElementById("tableContainer");
+    const resultBody = document.getElementById("resultBody");
+    const searchInput =
+        document.getElementById("searchInput");
+    const statusFilter =
+        document.getElementById("statusFilter");
+
+    let reportRows = [];
+
+    function escapeHtml(value) {
+        return String(value ?? "").replace(
+            /[&<>"']/g,
+            character => ({
+                "&": "&amp;",
+                "<": "&lt;",
+                ">": "&gt;",
+                '"': "&quot;",
+                "'": "&#039;"
+            })[character]
+        );
+    }
+
+    function getCookie(name) {
+        const cookies = document.cookie
+            ? document.cookie.split(";")
+            : [];
+
+        for (const cookie of cookies) {
+            const trimmed = cookie.trim();
+
+            if (
+                trimmed.substring(
+                    0,
+                    name.length + 1
+                ) === name + "="
+            ) {
+                return decodeURIComponent(
+                    trimmed.substring(name.length + 1)
+                );
+            }
+        }
+
+        return "";
+    }
+
+    function showMessage(text, type) {
+        messageBox.textContent = text;
+        messageBox.className =
+            "message " +
+            (
+                type === "error"
+                    ? "message-error"
+                    : "message-info"
+            );
+    }
+
+    function hideMessage() {
+        messageBox.className = "message hidden";
+        messageBox.textContent = "";
+    }
+
+    function statusBadge(status) {
+        let className = "badge-danger";
+
+        if (
+            status === "Найдено" ||
+            status.startsWith("Найдено:")
+        ) {
+            className = "badge-success";
+        } else if (
+            status === "Требует проверки" ||
+            status === "Несколько совпадений"
+        ) {
+            className = "badge-warning";
+        }
+
+        return (
+            `<span class="badge ${className}">` +
+            `${escapeHtml(status)}</span>`
+        );
+    }
+
+    function renderAccounts(exact, similar) {
+        const items = [];
+
+        for (const account of exact || []) {
+            items.push({
+                ...account,
+                type: "точное совпадение"
+            });
+        }
+
+        for (const account of similar || []) {
+            items.push({
+                ...account,
+                type: "похожее совпадение"
+            });
+        }
+
+        if (!items.length) {
+            return '<span class="muted">Нет совпадений</span>';
+        }
+
+        return items.map(account => {
+            const active = account.active
+                ? "активен"
+                : "неактивен";
+
+            return `
+                <div class="account">
+                    <div>
+                        <strong>
+                            ${escapeHtml(account.display)}
+                        </strong>
+                    </div>
+                    <div class="account-meta">
+                        ID ${escapeHtml(account.id)};
+                        ${escapeHtml(active)};
+                        ${escapeHtml(account.type)};
+                        ${escapeHtml(account.matched_by)}
+                    </div>
+                </div>
+            `;
+        }).join("");
+    }
+
+    function renderWarnings(warnings) {
+        if (!warnings || !warnings.length) {
+            return '<span class="muted">—</span>';
+        }
+
+        return warnings.map(warning => (
+            `<div class="warning">` +
+            `${escapeHtml(warning)}</div>`
+        )).join("");
+    }
+
+    function renderSummary(summary) {
+        const cards = [
+            ["directors_1c", "Сотрудников из 1С"],
+            ["stores_1c", "Уникальных магазинов"],
+            ["bitrix_users", "Пользователей Bitrix24"],
+            ["personal_found", "Личные записи найдены"],
+            ["personal_ambiguous", "Несколько личных записей"],
+            ["personal_possible", "Личные требуют проверки"],
+            ["personal_missing", "Личные не найдены"],
+            ["shared_found", "Общие записи найдены"],
+            ["shared_possible", "Общие требуют проверки"],
+            ["shared_missing", "Общие не найдены"]
+        ];
+
+        summaryBox.innerHTML = cards.map(
+            ([key, label]) => `
+                <div class="summary-card">
+                    <div class="summary-value">
+                        ${escapeHtml(summary[key] ?? 0)}
+                    </div>
+                    <div class="summary-label">
+                        ${escapeHtml(label)}
+                    </div>
+                </div>
+            `
+        ).join("");
+
+        summaryBox.classList.remove("hidden");
+    }
+
+    function rowMatchesStatus(row, filter) {
+        if (filter === "all") {
+            return true;
+        }
+
+        if (filter === "personal_missing") {
+            return row.personal_status === "Не найдено";
+        }
+
+        if (filter === "shared_missing") {
+            return row.shared_status === "Не найдено";
+        }
+
+        if (filter === "store_missing") {
+            return !row.store;
+        }
+
+        if (filter === "problem") {
+            return (
+                row.personal_status !== "Найдено" ||
+                !row.shared_exact.length ||
+                !row.store ||
+                row.warnings.length > 0
+            );
+        }
+
+        return true;
+    }
+
+    function renderRows() {
+        const query = searchInput.value
+            .trim()
+            .toLocaleLowerCase("ru-RU");
+
+        const filter = statusFilter.value;
+
+        const filtered = reportRows.filter(row => {
+            if (!rowMatchesStatus(row, filter)) {
+                return false;
+            }
+
+            if (!query) {
+                return true;
+            }
+
+            return JSON.stringify(row)
+                .toLocaleLowerCase("ru-RU")
+                .includes(query);
+        });
+
+        resultBody.innerHTML = filtered.map(row => {
+            const employee = row.employee || {};
+            const store = row.store || {};
+
+            return `
+                <tr>
+                    <td>${escapeHtml(store.region || "—")}</td>
+
+                    <td>
+                        ${escapeHtml(employee.smstore || "—")}
+                    </td>
+
+                    <td>
+                        <strong>
+                            ${escapeHtml(store.name || "Не найден")}
+                        </strong>
+                        <div class="account-meta">
+                            ${escapeHtml(store.address || "")}
+                        </div>
+                    </td>
+
+                    <td>
+                        <strong>
+                            ${escapeHtml(employee.fio)}
+                        </strong>
+                        <div class="account-meta">
+                            ${escapeHtml(employee.position)}
+                        </div>
+                        <div class="account-meta">
+                            ${escapeHtml(employee.department)}
+                        </div>
+                    </td>
+
+                    <td>${escapeHtml(employee.inn || "—")}</td>
+
+                    <td>
+                        ${statusBadge(row.personal_status)}
+                        <div style="margin-top:8px">
+                            ${renderAccounts(
+                                row.personal_exact,
+                                row.personal_similar
+                            )}
+                        </div>
+                    </td>
+
+                    <td>
+                        ${escapeHtml(row.store_identity)}
+                    </td>
+
+                    <td>
+                        ${statusBadge(row.shared_status)}
+                        <div style="margin-top:8px">
+                            ${renderAccounts(
+                                row.shared_exact,
+                                row.shared_similar
+                            )}
+                        </div>
+                    </td>
+
+                    <td>
+                        ${renderWarnings(row.warnings)}
+                    </td>
+                </tr>
+            `;
+        }).join("");
+
+        if (!filtered.length) {
+            resultBody.innerHTML = `
+                <tr>
+                    <td colspan="9" class="muted">
+                        По заданным условиям ничего не найдено.
+                    </td>
+                </tr>
+            `;
+        }
+    }
+
+    async function runReport() {
+        runButton.disabled = true;
+        downloadButton.classList.add("hidden");
+        summaryBox.classList.add("hidden");
+        filtersBox.classList.add("hidden");
+        tableContainer.classList.add("hidden");
+
+        showMessage(
+            "Получаю данные из 1С и Bitrix24. " +
+            "Это может занять несколько минут.",
+            "info"
+        );
+
+        try {
+            const response = await fetch(
+                "{% url 'directors_report_run' %}",
+                {
+                    method: "POST",
+                    credentials: "same-origin",
+                    headers: {
+                        "X-CSRFToken": getCookie("csrftoken"),
+                        "X-Requested-With": "XMLHttpRequest"
+                    }
+                }
+            );
+
+            const contentType =
+                response.headers.get("content-type") || "";
+
+            if (!contentType.includes("application/json")) {
+                throw new Error(
+                    "Сервер вернул неожиданный ответ. " +
+                    "Возможно, истекла авторизация."
+                );
+            }
+
+            const data = await response.json();
+
+            if (!response.ok || !data.ok) {
+                throw new Error(
+                    data.error ||
+                    "Не удалось сформировать отчёт."
+                );
+            }
+
+            reportRows = data.rows || [];
+
+            renderSummary(data.summary || {});
+            renderRows();
+
+            filtersBox.classList.remove("hidden");
+            tableContainer.classList.remove("hidden");
+
+            downloadButton.href = data.download_url;
+            downloadButton.classList.remove("hidden");
+
+            showMessage(
+                `Отчёт сформирован за ` +
+                `${data.elapsed_seconds} сек. ` +
+                `Найдено записей из 1С: ` +
+                `${data.summary.directors_1c}.`,
+                "info"
+            );
+
+        } catch (error) {
+            showMessage(
+                error.message ||
+                "Произошла ошибка формирования отчёта.",
+                "error"
+            );
+        } finally {
+            runButton.disabled = false;
+        }
+    }
+
+    runButton.addEventListener("click", runReport);
+    searchInput.addEventListener("input", renderRows);
+    statusFilter.addEventListener("change", renderRows);
+</script>
+</body>
+</html>
