@@ -199,6 +199,22 @@ urlpatterns = [
         views.ukm_rotation_logout,
         name="ukm_rotation_logout",
     ),
+
+    path(
+        "reports/directors/",
+        views.directors_report_page,
+        name="directors_report",
+    ),
+    path(
+        "reports/directors/run/",
+        views.directors_report_run,
+        name="directors_report_run",
+    ),
+    path(
+        "reports/directors/download/<str:token>/",
+        views.directors_report_download,
+        name="directors_report_download",
+    ),
     
     path("maxbot/", views.maxbot_dashboard, name="maxbot_dashboard"),
 
