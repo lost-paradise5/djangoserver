@@ -50,6 +50,7 @@ from django.utils.timezone import now as tz_now
 import re   
 from django.http import JsonResponse, HttpResponseForbidden
 from django.http import StreamingHttpResponse, FileResponse, HttpResponse
+from django.http import Http404
 from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
@@ -103,6 +104,12 @@ from frostapp.services.ukm_rotation_bitrix_auth import (
     pending_rotation_login,
     rotation_client_ip,
     ukm_rotation_bitrix_required,
+)
+
+from frostapp.services.directors_report import (
+    DirectorsReportError,
+    build_directors_report,
+    write_directors_report_xlsx,
 )
 
 from frostapp.services.bitrix_cash_reboot import (
@@ -241,6 +248,24 @@ SHIFT_QUEUE_BATCH_SIZE = int(
 
 SHIFT_QUEUE_LOCK_STALE_MINUTES = int(
     os.getenv("SHIFT_QUEUE_LOCK_STALE_MINUTES", "30")
+)
+
+
+
+
+
+DIRECTORS_REPORT_DIR = Path(
+    os.getenv(
+        "DIRECTORS_REPORT_DIR",
+        "/app/reports/directors",
+    )
+)
+
+DIRECTORS_REPORT_FILE_TTL_SECONDS = int(
+    os.getenv(
+        "DIRECTORS_REPORT_FILE_TTL_SECONDS",
+        "86400",
+    )
 )
 
 
@@ -37809,3 +37834,190 @@ def ukm_rotation_logout(request):
     return redirect(
         "ukm_rotation_login"
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _cleanup_old_directors_reports():
+    try:
+        if not DIRECTORS_REPORT_DIR.exists():
+            return
+
+        cutoff = (
+            time.time()
+            - DIRECTORS_REPORT_FILE_TTL_SECONDS
+        )
+
+        for report_file in DIRECTORS_REPORT_DIR.glob(
+            "*.xlsx"
+        ):
+            try:
+                if report_file.stat().st_mtime < cutoff:
+                    report_file.unlink()
+            except OSError:
+                logger.warning(
+                    "[DIRECTORS_REPORT] "
+                    "Не удалось удалить старый отчёт %s",
+                    report_file,
+                    exc_info=True,
+                )
+
+    except Exception:
+        logger.warning(
+            "[DIRECTORS_REPORT] Ошибка очистки отчётов",
+            exc_info=True,
+        )
+
+
+@never_cache
+@ukm_rotation_bitrix_required
+@require_GET
+def directors_report_page(request):
+    return render(
+        request,
+        "frostapp/directors_report.html",
+    )
+
+
+@never_cache
+@ukm_rotation_bitrix_required
+@require_POST
+@csrf_protect
+def directors_report_run(request):
+    started_at = time.monotonic()
+
+    try:
+        report = build_directors_report(
+            onec_url=ONEC_WORKING_EMPLOYEES_URL,
+            onec_username=ONEC_WORKING_EMPLOYEES_AUTH_USER,
+            onec_password=ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD,
+            onec_timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT,
+            bitrix_user_get_url=BITRIX_USER_GET_URL,
+            bitrix_inn_field=BITRIX_INN_FIELD,
+        )
+
+        DIRECTORS_REPORT_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        token = uuid.uuid4().hex
+        report_path = (
+            DIRECTORS_REPORT_DIR
+            / f"{token}.xlsx"
+        )
+
+        write_directors_report_xlsx(
+            report,
+            report_path,
+        )
+
+        _cleanup_old_directors_reports()
+
+        elapsed_seconds = round(
+            time.monotonic() - started_at,
+            2,
+        )
+
+        logger.info(
+            "[DIRECTORS_REPORT] Отчёт сформирован: "
+            "directors=%s bitrix_users=%s elapsed=%s",
+            report["summary"]["directors_1c"],
+            report["summary"]["bitrix_users"],
+            elapsed_seconds,
+        )
+
+        return JsonResponse({
+            "ok": True,
+            "generated_at": report["generated_at"],
+            "elapsed_seconds": elapsed_seconds,
+            "summary": report["summary"],
+            "rows": report["rows"],
+            "download_url": reverse(
+                "directors_report_download",
+                kwargs={"token": token},
+            ),
+        })
+
+    except DirectorsReportError as exc:
+        logger.warning(
+            "[DIRECTORS_REPORT] Ожидаемая ошибка: %s",
+            exc,
+        )
+
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+            },
+            status=502,
+        )
+
+    except Exception:
+        logger.exception(
+            "[DIRECTORS_REPORT] "
+            "Непредвиденная ошибка"
+        )
+
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": (
+                    "Не удалось сформировать отчёт. "
+                    "Подробности записаны в журнал Django."
+                ),
+            },
+            status=500,
+        )
+
+
+@never_cache
+@ukm_rotation_bitrix_required
+@require_GET
+def directors_report_download(request, token):
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        raise Http404
+
+    report_path = (
+        DIRECTORS_REPORT_DIR
+        / f"{token}.xlsx"
+    )
+
+    if not report_path.is_file():
+        raise Http404
+
+    current_date = timezone.localtime().strftime(
+        "%Y-%m-%d_%H-%M"
+    )
+
+    return FileResponse(
+        report_path.open("rb"),
+        as_attachment=True,
+        filename=(
+            f"Отчёт_по_директорам_{current_date}.xlsx"
+        ),
+        content_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
+
+
+
+
+
+
+
+
+
