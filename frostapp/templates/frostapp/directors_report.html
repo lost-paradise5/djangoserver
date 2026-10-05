@@ -634,34 +634,6 @@
         return true;
     }
 
-    function rowMatchesStatus(row, filter) {
-        if (filter === "all") {
-            return true;
-        }
-
-        if (filter === "personal_missing") {
-            return row.personal_status === "Не найдено";
-        }
-
-        if (filter === "shared_missing") {
-            return row.shared_status === "Не найдено";
-        }
-
-        if (filter === "store_missing") {
-            return !row.store;
-        }
-
-        if (filter === "problem") {
-            return (
-                row.personal_status !== "Найдено" ||
-                !row.shared_exact.length ||
-                !row.store ||
-                row.warnings.length > 0
-            );
-        }
-
-        return true;
-    }
 
     function renderRows() {
         const query = searchInput.value
@@ -849,7 +821,7 @@
                 `Отчёт сформирован за ` +
                 `${data.elapsed_seconds} сек. ` +
                 `Найдено записей из 1С: ` +
-                `${data.summary.directors_1c}.`,
+                `${data.summary.target_employees}.`,
                 "info"
             );
 
