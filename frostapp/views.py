@@ -37932,9 +37932,12 @@ def directors_report_run(request):
 
         logger.info(
             "[DIRECTORS_REPORT] Отчёт сформирован: "
-            "directors=%s bitrix_users=%s elapsed=%s",
-            report["summary"]["directors_1c"],
+            "employees=%s stores=%s bitrix_users=%s "
+            "issues=%s elapsed=%s",
+            report["summary"]["target_employees"],
+            report["summary"]["stores_1c"],
             report["summary"]["bitrix_users"],
+            report["summary"]["issues"],
             elapsed_seconds,
         )
 
@@ -37943,7 +37946,8 @@ def directors_report_run(request):
             "generated_at": report["generated_at"],
             "elapsed_seconds": elapsed_seconds,
             "summary": report["summary"],
-            "rows": report["rows"],
+            "stores": report["stores"],
+            "issues": report["issues"],
             "download_url": reverse(
                 "directors_report_download",
                 kwargs={"token": token},
