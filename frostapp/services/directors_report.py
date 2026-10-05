@@ -842,6 +842,57 @@ def _alias_tokens(alias: str) -> set[str]:
     return set(_tokenize_account_name(alias))
 
 
+def _best_alias_ratio(
+    alias: str,
+    bitrix_user: dict,
+) -> float:
+    """
+    Сравнивает название магазина с отдельными фрагментами
+    имени пользователя Bitrix24.
+
+    Используется для неточного поиска магазинов:
+    Каштак, Шилка-1, Шилка-2 и аналогичных.
+    """
+    normalized_alias = _normalize_text(alias)
+    alias_tokens = normalized_alias.split()
+
+    candidate_tokens = (
+        bitrix_user.get("name_text", "")
+        .split()
+    )
+
+    if not alias_tokens or not candidate_tokens:
+        return 0.0
+
+    window_size = len(alias_tokens)
+    windows = []
+
+    for index in range(len(candidate_tokens)):
+        window = " ".join(
+            candidate_tokens[
+                index:index + window_size
+            ]
+        ).strip()
+
+        if window:
+            windows.append(window)
+
+    if not windows:
+        return 0.0
+
+    return max(
+        SequenceMatcher(
+            None,
+            normalized_alias,
+            window,
+        ).ratio()
+        for window in windows
+    )
+
+
+
+
+
 def _shared_match_score(
     identity: dict,
     bitrix_user: dict,
