@@ -37946,8 +37946,7 @@ def directors_report_run(request):
             "generated_at": report["generated_at"],
             "elapsed_seconds": elapsed_seconds,
             "summary": report["summary"],
-            "stores": report["stores"],
-            "issues": report["issues"],
+            "rows": report["rows"],
             "download_url": reverse(
                 "directors_report_download",
                 kwargs={"token": token},
