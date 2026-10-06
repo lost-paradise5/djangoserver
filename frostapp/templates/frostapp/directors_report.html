@@ -340,14 +340,11 @@
         <table>
             <thead>
             <tr>
-                <th>Регион</th>
-                <th>smstore</th>
                 <th>Магазин</th>
-                <th>Сотрудники из 1С</th>
-                <th>Личные записи Bitrix24</th>
-                <th>Общая запись администраторов</th>
-                <th>Общая запись приемщиков</th>
-                <th>Проблемы</th>
+                <th>Должность</th>
+                <th>ФИО</th>
+                <th>Учётная запись</th>
+                <th>Результат / уточнение</th>
             </tr>
             </thead>
 
@@ -371,7 +368,7 @@
     const statusFilter =
         document.getElementById("statusFilter");
 
-    let reportStores = [];
+    let reportRows = [];
 
     function escapeHtml(value) {
         return String(value ?? "").replace(
@@ -508,12 +505,9 @@
             ["directors_1c", "Директоров"],
             ["administrators_1c", "Администраторов"],
             ["receivers_1c", "Приемщиков"],
-            ["personal_found", "Личные записи найдены"],
-            ["personal_possible", "Личные требуют проверки"],
-            ["personal_missing", "Личные не найдены"],
-            ["shared_admin_found", "Общие администраторов"],
-            ["shared_receiver_found", "Общие приемщиков"],
-            ["issues", "Спорных моментов"]
+            ["found", "Записи найдены"],
+            ["possible", "Требуют проверки"],
+            ["missing", "Не найдены"]
         ];
     
         summaryBox.innerHTML = cards.map(
@@ -533,102 +527,33 @@
     }
 
 
-    function renderEmployees(storeResult) {
-        if (!storeResult.employees.length) {
-            return '<span class="muted">Нет сотрудников</span>';
-        }
-    
-        return storeResult.employees.map(item => {
-            const employee = item.employee;
-    
-            return `
-                <div class="account">
-                    <div>
-                        <strong>
-                            ${escapeHtml(employee.role_group)}
-                        </strong>
-                        — ${escapeHtml(employee.fio)}
-                    </div>
-                    <div class="account-meta">
-                        ${escapeHtml(employee.position)}
-                    </div>
-                </div>
-            `;
-        }).join("");
-    }
     
     
-    function renderPersonalAccounts(storeResult) {
-        return storeResult.employees.map(item => {
-            return `
-                <div class="account">
-                    <div>
-                        <strong>
-                            ${escapeHtml(item.employee.fio)}
-                        </strong>
-                    </div>
-                    <div>
-                        ${statusBadge(item.personal_status)}
-                    </div>
-                    <div style="margin-top:6px">
-                        ${renderAccounts(
-                            item.personal_exact,
-                            item.personal_similar
-                        )}
-                    </div>
-                </div>
-            `;
-        }).join("");
-    }
-    
-    
-    function storeHasProblems(storeResult) {
-        if (!storeResult.store) {
-            return true;
-        }
-    
-        if (storeResult.warnings.length) {
-            return true;
-        }
-    
-        if (!storeResult.shared_admin_exact.length) {
-            return true;
-        }
-    
-        if (!storeResult.shared_receiver_exact.length) {
-            return true;
-        }
-    
-        return storeResult.employees.some(item => (
-            item.personal_status !== "Найдено"
-        ));
-    }
-    
-    
-    function rowMatchesStatus(storeResult, filter) {
+    function rowMatchesStatus(row, filter) {
         if (filter === "all") {
             return true;
         }
     
         if (filter === "problem") {
-            return storeHasProblems(storeResult);
+            return row.status !== "Найдено";
         }
     
         if (filter === "personal_missing") {
-            return storeResult.employees.some(item => (
-                item.personal_status === "Не найдено"
-            ));
+            return (
+                row.account_type === "Личная" &&
+                row.status === "Не найдено"
+            );
         }
     
         if (filter === "shared_missing") {
             return (
-                !storeResult.shared_admin_exact.length ||
-                !storeResult.shared_receiver_exact.length
+                row.account_type !== "Личная" &&
+                row.status === "Не найдено"
             );
         }
     
         if (filter === "store_missing") {
-            return !storeResult.store;
+            return !row.store;
         }
     
         return true;
@@ -642,8 +567,8 @@
     
         const filter = statusFilter.value;
     
-        const filtered = reportStores.filter(storeResult => {
-            if (!rowMatchesStatus(storeResult, filter)) {
+        const filtered = reportRows.filter(row => {
+            if (!rowMatchesStatus(row, filter)) {
                 return false;
             }
     
@@ -651,100 +576,60 @@
                 return true;
             }
     
-            return JSON.stringify(storeResult)
+            return JSON.stringify(row)
                 .toLocaleLowerCase("ru-RU")
                 .includes(query);
         });
     
-        resultBody.innerHTML = filtered.map(storeResult => {
-            const store = storeResult.store || {};
+        resultBody.innerHTML = filtered.map(row => {
+            const store = row.store || {};
     
             return `
                 <tr>
                     <td>
-                        ${escapeHtml(store.region || "—")}
-                    </td>
-    
-                    <td>
-                        ${escapeHtml(
-                            storeResult.smstore || "—"
-                        )}
-                    </td>
-    
-                    <td>
                         <strong>
-                            ${escapeHtml(
-                                store.name || "Не найден"
-                            )}
+                            ${escapeHtml(row.store_name)}
                         </strong>
+    
+                        <div class="account-meta">
+                            smstore:
+                            ${escapeHtml(row.smstore ?? "—")}
+                        </div>
     
                         <div class="account-meta">
                             ${escapeHtml(store.address || "")}
                         </div>
+                    </td>
     
+                    <td>
+                        ${escapeHtml(row.position)}
+                    </td>
+    
+                    <td>
+                        <strong>
+                            ${escapeHtml(row.fio)}
+                        </strong>
+                    </td>
+    
+                    <td>
                         <div class="account-meta">
-                            Идентификатор:
-                            ${escapeHtml(
-                                storeResult.store_identity
-                            )}
+                            ${escapeHtml(row.account_type)}
                         </div>
-                    </td>
     
-                    <td>
-                        ${renderEmployees(storeResult)}
-                    </td>
-    
-                    <td>
-                        ${renderPersonalAccounts(storeResult)}
-                    </td>
-    
-                    <td>
-                        ${statusBadge(
-                            storeResult.shared_admin_status
-                        )}
-    
-                        <div style="margin-top:8px">
+                        <div style="margin-top:6px">
                             ${renderAccounts(
-                                storeResult.shared_admin_exact,
-                                storeResult.shared_admin_similar
+                                row.exact,
+                                row.similar
                             )}
                         </div>
                     </td>
     
                     <td>
-                        ${statusBadge(
-                            storeResult.shared_receiver_status
-                        )}
+                        ${statusBadge(row.status)}
     
-                        <div style="margin-top:8px">
-                            ${renderAccounts(
-                                storeResult.shared_receiver_exact,
-                                storeResult.shared_receiver_similar
-                            )}
+                        <div style="margin-top:7px">
+                            ${escapeHtml(row.comment)}
                         </div>
-                    </td>
-    
-                    <td>
-                        ${renderWarnings(
-                            storeResult.warnings
-                        )}
-    
-                        ${
-                            storeHasProblems(storeResult)
-                                ? `
-                                    <div class="warning">
-                                        Есть данные, требующие
-                                        проверки. Подробности —
-                                        в Excel на листе
-                                        «Спорные моменты».
-                                    </div>
-                                `
-                                : `
-                                    <span class="muted">
-                                        Спорных моментов нет
-                                    </span>
-                                `
-                        }
                     </td>
                 </tr>
             `;
@@ -753,7 +638,7 @@
         if (!filtered.length) {
             resultBody.innerHTML = `
                 <tr>
-                    <td colspan="8" class="muted">
+                    <td colspan="5" class="muted">
                         По заданным условиям ничего не найдено.
                     </td>
                 </tr>
@@ -806,7 +691,7 @@
                 );
             }
 
-            reportStores = data.stores || [];
+            reportRows = data.rows || [];
 
             renderSummary(data.summary || {});
             renderRows();
