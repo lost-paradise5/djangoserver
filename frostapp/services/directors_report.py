@@ -28,7 +28,7 @@ ONEC_POSITION_GROUPS = {
     "администратор магазина": "Администратор",
 
     "приемщик": "Приемщик",
-    "приемщик магазина": "Приемщик",
+    "приемщик товара": "Приемщик",
 }
 
 SHARED_ROLE_MARKERS = {
@@ -179,6 +179,15 @@ def _load_onec_directors(
     seen = set()
 
     for item in all_rows:
+
+        state = _normalize_text(item.get("Состояние"))
+
+        # Если поле заполнено, берём только работающих.
+        if state and state not in {
+            "работа",
+            "работает",
+        }:
+            continue
         position_raw = _string(item.get("Должность"))
         position_normalized = _normalize_text(position_raw)
         
@@ -405,6 +414,15 @@ def _prepare_bitrix_users(
     prepared = []
 
     for user in users:
+        is_active = _bool_from_bitrix(
+            user.get("ACTIVE", "Y")
+        )
+    
+        # Неактивных и уволенных пользователей Bitrix24
+        # вообще не рассматриваем как совпадения.
+        if not is_active:
+            continue
+    
         name_text = _normalize_text(
             " ".join([
                 _string(user.get("NAME")),
@@ -425,9 +443,7 @@ def _prepare_bitrix_users(
             "raw": user,
             "id": _string(user.get("ID")),
             "display": _bitrix_display_name(user),
-            "active": _bool_from_bitrix(
-                user.get("ACTIVE", "Y")
-            ),
+            "active": True,
             "email": _string(user.get("EMAIL")),
             "work_position": _string(
                 user.get("WORK_POSITION")
@@ -687,6 +703,135 @@ def _location_words(*values: Any) -> list[str]:
     return sorted(result)
 
 
+
+
+ADDRESS_STOP_WORDS = {
+    "магазин",
+    "дискаунтер",
+    "николаевский",
+    "улица",
+    "ул",
+    "дом",
+    "проспект",
+    "пр",
+    "переулок",
+    "район",
+    "город",
+    "село",
+    "поселок",
+    "корпус",
+    "строение",
+    "улан",
+    "удэ",
+    "чита",
+    "россия",
+    "республика",
+    "бурятия",
+    "забайкальский",
+    "край",
+}
+
+SMALL_ADDRESS_NUMBER_RE = re.compile(
+    r"(?<!\d)"
+    r"(\d{1,3}[a-zа-я]?"
+    r"(?:[/\-]\d{1,3}[a-zа-я]?)?)"
+    r"(?!\d)",
+    flags=re.IGNORECASE,
+)
+
+
+def _address_words(value: Any) -> set[str]:
+    result = set()
+
+    for token in _normalize_text(value).split():
+        if (
+            token.isalpha()
+            and len(token) >= 4
+            and token not in ADDRESS_STOP_WORDS
+        ):
+            result.add(token)
+
+    return result
+
+
+def _address_numbers(value: Any) -> set[str]:
+    text = (
+        _string(value)
+        .casefold()
+        .replace("ё", "е")
+        .replace(" ", "")
+    )
+
+    return {
+        match.casefold()
+        for match in SMALL_ADDRESS_NUMBER_RE.findall(
+            text
+        )
+    }
+
+
+def _extract_store_house(address: Any) -> str:
+    text = (
+        _string(address)
+        .casefold()
+        .replace("ё", "е")
+    )
+
+    # Сначала ищем явное обозначение дома.
+    explicit_match = re.search(
+        r"(?:\bдом\b|\bд\.)\s*"
+        r"(\d{1,3}[a-zа-я]?"
+        r"(?:[/\-]\d{1,3}[a-zа-я]?)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if explicit_match:
+        return explicit_match.group(1).replace(
+            " ",
+            "",
+        )
+
+    numbers = list(
+        SMALL_ADDRESS_NUMBER_RE.findall(text)
+    )
+
+    if numbers:
+        return numbers[-1].casefold()
+
+    return ""
+
+
+def _address_match_level(
+    identity: dict,
+    account_name: str,
+) -> tuple[str, list[str]]:
+    store_words = set(
+        identity.get("address_words", [])
+    )
+    store_house = identity.get("address_house", "")
+
+    account_words = _address_words(account_name)
+    account_numbers = _address_numbers(account_name)
+
+    common_words = sorted(
+        store_words & account_words
+    )
+
+    street_matches = bool(common_words)
+    house_matches = bool(
+        store_house
+        and store_house in account_numbers
+    )
+
+    if street_matches and house_matches:
+        return "exact", common_words
+
+    if street_matches or house_matches:
+        return "partial", common_words
+
+    return "none", []
+
 def _build_store_identity(
     store: dict | None,
     smstore: int | None,
@@ -697,7 +842,8 @@ def _build_store_identity(
         "brand": "",
         "number": None,
         "aliases": [],
-        "location_tokens": [],
+        "address_words": [],
+        "address_house": "",
         "recognized": False,
     }
 
@@ -711,16 +857,17 @@ def _build_store_identity(
         raw_name.casefold().replace("ё", "е")
     )
 
+    remaining_name = normalized_name
+
     brand_match = re.search(
         r"(николаевский|дискаунтер)",
         normalized_name,
         flags=re.IGNORECASE,
     )
 
-    remaining_name = normalized_name
-
     if brand_match:
         identity["brand"] = brand_match.group(1)
+
         remaining_name = normalized_name[
             brand_match.end():
         ].strip(" \t\r\n-–—№#")
@@ -759,9 +906,13 @@ def _build_store_identity(
                     location_match.end():
                 ].strip()
 
-    identity["location_tokens"] = _location_words(
-        remaining_name,
-        raw_address,
+    address_source = raw_address or remaining_name
+
+    identity["address_words"] = sorted(
+        _address_words(address_source)
+    )
+    identity["address_house"] = (
+        _extract_store_house(address_source)
     )
 
     for alias in overrides.get(str(smstore), []):
@@ -898,10 +1049,8 @@ def _shared_match_score(
     bitrix_user: dict,
     shared_role: str,
 ) -> tuple[int, str]:
-    tokens = _tokenize_account_name(
-        bitrix_user["name_text"]
-    )
-
+    account_name = bitrix_user["name_text"]
+    tokens = _tokenize_account_name(account_name)
     token_set = set(tokens)
 
     role_positions = _shared_role_positions(
@@ -918,8 +1067,19 @@ def _shared_match_score(
         else "Приемщик/Приемка"
     )
 
-    # Сначала проверяем именованные магазины:
-    # Шилка-1, Шилка-2, Каштак и ручные псевдонимы.
+    address_level, common_address_words = (
+        _address_match_level(
+            identity,
+            account_name,
+        )
+    )
+
+    address_description = ", ".join(
+        common_address_words
+    )
+
+    alias_matched = False
+
     for alias in identity.get("aliases", []):
         expected_tokens = _alias_tokens(alias)
 
@@ -927,10 +1087,8 @@ def _shared_match_score(
             expected_tokens
             and expected_tokens.issubset(token_set)
         ):
-            return (
-                100,
-                f"{role_title} + название магазина",
-            )
+            alias_matched = True
+            break
 
     store_number = identity.get("number")
 
@@ -940,69 +1098,59 @@ def _shared_match_score(
             role_positions,
         )
 
-        # В названии может быть нужное число как номер дома,
-        # но номер около роли должен совпасть с магазином.
+        # Номер возле роли должен совпадать с номером
+        # магазина, а не с номером дома.
         if store_number not in contextual_numbers:
             return 0, ""
 
-        known_brands = {
-            token
-            for token in token_set
-            if token in {
-                "николаевский",
-                "дискаунтер",
-            }
-        }
-
-        store_brand = identity.get("brand")
-
-        # Если сеть явно указана, но это другая сеть,
-        # совпадение сразу исключаем.
-        if (
-            known_brands
-            and store_brand
-            and store_brand not in known_brands
-        ):
-            return 0, ""
-
-        brand_confirmed = bool(
-            store_brand
-            and store_brand in token_set
-        )
-
-        location_matches = (
-            set(identity.get("location_tokens", []))
-            & token_set
-        )
-
-        if brand_confirmed and location_matches:
+        if address_level == "exact":
             return (
                 100,
-                f"{role_title} + номер + сеть + адрес",
+                f"{role_title}: номер магазина, "
+                f"улица и дом совпали"
+                + (
+                    f" ({address_description})"
+                    if address_description
+                    else ""
+                ),
             )
 
-        if brand_confirmed:
+        if address_level == "partial":
             return (
-                98,
-                f"{role_title} + номер + сеть",
+                78,
+                f"{role_title}: номер магазина совпал, "
+                f"адрес совпал только частично",
             )
 
-        if location_matches:
-            return (
-                96,
-                f"{role_title} + номер + адрес",
-            )
-
-        # Номер и роль совпали, но магазин не подтверждён
-        # ни сетью, ни адресом. Это спорное совпадение.
         return (
-            76,
-            f"{role_title} + номер, "
-            f"но сеть/адрес не подтверждены",
+            72,
+            f"{role_title}: номер магазина совпал, "
+            f"но адрес не подтверждён",
         )
 
-    # Нечёткий поиск применяется только к именованным
-    # магазинам, а не к числовым номерам.
+    if alias_matched:
+        # Для Шилки, Каштака и других именованных
+        # магазинов также проверяем адрес.
+        if address_level == "exact":
+            return (
+                100,
+                f"{role_title}: название магазина, "
+                f"улица и дом совпали",
+            )
+
+        if not identity.get("address_words"):
+            return (
+                96,
+                f"{role_title}: совпало уникальное "
+                f"название магазина",
+            )
+
+        return (
+            78,
+            f"{role_title}: название магазина совпало, "
+            f"но адрес требует проверки",
+        )
+
     for alias in identity.get("aliases", []):
         ratio = _best_alias_ratio(
             alias,
@@ -1011,8 +1159,9 @@ def _shared_match_score(
 
         if ratio >= 0.84:
             return (
-                round(68 + ratio * 10),
-                f"Похожее название магазина + {role_title}",
+                70,
+                f"{role_title}: похожее название "
+                f"магазина",
             )
 
     return 0, ""
@@ -1061,6 +1210,22 @@ def _match_shared_account(
     similar.sort(key=sort_key)
 
     return exact, similar[:10]
+
+
+def _compact_account_status(
+    exact: list[dict],
+    similar: list[dict],
+) -> str:
+    if len(exact) == 1:
+        return "Найдено"
+
+    if len(exact) > 1:
+        return "Несколько совпадений"
+
+    if similar:
+        return "Требует проверки"
+
+    return "Не найдено"
 
 
 def _personal_status(
@@ -1112,6 +1277,7 @@ def build_directors_report(
         url=bitrix_user_get_url,
     )
 
+    # Здесь уже остаются только активные пользователи.
     bitrix_users = _prepare_bitrix_users(
         bitrix_raw_users,
         bitrix_inn_field,
@@ -1142,6 +1308,8 @@ def build_directors_report(
     prepared_stores = {}
 
     for smstore, store_models in stores_by_smstore.items():
+        # Сначала действующий магазин, затем самая
+        # новая запись.
         store_models.sort(
             key=lambda item: (
                 item.close_date is not None,
@@ -1166,431 +1334,207 @@ def build_directors_report(
         }
 
     aliases = _load_store_alias_overrides()
+    shared_cache = {}
+    rows = []
 
-    employees_by_store = defaultdict(list)
+    status_totals = {
+        "found": 0,
+        "ambiguous": 0,
+        "possible": 0,
+        "missing": 0,
+    }
 
     for employee in employees:
-        employees_by_store[
-            employee["smstore"]
-        ].append(employee)
-
-    stores_result = []
-    issues = []
-
-    personal_found = 0
-    personal_ambiguous = 0
-    personal_possible = 0
-    personal_missing = 0
-
-    shared_admin_found = 0
-    shared_admin_possible = 0
-    shared_admin_missing = 0
-
-    shared_receiver_found = 0
-    shared_receiver_possible = 0
-    shared_receiver_missing = 0
-
-    for smstore, store_employees in employees_by_store.items():
+        smstore = employee["smstore"]
         store = prepared_stores.get(smstore)
-        store_warnings = []
-
-        if smstore is None:
-            store_warnings.append(
-                "У сотрудников не заполнен ИдМагазина."
-            )
-
-        elif not store:
-            store_warnings.append(
-                f"В stores не найден smstore={smstore}."
-            )
-
-        else:
-            if store["duplicate_count"] > 1:
-                store_warnings.append(
-                    "В stores найдено несколько записей "
-                    "с одинаковым smstore."
-                )
-
-            if store["close_date"]:
-                store_warnings.append(
-                    f"У магазина указана дата закрытия: "
-                    f"{store['close_date']}."
-                )
-
-        identity = _build_store_identity(
-            store,
-            smstore,
-            aliases,
-        )
-
-        if store and not identity["recognized"]:
-            store_warnings.append(
-                "Не удалось определить номер или название "
-                "магазина для поиска общей учётной записи."
-            )
-
-        admin_exact, admin_similar = (
-            _match_shared_account(
-                identity,
-                bitrix_users,
-                "administrator",
-            )
-        )
-
-        receiver_exact, receiver_similar = (
-            _match_shared_account(
-                identity,
-                bitrix_users,
-                "receiver",
-            )
-        )
-
-        admin_status = _shared_status(
-            admin_exact,
-            admin_similar,
-        )
-        receiver_status = _shared_status(
-            receiver_exact,
-            receiver_similar,
-        )
-
-        if admin_exact:
-            shared_admin_found += 1
-        elif admin_similar:
-            shared_admin_possible += 1
-        else:
-            shared_admin_missing += 1
-
-        if receiver_exact:
-            shared_receiver_found += 1
-        elif receiver_similar:
-            shared_receiver_possible += 1
-        else:
-            shared_receiver_missing += 1
 
         store_name = (
             (store or {}).get("name")
             or f"smstore={smstore}"
         )
 
-        if not store:
-            issues.append({
-                "category": "Магазин",
-                "smstore": smstore,
-                "store_name": store_name,
-                "employee_fio": "",
-                "issue": (
-                    "Магазин не найден в таблице stores."
-                ),
-                "candidates": "",
-                "recommendation": (
-                    "Проверить stores.smstore и "
-                    "ИдМагазина из 1С."
-                ),
-            })
+        comments = []
 
-        elif not identity["recognized"]:
-            issues.append({
-                "category": "Идентификатор магазина",
-                "smstore": smstore,
-                "store_name": store_name,
-                "employee_fio": "",
-                "issue": (
+        if smstore is None:
+            comments.append(
+                "В 1С не заполнен ИдМагазина."
+            )
+        elif not store:
+            comments.append(
+                f"В stores не найден smstore={smstore}."
+            )
+        else:
+            if store["duplicate_count"] > 1:
+                comments.append(
+                    "В stores несколько записей "
+                    "с одинаковым smstore."
+                )
+
+            if store["close_date"]:
+                comments.append(
+                    "У магазина указана дата закрытия "
+                    f"{store['close_date']}."
+                )
+
+        role_group = employee["role_group"]
+
+        if role_group == "Директор":
+            account_type = "Личная"
+
+            exact, similar = _match_person(
+                employee,
+                bitrix_users,
+            )
+
+        else:
+            if role_group == "Администратор":
+                shared_role = "administrator"
+                account_type = "Общая администратора"
+            else:
+                shared_role = "receiver"
+                account_type = "Общая приемки"
+
+            cache_key = (
+                smstore,
+                shared_role,
+            )
+
+            if cache_key not in shared_cache:
+                identity = _build_store_identity(
+                    store,
+                    smstore,
+                    aliases,
+                )
+
+                exact, similar = (
+                    _match_shared_account(
+                        identity,
+                        bitrix_users,
+                        shared_role,
+                    )
+                )
+
+                shared_cache[cache_key] = {
+                    "exact": exact,
+                    "similar": similar,
+                    "identity": identity,
+                }
+
+            cached = shared_cache[cache_key]
+
+            exact = cached["exact"]
+            similar = cached["similar"]
+            identity = cached["identity"]
+
+            if store and not identity["recognized"]:
+                comments.append(
                     "Не удалось определить номер или "
                     "название магазина."
-                ),
-                "candidates": "",
-                "recommendation": (
-                    "Добавить псевдоним в "
-                    "DIRECTORS_STORE_ALIASES_JSON."
-                ),
-            })
+                )
 
-        if not admin_exact:
-            issues.append({
-                "category": "Общая запись администраторов",
-                "smstore": smstore,
-                "store_name": store_name,
-                "employee_fio": "",
-                "issue": (
-                    "Найдены только спорные совпадения."
-                    if admin_similar
-                    else
-                    "Общая учётная запись "
-                    "администраторов не найдена."
-                ),
-                "candidates": _matches_to_text(
-                    [],
-                    admin_similar,
-                ),
-                "recommendation": (
-                    "Проверить название общей записи "
-                    "администраторов в Bitrix24."
-                ),
-            })
-
-        elif len(admin_exact) > 1:
-            issues.append({
-                "category": "Общая запись администраторов",
-                "smstore": smstore,
-                "store_name": store_name,
-                "employee_fio": "",
-                "issue": (
-                    "Найдено несколько точных общих "
-                    "учётных записей администраторов."
-                ),
-                "candidates": _matches_to_text(
-                    admin_exact,
-                    [],
-                ),
-                "recommendation": (
-                    "Проверить дубли и неактивные "
-                    "учётные записи."
-                ),
-            })
-
-        if not receiver_exact:
-            issues.append({
-                "category": "Общая запись приемщиков",
-                "smstore": smstore,
-                "store_name": store_name,
-                "employee_fio": "",
-                "issue": (
-                    "Найдены только спорные совпадения."
-                    if receiver_similar
-                    else
-                    "Общая учётная запись "
-                    "приемщиков не найдена."
-                ),
-                "candidates": _matches_to_text(
-                    [],
-                    receiver_similar,
-                ),
-                "recommendation": (
-                    "Проверить записи со словами "
-                    "Приемщик или Приемка в Bitrix24."
-                ),
-            })
-
-        elif len(receiver_exact) > 1:
-            issues.append({
-                "category": "Общая запись приемщиков",
-                "smstore": smstore,
-                "store_name": store_name,
-                "employee_fio": "",
-                "issue": (
-                    "Найдено несколько точных общих "
-                    "учётных записей приемщиков."
-                ),
-                "candidates": _matches_to_text(
-                    receiver_exact,
-                    [],
-                ),
-                "recommendation": (
-                    "Проверить дубли и неактивные "
-                    "учётные записи."
-                ),
-            })
-
-        employee_results = []
-
-        counts = {
-            "directors": 0,
-            "administrators": 0,
-            "receivers": 0,
-            "total": 0,
-        }
-
-        names_by_role = {
-            "Директор": [],
-            "Администратор": [],
-            "Приемщик": [],
-        }
-
-        role_count_key = {
-            "Директор": "directors",
-            "Администратор": "administrators",
-            "Приемщик": "receivers",
-        }
-
-        store_employees.sort(
-            key=lambda item: (
-                {
-                    "Директор": 1,
-                    "Администратор": 2,
-                    "Приемщик": 3,
-                }.get(item["role_group"], 9),
-                item["fio"].casefold(),
-            )
+        status = _compact_account_status(
+            exact,
+            similar,
         )
 
-        for employee in store_employees:
-            personal_exact, personal_similar = (
-                _match_person(
-                    employee,
-                    bitrix_users,
-                )
+        if status == "Найдено":
+            status_totals["found"] += 1
+
+            comments.append(
+                exact[0]["matched_by"]
             )
 
-            personal_status = _personal_status(
-                personal_exact,
-                personal_similar,
+        elif status == "Несколько совпадений":
+            status_totals["ambiguous"] += 1
+
+            comments.append(
+                "Найдено несколько точных записей. "
+                "Нужно проверить дубли."
             )
 
-            if personal_status == "Найдено":
-                personal_found += 1
-            elif personal_status == "Несколько совпадений":
-                personal_ambiguous += 1
-            elif personal_status == "Требует проверки":
-                personal_possible += 1
-            else:
-                personal_missing += 1
+        elif status == "Требует проверки":
+            status_totals["possible"] += 1
 
-            counts["total"] += 1
-
-            count_key = role_count_key.get(
-                employee["role_group"]
+            comments.append(
+                "Есть похожая запись, но совпадение "
+                "не подтверждено полностью."
             )
 
-            if count_key:
-                counts[count_key] += 1
+        else:
+            status_totals["missing"] += 1
 
-            names_by_role.setdefault(
-                employee["role_group"],
-                [],
-            ).append(employee["fio"])
+            comments.append(
+                "Подходящая активная учётная запись "
+                "не найдена."
+            )
 
-            employee_warnings = []
-
-            if len(personal_exact) > 1:
-                employee_warnings.append(
-                    "Найдено несколько личных "
-                    "учётных записей."
-                )
-
-            if personal_status != "Найдено":
-                issue_text = {
-                    "Несколько совпадений": (
-                        "Найдено несколько личных "
-                        "учётных записей."
-                    ),
-                    "Требует проверки": (
-                        "Найдено только спорное "
-                        "совпадение личной записи."
-                    ),
-                    "Не найдено": (
-                        "Личная учётная запись "
-                        "не найдена."
-                    ),
-                }.get(
-                    personal_status,
-                    personal_status,
-                )
-
-                issues.append({
-                    "category": "Личная запись сотрудника",
-                    "smstore": smstore,
-                    "store_name": store_name,
-                    "employee_fio": employee["fio"],
-                    "issue": issue_text,
-                    "candidates": _matches_to_text(
-                        personal_exact,
-                        personal_similar,
-                    ),
-                    "recommendation": (
-                        "Проверить ИНН, ФИО и активность "
-                        "пользователя в Bitrix24."
-                    ),
-                })
-
-            employee_results.append({
-                "employee": employee,
-                "personal_status": personal_status,
-                "personal_exact": personal_exact,
-                "personal_similar": personal_similar,
-                "warnings": employee_warnings,
-            })
-
-        stores_result.append({
-            "smstore": smstore,
+        rows.append({
             "store": store,
-            "store_identity": (
-                identity["label"]
-                or "Не определён"
-            ),
-            "store_brand": identity["brand"],
-            "counts": counts,
-            "names_by_role": names_by_role,
-            "employees": employee_results,
-            "shared_admin_status": admin_status,
-            "shared_admin_exact": admin_exact,
-            "shared_admin_similar": admin_similar,
-            "shared_receiver_status": receiver_status,
-            "shared_receiver_exact": receiver_exact,
-            "shared_receiver_similar": receiver_similar,
-            "warnings": store_warnings,
+            "smstore": smstore,
+            "store_name": store_name,
+            "position": employee["position"],
+            "role_group": role_group,
+            "fio": employee["fio"],
+            "inn": employee["inn"],
+            "account_type": account_type,
+            "status": status,
+            "exact": exact,
+            "similar": similar,
+            "comment": " ".join(comments),
         })
 
-    stores_result.sort(
-        key=lambda item: (
-            _string(
-                (item.get("store") or {}).get("region")
-            ).casefold(),
-            _string(
-                (item.get("store") or {}).get("name")
-            ).casefold(),
-            item.get("smstore") or 0,
-        )
-    )
+    role_order = {
+        "Директор": 1,
+        "Администратор": 2,
+        "Приемщик": 3,
+    }
 
-    issues.sort(
-        key=lambda item: (
-            _string(item.get("store_name")).casefold(),
-            _string(item.get("category")).casefold(),
-            _string(item.get("employee_fio")).casefold(),
+    rows.sort(
+        key=lambda row: (
+            _string(
+                (row.get("store") or {}).get("region")
+            ).casefold(),
+            row["store_name"].casefold(),
+            role_order.get(row["role_group"], 9),
+            row["fio"].casefold(),
         )
     )
 
     summary = {
         "onec_total_employees": onec_total,
-        "target_employees": len(employees),
-        "stores_1c": len(stores_result),
-        "stores_mapped": sum(
-            1
-            for item in stores_result
-            if item["store"]
-        ),
+        "target_employees": len(rows),
+        "stores_1c": len({
+            row["smstore"]
+            for row in rows
+        }),
         "directors_1c": sum(
-            item["counts"]["directors"]
-            for item in stores_result
+            row["role_group"] == "Директор"
+            for row in rows
         ),
         "administrators_1c": sum(
-            item["counts"]["administrators"]
-            for item in stores_result
+            row["role_group"] == "Администратор"
+            for row in rows
         ),
         "receivers_1c": sum(
-            item["counts"]["receivers"]
-            for item in stores_result
+            row["role_group"] == "Приемщик"
+            for row in rows
         ),
         "bitrix_users": len(bitrix_users),
-        "personal_found": personal_found,
-        "personal_ambiguous": personal_ambiguous,
-        "personal_possible": personal_possible,
-        "personal_missing": personal_missing,
-        "shared_admin_found": shared_admin_found,
-        "shared_admin_possible": shared_admin_possible,
-        "shared_admin_missing": shared_admin_missing,
-        "shared_receiver_found": shared_receiver_found,
-        "shared_receiver_possible": shared_receiver_possible,
-        "shared_receiver_missing": shared_receiver_missing,
-        "issues": len(issues),
+        "found": status_totals["found"],
+        "ambiguous": status_totals["ambiguous"],
+        "possible": status_totals["possible"],
+        "missing": status_totals["missing"],
+        "issues": (
+            status_totals["ambiguous"]
+            + status_totals["possible"]
+            + status_totals["missing"]
+        ),
     }
 
     return {
         "generated_at": timezone.localtime().isoformat(),
         "summary": summary,
-        "stores": stores_result,
-        "issues": issues,
+        "rows": rows,
     }
 
 
@@ -1726,268 +1670,66 @@ def write_directors_report_xlsx(
     )
 
     workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Отчёт"
 
-    # -------------------------------------------------
-    # Лист 1. Все сотрудники из 1С по магазинам
-    # -------------------------------------------------
-    onec_ws = workbook.active
-    onec_ws.title = "Сотрудники 1С"
-
-    onec_ws.append([
-        "Регион",
-        "smstore / ИдМагазина",
+    worksheet.append([
         "Магазин",
-        "Адрес",
-        "Группа должности",
-        "Должность в 1С",
+        "Должность",
         "ФИО",
-        "ИНН",
-        "Телефон",
-        "Почта",
-        "Подразделение",
+        "Учётная запись Bitrix24",
+        "Результат / уточнение",
     ])
 
-    for store_result in report["stores"]:
-        store = store_result.get("store") or {}
+    for row in report["rows"]:
+        store = row.get("store") or {}
 
-        for employee_result in store_result["employees"]:
-            employee = employee_result["employee"]
+        store_parts = [
+            row["store_name"],
+        ]
 
-            onec_ws.append([
-                _excel_safe(store.get("region", "")),
-                employee.get("smstore") or "",
-                _excel_safe(store.get("name", "")),
-                _excel_safe(store.get("address", "")),
-                _excel_safe(employee["role_group"]),
-                _excel_safe(employee["position"]),
-                _excel_safe(employee["fio"]),
-                _excel_safe(employee["inn"]),
-                _excel_safe(employee["phone"]),
-                _excel_safe(employee["email"]),
-                _excel_safe(employee["department"]),
-            ])
+        if row.get("smstore") is not None:
+            store_parts.append(
+                f"smstore={row['smstore']}"
+            )
 
-    _style_worksheet(onec_ws)
+        if store.get("region"):
+            store_parts.append(store["region"])
 
-    # -------------------------------------------------
-    # Лист 2. Проверка Bitrix
-    # -------------------------------------------------
-    bitrix_ws = workbook.create_sheet(
-        "Проверка Bitrix"
-    )
+        store_text = "\n".join(store_parts)
 
-    bitrix_ws.append([
-        "Регион",
-        "smstore",
-        "Магазин",
-        "Идентификатор магазина",
-        "Группа должности",
-        "Должность в 1С",
-        "ФИО",
-        "ИНН",
-        "Статус личной записи",
-        "Личные записи Bitrix24",
-        "Статус общей записи администраторов",
-        "Общие записи администраторов",
-        "Статус общей записи приемщиков",
-        "Общие записи приемщиков",
-        "Предупреждения",
-    ])
-
-    for store_result in report["stores"]:
-        store = store_result.get("store") or {}
-
-        admin_accounts = _matches_to_text(
-            store_result["shared_admin_exact"],
-            store_result["shared_admin_similar"],
+        matches = _matches_to_text(
+            row["exact"],
+            row["similar"],
         )
 
-        receiver_accounts = _matches_to_text(
-            store_result["shared_receiver_exact"],
-            store_result["shared_receiver_similar"],
+        account_text = (
+            f"{row['account_type']}\n{matches}"
+            if matches
+            else (
+                f"{row['account_type']}\n"
+                "Учётная запись не найдена"
+            )
         )
 
-        for employee_result in store_result["employees"]:
-            employee = employee_result["employee"]
+        result_text = (
+            f"{row['status']}. {row['comment']}"
+        ).strip()
 
-            warnings = (
-                list(store_result["warnings"])
-                + list(employee_result["warnings"])
-            )
-
-            bitrix_ws.append([
-                _excel_safe(store.get("region", "")),
-                employee.get("smstore") or "",
-                _excel_safe(store.get("name", "")),
-                _excel_safe(
-                    store_result["store_identity"]
-                ),
-                _excel_safe(employee["role_group"]),
-                _excel_safe(employee["position"]),
-                _excel_safe(employee["fio"]),
-                _excel_safe(employee["inn"]),
-                _excel_safe(
-                    employee_result["personal_status"]
-                ),
-                _excel_safe(
-                    _matches_to_text(
-                        employee_result[
-                            "personal_exact"
-                        ],
-                        employee_result[
-                            "personal_similar"
-                        ],
-                    )
-                ),
-                _excel_safe(
-                    store_result[
-                        "shared_admin_status"
-                    ]
-                ),
-                _excel_safe(admin_accounts),
-                _excel_safe(
-                    store_result[
-                        "shared_receiver_status"
-                    ]
-                ),
-                _excel_safe(receiver_accounts),
-                _excel_safe("\n".join(warnings)),
-            ])
-
-    _style_worksheet(bitrix_ws)
-
-    # -------------------------------------------------
-    # Лист 3. Сводка по магазинам
-    # -------------------------------------------------
-    stores_ws = workbook.create_sheet(
-        "Сводка по магазинам"
-    )
-
-    stores_ws.append([
-        "Регион",
-        "smstore",
-        "Магазин",
-        "Адрес",
-        "Всего сотрудников",
-        "Количество директоров",
-        "Директора",
-        "Количество администраторов",
-        "Администраторы",
-        "Количество приемщиков",
-        "Приемщики",
-        "Личные записи сотрудников Bitrix24",
-        "Общие записи администраторов",
-        "Общие записи приемщиков",
-        "Предупреждения",
-    ])
-
-    for store_result in report["stores"]:
-        store = store_result.get("store") or {}
-
-        personal_accounts = []
-
-        for employee_result in store_result["employees"]:
-            employee = employee_result["employee"]
-
-            personal_accounts.append(
-                f"{employee['role_group']}: "
-                f"{employee['fio']} — "
-                f"{employee_result['personal_status']}"
-            )
-
-            accounts_text = _matches_to_text(
-                employee_result["personal_exact"],
-                employee_result["personal_similar"],
-            )
-
-            if accounts_text:
-                personal_accounts.append(
-                    accounts_text
-                )
-
-        stores_ws.append([
-            _excel_safe(store.get("region", "")),
-            store_result.get("smstore") or "",
-            _excel_safe(store.get("name", "")),
-            _excel_safe(store.get("address", "")),
-            store_result["counts"]["total"],
-            store_result["counts"]["directors"],
-            _excel_safe(
-                _employee_names_text(
-                    store_result,
-                    "Директор",
-                )
-            ),
-            store_result["counts"]["administrators"],
-            _excel_safe(
-                _employee_names_text(
-                    store_result,
-                    "Администратор",
-                )
-            ),
-            store_result["counts"]["receivers"],
-            _excel_safe(
-                _employee_names_text(
-                    store_result,
-                    "Приемщик",
-                )
-            ),
-            _excel_safe("\n".join(personal_accounts)),
-            _excel_safe(
-                _matches_to_text(
-                    store_result[
-                        "shared_admin_exact"
-                    ],
-                    store_result[
-                        "shared_admin_similar"
-                    ],
-                )
-            ),
-            _excel_safe(
-                _matches_to_text(
-                    store_result[
-                        "shared_receiver_exact"
-                    ],
-                    store_result[
-                        "shared_receiver_similar"
-                    ],
-                )
-            ),
-            _excel_safe(
-                "\n".join(store_result["warnings"])
-            ),
+        worksheet.append([
+            _excel_safe(store_text),
+            _excel_safe(row["position"]),
+            _excel_safe(row["fio"]),
+            _excel_safe(account_text),
+            _excel_safe(result_text),
         ])
 
-    _style_worksheet(stores_ws)
+    _style_worksheet(worksheet)
 
-    # -------------------------------------------------
-    # Лист 4. Все спорные моменты
-    # -------------------------------------------------
-    issues_ws = workbook.create_sheet(
-        "Спорные моменты"
-    )
-
-    issues_ws.append([
-        "Категория",
-        "smstore",
-        "Магазин",
-        "ФИО сотрудника",
-        "Проблема",
-        "Возможные совпадения",
-        "Что проверить",
-    ])
-
-    for issue in report["issues"]:
-        issues_ws.append([
-            _excel_safe(issue["category"]),
-            issue.get("smstore") or "",
-            _excel_safe(issue["store_name"]),
-            _excel_safe(issue["employee_fio"]),
-            _excel_safe(issue["issue"]),
-            _excel_safe(issue["candidates"]),
-            _excel_safe(issue["recommendation"]),
-        ])
-
-    _style_worksheet(issues_ws)
+    worksheet.column_dimensions["A"].width = 38
+    worksheet.column_dimensions["B"].width = 26
+    worksheet.column_dimensions["C"].width = 38
+    worksheet.column_dimensions["D"].width = 65
+    worksheet.column_dimensions["E"].width = 65
 
     workbook.save(target_path)
