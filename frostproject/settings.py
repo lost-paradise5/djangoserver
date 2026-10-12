@@ -159,35 +159,92 @@ SECURE_PROXY_SSL_HEADER = (
 )
 
 
-# EMAIL / SMTP (Mail.ru)
+# # EMAIL / SMTP (Mail.ru)
 
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+# EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 
-# EMAIL_HOST = 'smtp.mail.ru'
+# # EMAIL_HOST = 'smtp.mail.ru'
+# # EMAIL_PORT = 465
+
+# # EMAIL_HOST_USER = 'denis.lomaster@mail.ru'
+# # EMAIL_HOST_PASSWORD = 'a61hEWZvzhNRPxjnhEIA'
+
+# # EMAIL_USE_SSL = True
+# # EMAIL_USE_TLS = False
+
+# # DEFAULT_FROM_EMAIL = 'denis.lomaster@mail.ru'
+# # SERVER_EMAIL = 'denis.lomaster@mail.ru'
+
+# # EMAIL_TIMEOUT = 15
+
+# EMAIL_HOST = 'smtp.yandex.ru'
 # EMAIL_PORT = 465
 
-# EMAIL_HOST_USER = 'denis.lomaster@mail.ru'
-# EMAIL_HOST_PASSWORD = 'a61hEWZvzhNRPxjnhEIA'
+# EMAIL_HOST_USER = 'informant@retail03.ru'
+# # EMAIL_HOST_PASSWORD = 'xkzuyzwzuavpcbpc'
 
+# EMAIL_HOST_PASSWORD = 'inzpkxlgmjgsejwn'
 # EMAIL_USE_SSL = True
 # EMAIL_USE_TLS = False
 
-# DEFAULT_FROM_EMAIL = 'denis.lomaster@mail.ru'
-# SERVER_EMAIL = 'denis.lomaster@mail.ru'
+# DEFAULT_FROM_EMAIL = 'informant@retail03.ru'
+# SERVER_EMAIL = 'informant@retail03.ru'
 
-# EMAIL_TIMEOUT = 15
+# EMAIL_TIMEOUT = 25
 
-EMAIL_HOST = 'smtp.yandex.ru'
-EMAIL_PORT = 465
 
-EMAIL_HOST_USER = 'informant@retail03.ru'
-# EMAIL_HOST_PASSWORD = 'xkzuyzwzuavpcbpc'
 
-EMAIL_HOST_PASSWORD = 'inzpkxlgmjgsejwn'
-EMAIL_USE_SSL = True
-EMAIL_USE_TLS = False
 
-DEFAULT_FROM_EMAIL = 'informant@retail03.ru'
-SERVER_EMAIL = 'informant@retail03.ru'
 
-EMAIL_TIMEOUT = 25
+
+
+
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+
+EMAIL_HOST = os.getenv(
+    "EMAIL_HOST",
+    "smtp.mail.ru",
+).strip()
+
+EMAIL_PORT = int(
+    os.getenv("EMAIL_PORT", "465")
+)
+
+EMAIL_HOST_USER = os.getenv(
+    "EMAIL_HOST_USER",
+    "",
+).strip()
+
+EMAIL_HOST_PASSWORD = os.getenv(
+    "EMAIL_HOST_PASSWORD",
+    "",
+).strip()
+
+EMAIL_USE_SSL = (
+    os.getenv("EMAIL_USE_SSL", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+EMAIL_USE_TLS = (
+    os.getenv("EMAIL_USE_TLS", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+DEFAULT_FROM_EMAIL = os.getenv(
+    "DEFAULT_FROM_EMAIL",
+    EMAIL_HOST_USER,
+).strip()
+
+SERVER_EMAIL = os.getenv(
+    "SERVER_EMAIL",
+    EMAIL_HOST_USER,
+).strip()
+
+EMAIL_TIMEOUT = int(
+    os.getenv("EMAIL_TIMEOUT", "25")
+)
+
+if EMAIL_USE_SSL and EMAIL_USE_TLS:
+    raise RuntimeError(
+        "EMAIL_USE_SSL и EMAIL_USE_TLS нельзя включать одновременно"
+    )
