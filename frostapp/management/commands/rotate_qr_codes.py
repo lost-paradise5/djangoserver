@@ -754,8 +754,20 @@ class Command(BaseCommand):
 
 
         except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
+            error_text = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            close_batch(
+                self._ukm4_batch_id,
+                outcome="failed",
+                summary={
+                    "error_type": type(exc).__name__,
+                },
+            )
+
             recorder.fail(error_text)
+
             logger.exception(
                 "[ROTATE][FATAL] system=%s error=%s",
                 target_system,
