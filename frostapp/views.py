@@ -94,6 +94,11 @@ from django.core.cache import cache
 from django.views.decorators.clickjacking import xframe_options_exempt
 
 
+from frostapp.services.ukm4_verification import (
+    prepare_check,
+    submission_result,
+)
+
 from frostapp.services.ukm_rotation_bitrix_auth import (
     RotationAuthError,
     audit_rotation,
@@ -4846,7 +4851,10 @@ def connect_store_mysql(host: str):
         password="jgOKsc2n",
         database="import4",
         charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=5,
+        read_timeout=15,
+        write_timeout=15,
     )
 
 
@@ -5953,6 +5961,7 @@ def _update_store_mysql_and_xml_for_single_store(
     *,
     target_system: str = "both",
     ukm5_submit_only: bool = False,
+    ukm4_check_id: str | None = None,
 ) -> dict:
     """
     Обновляет кассира по одному магазину:
@@ -6087,8 +6096,46 @@ def _update_store_mysql_and_xml_for_single_store(
                 "VALUES ('incr', %s)",
                 (base_version,)
             )
-    
+            
+            if ukm4_check_id:
+                date_columns = (
+                    "`start_date`, `end_date`"
+                    if ttl_supported
+                    else (
+                        "NULL AS start_date, "
+                        "NULL AS end_date"
+                    )
+                )
+            
+                cur.execute(
+                    "SELECT `password`, "
+                    + date_columns
+                    + " FROM `users` "
+                      "WHERE `store` = %s AND `id` = %s",
+                    (
+                        int(store_id),
+                        int(cashier_id),
+                    ),
+                )
+            
+                converter_row = cur.fetchone()
+            
+                if not converter_row:
+                    raise RuntimeError(
+                        "После записи не найдена строка "
+                        "в import4.users"
+                    )
+            
+                # Сохраняем ожидаемый хеш и даты до commit.
+                prepare_check(
+                    task_id=ukm4_check_id,
+                    host=str(ukm4ip),
+                    converter_row=converter_row,
+                )
+            
             conv.commit()
+            
+            submission_result(ukm4_check_id)
     
             result["ukm4"] = {
                 "status": "ok",
@@ -6112,6 +6159,13 @@ def _update_store_mysql_and_xml_for_single_store(
             if conv:
                 try:
                     conv.rollback()
+                    submission_result(
+                        ukm4_check_id,
+                        error=(
+                            f"{type(e).__name__}: "
+                            "ошибка отправки в конвертер"
+                        ),
+                    )
                 except Exception:
                     pass
     
@@ -6130,14 +6184,11 @@ def _update_store_mysql_and_xml_for_single_store(
                     conv.close()
             except Exception:
                 pass
-    else:
-        logger.error(f"[QR/EMP] Store {store_id}: ukm4ip not found; пропускаем import4.users/signal")
-        result["ukm4"] = {
-            "status": "skipped_no_ukm4ip",
-            "host": None,
-            "version": None,
-            "error": "ukm4ip not found",
-        }
+    elif target_system in {"ukm4", "both"}:
+        submission_result(
+            ukm4_check_id,
+            error="Не найден ukm4ip магазина",
+        )
 
     # ---- UKM5 / API вместо XML ----
 
