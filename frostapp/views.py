@@ -3759,21 +3759,64 @@ _TELEGRAM_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _MAX_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _QR_DB_LOG_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
-def send_max_admin_log(message: str) -> None:
+# def send_max_admin_log(message: str) -> None:
+#     """
+#     Отправка админ-лога в MAX фиксированному пользователю.
+#     Синхронная функция, вызывать её нужно через executor.
+#     """
+#     text = (message or "").strip()
+#     if not text:
+#         return
+
+#     try:
+#         ok = send_max_to_user(MAX_ADMIN_LOG_USER_ID, text)
+#         if not ok:
+#             logger.error(f"[MAX/ADMIN] Не удалось отправить лог user_id={MAX_ADMIN_LOG_USER_ID}")
+#     except Exception as e:
+#         logger.exception(f"[MAX/ADMIN] Ошибка отправки лога в MAX: {e}")
+
+def send_max_admin_log(message: str) -> bool:
     """
-    Отправка админ-лога в MAX фиксированному пользователю.
-    Синхронная функция, вызывать её нужно через executor.
+    Синхронная отправка лога админу MAX.
+
+    Возвращает True, если send_max_to_user()
+    подтвердил успешную отправку.
     """
     text = (message or "").strip()
+
     if not text:
-        return
+        return False
+
+    if not MAX_BOT_TOKEN:
+        logger.error(
+            "[MAX/ADMIN] MAX_BOT_TOKEN не настроен"
+        )
+        return False
 
     try:
-        ok = send_max_to_user(MAX_ADMIN_LOG_USER_ID, text)
+        ok = bool(
+            send_max_to_user(
+                MAX_ADMIN_LOG_USER_ID,
+                text,
+            )
+        )
+
         if not ok:
-            logger.error(f"[MAX/ADMIN] Не удалось отправить лог user_id={MAX_ADMIN_LOG_USER_ID}")
-    except Exception as e:
-        logger.exception(f"[MAX/ADMIN] Ошибка отправки лога в MAX: {e}")
+            logger.error(
+                "[MAX/ADMIN] Не удалось отправить "
+                "лог user_id=%s",
+                MAX_ADMIN_LOG_USER_ID,
+            )
+
+        return ok
+
+    except Exception:
+        logger.exception(
+            "[MAX/ADMIN] Ошибка отправки "
+            "лога user_id=%s",
+            MAX_ADMIN_LOG_USER_ID,
+        )
+        return False
 
 
 def _send_max_log_async(message: str) -> None:
