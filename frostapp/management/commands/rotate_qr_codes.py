@@ -2038,7 +2038,15 @@ class Command(BaseCommand):
     
             issues.append("UKM5 WARN: " + ", ".join(warn_reasons))
 
-    
+
+        if (
+            target_system == "ukm4"
+            and ukm4_status == "ok"
+        ):
+            notes.append(
+                "Передано в import4.users/signal; "
+                "проверка trm_in_users выполняется отдельно"
+            )
 
         if not issues:
             return "ok", "; ".join(notes) if notes else "OK"
@@ -2279,6 +2287,12 @@ class Command(BaseCommand):
                 f"🌙 Обновление {system_label}"
             )
 
+            if target_system == "ukm4" and not dry_run:
+                header = (
+                    "🌙 УКМ-4: отправка в конвертер завершена.\n"
+                    "Проверка базы выполняется отдельно."
+                )
+
 
 
             ukm4_ok = ukm4_err = 0
@@ -2407,7 +2421,12 @@ class Command(BaseCommand):
 
 
             if target_system == "ukm4":
-                sync_summary = [f"UKM4: ok={ukm4_ok} err={ukm4_err}"]
+                sync_summary = [
+                    (
+                        "УКМ-4: передано конвертеру="
+                        f"{ukm4_ok}; ошибок отправки={ukm4_err}"
+                    ),
+                ]
             else:
                 sync_summary = [
                     f"UKM5: confirmed={ukm5_ok} "
@@ -2457,7 +2476,11 @@ class Command(BaseCommand):
 
                 ),
 
-                f"Обновлено: {rotated}",
+                (
+                    f"Отправлено без ошибок: {rotated}"
+                    if target_system == "ukm4"
+                    else f"Обновлено: {rotated}"
+                ),
 
                 f"Частично: {partial}",
 
