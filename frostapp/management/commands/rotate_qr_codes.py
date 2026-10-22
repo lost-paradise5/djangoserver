@@ -26,6 +26,12 @@ from frostapp.views import (
     TRM_SMALL_MAX,
 )
 
+from frostapp.services.ukm4_verification import (
+    start_batch,
+    close_batch,
+    create_check,
+)
+
 from frostapp.services.ukm_rotation_bitrix_auth import (
     rotation_actor_label,
 )
@@ -214,7 +220,14 @@ class Command(BaseCommand):
             help='Ограничить обработку одним user_id'
         )
 
-        parser.add_argument('--tz', type=str, default=os.getenv('ROTATION_TZ', 'Europe/Stockholm'))
+        parser.add_argument(
+            "--tz",
+            type=str,
+            default=os.getenv(
+                "ROTATION_TZ",
+                "Asia/Irkutsk",
+            ),
+        )
 
         parser.add_argument(
 
@@ -239,6 +252,7 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         target_system = str(opts["system"]).lower()
         self.target_system = target_system
+        self._ukm4_batch_id = None
         recorder = UkmRotationRunRecorder(opts.get("run_id"))
 
         self._rotation_initiator = (
@@ -272,6 +286,14 @@ class Command(BaseCommand):
 
 
         try:
+            if (
+                target_system == "ukm4"
+                and not opts["dry_run"]
+            ):
+                self._ukm4_batch_id = start_batch(
+                    run_id=self._rotation_run_id,
+                    initiator=self._rotation_initiator,
+                )
 
             bs = opts['batch_size']
             tz = ZoneInfo(opts['tz'])
@@ -571,6 +593,13 @@ class Command(BaseCommand):
                         f"Не удалось получить сотрудников из 1С: "
                         f"{type(exc).__name__}: {exc}"
                     )
+                    close_batch(
+                        self._ukm4_batch_id,
+                        outcome="failed",
+                        summary={
+                            "error_type": type(exc).__name__,
+                        },
+                    )
                     logger.error(
                         "[ROTATE][ORG_INN][FATAL] %s",
                         error_text,
@@ -702,6 +731,25 @@ class Command(BaseCommand):
                 failed_users=failed,
                 elapsed_sec=elapsed,
             )
+            close_batch(
+                self._ukm4_batch_id,
+                outcome=run_status,
+                summary={
+                    "rotation": {
+                        "candidates": total,
+                        "submitted_users": rotated,
+                        "partial": partial,
+                        "skipped": skipped,
+                        "failed": failed,
+                        "excluded_department": len(
+                            excluded_department_details
+                        ),
+                    },
+                    "tz": opts["tz"],
+                },
+            )
+
+        
 
 
 
@@ -728,7 +776,16 @@ class Command(BaseCommand):
             )
             raise
         finally:
-            self._release_lock()
+            try:
+                # Если пакет уже закрыт выше,
+                # повторный вызов ничего не меняет.
+                close_batch(
+                    self._ukm4_batch_id,
+                    outcome="interrupted",
+                    summary={},
+                )
+            finally:
+                self._release_lock()
 
 
 
@@ -1776,6 +1833,20 @@ class Command(BaseCommand):
                 if converter_cashier_id is None:
                     converter_cashier_id = cashier_id_for_store
 
+
+                check_id = None
+
+                if target_system == "ukm4":
+                    check_id = create_check(
+                        batch_id=self._ukm4_batch_id,
+                        user_id=int(user.id),
+                        store_id=int(store_id),
+                        cashier_id=int(cashier_id_for_store),
+                        fio=fio,
+                        inn=plain_inn,
+                        password=password_plain,
+                    )
+
                 sync_result = _update_store_mysql_and_xml_for_single_store(
                     store_id=store_id,
                     cashier_id=cashier_id_for_store,
@@ -1785,6 +1856,7 @@ class Command(BaseCommand):
                     password_plain=password_plain,
                     target_system=target_system,
                     ukm5_submit_only=ukm5_submit_only,
+                    ukm4_check_id=check_id,
                 )
 
                 store_status, store_summary = self._classify_store_sync(
