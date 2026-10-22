@@ -6194,27 +6194,41 @@ def _update_store_mysql_and_xml_for_single_store(
             )
     
         except Exception as e:
-            logger.error(
-                f"[QR/EMP] Store {store_id} ({ukm4ip}) MySQL error: {e}",
-                exc_info=True
+            logger.exception(
+                "[QR/EMP] Store %s (%s): "
+                "ошибка отправки в конвертер",
+                store_id,
+                ukm4ip,
             )
-    
-            if conv:
+
+            if conv is not None:
                 try:
                     conv.rollback()
-                    submission_result(
-                        ukm4_check_id,
-                        error=(
-                            f"{type(e).__name__}: "
-                            "ошибка отправки в конвертер"
-                        ),
-                    )
                 except Exception:
-                    pass
-    
+                    logger.exception(
+                        "[QR/EMP] Store %s (%s): "
+                        "не удалось выполнить rollback",
+                        store_id,
+                        ukm4ip,
+                    )
+
+            # Выполняется независимо от наличия
+            # соединения и результата rollback.
+            submission_result(
+                ukm4_check_id,
+                error=(
+                    f"{type(e).__name__}: "
+                    "ошибка отправки в конвертер"
+                ),
+            )
+
             result["ukm4"] = {
                 "status": "error",
-                "host": str(ukm4ip) if ukm4ip else None,
+                "host": (
+                    str(ukm4ip)
+                    if ukm4ip
+                    else None
+                ),
                 "version": None,
                 "error": str(e),
             }
@@ -6228,6 +6242,20 @@ def _update_store_mysql_and_xml_for_single_store(
             except Exception:
                 pass
     elif target_system in {"ukm4", "both"}:
+        result["ukm4"] = {
+            "status": "skipped_no_ukm4ip",
+            "host": None,
+            "version": None,
+            "error": "Не найден ukm4ip магазина",
+        }
+
+        logger.error(
+            "[QR/EMP] Store %s: "
+            "не найден ukm4ip, запись в конвертер "
+            "не выполнена",
+            store_id,
+        )
+
         submission_result(
             ukm4_check_id,
             error="Не найден ukm4ip магазина",
