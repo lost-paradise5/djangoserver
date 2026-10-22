@@ -970,11 +970,15 @@ def queue_reports():
 
 
 def send_one():
+    # Импорт внутри функции исключает
+    # циклический импорт с views.py.
+    from frostapp.views import send_max_admin_log
+
     rows = sql("""
         SELECT o.*
         FROM ukm4_max_outbox o
-        WHERE sent_at IS NULL
-          AND next_attempt_at <= now()
+        WHERE o.sent_at IS NULL
+          AND o.next_attempt_at <= now()
           AND NOT EXISTS (
               SELECT 1
               FROM ukm4_max_outbox previous
@@ -982,7 +986,7 @@ def send_one():
                 AND previous.part < o.part
                 AND previous.sent_at IS NULL
           )
-        ORDER BY id
+        ORDER BY o.id
         LIMIT 1
     """)
 
@@ -991,51 +995,17 @@ def send_one():
 
     item = rows[0]
 
-    try:
-        token = env("UKM4_MAX_BOT_TOKEN")
-        chat_id = env("UKM4_MAX_CHAT_ID")
+    sent = send_max_admin_log(
+        item["text"]
+    )
 
-        if not token or not chat_id:
-            raise ValueError(
-                "Не настроены UKM4_MAX_BOT_TOKEN "
-                "/ UKM4_MAX_CHAT_ID"
-            )
-
-        response = requests.post(
-            "https://platform-api2.max.ru/messages",
-            params={
-                "chat_id": int(chat_id),
-            },
-            headers={
-                "Authorization": token,
-            },
-            json={
-                "text": item["text"],
-            },
-            timeout=(5, 15),
-            allow_redirects=False,
-        )
-
-        response.raise_for_status()
-        body = response.json()
-
-        message_id = (
-            (
-                (body.get("message") or {})
-                .get("body") or {}
-            )
-            .get("mid")
-        )
-
-        if not message_id:
-            raise ValueError(
-                "MAX не подтвердил message.body.mid"
-            )
-
-    except Exception as exc:
+    if not sent:
         delay = min(
             3600,
-            15 * 2 ** min(item["attempts"], 8),
+            15 * 2 ** min(
+                item["attempts"],
+                8,
+            ),
         )
 
         sql("""
@@ -1045,8 +1015,12 @@ def send_one():
                 next_attempt_at =
                     now() + %s * interval '1 second'
             WHERE id = %s
+              AND sent_at IS NULL
         """, [
-            type(exc).__name__,
+            (
+                "Отправка админу MAX "
+                "не подтверждена"
+            ),
             delay,
             item["id"],
         ])
@@ -1056,13 +1030,10 @@ def send_one():
     sql("""
         UPDATE ukm4_max_outbox
         SET sent_at = now(),
-            message_id = %s,
             attempts = attempts + 1,
             last_error = ''
         WHERE id = %s
-    """, [
-        str(message_id),
-        item["id"],
-    ])
+          AND sent_at IS NULL
+    """, [item["id"]])
 
     return True
