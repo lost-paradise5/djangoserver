@@ -95,19 +95,91 @@ def deleted(value):
     )
 
 
-def start_batch(run_id=None, initiator=None):
+# def start_batch(run_id=None, initiator=None):
+#     batch_id = str(uuid.uuid4())
+
+#     sql("""
+#         INSERT INTO ukm4_verify_batch(
+#             id, rotation_run_id, meta
+#         )
+#         VALUES (%s, %s, %s::jsonb)
+#     """, [
+#         batch_id,
+#         run_id or None,
+#         json.dumps(
+#             {"initiator": initiator or {}},
+#             ensure_ascii=False,
+#         ),
+#     ])
+
+#     return batch_id
+
+def start_batch(
+    run_id=None,
+    initiator=None,
+):
     batch_id = str(uuid.uuid4())
+
+    meta = {
+        "initiator": initiator or {},
+    }
+
+    enabled = env(
+        "UKM4_STORE_ALERTS_ENABLED",
+        "1",
+    ).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    if enabled:
+        chat_id = int(
+            env(
+                "UKM4_STORE_ALERT_CHAT_ID",
+                "-80639054600805",
+            )
+        )
+
+        bot_url = env(
+            "UKM4_BACKUP_BOT_URL",
+            "https://max.ru/id0300005666_bot",
+        )
+
+        if (
+            not chat_id
+            or not bot_url.startswith(
+                "https://max.ru/"
+            )
+            or len(bot_url) > 300
+        ):
+            raise ValueError(
+                "Проверьте настройки чата "
+                "и резервного бота"
+            )
+
+        meta["store_alert"] = {
+            "chat_id": chat_id,
+            "bot_url": bot_url,
+            "tz": env(
+                "ROTATION_TZ",
+                "Asia/Irkutsk",
+            ),
+        }
 
     sql("""
         INSERT INTO ukm4_verify_batch(
-            id, rotation_run_id, meta
+            id,
+            rotation_run_id,
+            meta
         )
         VALUES (%s, %s, %s::jsonb)
     """, [
         batch_id,
         run_id or None,
         json.dumps(
-            {"initiator": initiator or {}},
+            meta,
             ensure_ascii=False,
         ),
     ])
@@ -1035,5 +1107,343 @@ def send_one():
         WHERE id = %s
           AND sent_at IS NULL
     """, [item["id"]])
+
+    return True
+
+
+
+
+
+
+
+
+
+
+ALERT_FAILURE_STATUSES = frozenset({
+    "timeout",
+    "unavailable",
+    "schema_error",
+    "submit_failed",
+})
+
+
+def _store_alert_tasks(
+    batch_id,
+    store_id,
+):
+    return sql("""
+        SELECT
+            t.*,
+            EXISTS (
+                SELECT 1
+                FROM ukm4_verify_task newer
+                WHERE newer.user_id = t.user_id
+                  AND newer.store_id = t.store_id
+                  AND newer.batch_id <> t.batch_id
+                  AND newer.prepared_at >
+                      COALESCE(
+                          t.prepared_at,
+                          t.created_at
+                      )
+            ) AS has_newer_attempt
+        FROM ukm4_verify_task t
+        WHERE t.batch_id = %s
+          AND t.store_id = %s
+        ORDER BY t.user_id
+    """, [
+        batch_id,
+        store_id,
+    ])
+
+
+def _store_alert_text(
+    batch,
+    store_id,
+    tasks,
+):
+    from frostapp.models import Store
+
+    failures = [
+        task
+        for task in tasks
+        if (
+            task["status"]
+            in ALERT_FAILURE_STATUSES
+            and not task["has_newer_attempt"]
+        )
+    ]
+
+    if not failures:
+        return None
+
+    # В текущем проекте Store связан с stores.
+    # Номер магазина здесь — ukm4store, не PK id.
+    name = (
+        Store.objects
+        .filter(ukm4store=store_id)
+        .order_by("id")
+        .values_list("name", flat=True)
+        .first()
+        or "Название не указано"
+    )
+
+    name = " ".join(
+        str(name).split()
+    )[:250]
+
+    config = batch["meta"]["store_alert"]
+    tz = ZoneInfo(config["tz"])
+
+    started = (
+        batch["started_at"]
+        .astimezone(tz)
+        .strftime("%d.%m.%Y %H:%M")
+    )
+
+    counts = Counter(
+        task["status"]
+        for task in failures
+    )
+
+    confirmed = sum(
+        task["status"] == "verified"
+        and not task["has_newer_attempt"]
+        for task in tasks
+    )
+
+    labels = {
+        "timeout": (
+            "Не совпали ожидаемые данные"
+        ),
+        "unavailable": (
+            "База УКМ-4 недоступна для проверки"
+        ),
+        "schema_error": (
+            "Не удалось проверить структуру данных"
+        ),
+        "submit_failed": (
+            "Ошибка передачи в конвертер"
+        ),
+    }
+
+    lines = [
+        (
+            "⚠️ УКМ-4: не подтверждено обновление "
+            "паролей и сроков действия"
+        ),
+        f"Магазин: {store_id} — {name}",
+        f"Запуск: {started} ({tz.key})",
+        (
+            f"Не подтверждено: {len(failures)} "
+            f"из {len(tasks)} сотрудников."
+        ),
+        f"Подтверждено: {confirmed}.",
+    ]
+
+    lines.extend(
+        f"{label}: {counts[status]}."
+        for status, label in labels.items()
+        if counts[status]
+    )
+
+    lines.extend([
+        "",
+        "Используйте резервный бейдж.",
+        "Бот для резервного бейджа:",
+        config["bot_url"],
+        f"Пакет: {batch['id']}",
+    ])
+
+    return "\n".join(lines)
+
+
+def queue_store_alerts():
+    with transaction.atomic():
+        pairs = sql("""
+            SELECT
+                b.id AS batch_id,
+                t.store_id
+            FROM ukm4_verify_batch b
+            JOIN ukm4_verify_task t
+                ON t.batch_id = b.id
+            WHERE b.closed_at IS NOT NULL
+              AND b.meta ? 'store_alert'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ukm4_store_alert_outbox a
+                  WHERE a.batch_id = b.id
+                    AND a.store_id = t.store_id
+              )
+            GROUP BY b.id, t.store_id
+
+            HAVING COUNT(*) FILTER (
+                WHERE t.status IN (
+                    'creating',
+                    'pending'
+                )
+            ) = 0
+
+            AND COUNT(*) FILTER (
+                WHERE t.status IN (
+                    'timeout',
+                    'unavailable',
+                    'schema_error',
+                    'submit_failed'
+                )
+            ) > 0
+
+            ORDER BY
+                MIN(b.started_at),
+                t.store_id
+            LIMIT 20
+        """)
+
+        for pair in pairs:
+            batch = sql("""
+                SELECT *
+                FROM ukm4_verify_batch
+                WHERE id = %s
+            """, [
+                pair["batch_id"],
+            ])[0]
+
+            tasks = _store_alert_tasks(
+                pair["batch_id"],
+                pair["store_id"],
+            )
+
+            body = _store_alert_text(
+                batch,
+                pair["store_id"],
+                tasks,
+            )
+
+            sql("""
+                INSERT INTO ukm4_store_alert_outbox(
+                    batch_id,
+                    store_id,
+                    chat_id,
+                    text,
+                    canceled_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    CASE
+                        WHEN %s THEN now()
+                        ELSE NULL
+                    END
+                )
+                ON CONFLICT (
+                    batch_id,
+                    store_id
+                )
+                DO NOTHING
+            """, [
+                pair["batch_id"],
+                pair["store_id"],
+                batch["meta"]["store_alert"]["chat_id"],
+                body or "",
+                body is None,
+            ])
+
+
+def send_one_store_alert():
+    from frostapp.views import (
+        send_max_to_chat,
+    )
+
+    rows = sql("""
+        SELECT *
+        FROM ukm4_store_alert_outbox
+        WHERE sent_at IS NULL
+          AND canceled_at IS NULL
+          AND next_attempt_at <= now()
+        ORDER BY id
+        LIMIT 1
+    """)
+
+    if not rows:
+        return False
+
+    item = rows[0]
+
+    batch = sql("""
+        SELECT *
+        FROM ukm4_verify_batch
+        WHERE id = %s
+    """, [
+        item["batch_id"],
+    ])[0]
+
+    # Заново проверяем актуальность перед
+    # каждой попыткой отправки.
+    tasks = _store_alert_tasks(
+        item["batch_id"],
+        item["store_id"],
+    )
+
+    body = _store_alert_text(
+        batch,
+        item["store_id"],
+        tasks,
+    )
+
+    if body is None:
+        sql("""
+            UPDATE ukm4_store_alert_outbox
+            SET canceled_at = now(),
+                last_error = %s
+            WHERE id = %s
+        """, [
+            "Заменено более новой отправкой",
+            item["id"],
+        ])
+
+        return True
+
+    message_id = send_max_to_chat(
+        item["chat_id"],
+        body,
+    )
+
+    if message_id:
+        sql("""
+            UPDATE ukm4_store_alert_outbox
+            SET sent_at = now(),
+                message_id = %s,
+                text = %s,
+                attempts = attempts + 1,
+                last_error = ''
+            WHERE id = %s
+        """, [
+            message_id,
+            body,
+            item["id"],
+        ])
+
+    else:
+        delay = min(
+            3600,
+            15 * 2 ** min(
+                item["attempts"],
+                8,
+            ),
+        )
+
+        sql("""
+            UPDATE ukm4_store_alert_outbox
+            SET attempts = attempts + 1,
+                last_error = %s,
+                next_attempt_at =
+                    now() + %s * interval '1 second'
+            WHERE id = %s
+        """, [
+            "MAX не подтвердил отправку в чат",
+            delay,
+            item["id"],
+        ])
 
     return True
