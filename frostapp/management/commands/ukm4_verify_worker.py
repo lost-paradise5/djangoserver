@@ -13,6 +13,8 @@ from frostapp.services.ukm4_verification import (
     verify_due,
     queue_reports,
     send_one,
+    queue_store_alerts,
+    send_one_store_alert,
 )
 
 
@@ -81,9 +83,18 @@ class Command(BaseCommand):
 
                 recover_interrupted()
                 verify_due()
+
+                queue_store_alerts()
                 queue_reports()
 
-                attempted_delivery = send_one()
+                # За один проход выполняем одну отправку.
+                # Предупреждения магазинам идут первыми.
+                attempted_delivery = (
+                    send_one_store_alert()
+                )
+
+                if not attempted_delivery:
+                    attempted_delivery = send_one()
 
                 if options["once"]:
                     return
