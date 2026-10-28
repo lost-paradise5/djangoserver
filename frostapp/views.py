@@ -404,29 +404,130 @@ def _env_value(name: str, default: str = "", env_path: str = "/app/.env") -> str
 
 
 
-def get_ukm5_full_xml_store_ids() -> set[int]:
-    """
-    Динамически читает список магазинов для ночной ротации.
+# def get_ukm5_full_xml_store_ids() -> set[int]:
+#     """
+#     Динамически читает список магазинов для ночной ротации.
 
-    Приоритет:
-      1. /app/.env
-      2. переменная окружения UKM5_FULL_XML_STORE_IDS
-      3. дефолт 2013,9016,1003
-    """
-    default_csv = "2013,9016,1003"
+#     Приоритет:
+#       1. /app/.env
+#       2. переменная окружения UKM5_FULL_XML_STORE_IDS
+#       3. дефолт 2013,9016,1003
+#     """
+#     default_csv = "2013,9016,1003"
 
-    raw_from_file = _read_simple_env_file_value("UKM5_FULL_XML_STORE_IDS", "/app/.env")
-    if raw_from_file is not None:
-        result = _parse_int_set(raw_from_file)
-        if result:
-            return result
+#     raw_from_file = _read_simple_env_file_value("UKM5_FULL_XML_STORE_IDS", "/app/.env")
+#     if raw_from_file is not None:
+#         result = _parse_int_set(raw_from_file)
+#         if result:
+#             return result
 
-        logger.warning(
-            "[ENV] UKM5_FULL_XML_STORE_IDS найден в /app/.env, но список пустой/некорректный. "
-            "Использую fallback."
+#         logger.warning(
+#             "[ENV] UKM5_FULL_XML_STORE_IDS найден в /app/.env, но список пустой/некорректный. "
+#             "Использую fallback."
+#         )
+
+#     return _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", default_csv)
+
+
+def _rotation_store_ids(
+    name: str,
+    default: str = "",
+) -> set[int]:
+    raw = _read_simple_env_file_value(
+        name,
+        "/app/.env",
+    )
+
+    if raw is None:
+        raw = _env_value(name, default)
+
+    try:
+        result = {
+            int(part.strip())
+            for part in raw.split(",")
+            if part.strip()
+        }
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Некорректный список магазинов {name}"
+        ) from None
+
+    if any(value <= 0 for value in result):
+        raise ValueError(
+            f"В {name} допустимы только "
+            "положительные ID магазинов"
         )
 
-    return _parse_int_set_env("UKM5_FULL_XML_STORE_IDS", default_csv)
+    return result
+
+
+def get_ukm_rotation_store_groups():
+    regular = _rotation_store_ids(
+        "UKM5_FULL_XML_STORE_IDS",
+        "2013,9016,1003",
+    )
+
+    discounters = _rotation_store_ids(
+        "UKM_DISCOUNTER_STORE_IDS",
+        "",
+    )
+
+    overlap = regular & discounters
+
+    if overlap:
+        raise ValueError(
+            "Магазины указаны в обоих списках: "
+            + ", ".join(
+                map(str, sorted(overlap))
+            )
+        )
+
+    return regular, discounters
+
+
+def get_ukm5_full_xml_store_ids() -> set[int]:
+    """
+    Общее множество магазинов ротации.
+
+    Старое имя сохраняется для совместимости.
+    """
+    regular, discounters = (
+        get_ukm_rotation_store_groups()
+    )
+
+    return regular | discounters
+
+
+def build_ukm_rotation_links_filter(
+    store_ids,
+    *,
+    discounter_store_ids=None,
+):
+    selected = {
+        int(value)
+        for value in store_ids
+    }
+
+    if discounter_store_ids is None:
+        _, discounter_store_ids = (
+            get_ukm_rotation_store_groups()
+        )
+
+    discounters = (
+        selected & set(discounter_store_ids)
+    )
+    regular = selected - discounters
+
+    return (
+        Q(
+            storeid__in=sorted(regular),
+            roleid__in=[1, 13],
+        )
+        | Q(
+            storeid__in=sorted(discounters),
+            roleid__in=[11, 12],
+        )
+    )
 
 
 # Оставляем старую переменную для совместимости со старым кодом.
