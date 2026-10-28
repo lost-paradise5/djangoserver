@@ -24,6 +24,8 @@ from frostapp.views import (
     is_ukm5_store,
     clear_ukm_store_runtime_caches,
     TRM_SMALL_MAX,
+    get_ukm_rotation_store_groups,
+    build_ukm_rotation_links_filter,
 )
 
 from frostapp.services.ukm4_verification import (
@@ -319,12 +321,20 @@ class Command(BaseCommand):
             # сбрасываем сведения о типах и привязках магазинов.
             clear_ukm_store_runtime_caches()
             
-            anchor_store_ids = sorted({
-                int(value)
-                for value in (
-                    get_ukm5_full_xml_store_ids() or {2013}
-                )
-            })
+            (
+                regular_store_ids,
+                discounter_store_ids,
+            ) = get_ukm_rotation_store_groups()
+
+            # Фиксируем формат магазинов на весь запуск.
+            self._rotation_discounter_store_ids = (
+                frozenset(discounter_store_ids)
+            )
+
+            anchor_store_ids = sorted(
+                regular_store_ids
+                | discounter_store_ids
+            )
             
             raw_selected_store_ids = opts.get("store_ids")
             selection_was_provided = (
@@ -490,9 +500,18 @@ class Command(BaseCommand):
 
             
 
-            target_user_ids = UKMUser.objects.filter(
-                storeid__in=target_store_ids
-            ).values("user_id")
+            target_user_ids = (
+                UKMUser.objects
+                .filter(
+                    build_ukm_rotation_links_filter(
+                        target_store_ids,
+                        discounter_store_ids=(
+                            self._rotation_discounter_store_ids
+                        ),
+                    )
+                )
+                .values("user_id")
+            )
 
             
 
@@ -1361,14 +1380,15 @@ class Command(BaseCommand):
         user_ids = [int(row["id"]) for row in user_rows]
 
     
-        links_qs = UKMUser.objects.filter(user_id__in=user_ids)
-
-    
-
-        if allowed_store_ids:
-            links_qs = links_qs.filter(
-                storeid__in=sorted(allowed_store_ids)
-            )
+        links_qs = UKMUser.objects.filter(
+            build_ukm_rotation_links_filter(
+                allowed_store_ids,
+                discounter_store_ids=(
+                    self._rotation_discounter_store_ids
+                ),
+            ),
+            user_id__in=user_ids,
+        )
 
     
 
@@ -1550,11 +1570,21 @@ class Command(BaseCommand):
                 )
                 return "skipped", info
 
-            ukm_qs = UKMUser.objects.filter(user_id=user.id)
-            if allowed_store_ids:
-                ukm_qs = ukm_qs.filter(
-                    storeid__in=sorted(allowed_store_ids)
-                )
+            selected_stores = (
+                allowed_store_ids
+                if allowed_store_ids is not None
+                else get_ukm5_full_xml_store_ids()
+            )
+
+            ukm_qs = UKMUser.objects.filter(
+                build_ukm_rotation_links_filter(
+                    selected_stores,
+                    discounter_store_ids=(
+                        self._rotation_discounter_store_ids
+                    ),
+                ),
+                user_id=user.id,
+            )
 
             ukm_links = list(
                 ukm_qs
