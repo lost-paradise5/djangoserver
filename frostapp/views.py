@@ -5148,19 +5148,23 @@ def connect_ukm5_srvdata():
     )
 
 
-def _map_pg_role_to_ukm5(role_id: int) -> int:
-    """
-    mapping:
-      1  -> 10002
-      13 -> 10001
-    """
+def _map_pg_role_to_ukm5(
+    role_id: int,
+) -> int:
     role_id = int(role_id)
-    if role_id == 13:
+
+    if role_id in {13, 11}:
         return 10001
-    if role_id == 1:
+
+    if role_id in {1, 12}:
         return 10002
 
-    logger.warning(f"[UKM5] Неожиданный role_id={role_id}, ставлю fallback=10002")
+    logger.warning(
+        "[UKM5] Неожиданный role_id=%s, "
+        "ставлю fallback=10002",
+        role_id,
+    )
+
     return 10002
 
 
@@ -9267,13 +9271,15 @@ def _build_ukm_rotation_store_catalog(
     if force_refresh:
         clear_ukm_store_runtime_caches()
 
-    configured_store_ids = sorted({
-        int(value)
-        for value in (
-            get_ukm5_full_xml_store_ids()
-            or {2013}
-        )
-    })
+    (
+        regular_store_ids,
+        discounter_store_ids,
+    ) = get_ukm_rotation_store_groups()
+
+    configured_store_ids = sorted(
+        regular_store_ids
+        | discounter_store_ids
+    )
 
     store_rows_by_id: dict[int, dict] = {}
 
@@ -9325,6 +9331,14 @@ def _build_ukm_rotation_store_catalog(
 
         item = {
             "store_id": store_id,
+            "is_discounter": (
+                store_id in discounter_store_ids
+            ),
+            "format_label": (
+                "Дискаунтер"
+                if store_id in discounter_store_ids
+                else "Магазин"
+            ),
             "smstore": row.get("smstore"),
             "name": str(
                 row.get("name") or ""
@@ -10199,6 +10213,90 @@ def send_max_to_user(max_user_id, message: str) -> bool:
         return False
 
 
+
+
+
+
+def send_max_to_chat(
+    chat_id,
+    message: str,
+) -> str | None:
+    """
+    Возвращает ID принятого сообщения.
+    При ошибке возвращает None.
+    """
+    text = str(message or "").strip()
+
+    token = _env_value(
+        "MAX_BOT_TOKEN",
+        MAX_BOT_TOKEN,
+    )
+
+    if not text or not token:
+        logger.error(
+            "[MAX/CHAT] Не задан текст "
+            "или MAX_BOT_TOKEN"
+        )
+        return None
+
+    try:
+        target = int(chat_id)
+
+        if target == 0 or len(text) > 4000:
+            raise ValueError(
+                "Некорректный chat_id "
+                "или слишком длинное сообщение"
+            )
+
+        api_base = _env_value(
+            "MAX_API_BASE",
+            MAX_API_BASE,
+        ).rstrip("/")
+
+        response = requests.post(
+            f"{api_base}/messages",
+            params={
+                "chat_id": target,
+            },
+            headers={
+                "Authorization": token,
+            },
+            json={
+                "text": text,
+            },
+            timeout=(5, 15),
+            allow_redirects=False,
+        )
+
+        response.raise_for_status()
+        body = response.json()
+
+        message_id = (
+            (
+                (body.get("message") or {})
+                .get("body") or {}
+            )
+            .get("mid")
+        )
+
+        if not message_id:
+            logger.error(
+                "[MAX/CHAT] Нет подтверждения "
+                "отправки chat_id=%s",
+                target,
+            )
+            return None
+
+        return str(message_id)
+
+    except Exception as exc:
+        logger.error(
+            "[MAX/CHAT] Ошибка отправки "
+            "chat_id=%s type=%s",
+            chat_id,
+            type(exc).__name__,
+        )
+        return None
 
 
 def send_email_to_user(user, subject: str, message: str) -> bool:
