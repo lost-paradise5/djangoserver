@@ -758,7 +758,11 @@ def bx_excluded_ids():
     )
 
     # Защищаем владельцев используемых вебхуков.
-    for url in (get_url, update_url):
+    for url in (
+        get_url,
+        update_url,
+        bx_im_user_get_url(),
+    ):
         match = re.search(
             r"/rest/(\d+)/",
             urlparse(url).path,
@@ -810,13 +814,47 @@ def bx_call(url, payload):
     return data
 
 
-def bx_dates(user):
+
+
+
+
+def bx_im_user_get_url():
+    get_url, _, scope = bx_urls()
+
+    default_url = (
+        get_url.rsplit("/", 1)[0]
+        + "/im.user.get.json"
+    )
+
+    url = cfg(
+        "BITRIX_IM_USER_GET_URL",
+        default_url,
+    ).strip()
+
+    parsed = urlparse(url)
+
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != scope
+    ):
+        raise AccessError(
+            "Вебхук im.user.get должен использовать HTTPS "
+            "и тот же портал Битрикса"
+        )
+
+    return url
+
+
+
+def bx_dates(user, options=None):
+    uid = str(user.get("ID") or "")
+
+    # LAST_ACTIVITY_DATE здесь больше не обязательное поле.
     required = {
         "ID",
         "ACTIVE",
         "IS_ONLINE",
         "LAST_LOGIN",
-        "LAST_ACTIVITY_DATE",
         "DATE_REGISTER",
     }
 
@@ -824,45 +862,145 @@ def bx_dates(user):
 
     if missing:
         raise AccessError(
-            "Битрикс не вернул поля: "
+            f"Битрикс ID={uid}: не вернул поля: "
             + ", ".join(sorted(missing))
-            + ". Проверьте scope user"
         )
 
-    parsed = {}
-
-    for field in (
-        "LAST_LOGIN",
-        "LAST_ACTIVITY_DATE",
-        "DATE_REGISTER",
-    ):
-        raw = user[field]
-
+    def read_date(field, raw):
         try:
-            parsed[field] = parse_dt(raw)
+            return parse_dt(raw)
 
         except AccessError as exc:
             raise AccessError(
-                f"Битрикс: ID={user.get('ID')}; "
+                f"Битрикс ID={uid}; "
                 f"поле={field}; "
                 f"тип={type(raw).__name__}; "
                 f"значение={repr(raw)[:200]}; "
                 f"{exc}"
             ) from None
 
+    last_login = read_date(
+        "LAST_LOGIN",
+        user["LAST_LOGIN"],
+    )
+
+    created = read_date(
+        "DATE_REGISTER",
+        user["DATE_REGISTER"],
+    )
+
+    # Пользователь онлайн: вызывающая функция его исключит.
+    if bool_value(user["IS_ONLINE"]):
+        return last_login, created
+
+    # Если уже по дате входа/создания запись не подходит,
+    # дополнительный запрос активности не требуется.
+    if options is not None:
+        if not is_stale(
+            last_login,
+            created,
+            options["days_bx"],
+            options["include_never"],
+        ):
+            return last_login, created
+
+    last_activity = read_date(
+        "LAST_ACTIVITY_DATE",
+        user.get("LAST_ACTIVITY_DATE"),
+    )
+
+    if last_activity is not None:
+        user["_INACTIVE_ACTIVITY_SOURCE"] = "user.get"
+
+    else:
+        if not uid.isdigit() or int(uid) <= 0:
+            raise AccessError(
+                "Битрикс вернул некорректный ID"
+            )
+
+        try:
+            response = bx_call(
+                bx_im_user_get_url(),
+                {"ID": int(uid)},
+            )
+
+        except AccessError as exc:
+            raise AccessError(
+                f"Битрикс ID={uid}: "
+                f"im.user.get не выполнен: {exc}"
+            ) from None
+
+        profile = response.get("result")
+
+        if (
+            not isinstance(profile, dict)
+            or str(profile.get("id")) != uid
+        ):
+            raise AccessError(
+                f"Битрикс ID={uid}: "
+                "im.user.get не подтвердил точный ID"
+            )
+
+        if "last_activity_date" not in profile:
+            raise AccessError(
+                f"Битрикс ID={uid}: "
+                "im.user.get не вернул last_activity_date"
+            )
+
+        activity_fields = (
+            "last_activity_date",
+            "mobile_last_date",
+            "desktop_last_date",
+        )
+
+        # Сохраняем источник и исходные данные активности
+        # в снимке учётной записи и журнале.
+        user["_INACTIVE_ACTIVITY_SOURCE"] = "im.user.get"
+
+        user["_INACTIVE_IM_ACTIVITY"] = {
+            key: profile.get(key)
+            for key in (
+                "id",
+                "status",
+                *activity_fields,
+            )
+        }
+
+        # Если дополнительный метод подтвердил онлайн,
+        # запись тоже должна быть исключена из блокировки.
+        if (
+            str(profile.get("status") or "").lower()
+            == "online"
+        ):
+            user["IS_ONLINE"] = "Y"
+
+        activity_dates = [
+            read_date(
+                "im.user.get." + field,
+                profile.get(field),
+            )
+            for field in activity_fields
+        ]
+
+        last_activity = max(
+            (
+                value
+                for value in activity_dates
+                if value is not None
+            ),
+            default=None,
+        )
+
     last_seen = max(
         (
-            parsed[field]
-            for field in (
-                "LAST_LOGIN",
-                "LAST_ACTIVITY_DATE",
-            )
-            if parsed[field] is not None
+            value
+            for value in (last_login, last_activity)
+            if value is not None
         ),
         default=None,
     )
 
-    return last_seen, parsed["DATE_REGISTER"]
+    return last_seen, created
 
 
 def bx_get_user(uid):
@@ -929,7 +1067,7 @@ def scan_bitrix(options):
             if not bool_value(user.get("ACTIVE")):
                 continue
 
-            last_seen, created = bx_dates(user)
+            last_seen, created = bx_dates(user, options)
 
             if bool_value(user.get("IS_ONLINE")):
                 continue
@@ -1006,7 +1144,7 @@ def operate_bitrix(candidate, options, dry_run, before_change):
             before,
         )
 
-    last_seen, created = bx_dates(before)
+    last_seen, created = bx_dates(before, options)
 
     if (
         bool_value(before.get("IS_ONLINE"))
