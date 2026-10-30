@@ -4,7 +4,7 @@ import os
 import re
 import time
 import uuid
-
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from collections import Counter
 from contextlib import contextmanager
 from urllib.parse import urlparse
@@ -106,24 +106,126 @@ def error_text(exc):
 
 
 def parse_dt(value):
-    if value is None or value == "":
+    if value is None or value is False:
         return None
+
+    zone_name = None
+
+    # Пустые JSON-объекты/массивы означают отсутствие значения.
+    if isinstance(value, (dict, list)) and not value:
+        return None
+
+    # Поддержка объекта:
+    # {
+    #     "date": "2026-10-30 12:00:00.000000",
+    #     "timezone": "Europe/Moscow",
+    #     "timezone_type": 3
+    # }
+    if isinstance(value, dict):
+        if "date" not in value:
+            raise AccessError(
+                "Объект даты не содержит поля date"
+            )
+
+        zone_name = value.get("timezone")
+        value = value["date"]
+
+        if (
+            value is None
+            or value is False
+            or (
+                isinstance(value, str)
+                and not value.strip()
+            )
+        ):
+            raise AccessError(
+                "Непустой объект содержит пустое поле date"
+            )
 
     if isinstance(value, datetime.datetime):
         result = value
-    else:
+
+    elif isinstance(value, datetime.date):
+        result = datetime.datetime.combine(
+            value,
+            datetime.time.min,
+        )
+
+    elif isinstance(value, str):
+        text = value.strip().replace("\u00a0", " ")
+
+        if not text:
+            return None
+
+        # ISO: 2026-10-30T12:00:00+03:00
         try:
-            result = parse_datetime(str(value))
-        except (TypeError, ValueError):
+            result = parse_datetime(text)
+        except (TypeError, ValueError, OverflowError):
             result = None
 
-    if result is None:
-        raise AccessError("Получена некорректная дата")
+        # Дополнительные форматы даты портала.
+        if result is None:
+            formats = (
+                "%d.%m.%Y %H:%M:%S.%f%z",
+                "%d.%m.%Y %H:%M:%S%z",
+                "%d.%m.%Y %H:%M:%S %z",
+                "%d.%m.%Y %H:%M:%S.%f",
+                "%d.%m.%Y %H:%M:%S",
+                "%d.%m.%Y %H:%M",
+                "%d.%m.%Y",
+            )
+
+            for fmt in formats:
+                try:
+                    result = datetime.datetime.strptime(
+                        text,
+                        fmt,
+                    )
+                    break
+                except ValueError:
+                    continue
+
+        if result is None:
+            raise AccessError(
+                "Получена некорректная дата"
+            )
+
+    else:
+        raise AccessError(
+            f"Неизвестный тип даты: {type(value).__name__}"
+        )
 
     if timezone.is_naive(result):
+        target_zone = timezone.get_default_timezone()
+
+        if zone_name:
+            if not isinstance(zone_name, str):
+                raise AccessError(
+                    "Некорректный тип часового пояса даты"
+                )
+
+            try:
+                target_zone = ZoneInfo(zone_name)
+
+            except (ZoneInfoNotFoundError, ValueError):
+                # Поддержка смещения вида +03:00.
+                try:
+                    target_zone = (
+                        datetime.datetime.fromisoformat(
+                            "2000-01-01T00:00:00" + zone_name
+                        ).tzinfo
+                    )
+                except ValueError:
+                    target_zone = None
+
+                if target_zone is None:
+                    raise AccessError(
+                        "Неизвестный часовой пояс даты"
+                    ) from None
+
         result = timezone.make_aware(
             result,
-            timezone.get_default_timezone(),
+            target_zone,
         )
 
     return result
@@ -718,25 +820,49 @@ def bx_dates(user):
         "DATE_REGISTER",
     }
 
-    if not required.issubset(user):
+    missing = required - set(user)
+
+    if missing:
         raise AccessError(
-            "Битрикс не вернул поля активности или регистрации. "
-            "Проверьте права вебхука и scope user"
+            "Битрикс не вернул поля: "
+            + ", ".join(sorted(missing))
+            + ". Проверьте scope user"
         )
 
-    dates = [
-        parse_dt(user.get("LAST_LOGIN")),
-        parse_dt(user.get("LAST_ACTIVITY_DATE")),
-    ]
+    parsed = {}
+
+    for field in (
+        "LAST_LOGIN",
+        "LAST_ACTIVITY_DATE",
+        "DATE_REGISTER",
+    ):
+        raw = user[field]
+
+        try:
+            parsed[field] = parse_dt(raw)
+
+        except AccessError as exc:
+            raise AccessError(
+                f"Битрикс: ID={user.get('ID')}; "
+                f"поле={field}; "
+                f"тип={type(raw).__name__}; "
+                f"значение={repr(raw)[:200]}; "
+                f"{exc}"
+            ) from None
 
     last_seen = max(
-        (value for value in dates if value is not None),
+        (
+            parsed[field]
+            for field in (
+                "LAST_LOGIN",
+                "LAST_ACTIVITY_DATE",
+            )
+            if parsed[field] is not None
+        ),
         default=None,
     )
 
-    created = parse_dt(user.get("DATE_REGISTER"))
-
-    return last_seen, created
+    return last_seen, parsed["DATE_REGISTER"]
 
 
 def bx_get_user(uid):
