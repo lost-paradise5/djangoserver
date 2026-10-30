@@ -4,6 +4,7 @@ from django.conf import settings
 from django.conf.urls.static import static
 
 from frostapp import views
+from frostapp import inactive_access as ia
 from frostapp.views import (
     queue_create,
     queue_update,
@@ -326,6 +327,30 @@ urlpatterns = [
         views.trm_users_export_kso_run,
         name="trm_users_export_kso_run",
     ),
+
+    path(
+        "ui/inactive-users/",
+        ia.page,
+        name="inactive_access_ui",
+    ),
+
+    path(
+        "ui/inactive-users/scan/",
+        ia.start_scan,
+        name="inactive_access_scan",
+    ),
+
+    path(
+        "ui/inactive-users/block/",
+        ia.start_block,
+        name="inactive_access_block",
+    ),
+
+    path(
+        "ui/inactive-users/jobs/<uuid:job_id>/status/",
+        ia.status,
+        name="inactive_access_status",
+    ),
     
     path('reports/working-employees-excel/', working_employees_excel_page, name='working_employees_excel_page'),
     path('reports/working-employees-excel/generate/', working_employees_excel_generate, name='working_employees_excel_generate'),
@@ -338,3 +363,5 @@ urlpatterns = [
     path("ui/smstaff/batch-by-store/download/", views.sm_staff_ui_batch_by_store_download, name="sm_staff_ui_batch_by_store_download"),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+urlpatterns = ia.protect_legacy_urls(urlpatterns)
