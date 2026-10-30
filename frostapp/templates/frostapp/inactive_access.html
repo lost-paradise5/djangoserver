@@ -1,0 +1,778 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}
+{{ block.super }}
+
+<style>
+    .ia {
+        max-width: 1600px;
+        font-size: 16px;
+        line-height: 1.5;
+    }
+
+    .ia h1 {
+        font-size: 28px;
+    }
+
+    .ia h2 {
+        margin-top: 0;
+        font-size: 21px;
+    }
+
+    .ia .panel {
+        margin: 20px 0;
+        padding: 20px;
+        border: 1px solid var(--hairline-color);
+        border-radius: 8px;
+        background: var(--body-bg);
+    }
+
+    .ia .grid,
+    .ia .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        align-items: end;
+    }
+
+    .ia .toolbar {
+        margin: 16px 0;
+        align-items: center;
+    }
+
+    .ia label {
+        display: block;
+        margin: 8px 0;
+    }
+
+    .ia input,
+    .ia select,
+    .ia button {
+        font-size: 15px;
+    }
+
+    .ia input[type="number"] {
+        width: 100px;
+    }
+
+    .ia button {
+        padding: 10px 16px;
+        border: 0;
+        border-radius: 5px;
+        background: var(--button-bg);
+        color: var(--button-fg);
+        cursor: pointer;
+    }
+
+    .ia button.danger {
+        background: #a92323;
+        color: white;
+    }
+
+    .ia button:disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+
+    .ia .warning {
+        padding: 12px 16px;
+        border-left: 4px solid #b85e00;
+        background: var(--darkened-bg);
+    }
+
+    .ia .note {
+        font-size: 14px;
+        color: var(--body-quiet-color);
+    }
+
+    .ia .scroll {
+        overflow: auto;
+    }
+
+    .ia table {
+        width: 100%;
+        font-size: 14px;
+    }
+
+    .ia th,
+    .ia td {
+        padding: 10px;
+        vertical-align: top;
+    }
+
+    .ia th {
+        white-space: nowrap;
+    }
+
+    .ia .message {
+        max-width: 400px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+
+    .ia .history {
+        max-height: 180px;
+        overflow: auto;
+    }
+</style>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">
+        Администрирование
+    </a>
+    › Неактивные учётные записи
+</div>
+{% endblock %}
+
+{% block content %}
+<main class="ia">
+
+    <h1>Неактивные учётные записи</h1>
+
+    <p>
+        Сначала сформируйте список, затем выберите записи
+        для проверки или отключения.
+        Каждая строка относится к одной конкретной системе.
+    </p>
+
+    <div class="warning">
+        Битрикс24: отключение устанавливает статус «уволен».
+        Супермаг: блокировка пока является заглушкой.
+    </div>
+
+    <section class="panel">
+        <h2>1. Сформировать список</h2>
+
+        <form
+            method="post"
+            action="{% url 'inactive_access_scan' %}"
+        >
+            {% csrf_token %}
+
+            <div class="grid">
+
+                <div>
+                    <label>
+                        <input
+                            type="checkbox"
+                            name="systems"
+                            value="ad"
+                            {% if 'ad' in defaults.systems %}checked{% endif %}
+                        >
+                        Active Directory
+                    </label>
+
+                    <label>
+                        Дней без входа
+                        <input
+                            type="number"
+                            name="days_ad"
+                            value="{{ defaults.days_ad }}"
+                            min="1"
+                            max="3650"
+                            required
+                        >
+                    </label>
+                </div>
+
+                <div>
+                    <label>
+                        <input
+                            type="checkbox"
+                            name="systems"
+                            value="bitrix"
+                            {% if 'bitrix' in defaults.systems %}checked{% endif %}
+                        >
+                        Битрикс24
+                    </label>
+
+                    <label>
+                        Дней без активности
+                        <input
+                            type="number"
+                            name="days_bx"
+                            value="{{ defaults.days_bx }}"
+                            min="1"
+                            max="3650"
+                            required
+                        >
+                    </label>
+                </div>
+
+                <div>
+                    <label>
+                        <input
+                            type="checkbox"
+                            name="systems"
+                            value="supermag"
+                            {% if 'supermag' in defaults.systems %}checked{% endif %}
+                        >
+                        Супермаг
+                    </label>
+
+                    <label>
+                        Дней без входа
+                        <input
+                            type="number"
+                            name="days_sm"
+                            value="{{ defaults.days_sm }}"
+                            min="1"
+                            max="3650"
+                            required
+                        >
+                    </label>
+                </div>
+
+                <div>
+                    <label>
+                        База Супермага
+
+                        <select name="sm_db">
+                            <option
+                                value="ALL"
+                                {% if selected_sm_db == 'ALL' %}selected{% endif %}
+                            >
+                                Все настроенные базы
+                            </option>
+
+                            {% for db in sm_dbs %}
+                            <option
+                                value="{{ db }}"
+                                {% if selected_sm_db == db %}selected{% endif %}
+                            >
+                                {{ db }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                </div>
+
+            </div>
+
+            <label>
+                <input
+                    type="checkbox"
+                    name="include_never"
+                    value="1"
+                    {% if defaults.include_never %}checked{% endif %}
+                >
+
+                Включать записи без даты входа,
+                если они созданы раньше выбранного порога
+            </label>
+
+            <p class="note">
+                Для AD учитывается последняя из
+                lastLogonTimestamp и lastLogon настроенного
+                контроллера. Для Битрикса — последняя из дат
+                входа и активности.
+                Недавно созданные записи исключаются.
+            </p>
+
+            <button
+                type="submit"
+                {% if active_job %}disabled{% endif %}
+            >
+                Запросить список
+            </button>
+
+        </form>
+    </section>
+
+    {% if active_job %}
+    <div class="warning">
+        Есть активное задание:
+
+        <a href="?job={{ active_job.pk }}">
+            {{ active_job.get_kind_display }} —
+            {{ active_job.get_status_display }}
+        </a>
+
+        <div class="note">
+            Если статус остаётся «В очереди»,
+            проверьте запуск worker.
+        </div>
+    </div>
+    {% endif %}
+
+    {% if job %}
+    <section class="panel">
+        <h2>
+            {{ job.get_kind_display }} —
+            {{ job.get_status_display }}
+        </h2>
+
+        <p>
+            Инициатор: <strong>{{ job.actor }}</strong><br>
+            Дата: {{ job.created_at|date:"d.m.Y H:i:s" }}<br>
+            ID: <code>{{ job.pk }}</code>
+        </p>
+
+        <p>{{ job.message }}</p>
+
+        {% if job.kind == 'scan' %}
+
+            {% for name,count in job.summary.counts.items %}
+            <p>{{ name }}: <strong>{{ count }}</strong></p>
+            {% endfor %}
+
+            {% for name,error in job.summary.errors.items %}
+            <p class="warning">{{ name }}: {{ error }}</p>
+            {% endfor %}
+
+        {% else %}
+
+            {% for name,count in job.summary.items %}
+            <p>{{ name }}: <strong>{{ count }}</strong></p>
+            {% endfor %}
+
+        {% endif %}
+
+        {% if job.status == 'queued' or job.status == 'running' %}
+        <p id="live-status" class="note">
+            Статус обновляется автоматически.
+            Закрытие страницы не отменяет задание.
+        </p>
+        {% endif %}
+    </section>
+    {% endif %}
+
+    {% if scan %}
+    <section class="panel">
+        <h2>2. Проверить и обработать записи</h2>
+
+        <p class="note">
+            Список от {{ scan.created_at|date:"d.m.Y H:i" }}.
+            AD: {{ scan.options.days_ad }} дней.
+            Битрикс: {{ scan.options.days_bx }} дней.
+            Супермаг: {{ scan.options.days_sm }} дней.
+            Перед изменением AD и Битрикса
+            состояние будет запрошено повторно.
+        </p>
+
+        <form method="get" class="toolbar">
+            <input
+                type="hidden"
+                name="job"
+                value="{{ job.pk }}"
+            >
+
+            <label>
+                Система
+
+                <select name="system">
+                    <option value="">Все системы</option>
+
+                    <option
+                        value="ad"
+                        {% if system == 'ad' %}selected{% endif %}
+                    >
+                        Active Directory
+                    </option>
+
+                    <option
+                        value="bitrix"
+                        {% if system == 'bitrix' %}selected{% endif %}
+                    >
+                        Битрикс24
+                    </option>
+
+                    <option
+                        value="supermag"
+                        {% if system == 'supermag' %}selected{% endif %}
+                    >
+                        Супермаг
+                    </option>
+                </select>
+            </label>
+
+            <label>
+                Поиск
+
+                <input
+                    name="q"
+                    value="{{ q }}"
+                    placeholder="ФИО, логин, ID, база"
+                >
+            </label>
+
+            <button type="submit">Найти</button>
+        </form>
+
+        <form
+            method="post"
+            action="{% url 'inactive_access_block' %}"
+            id="block-form"
+            data-count="{{ page_obj.paginator.count }}"
+        >
+            {% csrf_token %}
+
+            <input
+                type="hidden"
+                name="scan"
+                value="{{ scan.pk }}"
+            >
+
+            <input
+                type="hidden"
+                name="system"
+                value="{{ system }}"
+            >
+
+            <input
+                type="hidden"
+                name="q"
+                value="{{ q }}"
+            >
+
+            <input
+                type="hidden"
+                name="selected_ids"
+                id="selected-ids"
+                value="[]"
+            >
+
+            <div class="toolbar">
+                <button
+                    type="submit"
+                    name="action"
+                    value="test"
+                    {% if active_job or not scan_ready %}disabled{% endif %}
+                >
+                    Проверить без изменений
+                </button>
+
+                <button
+                    type="submit"
+                    name="action"
+                    value="block"
+                    class="danger"
+                    {% if active_job or not scan_ready %}disabled{% endif %}
+                >
+                    Заблокировать выбранные
+                </button>
+
+                <span id="selected-count">Выбрано: 0</span>
+            </div>
+
+            <label>
+                <input
+                    type="checkbox"
+                    name="all_filtered"
+                    id="all-filtered"
+                    value="1"
+                >
+
+                Обработать все
+                {{ page_obj.paginator.count }}
+                записей с текущими фильтрами,
+                включая другие страницы
+            </label>
+
+            <div class="scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>
+                                <input
+                                    type="checkbox"
+                                    id="select-page"
+                                    aria-label="Выбрать страницу"
+                                >
+                            </th>
+                            <th>Система / база</th>
+                            <th>Логин / ID</th>
+                            <th>ФИО</th>
+                            <th>Последняя активность</th>
+                            <th>Создана</th>
+                            <th>Результат</th>
+                            <th>Действие</th>
+                        </tr>
+                    </thead>
+
+                    <tbody>
+                        {% for c in rows %}
+                        <tr>
+                            <td>
+                                <input
+                                    type="checkbox"
+                                    class="candidate-check"
+                                    value="{{ c.pk }}"
+                                    aria-label="Выбрать {{ c.target }}"
+                                >
+                            </td>
+
+                            <td>
+                                {{ c.get_system_display }}<br>
+                                <span class="note">
+                                    {{ c.scope }}
+                                </span>
+                            </td>
+
+                            <td>{{ c.target }}</td>
+                            <td>{{ c.fio|default:"—" }}</td>
+
+                            <td>
+                                {{ c.last_seen|date:"d.m.Y H:i"|default:"Нет данных" }}
+                            </td>
+
+                            <td>
+                                {{ c.created|date:"d.m.Y H:i"|default:"Нет данных" }}
+                            </td>
+
+                            <td>
+                                <strong>
+                                    {{ c.get_state_display }}
+                                </strong>
+
+                                <div class="message">
+                                    {{ c.message }}
+                                </div>
+                            </td>
+
+                            <td>
+                                <button
+                                    type="submit"
+                                    name="row"
+                                    value="{{ c.pk }}"
+                                    {% if active_job or not scan_ready or c.state == 'blocked' or c.state == 'already_disabled' %}disabled{% endif %}
+                                >
+                                    Отключить
+                                </button>
+                            </td>
+                        </tr>
+
+                        {% empty %}
+                        <tr>
+                            <td colspan="8">
+                                Записей нет.
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </form>
+
+        <p>
+            Всего: {{ page_obj.paginator.count }}.
+            Страница {{ page_obj.number }}
+            из {{ page_obj.paginator.num_pages }}.
+        </p>
+
+        {% if page_obj.has_previous %}
+        <a href="?job={{ job.pk }}&amp;system={{ system|urlencode }}&amp;q={{ q|urlencode }}&amp;page={{ page_obj.previous_page_number }}">
+            ← Назад
+        </a>
+        {% endif %}
+
+        {% if page_obj.has_next %}
+        <a href="?job={{ job.pk }}&amp;system={{ system|urlencode }}&amp;q={{ q|urlencode }}&amp;page={{ page_obj.next_page_number }}">
+            Далее →
+        </a>
+        {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="panel">
+        <h2>Последние задания</h2>
+
+        <div class="history">
+            {% for item in jobs %}
+            <p>
+                <a href="?job={{ item.pk }}">
+                    {{ item.created_at|date:"d.m.Y H:i:s" }}
+                    —
+                    {{ item.get_kind_display }}
+                    —
+                    {{ item.get_status_display }}
+                </a>
+
+                · {{ item.actor }}
+            </p>
+
+            {% empty %}
+            <p>Заданий пока нет.</p>
+            {% endfor %}
+        </div>
+    </section>
+
+    {% if job %}
+    <section class="panel">
+        <h2>Журнал текущего задания</h2>
+
+        <p class="note">
+            Показаны последние 300 событий.
+            Полный журнал хранится в PostgreSQL.
+        </p>
+
+        <div class="scroll">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Дата</th>
+                        <th>Инициатор</th>
+                        <th>Учётная запись</th>
+                        <th>Событие</th>
+                        <th>Результат</th>
+                        <th>Сообщение</th>
+                    </tr>
+                </thead>
+
+                <tbody>
+                    {% for event in events %}
+                    <tr>
+                        <td>
+                            {{ event.created_at|date:"d.m.Y H:i:s" }}
+                        </td>
+
+                        <td>{{ event.actor }}</td>
+
+                        <td>
+                            {{ event.candidate.target|default:"—" }}
+                        </td>
+
+                        <td>{{ event.event }}</td>
+                        <td>{{ event.outcome }}</td>
+
+                        <td class="message">
+                            {{ event.message }}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+    {% endif %}
+
+</main>
+
+<script>
+(() => {
+    const form = document.getElementById("block-form");
+
+    if (form) {
+        const checks = [
+            ...document.querySelectorAll(".candidate-check")
+        ];
+
+        const selectPage = document.getElementById("select-page");
+        const allFiltered = document.getElementById("all-filtered");
+        const selectedCount = document.getElementById("selected-count");
+        const selectedIds = document.getElementById("selected-ids");
+
+        function updateCount() {
+            const count = allFiltered.checked
+                ? Number(form.dataset.count)
+                : checks.filter(item => item.checked).length;
+
+            selectedCount.textContent = "Выбрано: " + count;
+        }
+
+        selectPage.addEventListener("change", event => {
+            checks.forEach(item => {
+                item.checked = event.target.checked;
+            });
+
+            updateCount();
+        });
+
+        checks.forEach(item => {
+            item.addEventListener("change", updateCount);
+        });
+
+        allFiltered.addEventListener("change", updateCount);
+
+        form.addEventListener("submit", event => {
+            const ids = checks
+                .filter(item => item.checked)
+                .map(item => item.value);
+
+            selectedIds.value = JSON.stringify(ids);
+
+            const button = event.submitter;
+            const singleRow = button && button.name === "row";
+
+            const count = singleRow
+                ? 1
+                : (
+                    allFiltered.checked
+                        ? Number(form.dataset.count)
+                        : ids.length
+                );
+
+            if (!count) {
+                event.preventDefault();
+                alert("Выберите учётные записи.");
+                return;
+            }
+
+            if (button && button.value === "test") {
+                return;
+            }
+
+            const confirmed = confirm(
+                "Отключить учётные записи: " + count + "?\n\n" +
+                "AD: отключение входа.\n" +
+                "Битрикс24: статус «уволен».\n" +
+                "Супермаг: только заглушка.\n\n" +
+                "Каждая операция будет записана в журнал."
+            );
+
+            if (!confirmed) {
+                event.preventDefault();
+            }
+        });
+    }
+
+    {% if job.status == 'queued' or job.status == 'running' %}
+
+    const initialStatus = "{{ job.status|escapejs }}";
+
+    setInterval(async () => {
+        try {
+            const response = await fetch(
+                "{% url 'inactive_access_status' job.pk %}",
+                {
+                    credentials: "same-origin",
+                    headers: {
+                        "Accept": "application/json"
+                    }
+                }
+            );
+
+            if (!response.ok) {
+                return;
+            }
+
+            const data = await response.json();
+
+            if (
+                data.finished
+                || data.status !== initialStatus
+            ) {
+                location.reload();
+                return;
+            }
+
+            const element = document.getElementById("live-status");
+
+            if (element) {
+                element.textContent =
+                    "Статус: " + data.status +
+                    ". Статистика: " +
+                    JSON.stringify(data.summary);
+            }
+
+        } catch (error) {
+            // Следующий опрос попробует получить статус снова.
+        }
+    }, 5000);
+
+    {% endif %}
+})();
+</script>
+{% endblock %}
