@@ -1,5 +1,6 @@
 from django.db import models
 import uuid
+from django.utils import timezone
 
 class Queue(models.Model):
     id = models.AutoField(primary_key=True)
@@ -1316,7 +1317,158 @@ class UkmRotationRunItem(models.Model):
 
 
 
+class InactiveAccessJob(models.Model):
+    KIND_CHOICES = [
+        ("scan", "Поиск"),
+        ("test", "Проверка без изменений"),
+        ("block", "Блокировка"),
+    ]
 
+    STATUS_CHOICES = [
+        ("queued", "В очереди"),
+        ("running", "Выполняется"),
+        ("done", "Завершено"),
+        ("partial", "Завершено с замечаниями"),
+        ("failed", "Ошибка"),
+        ("interrupted", "Прервано — требуется проверка"),
+    ]
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    kind = models.CharField(
+        max_length=10,
+        choices=KIND_CHOICES,
+    )
+
+    status = models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default="queued",
+    )
+
+    created_at = models.DateTimeField(default=timezone.now)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    actor = models.CharField(max_length=254)
+    actor_pk = models.CharField(max_length=128, blank=True)
+    ip = models.CharField(max_length=64, blank=True)
+
+    options = models.JSONField(default=dict)
+    summary = models.JSONField(default=dict)
+    message = models.TextField(blank=True)
+
+    slot = models.PositiveSmallIntegerField(default=1)
+
+    source = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+
+    class Meta:
+        managed = False
+        db_table = "inactive_access_job"
+        ordering = ["-created_at"]
+
+
+class InactiveAccessCandidate(models.Model):
+    SYSTEM_CHOICES = [
+        ("ad", "Active Directory"),
+        ("bitrix", "Битрикс24"),
+        ("supermag", "Супермаг"),
+    ]
+
+    STATE_CHOICES = [
+        ("pending", "Ожидает решения"),
+        ("processing", "Выполняется"),
+        ("blocked", "Заблокирована"),
+        ("already_disabled", "Уже отключена"),
+        ("skipped", "Пропущена после проверки"),
+        ("unsupported", "Заглушка Супермага"),
+        ("failed", "Ошибка до изменения"),
+        ("unknown", "Результат требует проверки"),
+    ]
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    scan = models.ForeignKey(
+        InactiveAccessJob,
+        on_delete=models.PROTECT,
+        related_name="inactive_candidates",
+    )
+
+    system = models.CharField(
+        max_length=10,
+        choices=SYSTEM_CHOICES,
+    )
+
+    target = models.CharField(max_length=254)
+    scope = models.CharField(max_length=128, blank=True)
+    identity = models.CharField(max_length=254)
+
+    fio = models.CharField(max_length=512, blank=True)
+
+    last_seen = models.DateTimeField(null=True, blank=True)
+    created = models.DateTimeField(null=True, blank=True)
+
+    snapshot = models.JSONField(default=dict)
+
+    state = models.CharField(
+        max_length=20,
+        choices=STATE_CHOICES,
+        default="pending",
+    )
+
+    message = models.TextField(blank=True)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        managed = False
+        db_table = "inactive_access_candidate"
+        ordering = ["system", "scope", "target"]
+
+
+class InactiveAccessAudit(models.Model):
+    id = models.BigAutoField(primary_key=True)
+
+    created_at = models.DateTimeField(default=timezone.now)
+
+    job = models.ForeignKey(
+        InactiveAccessJob,
+        on_delete=models.PROTECT,
+        related_name="inactive_events",
+    )
+
+    candidate = models.ForeignKey(
+        InactiveAccessCandidate,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+
+    actor = models.CharField(max_length=254)
+    ip = models.CharField(max_length=64, blank=True)
+
+    event = models.CharField(max_length=40)
+    outcome = models.CharField(max_length=24)
+
+    message = models.TextField(blank=True)
+    details = models.JSONField(default=dict)
+
+    class Meta:
+        managed = False
+        db_table = "inactive_access_audit"
+        ordering = ["-id"]
 
 
 
