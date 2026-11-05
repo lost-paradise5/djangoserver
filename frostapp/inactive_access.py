@@ -20,7 +20,9 @@ from django.contrib.admin.views.decorators import staff_member_required
 from django.core.paginator import Paginator
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connection, transaction, IntegrityError
-from django.db.models import Q
+from django.contrib.auth import logout as auth_logout
+from django.db.models import Q, Count
+from urllib.parse import urlencode
 from django.http import Http404, JsonResponse
 from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse
@@ -1430,10 +1432,13 @@ def create_block_job(request):
 
             elif request.POST.get("all_filtered") == "1":
                 raw_ids = list(
-                    filtered_candidates(
-                        scan,
-                        request.POST.get("system", ""),
-                        request.POST.get("q", "")[:200],
+                    ui_selectable(
+                        ui_candidates(
+                            scan,
+                            request.POST.get("system", ""),
+                            request.POST.get("q", "")[:200],
+                            request.POST.get("state", ""),
+                        )
                     )
                     .values_list("pk", flat=True)[:10001]
                 )
@@ -1882,31 +1887,137 @@ def find_job(raw_id):
     return get_object_or_404(Job, pk=job_id)
 
 
+
+
+def ui_candidates(scan, system="", query="", state=""):
+    rows = filtered_candidates(scan, system, query)
+
+    groups = {
+        "pending": ["pending"],
+        "blocked": ["blocked", "already_disabled"],
+        "attention": ["failed", "unknown", "skipped"],
+    }
+
+    if state in groups:
+        rows = rows.filter(state__in=groups[state])
+
+    return rows
+
+
+def ui_selectable(rows):
+    return rows.filter(
+        system__in=["ad", "bitrix"],
+    ).exclude(
+        state__in=[
+            "blocked",
+            "already_disabled",
+            "processing",
+        ],
+    )
+
+
 @staff_member_required
 @never_cache
 @require_GET
 def page(request):
-    if request.GET.get("job"):
-        job = find_job(request.GET["job"])
-    else:
-        job = Job.objects.first()
+    jobs = Job.objects.filter(
+        Q(kind="scan") | Q(source__isnull=False)
+    )
 
-    if job and job.kind == "scan":
-        scan = job
-    else:
-        scan = job.source if job else None
+    job = (
+        find_job(request.GET["job"])
+        if request.GET.get("job")
+        else jobs.first()
+    )
+
+    scan = (
+        job
+        if job and job.kind == "scan"
+        else (job.source if job else None)
+    )
+
+    active_job = Job.objects.filter(
+        status__in=LIVE_STATUSES
+    ).first()
 
     system = request.GET.get("system", "")
+    if system not in {"ad", "bitrix", "supermag"}:
+        system = ""
+
+    state = request.GET.get("state", "")
+    if state not in {"pending", "blocked", "attention"}:
+        state = ""
+
     query = request.GET.get("q", "").strip()[:200]
 
-    candidates = (
-        filtered_candidates(scan, system, query)
+    rows = (
+        ui_candidates(scan, system, query, state)
         if scan
         else Candidate.objects.none()
     )
 
-    paginator = Paginator(candidates, 200)
-    current_page = paginator.get_page(request.GET.get("page"))
+    page_obj = Paginator(rows, 100).get_page(
+        request.GET.get("page")
+    )
+
+    available_count = ui_selectable(rows).count()
+
+    scan_ready = bool(
+        scan and scan.status in {"done", "partial"}
+    )
+
+    expired = False
+
+    if scan_ready:
+        try:
+            check_scan_age(scan)
+        except AccessError:
+            expired = True
+
+    can_operate = bool(
+        scan_ready
+        and not expired
+        and not active_job
+    )
+
+    state_labels = {
+        "pending": ("Ожидает решения", "neutral"),
+        "processing": ("Обрабатывается", "blue"),
+        "blocked": ("Доступ отключён", "green"),
+        "already_disabled": ("Уже отключена", "green"),
+        "skipped": ("Пропущена", "amber"),
+        "unsupported": ("Только просмотр", "neutral"),
+        "failed": ("Ошибка", "red"),
+        "unknown": ("Нужна проверка", "amber"),
+    }
+
+    now = timezone.now()
+
+    for row in page_obj.object_list:
+        row.ui_state, row.ui_tone = state_labels.get(
+            row.state,
+            ("Нужна проверка", "amber"),
+        )
+
+        if row.system == "supermag":
+            row.ui_state = "Только просмотр"
+            row.ui_tone = "neutral"
+
+        row.ui_selectable = bool(
+            can_operate
+            and row.system in {"ad", "bitrix"}
+            and row.state not in {
+                "blocked",
+                "already_disabled",
+                "processing",
+            }
+        )
+
+        row.ui_days = (
+            max(0, (now - row.last_seen).days)
+            if row.last_seen
+            else None
+        )
 
     defaults = (
         scan.options
@@ -1921,46 +2032,325 @@ def page(request):
         }
     )
 
-    selected_sm_db = (
-        defaults["dbs"][0]
-        if len(defaults.get("dbs", [])) == 1
+    chosen_dbs = defaults.get("dbs", ["BINUU00"])
+
+    selected_db = (
+        chosen_dbs[0]
+        if len(chosen_dbs) == 1
         else "ALL"
     )
 
-    context = admin.site.each_context(request)
+    names = {
+        "ad": "Active Directory",
+        "bitrix": "Битрикс24",
+        "supermag": "Супермаг",
+    }
 
-    context.update({
-        "title": "Неактивные учётные записи",
-        "job": job,
-        "scan": scan,
-        "jobs": Job.objects.all()[:30],
-        "active_job": Job.objects.filter(
-            status__in=LIVE_STATUSES
-        ).first(),
-        "rows": current_page.object_list,
-        "page_obj": current_page,
-        "system": system,
-        "q": query,
-        "defaults": defaults,
-        "sm_dbs": sorted(legacy().ORACLE_TNS_MAP),
-        "selected_sm_db": selected_sm_db,
-        "scan_ready": bool(
-            scan and scan.status in {"done", "partial"}
-        ),
-        "events": (
-            Audit.objects
-            .filter(job=job)
-            .select_related("candidate")[:300]
-            if job
-            else []
-        ),
-    })
+    totals = {key: 0 for key in names}
+
+    if scan:
+        counts = (
+            Candidate.objects
+            .filter(scan=scan)
+            .values("system")
+            .annotate(total=Count("id"))
+        )
+
+        for item in counts:
+            totals[item["system"]] = item["total"]
+
+    system_counts = [
+        {
+            "name": names[key],
+            "count": totals[key],
+        }
+        for key in names
+        if key in defaults.get("systems", [])
+    ]
+
+    source_errors = []
+
+    if scan:
+        for key, detail in scan.summary.get(
+            "errors", {}
+        ).items():
+            code, _, scope = key.partition(":")
+
+            source_errors.append({
+                "name": (
+                    names.get(code, code)
+                    + (f" · {scope}" if scope else "")
+                ),
+                "detail": detail,
+            })
+
+    job_titles = {
+        "scan": "Поиск учётных записей",
+        "test": "Проверка выбранных записей",
+        "block": "Отключение доступа",
+    }
+
+    status_titles = {
+        "queued": "В очереди",
+        "running": "Выполняется",
+        "done": "Завершено",
+        "partial": "Есть замечания",
+        "failed": "Не удалось завершить",
+        "interrupted": "Прервано",
+    }
+
+    history = list(jobs[:15])
+
+    for item in history:
+        item.ui_title = job_titles.get(
+            item.kind,
+            "Обработка записей",
+        )
+        item.ui_status = status_titles.get(
+            item.status,
+            item.status,
+        )
+
+    metrics = []
+
+    if job and job.kind in {"block", "test"}:
+        metric_settings = [
+            ("checked", "Прошли проверку", "blue"),
+            ("blocked", "Доступ отключён", "green"),
+            ("already_disabled", "Уже отключены", "neutral"),
+            ("skipped", "Пропущены", "amber"),
+            ("failed", "Ошибки", "red"),
+            ("unknown", "Нужна проверка", "amber"),
+            ("unsupported", "Только просмотр", "neutral"),
+        ]
+
+        for code, label, tone in metric_settings:
+            count = job.summary.get(code, 0)
+
+            if count:
+                metrics.append({
+                    "label": label,
+                    "count": count,
+                    "tone": tone,
+                })
+
+    events = []
+
+    if job:
+        events = list(
+            Audit.objects.filter(
+                job=job,
+                event__in=[
+                    "requested",
+                    "target_result",
+                    "finished",
+                    "interrupted",
+                    "legacy_write_rejected",
+                ],
+            )
+            .select_related("candidate")[:100]
+        )
+
+        outcome_labels = {
+            "queued": "Задание создано",
+            "checked": "Проверено без изменений",
+            "blocked": "Доступ отключён",
+            "already_disabled": "Уже отключена",
+            "skipped": "Пропущена после проверки",
+            "failed": "Не удалось выполнить",
+            "unknown": "Нужна проверка результата",
+            "unsupported": "Только просмотр",
+            "done": "Завершено",
+            "partial": "Завершено с замечаниями",
+            "rejected": "Запрос отклонён",
+        }
+
+        for event in events:
+            event.ui_label = outcome_labels.get(
+                event.outcome,
+                "Обработка записи",
+            )
+
+    params = (
+        {
+            "job": str(job.pk),
+            "system": system,
+            "q": query,
+            "state": state,
+        }
+        if job
+        else {}
+    )
+
+    def page_url(number):
+        return (
+            reverse("inactive_access_ui")
+            + "?"
+            + urlencode({**params, "page": number})
+        )
 
     return render(
         request,
         "frostapp/inactive_access.html",
-        context,
+        {
+            "job": job,
+            "scan": scan,
+            "active_job": active_job,
+            "history": history,
+            "events": events,
+            "metrics": metrics,
+            "job_title": (
+                job_titles.get(job.kind, "")
+                if job else ""
+            ),
+            "job_status": (
+                status_titles.get(job.status, "")
+                if job else ""
+            ),
+            "page_obj": page_obj,
+            "rows": page_obj.object_list,
+            "available_count": available_count,
+            "can_operate": can_operate,
+            "has_bitrix": ui_selectable(rows).filter(
+                system="bitrix"
+            ).exists(),
+            "scan_expired": expired,
+            "scan_ready": scan_ready,
+            "system": system,
+            "q": query,
+            "state": state,
+            "defaults": defaults,
+            "sm_dbs": sorted(legacy().ORACLE_TNS_MAP),
+            "selected_sm_db": selected_db,
+            "system_counts": system_counts,
+            "source_errors": source_errors,
+            "search_open": not scan or expired,
+            "user_label": (
+                request.user.get_full_name()
+                or request.user.get_username()
+            ),
+            "active_title": (
+                job_titles.get(
+                    active_job.kind,
+                    "Обработка записей",
+                )
+                if active_job else ""
+            ),
+            "active_total": (
+                len(active_job.options.get(
+                    "candidate_ids", []
+                ))
+                if active_job else 0
+            ),
+            "previous_url": (
+                page_url(page_obj.previous_page_number())
+                if page_obj.has_previous() else ""
+            ),
+            "next_url": (
+                page_url(page_obj.next_page_number())
+                if page_obj.has_next() else ""
+            ),
+        },
     )
+
+
+@staff_member_required
+@csrf_protect
+@require_POST
+def logout_page(request):
+    auth_logout(request)
+
+    return redirect(
+        reverse("admin:login")
+        + "?"
+        + urlencode({
+            "next": reverse("inactive_access_ui"),
+        })
+    )
+
+
+
+
+
+# @staff_member_required
+# @never_cache
+# @require_GET
+# def page(request):
+#     if request.GET.get("job"):
+#         job = find_job(request.GET["job"])
+#     else:
+#         job = Job.objects.first()
+
+#     if job and job.kind == "scan":
+#         scan = job
+#     else:
+#         scan = job.source if job else None
+
+#     system = request.GET.get("system", "")
+#     query = request.GET.get("q", "").strip()[:200]
+
+#     candidates = (
+#         filtered_candidates(scan, system, query)
+#         if scan
+#         else Candidate.objects.none()
+#     )
+
+#     paginator = Paginator(candidates, 200)
+#     current_page = paginator.get_page(request.GET.get("page"))
+
+#     defaults = (
+#         scan.options
+#         if scan
+#         else {
+#             "days_ad": 60,
+#             "days_sm": 100,
+#             "days_bx": 90,
+#             "systems": ["ad", "bitrix", "supermag"],
+#             "dbs": ["BINUU00"],
+#             "include_never": True,
+#         }
+#     )
+
+#     selected_sm_db = (
+#         defaults["dbs"][0]
+#         if len(defaults.get("dbs", [])) == 1
+#         else "ALL"
+#     )
+
+#     context = admin.site.each_context(request)
+
+#     context.update({
+#         "title": "Неактивные учётные записи",
+#         "job": job,
+#         "scan": scan,
+#         "jobs": Job.objects.all()[:30],
+#         "active_job": Job.objects.filter(
+#             status__in=LIVE_STATUSES
+#         ).first(),
+#         "rows": current_page.object_list,
+#         "page_obj": current_page,
+#         "system": system,
+#         "q": query,
+#         "defaults": defaults,
+#         "sm_dbs": sorted(legacy().ORACLE_TNS_MAP),
+#         "selected_sm_db": selected_sm_db,
+#         "scan_ready": bool(
+#             scan and scan.status in {"done", "partial"}
+#         ),
+#         "events": (
+#             Audit.objects
+#             .filter(job=job)
+#             .select_related("candidate")[:300]
+#             if job
+#             else []
+#         ),
+#     })
+
+#     return render(
+#         request,
+#         "frostapp/inactive_access.html",
+#         context,
+#     )
 
 
 @staff_member_required
