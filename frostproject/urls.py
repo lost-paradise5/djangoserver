@@ -211,6 +211,12 @@ urlpatterns = [
         views.directors_report_run,
         name="directors_report_run",
     ),
+
+    path(
+        "ui/inactive-users/logout/",
+        ia.logout_page,
+        name="inactive_access_logout",
+    ),
     path(
         "reports/directors/download/<str:token>/",
         views.directors_report_download,
