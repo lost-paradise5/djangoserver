@@ -966,13 +966,6 @@ def bx_dates(user, options=None):
             )
         }
 
-        # Если дополнительный метод подтвердил онлайн,
-        # запись тоже должна быть исключена из блокировки.
-        if (
-            str(profile.get("status") or "").lower()
-            == "online"
-        ):
-            user["IS_ONLINE"] = "Y"
 
         activity_dates = [
             read_date(
