@@ -26,6 +26,7 @@ from frostapp.views import (
     TRM_SMALL_MAX,
     get_ukm_rotation_store_groups,
     build_ukm_rotation_links_filter,
+    _request_working_employees,
 )
 
 from frostapp.services.ukm4_verification import (
@@ -909,7 +910,7 @@ class Command(BaseCommand):
 
         started_at = time.monotonic()
 
-        response = requests.get(
+        response = _request_working_employees(
             ONEC_WORKING_EMPLOYEES_URL,
             auth=auth,
             headers={"Accept": "application/json"},
