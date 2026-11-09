@@ -393,7 +393,35 @@ def _env_value(name: str, default: str = "", env_path: str = "/app/.env") -> str
 
 
 
+def _request_working_employees(
+    url: str,
+    *,
+    timeout: float | tuple[float, float],
+    auth: tuple[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+    token = _env_value("ONEC_WORKING_EMPLOYEES_API_TOKEN")
 
+    request_headers = dict(headers or {})
+    if token:
+        request_headers["X-API-Token"] = token
+
+    response = requests.get(
+        url,
+        auth=auth,
+        headers=request_headers,
+        timeout=timeout,
+        allow_redirects=not bool(token),
+    )
+
+    if token and 300 <= response.status_code < 400:
+        raise requests.exceptions.HTTPError(
+            f"Get_WorkingEmployees вернул HTTP {response.status_code}. "
+            "Укажите конечный адрес в ONEC_WORKING_EMPLOYEES_URL.",
+            response=response,
+        )
+
+    return response
 
 
 
@@ -7061,7 +7089,7 @@ def _fetch_working_employees_from_1c() -> list[dict]:
     }
 
     logger.info("[WORKING_EMPLOYEES_EXCEL] Requesting 1C employees: %s", ONEC_WORKING_EMPLOYEES_URL)
-    response = requests.get(
+    response = _request_working_employees(
         ONEC_WORKING_EMPLOYEES_URL,
         auth=auth,
         headers=headers,
@@ -17276,7 +17304,7 @@ def _fetch_onec_working_employees() -> list[dict]:
 
     t0 = time.time()
     logger.info(f"[INN_SYNC] 1C request: {ONEC_WORKING_EMPLOYEES_URL}")
-    r = requests.get(
+    r = _request_working_employees(
         ONEC_WORKING_EMPLOYEES_URL,
         auth=auth,
         timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT,
@@ -25102,7 +25130,7 @@ def _release_sync_lock():
 
 
 def _one_c_get_working_employees() -> list[dict]:
-    r = requests.get(ONEC_WORKING_EMPLOYEES_URL, timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT)
+    r = _request_working_employees(ONEC_WORKING_EMPLOYEES_URL, timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT)
     r.raise_for_status()
     js = r.json()
     if not isinstance(js, list):
@@ -27954,7 +27982,7 @@ def _max_report_fetch_working_employees(
             force_refresh,
         )
 
-        response = requests.get(
+        response = _request_working_employees(
             ONEC_WORKING_EMPLOYEES_URL,
             **request_kwargs,
         )
@@ -32798,7 +32826,7 @@ def _fetch_working_employees_from_1c() -> list[dict]:
     if ONEC_WORKING_EMPLOYEES_AUTH_USER and ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD:
         auth = (ONEC_WORKING_EMPLOYEES_AUTH_USER, ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD)
 
-    response = requests.get(
+    response = _request_working_employees(
         ONEC_WORKING_EMPLOYEES_URL,
         auth=auth,
         timeout=(20, 240),
@@ -35685,7 +35713,7 @@ def _store_report_fetch_onec_working_employees() -> list[dict]:
             ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD,
         )
 
-    response = requests.get(
+    response = _request_working_employees(
         ONEC_WORKING_EMPLOYEES_URL,
         auth=auth,
         timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT,
@@ -36570,7 +36598,7 @@ def _fetch_onec_working_employees() -> list[dict]:
     auth = (auth_user, auth_password) if auth_user else None
 
     try:
-        response = requests.get(
+        response = _request_working_employees(
             ONEC_WORKING_EMPLOYEES_URL,
             auth=auth,
             headers={
@@ -38226,6 +38254,7 @@ def directors_report_run(request):
             onec_username=ONEC_WORKING_EMPLOYEES_AUTH_USER,
             onec_password=ONEC_WORKING_EMPLOYEES_AUTH_PASSWORD,
             onec_timeout=ONEC_WORKING_EMPLOYEES_TIMEOUT,
+            onec_api_token=_env_value("ONEC_WORKING_EMPLOYEES_API_TOKEN"),
             bitrix_user_get_url=BITRIX_USER_GET_URL,
             bitrix_inn_field=BITRIX_INN_FIELD,
         )
