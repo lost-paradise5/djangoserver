@@ -145,6 +145,7 @@ def _load_onec_directors(
     username: str,
     password: str,
     timeout: int,
+    api_token: str = "",
 ) -> tuple[list[dict], int]:
     if not url:
         raise DirectorsReportError(
@@ -159,8 +160,17 @@ def _load_onec_directors(
         response = requests.get(
             url,
             auth=auth,
+            headers=headers,
             timeout=(10, max(30, timeout)),
+            allow_redirects=not bool(api_token),
         )
+
+        if api_token and 300 <= response.status_code < 400:
+            raise DirectorsReportError(
+                f"Get_WorkingEmployees вернул HTTP {response.status_code}. "
+                "Укажите конечный адрес в ONEC_WORKING_EMPLOYEES_URL."
+            )
+
         response.raise_for_status()
     except RequestException as exc:
         raise DirectorsReportError(
@@ -1265,12 +1275,14 @@ def build_directors_report(
     onec_timeout: int,
     bitrix_user_get_url: str,
     bitrix_inn_field: str,
+    onec_api_token: str = "",
 ) -> dict:
     employees, onec_total = _load_onec_directors(
         url=onec_url,
         username=onec_username,
         password=onec_password,
         timeout=onec_timeout,
+        api_token=onec_api_token,
     )
 
     bitrix_raw_users = _load_all_bitrix_users(
