@@ -223,7 +223,7 @@ def _process_links(report, candidates, *, write):
     existing = defaultdict(list)
 
     for link in UKMUser.objects.filter(user_id__in=user_ids).values(
-        "user_id", "storeid", "roleid", "version",
+        "id", "user_id", "storeid", "roleid", "version",
     ).order_by("storeid", "roleid", "id"):
         existing[link["user_id"]].append(link)
 
@@ -231,50 +231,81 @@ def _process_links(report, candidates, *, write):
         row["existing"] = existing.get(row.get("user_id"), [])
 
     new_links = []
+    changed_links = []
+
     for (user_id, storeid), rows in candidates.items():
-        at_store = [
-            link for link in existing[user_id]
-            if link["storeid"] == storeid
-        ]
         roles = {row["roleid"] for row in rows}
-
-        if at_store:
-            for row in rows:
-                has_role = any(link["roleid"] == row["roleid"] for link in at_store)
-                reason = (
-                    "Привязка уже есть."
-                    if has_role
-                    else "Привязка уже есть с другой ролью."
-                )
-                row.update(state="exists", reason=reason)
-
-        elif len(roles) != 1:
+        if len(roles) != 1:
             for row in rows:
                 row.update(
                     state="skip",
                     reason="В 1С конфликт ролей для пользователя и магазина.",
                 )
+            continue
 
-        else:
-            first, *duplicates = rows
+        at_store = [
+            link for link in existing[user_id]
+            if link["storeid"] == storeid
+        ]
+        if len(at_store) > 1:
+            for row in rows:
+                row.update(
+                    state="skip",
+                    reason="В базе несколько привязок этого пользователя к магазину.",
+                )
+            continue
+
+        first, *duplicates = rows
+        target_role = first["roleid"]
+
+        if not at_store:
             if write:
-                first.update(state="added", reason="Привязка добавлена.")
                 new_links.append(
                     UKMUser(
                         user_id=user_id,
                         storeid=storeid,
-                        roleid=first["roleid"],
+                        roleid=target_role,
                         version=1,
                     )
                 )
+                first.update(state="added", reason="Привязка добавлена.")
             else:
                 first.update(state="planned", reason="Будет добавлена.")
 
-            for row in duplicates:
-                row.update(state="duplicate", reason="Повтор строки 1С. Учтена один раз.")
+        else:
+            link = at_store[0]
+            old_role = link["roleid"]
+
+            if old_role == target_role:
+                first.update(
+                    state="exists",
+                    reason="Привязка уже есть с нужной ролью.",
+                )
+            elif write:
+                changed_links.append(
+                    UKMUser(id=link["id"], roleid=target_role)
+                )
+                first.update(
+                    state="updated",
+                    reason=f"Роль изменена: {old_role} → {target_role}.",
+                )
+            else:
+                first.update(
+                    state="planned_update",
+                    reason=f"Роль будет изменена: {old_role} → {target_role}.",
+                )
+
+        for row in duplicates:
+            row.update(
+                state="duplicate",
+                reason="Повтор строки 1С. Учтена один раз.",
+            )
 
     if new_links:
         UKMUser.objects.bulk_create(new_links, batch_size=500)
+
+    if changed_links:
+        UKMUser.objects.bulk_update(changed_links, ["roleid"], batch_size=500)
 
 
 def _apply_links(report, candidates, *, write):
