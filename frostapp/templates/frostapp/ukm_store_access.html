@@ -109,8 +109,10 @@
           <span>Уже есть <b>{{ counts.exists|default:"0" }}</b></span>
           {% if mode == "test" %}
             <span>Будет добавлено <b>{{ counts.planned|default:"0" }}</b></span>
+            <span>Ролей к обновлению <b>{{ counts.planned_update|default:"0" }}</b></span>
           {% else %}
             <span>Добавлено <b>{{ counts.added|default:"0" }}</b></span>
+            <span>Ролей обновлено <b>{{ counts.updated|default:"0" }}</b></span>
           {% endif %}
           <span>Пропущено <b>{{ counts.skip|default:"0" }}</b></span>
           <span>Повторы 1С <b>{{ counts.duplicate|default:"0" }}</b></span>
@@ -226,7 +228,7 @@
   if (accessForm) {
     accessForm.addEventListener('submit', (event) => {
       if (event.submitter?.value === 'apply' &&
-          !window.confirm('Добавить отсутствующие привязки в PostgreSQL?')) {
+          !window.confirm('Добавить новые привязки и обновить роли по данным 1С?')) {
         event.preventDefault();
       }
     });
