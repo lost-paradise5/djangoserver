@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Привязки магазинов УКМ</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font: 16px/1.5 system-ui, sans-serif;
+      color: #192a40;
+      background: #f1f5f9;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1440px; margin: auto; padding: clamp(16px, 4vw, 42px); }
+    h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.2; margin: 0 0 8px; }
+    h2 { margin: 0 0 12px; font-size: 22px; }
+    p { margin: 0 0 12px; }
+    small, .muted { color: #52647a; }
+    nav, .actions, .stats, .pager { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+    nav, .stats, .pager { margin: 16px 0; }
+    nav a {
+      padding: 8px 14px;
+      border-radius: 8px;
+      color: #173c78;
+      text-decoration: none;
+      font-weight: 650;
+    }
+    nav a[aria-current="page"] { background: #dbeafe; }
+    section {
+      background: #fff;
+      border: 1px solid #dce5ef;
+      border-radius: 12px;
+      margin-bottom: 16px;
+      padding: clamp(14px, 3vw, 24px);
+    }
+    button {
+      cursor: pointer;
+      font: inherit;
+      font-weight: 650;
+      border: 1px solid #a9bdd4;
+      background: #fff;
+      color: #173c78;
+      padding: 8px 14px;
+      border-radius: 8px;
+    }
+    button.primary { color: #fff; background: #214c91; border-color: #214c91; }
+    button:disabled { opacity: .55; cursor: default; }
+    :focus-visible { outline: 3px solid #4475d2; outline-offset: 3px; }
+    .stats span, .badge { background: #edf3fa; padding: 4px 8px; border-radius: 6px; }
+    .badge { display: inline-block; font-weight: 650; }
+    .badge.added { color: #14532d; background: #dcfce7; }
+    .badge.planned { color: #173c78; background: #dbeafe; }
+    .badge.skip { color: #7c4309; background: #fef3c7; }
+    .error { color: #8d2222; background: #fff0f0; border-color: #f0bcbc; }
+    .scroll { overflow: auto; max-height: 68vh; border: 1px solid #dce5ef; border-radius: 8px; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: .92rem; }
+    th, td { text-align: left; vertical-align: top; padding: 9px; border-bottom: 1px solid #e5edf5; }
+    th { position: sticky; top: 0; background: #edf3fa; white-space: nowrap; }
+    td { min-width: 100px; max-width: 400px; overflow-wrap: anywhere; white-space: pre-wrap; }
+    summary { cursor: pointer; }
+    pre { padding: 12px; background: #eef3fa; overflow: auto; max-height: 60vh; }
+    code { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Привязки магазинов УКМ</h1>
+  <p class="muted">Сотрудники из 1С и их привязки к магазинам в PostgreSQL</p>
+
+  <nav aria-label="Разделы">
+    <a href="?tab=access" {% if tab == "access" %}aria-current="page"{% endif %}>
+      Привязки УКМ
+    </a>
+    <a href="?tab=source" {% if tab == "source" %}aria-current="page"{% endif %}>
+      Ответ 1С
+    </a>
+  </nav>
+
+  {% if error %}
+    <section class="error" role="alert">{{ error }}</section>
+  {% endif %}
+
+  {% if tab == "access" %}
+    <section>
+      <h2>Синхронизация привязок</h2>
+      <p>Магазины из <code>{{ store_env }}</code></p>
+      <p><strong>{{ store_ids|join:", "|default:"Список не задан" }}</strong></p>
+
+      <form method="post" id="access-form" class="actions">
+        {% csrf_token %}
+        <button type="submit" name="mode" value="test" {% if not store_ids %}disabled{% endif %}>
+          Запуск (тест)
+        </button>
+        <button type="submit" name="mode" value="apply" class="primary" {% if not store_ids %}disabled{% endif %}>
+          Запуск
+        </button>
+      </form>
+    </section>
+
+    {% if result_ready %}
+      <section>
+        <h2>{% if mode == "test" %}Результат теста{% else %}Результат запуска{% endif %}</h2>
+        <div class="stats">
+          <span>Всего из 1С <b>{{ total_1c }}</b></span>
+          <span>По выбранным магазинам <b>{{ report|length }}</b></span>
+          <span>Найдено по ИНН и ФИО <b>{{ found }}</b></span>
+          <span>Уже есть <b>{{ counts.exists|default:"0" }}</b></span>
+          {% if mode == "test" %}
+            <span>Будет добавлено <b>{{ counts.planned|default:"0" }}</b></span>
+          {% else %}
+            <span>Добавлено <b>{{ counts.added|default:"0" }}</b></span>
+          {% endif %}
+          <span>Пропущено <b>{{ counts.skip|default:"0" }}</b></span>
+          <span>Повторы 1С <b>{{ counts.duplicate|default:"0" }}</b></span>
+        </div>
+
+        {% if missing_stores %}
+          <p>По этим ID 1С не вернула сотрудников: <b>{{ missing_stores|join:", " }}</b></p>
+        {% endif %}
+
+        {% if report %}
+          <div class="scroll" tabindex="0" aria-label="Результаты по сотрудникам">
+            <table>
+              <thead>
+                <tr>
+                  <th>ФИО и ИНН в 1С</th>
+                  <th>Должность в 1С</th>
+                  <th>Магазин</th>
+                  <th>Пользователь в базе</th>
+                  <th>Привязки до запуска</th>
+                  <th>Роль из 1С</th>
+                  <th>Результат</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in report %}
+                  <tr>
+                    <td><b>{{ row.fio|default:"—" }}</b><br><small>{{ row.inn|default:"—" }}</small></td>
+                    <td>{{ row.position|default:"—" }}</td>
+                    <td>{{ row.name|default:"—" }}<br><small>1С {{ row.smstore }} · УКМ {{ row.ukm4store|default:"—" }}</small></td>
+                    <td>
+                      {% if row.user_id %}
+                        {{ row.db_fio }}<br><small>ID {{ row.user_id }}</small>
+                      {% elif row.users_found %}
+                        <details>
+                          <summary>Кандидаты по ИНН</summary>
+                          {% for user in row.users_found %}
+                            <div>{{ user.full_name }} · ID {{ user.id }}</div>
+                          {% endfor %}
+                        </details>
+                      {% else %}
+                        —
+                      {% endif %}
+                    </td>
+                    <td>
+                      {% if row.existing %}
+                        <details>
+                          <summary>Привязок: {{ row.existing|length }}</summary>
+                          {% for link in row.existing %}
+                            <div>Магазин {{ link.storeid }} · роль {{ link.roleid }} · v{{ link.version }}</div>
+                          {% endfor %}
+                        </details>
+                      {% else %}
+                        —
+                      {% endif %}
+                    </td>
+                    <td>{{ row.roleid|default:"—" }}</td>
+                    <td><span class="badge {{ row.state }}">{{ row.reason }}</span></td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p>В ответе 1С нет записей по выбранным магазинам.</p>
+        {% endif %}
+      </section>
+    {% endif %}
+  {% else %}
+    <section>
+      <h2>Сотрудники из 1С</h2>
+      <p class="muted">Данные всех магазинов, по 25 записей на страницу.</p>
+      <form method="post">
+        {% csrf_token %}
+        <button type="submit" name="mode" value="source" class="primary">
+          Показать список
+        </button>
+      </form>
+    </section>
+
+    {% if source_loaded %}
+      <section>
+        <h2>Получено записей {{ source_count }}</h2>
+        {{ source_rows|json_script:"onec-rows" }}
+        {% if not source_is_list %}
+          {{ source_payload|json_script:"onec-payload" }}
+        {% endif %}
+
+        <div class="pager">
+          <button type="button" id="prev-page">Назад</button>
+          <span id="page-number" role="status"></span>
+          <button type="button" id="next-page">Вперёд</button>
+        </div>
+
+        <div class="scroll" tabindex="0" aria-label="Таблица сотрудников из 1С">
+          <table>
+            <thead><tr id="onec-columns"></tr></thead>
+            <tbody id="onec-table"></tbody>
+          </table>
+        </div>
+
+        <details id="raw-response">
+          <summary>Показать полный JSON ответа</summary>
+          <pre id="raw-content"></pre>
+        </details>
+      </section>
+    {% endif %}
+  {% endif %}
+</main>
+
+<script>
+  const accessForm = document.getElementById('access-form');
+
+  if (accessForm) {
+    accessForm.addEventListener('submit', (event) => {
+      if (event.submitter?.value === 'apply' &&
+          !window.confirm('Добавить отсутствующие привязки в PostgreSQL?')) {
+        event.preventDefault();
+      }
+    });
+  }
+
+  const sourceData = document.getElementById('onec-rows');
+
+  if (sourceData) {
+    const rows = JSON.parse(sourceData.textContent);
+    const perPage = 25;
+    const pageCount = Math.max(1, Math.ceil(rows.length / perPage));
+    const isRecord = (value) =>
+      value !== null && typeof value === 'object' && !Array.isArray(value);
+
+    const fields = new Set(rows.flatMap((row) => isRecord(row) ? Object.keys(row) : []));
+    const priority = ['ИдМагазина', 'ИНН', 'Фамилия', 'Имя', 'Отчество', 'ФИО', 'Должность'];
+    const columns = [...priority.filter((field) => fields.delete(field)), ...fields];
+    const showOther = rows.some((row) => !isRecord(row));
+
+    const head = document.getElementById('onec-columns');
+    const body = document.getElementById('onec-table');
+    const prev = document.getElementById('prev-page');
+    const next = document.getElementById('next-page');
+    const label = document.getElementById('page-number');
+    let page = 1;
+
+    function cell(row, tag, value) {
+      const node = document.createElement(tag);
+      node.textContent = typeof value === 'string' ? value : JSON.stringify(value ?? '');
+      row.append(node);
+    }
+
+    cell(head, 'th', '№');
+    for (const column of columns) cell(head, 'th', column);
+    if (showOther) cell(head, 'th', 'Значение');
+
+    function showPage() {
+      const start = (page - 1) * perPage;
+      const fragment = document.createDocumentFragment();
+
+      rows.slice(start, start + perPage).forEach((row, index) => {
+        const tr = document.createElement('tr');
+        const record = isRecord(row);
+
+        cell(tr, 'td', start + index + 1);
+        for (const column of columns) {
+          cell(tr, 'td', record && Object.hasOwn(row, column) ? row[column] : '');
+        }
+        if (showOther) cell(tr, 'td', record ? '' : row);
+
+        fragment.append(tr);
+      });
+
+      body.replaceChildren(fragment);
+      label.textContent = rows.length ? 'Страница ' + page + ' из ' + pageCount : 'Нет записей';
+      prev.disabled = page <= 1;
+      next.disabled = page >= pageCount;
+    }
+
+    prev.addEventListener('click', () => { page -= 1; showPage(); });
+    next.addEventListener('click', () => { page += 1; showPage(); });
+    showPage();
+
+    const details = document.getElementById('raw-response');
+    details.addEventListener('toggle', () => {
+      const content = document.getElementById('raw-content');
+      if (details.open && !content.textContent) {
+        const fullResponse = document.getElementById('onec-payload');
+        content.textContent = JSON.stringify(
+          fullResponse ? JSON.parse(fullResponse.textContent) : rows,
+          null,
+          2,
+        );
+      }
+    });
+  }
+</script>
+</body>
+</html>
