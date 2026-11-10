@@ -3,6 +3,7 @@ from django.urls import path, re_path
 from django.conf import settings
 from django.conf.urls.static import static
 
+from frostapp.ukm_store_access import ukm_store_access
 from frostapp import views
 from frostapp import inactive_access as ia
 from frostapp.views import (
@@ -90,6 +91,7 @@ urlpatterns = [
     path('sm/staff/sync-inn/', sm_staff_sync_inn, name='sm_staff_sync_inn'),
     path('sm/staff/by-db/', sm_staff_list_by_db, name='sm_staff_list_by_db'),
     path('ui/smstaff/', sm_staff_ui_list, name='sm_staff_ui_list'),
+    path("ukm-store-access/", ukm_store_access, name="ukm_store_access"),
     re_path(r'^ui/smstaff/(?P<db>[^/]+)/edit/(?P<staff_id>-?\d+)/$', 
             sm_staff_ui_edit_inn, 
             name='sm_staff_ui_edit_inn'),
