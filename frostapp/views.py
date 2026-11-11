@@ -14172,7 +14172,7 @@ def get_reboot_stores_for_user(user: User) -> list[dict]:
         UKMUser.objects
         .filter(
             user_id=user.id,
-            roleid__in=[12, 13],
+            roleid__in=[11, 13],
         )
         .values("storeid", "roleid")
     )
@@ -14292,8 +14292,8 @@ def get_devices_for_user_store(
 
     if 13 in role_ids:
         role_id = 13
-    elif 12 in role_ids:
-        role_id = 12
+    elif 11 in role_ids:
+        role_id = 11
     else:
         raise PermissionError(
             f"Нет прав администратора на магазин {ukm_store_id}"
