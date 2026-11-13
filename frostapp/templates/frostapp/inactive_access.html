@@ -97,6 +97,88 @@ h2 {
     color: #fff;
 }
 
+
+
+
+
+.activity-filters {
+    grid-column: 1 / -1;
+    flex-basis: 100%;
+    width: 100%;
+    min-width: 0;
+    margin: 16px 0;
+    padding: 20px;
+    border: 1px solid #dce3ed;
+    border-radius: 14px;
+    box-sizing: border-box;
+}
+
+.activity-filters legend {
+    padding: 0 8px;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.activity-filters-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 16px;
+}
+
+.activity-filters-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 16px;
+}
+
+.activity-filters-grid input {
+    width: 100%;
+    min-width: 0;
+    min-height: 48px;
+    padding: 10px 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+    background: #fff;
+    color: #172033;
+    font: inherit;
+    font-size: 18px;
+    box-sizing: border-box;
+}
+
+.activity-filters-grid input:focus {
+    outline: 3px solid #dbeafe;
+    border-color: #2563eb;
+}
+
+.activity-filters-hint {
+    margin: 14px 0 0;
+    color: #64748b;
+    font-size: 15px;
+    line-height: 1.5;
+}
+
+.activity-filter-error {
+    margin: 16px 0;
+    padding: 16px;
+    border-radius: 12px;
+    background: #fef2f2;
+    color: #991b1b;
+    font-size: 17px;
+}
+
+@media (max-width: 1000px) {
+    .activity-filters-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 560px) {
+    .activity-filters-grid {
+        grid-template-columns: 1fr;
+    }
+}    
+
 .account {
     display: flex;
     align-items: center;
@@ -453,7 +535,7 @@ select {
     margin-top: 22px;
 }
 
-.filters input {
+.filters > input[type="search"] {
     flex: 1;
     min-width: 230px;
 }
@@ -793,8 +875,8 @@ dialog p {
 
     .filters { gap: 9px; }
 
-    .filters input,
-    .filters select {
+    .filters > input[type="search"],
+    .filters > select {
         width: 100%;
         min-width: 0;
         flex: auto;
@@ -1295,16 +1377,78 @@ dialog p {
                     </option>
                 </select>
 
+                <fieldset class="activity-filters">
+                    <legend>Последний вход / активность</legend>
+                
+                    <div class="activity-filters-grid">
+                        <label>
+                            <span>С даты</span>
+                            <input
+                                type="date"
+                                name="seen_from"
+                                value="{{ activity.seen_from }}"
+                            >
+                        </label>
+                
+                        <label>
+                            <span>По дату</span>
+                            <input
+                                type="date"
+                                name="seen_to"
+                                value="{{ activity.seen_to }}"
+                            >
+                        </label>
+                
+                        <label>
+                            <span>Не заходил: от дней</span>
+                            <input
+                                type="number"
+                                name="idle_min"
+                                min="0"
+                                max="36500"
+                                step="1"
+                                placeholder="Например, 180"
+                                value="{{ activity.idle_min }}"
+                            >
+                        </label>
+                
+                        <label>
+                            <span>Не заходил: до дней</span>
+                            <input
+                                type="number"
+                                name="idle_max"
+                                min="0"
+                                max="36500"
+                                step="1"
+                                placeholder="Без ограничения"
+                                value="{{ activity.idle_max }}"
+                            >
+                        </label>
+                    </div>
+                
+                    <p class="activity-filters-hint">
+                        Даты включительно. Давность — в полных днях
+                        на момент формирования списка.
+                    </p>
+                </fieldset>
+
                 <button class="btn" type="submit">
                     Найти
                 </button>
 
-                {% if q or system or state %}
+                {% if q or system or state or activity.seen_from or activity.seen_to or activity.idle_min or activity.idle_max %}
                 <a class="small" href="?job={{ job.pk }}">
                     Сбросить
                 </a>
                 {% endif %}
             </form>
+
+            {% if activity_error %}
+                <div class="activity-filter-error" role="alert">
+                    {{ activity_error }}
+                </div>
+            {% endif %}
+
             {% endif %}
         </div>
 
@@ -1317,6 +1461,15 @@ dialog p {
             data-has-bitrix="{% if has_bitrix %}1{% else %}0{% endif %}"
         >
             {% csrf_token %}
+
+
+            {% for name, value in activity.items %}
+                <input
+                    type="hidden"
+                    name="{{ name }}"
+                    value="{{ value }}"
+                >
+            {% endfor %}
 
             <input
                 type="hidden"
@@ -1556,7 +1709,7 @@ dialog p {
                     Начните с поиска
                 {% elif not scan_ready %}
                     Список формируется
-                {% elif q or system or state %}
+                {% elif q or system or state or activity.seen_from or activity.seen_to or activity.idle_min or activity.idle_max %}
                     По этим фильтрам записей нет
                 {% else %}
                     Неактивные записи не найдены
@@ -1569,7 +1722,7 @@ dialog p {
                     «Сформировать список».
                 {% elif not scan_ready %}
                     Результат появится после завершения поиска.
-                {% elif q or system or state %}
+                {% elif q or system or state or activity.seen_from or activity.seen_to or activity.idle_min or activity.idle_max %}
                     Измените условия поиска
                     или сбросьте фильтры.
                 {% else %}
