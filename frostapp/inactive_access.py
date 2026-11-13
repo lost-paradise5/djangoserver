@@ -634,6 +634,15 @@ def operate_ad(candidate, options, dry_run, before_change):
                 before,
             )
 
+
+        if not matches_activity_filters(last_seen, options):
+            return result(
+                "skipped",
+                "Дата последнего входа/активности "
+                "больше не соответствует фильтрам",
+                before,
+            )
+
         if not is_stale(
             last_seen,
             created,
@@ -1141,6 +1150,14 @@ def operate_bitrix(candidate, options, dry_run, before_change):
 
     last_seen, created = bx_dates(before, options)
 
+    if not matches_activity_filters(last_seen, options):
+        return result(
+            "skipped",
+            "Дата последнего входа/активности "
+            "больше не соответствует фильтрам",
+            before,
+        )
+
     if (
         bool_value(before.get("IS_ONLINE"))
         or not is_stale(
@@ -1427,20 +1444,27 @@ def create_block_job(request):
 
             check_scan_age(scan)
 
+            activity = read_activity_filters(request.POST)
+
+            eligible = ui_selectable(
+                ui_candidates(
+                    scan,
+                    request.POST.get("system", ""),
+                    request.POST.get("q", "").strip()[:200],
+                    request.POST.get("state", ""),
+                    activity,
+                )
+            )
+
             if request.POST.get("row"):
                 raw_ids = [request.POST["row"]]
 
             elif request.POST.get("all_filtered") == "1":
                 raw_ids = list(
-                    ui_selectable(
-                        ui_candidates(
-                            scan,
-                            request.POST.get("system", ""),
-                            request.POST.get("q", "")[:200],
-                            request.POST.get("state", ""),
-                        )
-                    )
-                    .values_list("pk", flat=True)[:10001]
+                    eligible.values_list(
+                        "pk",
+                        flat=True,
+                    )[:10001]
                 )
 
             else:
@@ -1471,20 +1495,21 @@ def create_block_job(request):
                     "Выберите от 1 до 10000 учётных записей"
                 )
 
-            count = Candidate.objects.filter(
-                scan=scan,
-                pk__in=ids,
-            ).count()
+            count = eligible.filter(pk__in=ids).count()
 
             if count != len(ids):
                 raise AccessError(
-                    "Часть записей не принадлежит этому поиску"
+                    "Часть записей недоступна "
+                    "или не соответствует фильтрам"
                 )
 
             job = Job.objects.create(
                 kind="test" if action == "test" else "block",
                 source=scan,
-                options={"candidate_ids": ids},
+                options={
+                    "candidate_ids": ids,
+                    "activity_filters": activity,
+                },
                 **actor_info(request),
             )
 
@@ -1499,6 +1524,8 @@ def create_block_job(request):
                     "candidate_ids": ids,
                     "scan": str(scan.pk),
                     "criteria": scan.options,
+                    "activity_filters": activity,
+                    "activity_at": scan.finished_at,
                 },
             )
 
@@ -1625,6 +1652,16 @@ def execute_block(job):
     counts = Counter()
     dry_run = job.kind == "test"
 
+    operation_options = {
+        **job.source.options,
+        "activity_filters": (
+            job.options.get("activity_filters") or {}
+        ),
+        "activity_at": (
+            job.source.finished_at or timezone.now()
+        ),
+    }
+
     handlers = {
         "ad": operate_ad,
         "bitrix": operate_bitrix,
@@ -1695,7 +1732,7 @@ def execute_block(job):
         try:
             answer = handlers[candidate.system](
                 candidate,
-                job.source.options,
+                operation_options,
                 dry_run,
                 before_change,
             )
@@ -1878,6 +1915,141 @@ def release_worker_lock():
 # Интерфейс
 # ============================================================
 
+
+
+
+
+ACTIVITY_FILTER_FIELDS = (
+    "seen_from",
+    "seen_to",
+    "idle_min",
+    "idle_max",
+)
+
+
+def read_activity_filters(data):
+    values = {
+        name: str(data.get(name) or "").strip()
+        for name in ACTIVITY_FILTER_FIELDS
+    }
+
+    for name in ("seen_from", "seen_to"):
+        if values[name]:
+            try:
+                if not re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}",
+                    values[name],
+                ):
+                    raise ValueError
+
+                values[name] = datetime.date.fromisoformat(
+                    values[name]
+                ).isoformat()
+
+            except ValueError:
+                raise AccessError(
+                    "Укажите корректные даты последнего входа"
+                ) from None
+
+    for name in ("idle_min", "idle_max"):
+        if values[name]:
+            try:
+                number = int(values[name])
+            except ValueError:
+                raise AccessError(
+                    "Давность входа укажите целым числом дней"
+                ) from None
+
+            if not 0 <= number <= 36500:
+                raise AccessError(
+                    "Давность входа должна быть от 0 до 36500 дней"
+                )
+
+            values[name] = str(number)
+
+    if values["seen_from"] and values["seen_to"]:
+        if values["seen_from"] > values["seen_to"]:
+            raise AccessError(
+                "Дата «с» должна быть не позже даты «по»"
+            )
+
+    if values["idle_min"] and values["idle_max"]:
+        if int(values["idle_min"]) > int(values["idle_max"]):
+            raise AccessError(
+                "Минимальная давность больше максимальной"
+            )
+
+    return values
+
+
+def activity_rules(values, at):
+    rules = []
+    zone = timezone.get_current_timezone()
+
+    for name, lookup, moment in (
+        ("seen_from", "gte", datetime.time.min),
+        ("seen_to", "lte", datetime.time.max),
+    ):
+        if values.get(name):
+            day = datetime.date.fromisoformat(values[name])
+
+            boundary = timezone.make_aware(
+                datetime.datetime.combine(day, moment),
+                zone,
+            )
+
+            rules.append((lookup, boundary))
+
+    if values.get("idle_min"):
+        rules.append((
+            "lte",
+            at - datetime.timedelta(
+                days=int(values["idle_min"])
+            ),
+        ))
+
+    if values.get("idle_max"):
+        rules.append((
+            "gt",
+            at - datetime.timedelta(
+                days=int(values["idle_max"]) + 1
+            ),
+        ))
+
+    return rules
+
+
+def matches_activity_filters(last_seen, options):
+    rules = activity_rules(
+        options.get("activity_filters") or {},
+        options.get("activity_at") or timezone.now(),
+    )
+
+    if not rules:
+        return True
+
+    if last_seen is None:
+        return False
+
+    for lookup, boundary in rules:
+        if lookup == "gte" and last_seen < boundary:
+            return False
+
+        if lookup == "lte" and last_seen > boundary:
+            return False
+
+        if lookup == "gt" and last_seen <= boundary:
+            return False
+
+    return True
+
+
+
+
+
+
+
+
 def find_job(raw_id):
     try:
         job_id = uuid.UUID(str(raw_id))
@@ -1889,7 +2061,13 @@ def find_job(raw_id):
 
 
 
-def ui_candidates(scan, system="", query="", state=""):
+def ui_candidates(
+    scan,
+    system="",
+    query="",
+    state="",
+    activity=None,
+):
     rows = filtered_candidates(scan, system, query)
 
     groups = {
@@ -1900,6 +2078,14 @@ def ui_candidates(scan, system="", query="", state=""):
 
     if state in groups:
         rows = rows.filter(state__in=groups[state])
+
+    for lookup, boundary in activity_rules(
+        activity or {},
+        scan.finished_at or timezone.now(),
+    ):
+        rows = rows.filter(**{
+            f"last_seen__{lookup}": boundary,
+        })
 
     return rows
 
@@ -1950,9 +2136,27 @@ def page(request):
 
     query = request.GET.get("q", "").strip()[:200]
 
+    activity = {
+        name: str(request.GET.get(name) or "").strip()
+        for name in ACTIVITY_FILTER_FIELDS
+    }
+
+    activity_error = ""
+
+    try:
+        activity = read_activity_filters(request.GET)
+    except AccessError as exc:
+        activity_error = str(exc)
+
     rows = (
-        ui_candidates(scan, system, query, state)
-        if scan
+        ui_candidates(
+            scan,
+            system,
+            query,
+            state,
+            activity,
+        )
+        if scan and not activity_error
         else Candidate.objects.none()
     )
 
@@ -1978,6 +2182,7 @@ def page(request):
         scan_ready
         and not expired
         and not active_job
+        and not activity_error
     )
 
     state_labels = {
@@ -1991,7 +2196,11 @@ def page(request):
         "unknown": ("Нужна проверка", "amber"),
     }
 
-    now = timezone.now()
+    now = (
+        scan.finished_at
+        if scan and scan.finished_at
+        else timezone.now()
+    )
 
     for row in page_obj.object_list:
         row.ui_state, row.ui_tone = state_labels.get(
@@ -2177,6 +2386,7 @@ def page(request):
             "system": system,
             "q": query,
             "state": state,
+            **activity,
         }
         if job
         else {}
@@ -2219,6 +2429,8 @@ def page(request):
             "system": system,
             "q": query,
             "state": state,
+            "activity": activity,
+            "activity_error": activity_error,
             "defaults": defaults,
             "sm_dbs": sorted(legacy().ORACLE_TNS_MAP),
             "selected_sm_db": selected_db,
