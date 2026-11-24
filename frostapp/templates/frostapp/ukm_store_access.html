@@ -45,6 +45,25 @@
       padding: 8px 14px;
       border-radius: 8px;
     }
+    .manual-box {
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid #dce5ef;
+    }
+    
+    .manual-box label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 650;
+    }
+    
+    .manual-field {
+      width: min(100%, 500px);
+      padding: 10px 12px;
+      border: 1px solid #a9bdd4;
+      border-radius: 8px;
+      font: inherit;
+    }
     button.primary { color: #fff; background: #214c91; border-color: #214c91; }
     button:disabled { opacity: .55; cursor: default; }
     :focus-visible { outline: 3px solid #4475d2; outline-offset: 3px; }
@@ -87,6 +106,9 @@
       <h2>Синхронизация привязок</h2>
       <p>Магазины из <code>{{ store_env }}</code></p>
       <p><strong>{{ store_ids|join:", "|default:"Список не задан" }}</strong></p>
+      {% if config_error %}
+        <p class="error">{{ config_error }}</p>
+      {% endif %}
 
       <form method="post" id="access-form" class="actions">
         {% csrf_token %}
@@ -97,11 +119,52 @@
           Запуск
         </button>
       </form>
+      <form method="post" id="manual-access-form" class="manual-box">
+        {% csrf_token %}
+      
+        <h2>Назначение ролей 1 и 2</h2>
+      
+        <p class="muted">
+          Укажи ИдМагазина из 1С через запятую.
+          Роль определяется по должности сотрудника.
+        </p>
+      
+        <label for="manual-store-ids">ID магазинов из 1С</label>
+      
+        <div class="actions">
+          <input
+            type="text"
+            id="manual-store-ids"
+            name="manual_store_ids"
+            class="manual-field"
+            value="{{ manual_store_ids }}"
+            placeholder="103,107,115"
+            required
+          >
+      
+          <button
+            type="submit"
+            name="mode"
+            value="manual"
+            class="primary"
+          >
+            Выполнить
+          </button>
+        </div>
+      </form>
     </section>
 
     {% if result_ready %}
       <section>
         <h2>{% if mode == "test" %}Результат теста{% else %}Результат запуска{% endif %}</h2>
+        <p>
+          Обработанные ИдМагазина из 1С:
+          <strong>{{ processed_store_ids|join:", " }}</strong>
+        </p>
+        
+        {% if mode == "manual" %}
+          <p class="muted">Назначение ролей 1 и 2 по должностям.</p>
+        {% endif %}
         <div class="stats">
           <span>Всего из 1С <b>{{ total_1c }}</b></span>
           <span>По выбранным магазинам <b>{{ report|length }}</b></span>
@@ -132,7 +195,7 @@
                   <th>Магазин</th>
                   <th>Пользователь в базе</th>
                   <th>Привязки до запуска</th>
-                  <th>Роль из 1С</th>
+                  <th>Назначаемая роль</th>
                   <th>Результат</th>
                 </tr>
               </thead>
@@ -140,7 +203,14 @@
                 {% for row in report %}
                   <tr>
                     <td><b>{{ row.fio|default:"—" }}</b><br><small>{{ row.inn|default:"—" }}</small></td>
-                    <td>{{ row.position|default:"—" }}</td>
+                    <td>
+                      {{ row.position|default:"—" }}
+                    
+                      {% if row.cashier_role %}
+                        <br>
+                        <small>РольКассира в 1С: {{ row.cashier_role }}</small>
+                      {% endif %}
+                    </td>
                     <td>{{ row.name|default:"—" }}<br><small>1С {{ row.smstore }} · УКМ {{ row.ukm4store|default:"—" }}</small></td>
                     <td>
                       {% if row.user_id %}
@@ -223,16 +293,18 @@
 </main>
 
 <script>
-  const accessForm = document.getElementById('access-form');
-
-  if (accessForm) {
-    accessForm.addEventListener('submit', (event) => {
-      if (event.submitter?.value === 'apply' &&
-          !window.confirm('Добавить новые привязки и обновить роли по данным 1С?')) {
+  document.querySelectorAll('#access-form, #manual-access-form').forEach((form) => {
+    form.addEventListener('submit', (event) => {
+      const mode = event.submitter?.value;
+  
+      if (
+        ['apply', 'manual'].includes(mode) &&
+        !window.confirm('Добавить привязки и обновить роли по данным 1С?')
+      ) {
         event.preventDefault();
       }
     });
-  }
+  });
 
   const sourceData = document.getElementById('onec-rows');
 
