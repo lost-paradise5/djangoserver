@@ -30,6 +30,23 @@ ROLE_11_POSITIONS = {
     "директор магазина",
 }
 
+ROLE_1_POSITIONS = {
+    "специалист торгового зала",
+    "сотрудник торгового зала",
+    "приемщик",
+    "приемщик товара",
+}
+
+ROLE_2_POSITIONS = {
+    "старший кассир",
+    "заведующий отделом",
+    "генеральный директор",
+    "менеджер",
+    "старший специалист торгового зала",
+    "администратор",
+    "администратор магазина",
+}
+
 
 class StoreAccessError(Exception):
     pass
@@ -52,18 +69,60 @@ def _store_id(value):
     return None
 
 
-def _configured_stores():
-    raw = _env_value(STORE_IDS_ENV)
+# def _configured_stores():
+#     raw = _env_value(STORE_IDS_ENV)
+#     if not raw:
+#         raise StoreAccessError(f"Заполни {STORE_IDS_ENV} в .env.")
+
+#     values = {_store_id(value) for value in raw.split(",")}
+#     if None in values:
+#         raise StoreAccessError(
+#             f"В {STORE_IDS_ENV} укажи положительные ID через запятую."
+#         )
+
+#     return sorted(values)
+
+
+def _parse_store_ids(raw, field_name):
+    raw = _text(raw)
     if not raw:
-        raise StoreAccessError(f"Заполни {STORE_IDS_ENV} в .env.")
+        raise StoreAccessError(f"Заполни {field_name}.")
 
     values = {_store_id(value) for value in raw.split(",")}
     if None in values:
         raise StoreAccessError(
-            f"В {STORE_IDS_ENV} укажи положительные ID через запятую."
+            f"В {field_name} укажи положительные ID через запятую."
         )
 
     return sorted(values)
+
+
+def _configured_stores():
+    return _parse_store_ids(
+        _env_value(STORE_IDS_ENV),
+        f"{STORE_IDS_ENV} в .env",
+    )
+
+
+def _manual_employee_role(position):
+    normalized = re.sub(r"[().,\-–—]+", " ", _name_key(position))
+    normalized = " ".join(normalized.split())
+
+    normalized = re.sub(
+        r"\s+[123](?:\s*[йя])?\s+(?:категории|категория|кат)$",
+        "",
+        normalized,
+    )
+
+    if normalized in ROLE_2_POSITIONS:
+        return 2
+
+    if normalized in ROLE_1_POSITIONS:
+        return 1
+
+    return None
+
+
 
 
 def _read_onec():
@@ -122,7 +181,7 @@ def _employee_rows(payload):
     raise StoreAccessError("В ответе 1С не найден список сотрудников.")
 
 
-def _plan_employees(records, store_ids):
+def _plan_employees(records, store_ids, *, role_mode="discounter"):
     selected = [
         (smstore, item)
         for item in records
@@ -163,13 +222,20 @@ def _plan_employees(records, store_ids):
             if (part := _text(item.get(key)))
         )
         position = _text(item.get("Должность"))
-        roleid = (11 if _name_key(position) in ROLE_11_POSITIONS else 12) if position else None
+
+        if role_mode == "manual":
+            roleid = _manual_employee_role(position)
+        else:
+            roleid = (
+                11 if _name_key(position) in ROLE_11_POSITIONS else 12
+            ) if position else None
 
         row = {
             "smstore": smstore,
             "fio": fio,
             "inn": inn,
             "position": position,
+            "cashier_role": _text(item.get("РольКассира")),
             "roleid": roleid,
         }
         report.append(row)
@@ -211,7 +277,12 @@ def _plan_employees(records, store_ids):
             }.get(len(mappings), "Несколько магазинов с одинаковым smstore.")
             row.update(state="skip", reason=reason)
         elif roleid is None:
-            row.update(state="skip", reason="В 1С не заполнена должность.")
+            reason = (
+                "В 1С не заполнена должность."
+                if not position
+                else "Для этой должности не задано правило назначения роли 1 или 2."
+            )
+            row.update(state="skip", reason=reason)
         else:
             candidates[user["id"], row["ukm4store"]].append(row)
 
@@ -325,6 +396,84 @@ def _apply_links(report, candidates, *, write):
         _process_links(report, candidates, write=True)
 
 
+# @transaction.non_atomic_requests
+# @never_cache
+# @staff_member_required
+# @csrf_protect
+# @require_http_methods(["GET", "POST"])
+# def ukm_store_access(request):
+#     if not request.user.is_superuser:
+#         raise PermissionDenied
+
+#     tab = "source" if request.GET.get("tab") == "source" else "access"
+#     mode = request.POST.get("mode") if request.method == "POST" else None
+
+#     if request.method == "POST" and mode not in {"test", "apply", "source"}:
+#         return HttpResponseBadRequest("Неизвестный режим.")
+
+#     if mode:
+#         tab = "source" if mode == "source" else "access"
+
+#     ctx = {"tab": tab, "mode": mode, "store_env": STORE_IDS_ENV}
+#     status = 200
+
+#     try:
+#         if tab == "access":
+#             ctx["store_ids"] = _configured_stores()
+
+#         if mode == "source":
+#             payload = _read_onec()
+#             try:
+#                 rows = _employee_rows(payload)
+#             except StoreAccessError:
+#                 rows = [payload]
+
+#             ctx.update(
+#                 source_loaded=True,
+#                 source_payload=payload,
+#                 source_rows=rows,
+#                 source_count=len(rows),
+#                 source_is_list=rows is payload,
+#             )
+#             logger.info(
+#                 "ukm_store_access actor=%s mode=source rows=%s",
+#                 request.user.pk, len(rows),
+#             )
+
+#         elif mode in {"test", "apply"}:
+#             records = _employee_rows(_read_onec())
+#             report, candidates, missing_stores = _plan_employees(records, ctx["store_ids"])
+#             _apply_links(report, candidates, write=mode == "apply")
+
+#             counts = Counter(row["state"] for row in report)
+#             ctx.update(
+#                 report=report,
+#                 result_ready=True,
+#                 missing_stores=missing_stores,
+#                 total_1c=len(records),
+#                 counts=dict(counts),
+#                 found=sum("user_id" in row for row in report),
+#             )
+#             logger.info(
+#                 "ukm_store_access actor=%s mode=%s stores=%s result=%s",
+#                 request.user.pk, mode, ctx["store_ids"], dict(counts),
+#             )
+
+#     except StoreAccessError as exc:
+#         ctx["error"] = str(exc)
+
+#     except DatabaseError as exc:
+#         logger.warning(
+#             "ukm_store_access actor=%s mode=%s database_error=%s",
+#             request.user.pk, mode, type(exc).__name__,
+#         )
+#         ctx["error"] = "PostgreSQL отклонил операцию. Проверь журнал Django."
+#         status = 503
+
+#     return render(request, "frostapp/ukm_store_access.html", ctx, status=status)
+
+
+
 @transaction.non_atomic_requests
 @never_cache
 @staff_member_required
@@ -337,21 +486,34 @@ def ukm_store_access(request):
     tab = "source" if request.GET.get("tab") == "source" else "access"
     mode = request.POST.get("mode") if request.method == "POST" else None
 
-    if request.method == "POST" and mode not in {"test", "apply", "source"}:
+    if request.method == "POST" and mode not in {
+        "test", "apply", "manual", "source",
+    }:
         return HttpResponseBadRequest("Неизвестный режим.")
 
     if mode:
         tab = "source" if mode == "source" else "access"
 
-    ctx = {"tab": tab, "mode": mode, "store_env": STORE_IDS_ENV}
+    ctx = {
+        "tab": tab,
+        "mode": mode,
+        "store_env": STORE_IDS_ENV,
+        "manual_store_ids": _text(
+            request.POST.get("manual_store_ids", "")
+        ),
+    }
     status = 200
 
-    try:
-        if tab == "access":
+    if tab == "access":
+        try:
             ctx["store_ids"] = _configured_stores()
+        except StoreAccessError as exc:
+            ctx["config_error"] = str(exc)
 
+    try:
         if mode == "source":
             payload = _read_onec()
+
             try:
                 rows = _employee_rows(payload)
             except StoreAccessError:
@@ -364,28 +526,59 @@ def ukm_store_access(request):
                 source_count=len(rows),
                 source_is_list=rows is payload,
             )
+
             logger.info(
                 "ukm_store_access actor=%s mode=source rows=%s",
-                request.user.pk, len(rows),
+                request.user.pk,
+                len(rows),
             )
 
-        elif mode in {"test", "apply"}:
+        elif mode in {"test", "apply", "manual"}:
+            if mode == "manual":
+                selected_ids = _parse_store_ids(
+                    ctx["manual_store_ids"],
+                    "поле ID магазинов",
+                )
+                role_mode = "manual"
+            else:
+                if ctx.get("config_error"):
+                    raise StoreAccessError(ctx["config_error"])
+
+                selected_ids = ctx["store_ids"]
+                role_mode = "discounter"
+
             records = _employee_rows(_read_onec())
-            report, candidates, missing_stores = _plan_employees(records, ctx["store_ids"])
-            _apply_links(report, candidates, write=mode == "apply")
+
+            report, candidates, missing_stores = _plan_employees(
+                records,
+                selected_ids,
+                role_mode=role_mode,
+            )
+
+            _apply_links(
+                report,
+                candidates,
+                write=mode in {"apply", "manual"},
+            )
 
             counts = Counter(row["state"] for row in report)
+
             ctx.update(
                 report=report,
                 result_ready=True,
                 missing_stores=missing_stores,
+                processed_store_ids=selected_ids,
                 total_1c=len(records),
                 counts=dict(counts),
                 found=sum("user_id" in row for row in report),
             )
+
             logger.info(
                 "ukm_store_access actor=%s mode=%s stores=%s result=%s",
-                request.user.pk, mode, ctx["store_ids"], dict(counts),
+                request.user.pk,
+                mode,
+                selected_ids,
+                dict(counts),
             )
 
     except StoreAccessError as exc:
@@ -394,9 +587,18 @@ def ukm_store_access(request):
     except DatabaseError as exc:
         logger.warning(
             "ukm_store_access actor=%s mode=%s database_error=%s",
-            request.user.pk, mode, type(exc).__name__,
+            request.user.pk,
+            mode,
+            type(exc).__name__,
         )
-        ctx["error"] = "PostgreSQL отклонил операцию. Проверь журнал Django."
+        ctx["error"] = (
+            "PostgreSQL отклонил операцию. Проверь журнал Django."
+        )
         status = 503
 
-    return render(request, "frostapp/ukm_store_access.html", ctx, status=status)
+    return render(
+        request,
+        "frostapp/ukm_store_access.html",
+        ctx,
+        status=status,
+    )
