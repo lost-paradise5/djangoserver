@@ -526,6 +526,37 @@ def get_ukm5_full_xml_store_ids() -> set[int]:
     return regular | discounters
 
 
+# def build_ukm_rotation_links_filter(
+#     store_ids,
+#     *,
+#     discounter_store_ids=None,
+# ):
+#     selected = {
+#         int(value)
+#         for value in store_ids
+#     }
+
+#     if discounter_store_ids is None:
+#         _, discounter_store_ids = (
+#             get_ukm_rotation_store_groups()
+#         )
+
+#     discounters = (
+#         selected & set(discounter_store_ids)
+#     )
+#     regular = selected - discounters
+
+#     return (
+#         Q(
+#             storeid__in=sorted(regular),
+#             roleid__in=[1, 13],
+#         )
+#         | Q(
+#             storeid__in=sorted(discounters),
+#             roleid__in=[11, 12],
+#         )
+#     )
+
 def build_ukm_rotation_links_filter(
     store_ids,
     *,
@@ -549,11 +580,11 @@ def build_ukm_rotation_links_filter(
     return (
         Q(
             storeid__in=sorted(regular),
-            roleid__in=[1, 13],
+            roleid__in=[1, 2, 13],
         )
         | Q(
             storeid__in=sorted(discounters),
-            roleid__in=[11, 12],
+            roleid__in=[2, 11, 12],
         )
     )
 
@@ -5176,12 +5207,31 @@ def connect_ukm5_srvdata():
     )
 
 
+# def _map_pg_role_to_ukm5(
+#     role_id: int,
+# ) -> int:
+#     role_id = int(role_id)
+
+#     if role_id in {13, 11}:
+#         return 10001
+
+#     if role_id in {1, 12}:
+#         return 10002
+
+#     logger.warning(
+#         "[UKM5] Неожиданный role_id=%s, "
+#         "ставлю fallback=10002",
+#         role_id,
+#     )
+
+#     return 10002
+
 def _map_pg_role_to_ukm5(
     role_id: int,
 ) -> int:
     role_id = int(role_id)
 
-    if role_id in {13, 11}:
+    if role_id in {2, 11, 13}:
         return 10001
 
     if role_id in {1, 12}:
