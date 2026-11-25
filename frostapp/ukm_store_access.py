@@ -30,21 +30,16 @@ ROLE_11_POSITIONS = {
     "директор магазина",
 }
 
-ROLE_1_POSITIONS = {
-    "специалист торгового зала",
-    "сотрудник торгового зала",
-    "приемщик",
-    "приемщик товара",
-}
-
 ROLE_2_POSITIONS = {
-    "старший кассир",
-    "заведующий отделом",
-    "генеральный директор",
-    "менеджер",
-    "старший специалист торгового зала",
     "администратор",
     "администратор магазина",
+    "старший специалист торгового зала",
+    "генеральный директор",
+    "заведующий отделом",
+    "зав отделом",
+    "завотделом",
+    "менеджер",
+    "старший кассир",
 }
 
 
@@ -108,19 +103,16 @@ def _manual_employee_role(position):
     normalized = re.sub(r"[().,\-–—]+", " ", _name_key(position))
     normalized = " ".join(normalized.split())
 
+    if not normalized:
+        return None
+
     normalized = re.sub(
         r"\s+[123](?:\s*[йя])?\s+(?:категории|категория|кат)$",
         "",
         normalized,
     )
 
-    if normalized in ROLE_2_POSITIONS:
-        return 2
-
-    if normalized in ROLE_1_POSITIONS:
-        return 1
-
-    return None
+    return 2 if normalized in ROLE_2_POSITIONS else 1
 
 
 
@@ -268,7 +260,7 @@ def _plan_employees(records, store_ids, *, role_mode="discounter"):
         user = matches[0]
         row.update(user_id=user["id"], db_fio=user["full_name"])
 
-        if not user["active"]:
+        if not user["active"] and role_mode != "manual":
             row.update(state="skip", reason="Пользователь найден, но неактивен.")
         elif len(mappings) != 1 or not _store_id(row.get("ukm4store")):
             reason = {
@@ -289,23 +281,33 @@ def _plan_employees(records, store_ids, *, role_mode="discounter"):
     return report, candidates, missing_stores
 
 
-def _process_links(report, candidates, *, write):
+def _process_links(report, candidates, *, write, manual=False):
     user_ids = {row["user_id"] for row in report if "user_id" in row}
     existing = defaultdict(list)
 
     for link in UKMUser.objects.filter(user_id__in=user_ids).values(
         "id", "user_id", "storeid", "roleid", "version",
-    ).order_by("storeid", "roleid", "id"):
+    ).order_by("id"):
         existing[link["user_id"]].append(link)
 
     for row in report:
         row["existing"] = existing.get(row.get("user_id"), [])
 
+    active_by_id = {}
+    if manual:
+        active_by_id = dict(
+            User.objects.filter(id__in=user_ids).values_list("id", "active")
+        )
+
     new_links = []
     changed_links = []
+    delete_ids = []
+    activate_ids = set()
+    processed_rows = []
 
     for (user_id, storeid), rows in candidates.items():
         roles = {row["roleid"] for row in rows}
+
         if len(roles) != 1:
             for row in rows:
                 row.update(
@@ -318,11 +320,20 @@ def _process_links(report, candidates, *, write):
             link for link in existing[user_id]
             if link["storeid"] == storeid
         ]
-        if len(at_store) > 1:
+
+        if len(at_store) > 1 and not manual:
             for row in rows:
                 row.update(
                     state="skip",
                     reason="В базе несколько привязок этого пользователя к магазину.",
+                )
+            continue
+
+        if manual and user_id not in active_by_id:
+            for row in rows:
+                row.update(
+                    state="skip",
+                    reason="Пользователь больше не найден в базе.",
                 )
             continue
 
@@ -339,32 +350,50 @@ def _process_links(report, candidates, *, write):
                         version=1,
                     )
                 )
-                first.update(state="added", reason="Привязка добавлена.")
-            else:
-                first.update(state="planned", reason="Будет добавлена.")
+
+            first.update(
+                state="added" if write else "planned",
+                reason="Привязка добавлена." if write else "Будет добавлена.",
+            )
 
         else:
-            link = at_store[0]
-            old_role = link["roleid"]
+            keep = at_store[0]
+            extra_ids = [link["id"] for link in at_store[1:]]
+            old_role = keep["roleid"]
 
-            if old_role == target_role:
-                first.update(
-                    state="exists",
-                    reason="Привязка уже есть с нужной ролью.",
-                )
-            elif write:
-                changed_links.append(
-                    UKMUser(id=link["id"], roleid=target_role)
-                )
-                first.update(
-                    state="updated",
-                    reason=f"Роль изменена: {old_role} → {target_role}.",
+            if old_role != target_role:
+                if write:
+                    changed_links.append(
+                        UKMUser(id=keep["id"], roleid=target_role)
+                    )
+
+                reason = (
+                    f"Роль изменена: {old_role} → {target_role}."
+                    if write
+                    else f"Роль будет изменена: {old_role} → {target_role}."
                 )
             else:
-                first.update(
-                    state="planned_update",
-                    reason=f"Роль будет изменена: {old_role} → {target_role}.",
+                reason = f"Привязка уже есть с ролью {target_role}."
+
+            if extra_ids:
+                delete_ids.extend(extra_ids)
+                reason += (
+                    f" Дублей удалено: {len(extra_ids)}."
+                    if write
+                    else f" Дублей к удалению: {len(extra_ids)}."
                 )
+
+            changed = old_role != target_role or bool(extra_ids)
+            state = "exists"
+            if changed:
+                state = "updated" if write else "planned_update"
+
+            first.update(state=state, reason=reason)
+
+        processed_rows.extend(rows)
+
+        if manual and not active_by_id[user_id]:
+            activate_ids.add(user_id)
 
         for row in duplicates:
             row.update(
@@ -372,28 +401,90 @@ def _process_links(report, candidates, *, write):
                 reason="Повтор строки 1С. Учтена один раз.",
             )
 
-    if new_links:
-        UKMUser.objects.bulk_create(new_links, batch_size=500)
+    if write:
+        if delete_ids:
+            UKMUser.objects.filter(id__in=delete_ids).delete()
 
-    if changed_links:
-        UKMUser.objects.bulk_update(changed_links, ["roleid"], batch_size=500)
+        if changed_links:
+            UKMUser.objects.bulk_update(
+                changed_links,
+                ["roleid"],
+                batch_size=500,
+            )
+
+        if new_links:
+            UKMUser.objects.bulk_create(new_links, batch_size=500)
+
+    activated_users = 0
+
+    if write and activate_ids:
+        activated_users = User.objects.filter(
+            id__in=activate_ids,
+            active=False,
+        ).update(active=True)
+
+    if manual:
+        for row in processed_rows:
+            if active_by_id[row["user_id"]]:
+                row["activation_note"] = "Уже активен."
+            else:
+                row["activation_note"] = (
+                    "Активирован: false → true."
+                    if write
+                    else "Будет активирован: false → true."
+                )
+
+    return {
+        "activated_users": activated_users,
+        "removed_duplicates": len(delete_ids) if write else 0,
+    }
 
 
-def _apply_links(report, candidates, *, write):
+def _apply_links(report, candidates, *, write, manual=False):
     if not write or not candidates:
-        _process_links(report, candidates, write=False)
-        return
+        return _process_links(
+            report,
+            candidates,
+            write=False,
+            manual=manual,
+        )
 
     if connection.vendor != "postgresql":
-        raise StoreAccessError("Запись доступна только через подключение PostgreSQL.")
+        raise StoreAccessError(
+            "Запись доступна только через подключение PostgreSQL."
+        )
 
     with transaction.atomic():
         with connection.cursor() as cursor:
             cursor.execute("SET LOCAL lock_timeout = '5s'")
-            table = connection.ops.quote_name(UKMUser._meta.db_table)
-            cursor.execute(f"LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE")
 
-        _process_links(report, candidates, write=True)
+        if manual:
+            user_ids = sorted({user_id for user_id, _ in candidates})
+
+            locked_ids = list(
+                User.objects.select_for_update()
+                .filter(id__in=user_ids)
+                .order_by("id")
+                .values_list("id", flat=True)
+            )
+
+            if locked_ids != user_ids:
+                raise StoreAccessError(
+                    "Состав пользователей изменился. Повтори запуск."
+                )
+
+        with connection.cursor() as cursor:
+            table = connection.ops.quote_name(UKMUser._meta.db_table)
+            cursor.execute(
+                f"LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE"
+            )
+
+        return _process_links(
+            report,
+            candidates,
+            write=True,
+            manual=manual,
+        )
 
 
 # @transaction.non_atomic_requests
@@ -555,10 +646,11 @@ def ukm_store_access(request):
                 role_mode=role_mode,
             )
 
-            _apply_links(
+            changes = _apply_links(
                 report,
                 candidates,
                 write=mode in {"apply", "manual"},
+                manual=mode == "manual",
             )
 
             counts = Counter(row["state"] for row in report)
@@ -571,6 +663,8 @@ def ukm_store_access(request):
                 total_1c=len(records),
                 counts=dict(counts),
                 found=sum("user_id" in row for row in report),
+                activated_users=changes["activated_users"],
+                removed_duplicates=changes["removed_duplicates"],
             )
 
             logger.info(
