@@ -584,7 +584,7 @@ def build_ukm_rotation_links_filter(
         )
         | Q(
             storeid__in=sorted(discounters),
-            roleid__in=[2, 11, 12],
+            roleid__in=[1, 2, 11, 12],
         )
     )
 
