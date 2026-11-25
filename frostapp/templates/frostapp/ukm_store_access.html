@@ -177,6 +177,10 @@
             <span>Добавлено <b>{{ counts.added|default:"0" }}</b></span>
             <span>Ролей обновлено <b>{{ counts.updated|default:"0" }}</b></span>
           {% endif %}
+          {% if mode == "manual" %}
+            <span>Активировано сотрудников <b>{{ activated_users|default:"0" }}</b></span>
+            <span>Удалено дублей привязок <b>{{ removed_duplicates|default:"0" }}</b></span>
+          {% endif %}
           <span>Пропущено <b>{{ counts.skip|default:"0" }}</b></span>
           <span>Повторы 1С <b>{{ counts.duplicate|default:"0" }}</b></span>
         </div>
@@ -196,6 +200,7 @@
                   <th>Пользователь в базе</th>
                   <th>Привязки до запуска</th>
                   <th>Назначаемая роль</th>
+                  <th>Активность пользователя</th>
                   <th>Результат</th>
                 </tr>
               </thead>
@@ -239,6 +244,7 @@
                       {% endif %}
                     </td>
                     <td>{{ row.roleid|default:"—" }}</td>
+                    <td>{{ row.activation_note|default:"—" }}</td>
                     <td><span class="badge {{ row.state }}">{{ row.reason }}</span></td>
                   </tr>
                 {% endfor %}
@@ -297,9 +303,13 @@
     form.addEventListener('submit', (event) => {
       const mode = event.submitter?.value;
   
+      const message = mode === 'manual'
+        ? 'Назначить роли, объединить дубли привязок и активировать найденных сотрудников?'
+        : 'Добавить привязки и обновить роли по данным 1С?';
+  
       if (
         ['apply', 'manual'].includes(mode) &&
-        !window.confirm('Добавить привязки и обновить роли по данным 1С?')
+        !window.confirm(message)
       ) {
         event.preventDefault();
       }
